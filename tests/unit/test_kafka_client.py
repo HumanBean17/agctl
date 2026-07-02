@@ -272,7 +272,7 @@ def test_consume_window_from_beginning_returns_all():
     client = KafkaClient(["host:9092"], consumer_factory=factory)
 
     result = client.consume_window(
-        topic, lookback_seconds=30, timeout_seconds=1, from_beginning=True
+        topic, lookback_seconds=30, timeout_seconds=0.02, from_beginning=True
     )
 
     assert len(result) == 3
@@ -305,7 +305,7 @@ def test_consume_window_lookback_excludes_old_messages():
     client = KafkaClient(["host:9092"], consumer_factory=factory)
 
     result = client.consume_window(
-        topic, lookback_seconds=10, timeout_seconds=1, from_beginning=False
+        topic, lookback_seconds=10, timeout_seconds=0.02, from_beginning=False
     )
 
     keys = {m["key"] for m in result}
@@ -334,7 +334,7 @@ def test_consume_window_parses_json_value():
     client = KafkaClient(["host:9092"], consumer_factory=factory)
 
     result = client.consume_window(
-        topic, lookback_seconds=10, timeout_seconds=1, from_beginning=True
+        topic, lookback_seconds=10, timeout_seconds=0.02, from_beginning=True
     )
 
     by_key = {m["key"]: m for m in result}
@@ -365,7 +365,7 @@ def test_consume_window_normalizes_fields():
     client = KafkaClient(["host:9092"], consumer_factory=factory)
 
     result = client.consume_window(
-        topic, lookback_seconds=10, timeout_seconds=1, from_beginning=True
+        topic, lookback_seconds=10, timeout_seconds=0.02, from_beginning=True
     )
 
     m = result[0]
@@ -392,7 +392,7 @@ def test_consume_window_empty_returns_empty_list():
     client = KafkaClient(["host:9092"], consumer_factory=factory)
 
     result = client.consume_window(
-        topic, lookback_seconds=10, timeout_seconds=1, from_beginning=True
+        topic, lookback_seconds=10, timeout_seconds=0.02, from_beginning=True
     )
 
     assert result == []
