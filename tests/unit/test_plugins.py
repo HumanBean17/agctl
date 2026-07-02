@@ -126,7 +126,7 @@ def test_load_plugins_import_time_guard(monkeypatch):
 
 def test_plugin_validation_errors_collects_strings():
     """A plugin's validate_config error strings become {path, message} records."""
-    from agctl.cli import _plugin_validation_errors
+    from agctl.commands.config_commands import _plugin_validation_errors
 
     plugin = types.SimpleNamespace(
         name="grpc",
@@ -141,7 +141,7 @@ def test_plugin_validation_errors_collects_strings():
 
 def test_plugin_validation_errors_skips_plugins_without_validate():
     """Plugins lacking validate_config are ignored (duck-typed loading)."""
-    from agctl.cli import _plugin_validation_errors
+    from agctl.commands.config_commands import _plugin_validation_errors
 
     plugin = types.SimpleNamespace(name="noop")  # no validate_config
     assert _plugin_validation_errors([plugin], {}) == []
@@ -149,7 +149,7 @@ def test_plugin_validation_errors_skips_plugins_without_validate():
 
 def test_plugin_validation_errors_isolates_raising_plugin():
     """A plugin whose validate_config raises is isolated, not fatal."""
-    from agctl.cli import _plugin_validation_errors
+    from agctl.commands.config_commands import _plugin_validation_errors
 
     def _boom(cfg):
         raise RuntimeError("boom")

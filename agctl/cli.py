@@ -1,29 +1,36 @@
-"""Click entry point (DESIGN §3, §7). Wires command groups and emits envelopes."""
+"""Click entry point (DESIGN §3, §7). Wires command groups and emits envelopes.
+
+The ``config`` command group lives in :mod:`agctl.commands.config_commands`;
+plugin loading (``_load_plugins`` / ``_LOADED_PLUGINS``) stays here because it
+is a CLI-bootstrap concern. Config validation reads the live plugin list via a
+thunk injected into ``config_commands`` (see :func:`set_plugins_provider`), so
+the dependency runs one way: ``cli → config_commands``.
+"""
 
 import importlib.metadata
 import sys
-import time
 from typing import Any
 
 import click
 
 from .commands.check_commands import check_ready
+from .commands.config_commands import (
+    config_show,
+    config_validate,
+    set_plugins_provider,
+)
 from .commands.db_commands import db_assert, db_query
 from .commands.discover_commands import discover
 from .commands.http_commands import http_call, http_ping, http_request
 from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
-from .config import ConfigError, load_config
-from .config.validator import validate_config
-from .output import emit
-
-_SECRET_FRAGMENTS = ("password", "token", "secret")
 
 #: Entry-point group for third-party protocol plugins (DESIGN §9.2).
 PLUGIN_ENTRY_POINT_GROUP = "agctl.plugins"
 
 #: Plugins successfully loaded at import time (DESIGN §9.2). Populated by
-#: :func:`_load_plugins`; consulted by ``agctl config validate`` so each plugin
-#: can validate its own config section (see :func:`_plugin_validation_errors`).
+#: :func:`_load_plugins`; read by ``agctl config validate`` via the thunk passed
+#: to :func:`agctl.commands.config_commands.set_plugins_provider` so each plugin
+#: can validate its own config section.
 _LOADED_PLUGINS: list[Any] = []
 
 
@@ -47,11 +54,11 @@ def _load_plugins(cli_group: click.Group) -> None:
 
     Each plugin object exposes ``.command_group`` (a :class:`click.Group`) and
     optionally ``.name`` (subcommand name) and ``.validate_config(config)``
-    (consulted by ``agctl config validate`` — see :func:`_plugin_validation_errors`).
-    Each load+register is wrapped in try/except so a broken plugin logs to stderr
-    and is skipped rather than bricking the CLI. An empty/missing ``agctl.plugins``
-    group is a clean no-op. Successfully loaded plugins are recorded in
-    ``_LOADED_PLUGINS`` so config validation can delegate to them.
+    (consulted by ``agctl config validate`` via the provider set below). Each
+    load+register is wrapped in try/except so a broken plugin logs to stderr
+    and is skipped rather than bricking the CLI. An empty/missing
+    ``agctl.plugins`` group is a clean no-op. Successfully loaded plugins are
+    recorded in ``_LOADED_PLUGINS`` so config validation can delegate to them.
     """
     global _LOADED_PLUGINS
     _LOADED_PLUGINS = []
@@ -76,65 +83,6 @@ def _load_plugins(cli_group: click.Group) -> None:
                 )
     except Exception as exc:  # noqa: BLE001 - never let the loader crash the CLI
         print(f"agctl: plugin loader error: {exc}", file=sys.stderr)
-
-
-def _plugin_validation_errors(plugins: list, config_dict: dict) -> list[dict]:
-    """Ask each loaded plugin to validate its own config section (DESIGN §9.2).
-
-    Each plugin's ``validate_config(config_dict)`` (if present) returns a list of
-    human-readable error strings. Those are folded into ``{path, message}`` error
-    records under ``plugin.<name>``. A plugin that raises is isolated: its error
-    becomes a single record rather than crashing ``config validate``.
-    """
-    errors: list[dict] = []
-    for plugin in plugins:
-        validate = getattr(plugin, "validate_config", None)
-        if not callable(validate):
-            continue
-        plugin_name = getattr(plugin, "name", None) or "unknown"
-        try:
-            returned = validate(config_dict) or []
-        except Exception as exc:  # noqa: BLE001 - plugin isolation
-            errors.append(
-                {"path": f"plugin.{plugin_name}", "message": f"plugin raised: {exc}"}
-            )
-            continue
-        for msg in returned:
-            errors.append({"path": f"plugin.{plugin_name}", "message": str(msg)})
-    return errors
-
-
-def _ms(start: float) -> int:
-    return int((time.monotonic() - start) * 1000)
-
-
-def _mask(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {k: ("***" if _is_secret(k) and v else _mask(v)) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_mask(v) for v in obj]
-    return obj
-
-
-def _is_secret(key: str) -> bool:
-    lowered = key.lower()
-    if any(frag in lowered for frag in _SECRET_FRAGMENTS):
-        return True
-    # "key" is too broad as a substring (would mask non-secret paths like
-    # kafka.ssl.key_location, or names like key_id). Treat it as a secret only
-    # when it names the key itself: a bare ``key`` or an ``*_key`` suffix.
-    return lowered == "key" or lowered.endswith("_key")
-
-
-def _emit_config_error(command: str, err: ConfigError, start: float) -> None:
-    errors = [{"message": err.message, **(err.detail or {})}]
-    emit(
-        ok=False,
-        command=command,
-        result={"valid": False, "errors": errors},
-        error={"type": "ConfigError", "message": err.message, "detail": err.detail},
-        duration_ms=_ms(start),
-    )
 
 
 @click.group()
@@ -171,6 +119,10 @@ def check_group() -> None:
     """Health/readiness checks (DESIGN §3.4)."""
 
 
+# Register subcommands on the config group (commands live in config_commands.py).
+config_group.add_command(config_validate)
+config_group.add_command(config_show)
+
 # Register subcommands on the http group.
 http_group.add_command(http_call)
 http_group.add_command(http_request)
@@ -196,65 +148,15 @@ check_group.add_command(check_ready)
 cli.add_command(discover)
 
 
+# Bridge config validation to the live loaded-plugins list. The thunk reads this
+# module's ``_LOADED_PLUGINS`` global at call time, so it stays correct even after
+# :func:`_load_plugins` reassigns that global.
+set_plugins_provider(lambda: _LOADED_PLUGINS)
+
+
 # Load third-party protocol plugins (DESIGN §9.2). A clean no-op today since no
 # plugins are registered; guarded so a broken plugin/importlib never bricks the CLI.
 _load_plugins(cli)
-
-
-@config_group.command("validate")
-@click.option("--config", "config_path", default=None)
-@click.pass_context
-def config_validate(ctx: click.Context, config_path: str | None) -> None:
-    """Parse and validate agctl.yaml (DESIGN §3.5). Exit 2 on any error."""
-    start = time.monotonic()
-    path = config_path or ctx.obj.get("config_path")
-    try:
-        cfg = load_config(path)
-    except ConfigError as err:
-        _emit_config_error("config.validate", err, start)
-        raise SystemExit(2)
-    errors, warnings = validate_config(cfg)
-    # Let loaded plugins validate their own config sections (DESIGN §9.2).
-    errors = errors + _plugin_validation_errors(_LOADED_PLUGINS, cfg.model_dump())
-    if errors:
-        summary = f"Configuration has {len(errors)} error(s)"
-        emit(
-            ok=False,
-            command="config.validate",
-            result={"valid": False, "errors": errors, "warnings": warnings},
-            error={
-                "type": "ConfigError",
-                "message": summary,
-                "detail": {"errors": errors, "warnings": warnings},
-            },
-            duration_ms=_ms(start),
-        )
-        raise SystemExit(2)
-    emit(
-        ok=True,
-        command="config.validate",
-        result={"valid": True, "warnings": warnings},
-        duration_ms=_ms(start),
-    )
-
-
-@config_group.command("show")
-@click.option("--config", "config_path", default=None)
-@click.option("--unmask", is_flag=True, default=False)
-@click.pass_context
-def config_show(ctx: click.Context, config_path: str | None, unmask: bool) -> None:
-    """Dump the resolved config as JSON, secrets masked (DESIGN §3.5)."""
-    start = time.monotonic()
-    path = config_path or ctx.obj.get("config_path")
-    try:
-        cfg = load_config(path)
-    except ConfigError as err:
-        _emit_config_error("config.show", err, start)
-        raise SystemExit(2)
-    data = cfg.model_dump()
-    if not unmask:
-        data = _mask(data)
-    emit(ok=True, command="config.show", result=data, duration_ms=_ms(start))
 
 
 if __name__ == "__main__":
