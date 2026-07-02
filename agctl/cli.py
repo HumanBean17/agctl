@@ -7,6 +7,7 @@ import click
 
 from .commands.check_commands import check_ready
 from .commands.db_commands import db_assert, db_query
+from .commands.discover_commands import discover
 from .commands.http_commands import http_call, http_ping, http_request
 from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
 from .config import ConfigError, load_config
@@ -97,6 +98,10 @@ kafka_group.add_command(kafka_assert)
 
 # Register subcommands on the check group.
 check_group.add_command(check_ready)
+
+
+# Register the top-level `discover` command directly on the root group.
+cli.add_command(discover)
 
 
 @config_group.command("validate")
