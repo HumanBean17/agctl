@@ -1071,7 +1071,14 @@ AGCTL_DATABASE__CONNECTIONS__MAIN_DB__PASSWORD=s3cr3t
 AGCTL_SERVICES__ORDER_SERVICE__BASE_URL=http://order-svc:8080
 ```
 
-To map a config path to an env var: uppercase each path segment, convert hyphens to `_` within a segment, and join segments with `__`. Example: `services.order-service.base_url` → `AGCTL_SERVICES__ORDER_SERVICE__BASE_URL`. Parsing back is not guaranteed to reconstruct hyphens (a `_` could be a hyphen or a literal underscore); overrides are write-oriented, so this is acceptable. The `__` delimiter mirrors Pydantic Settings / Spring Boot and keeps keys containing single underscores unambiguous.
+To map a config path to an env var: uppercase each path segment, convert hyphens to `_` within a segment, and join segments with `__`. Example: `services.order-service.base_url` → `AGCTL_SERVICES__ORDER_SERVICE__BASE_URL`.
+
+Two matching rules keep overrides predictable:
+
+- **At least two segments required.** An override must contain a `__` separator. This prevents single-token env vars from being misread as overrides — notably `AGCTL_CONFIG` (the config-file path) and `AGCTL_TEST_*` flags, which must not touch config values.
+- **Case- and hyphen-insensitive key matching against existing keys.** `AGCTL_SERVICES__ORDER_SERVICE__BASE_URL` overrides the real `services.order-service.base_url` entry rather than creating a phantom `order_service` sibling. When no existing key matches, a new key is written under the lowercased segment name.
+
+Parsing back is not guaranteed to reconstruct hyphens (a `_` could be a hyphen or a literal underscore); overrides are write-oriented, so this is acceptable. The `__` delimiter mirrors Pydantic Settings / Spring Boot and keeps keys containing single underscores unambiguous.
 
 ---
 
@@ -1255,13 +1262,20 @@ agctl/                         # Repository root
 │
 ├── agctl/                     # Main Python package
 │   ├── __init__.py
-│   ├── cli.py                     # Click entry point; registers command groups
-│   ├── output.py                  # JSON envelope builder; all stdout writes go here
+│   ├── cli.py                     # Click entry point; registers command groups; loads plugins
+│   ├── command.py                 # @envelope decorator + load_config_or_raise
+│   ├── output.py                  # emit() — the single permitted stdout write path
+│   ├── errors.py                  # typed AgctlError hierarchy
+│   ├── params.py                  # --param k=v  →  dict[str,str]
+│   ├── resolution.py              # {placeholder} fill, body deep_merge, :name→%(name)s
+│   ├── assertions.py              # jq / subset / equals / coercion primitives
+│   ├── assertion_registry.py      # pluggable assertion-mode registry + entry-point discovery
+│   ├── plugin_protocol.py         # Protocol contract for protocol plugins
 │   │
 │   ├── commands/                  # One module per command group
 │   │   ├── __init__.py
-│   │   ├── http_commands.py       # `agctl http call` and `agctl http request`
-│   │   ├── kafka_commands.py      # `agctl kafka consume/produce/assert`
+│   │   ├── http_commands.py       # `agctl http call` / `request` / `ping`
+│   │   ├── kafka_commands.py      # `agctl kafka produce / consume / assert`
 │   │   ├── db_commands.py         # `agctl db query` and `agctl db assert`
 │   │   ├── check_commands.py      # `agctl check ready`
 │   │   ├── config_commands.py     # `agctl config validate` and `agctl config show`
@@ -1269,15 +1283,20 @@ agctl/                         # Repository root
 │   │
 │   ├── config/                    # Config loading pipeline
 │   │   ├── __init__.py
-│   │   ├── loader.py              # Discovery walk, file parsing, env var interpolation
-│   │   ├── validator.py           # Schema validation (jsonschema or pydantic)
-│   │   └── resolver.py            # AGCTL_* env var override layer
+│   │   ├── loader.py              # Discovery walk, interpolation, override merge, validation
+│   │   ├── resolver.py            # AGCTL_* env var override layer
+│   │   ├── validator.py           # Cross-reference checks + description warnings
+│   │   │                          #   (Pydantic schema validation lives in models.py)
+│   │   └── models.py              # Pydantic v2 typed config models
 │   │
 │   └── clients/                   # Protocol clients; each is independently instantiable
 │       ├── __init__.py
-│       ├── http_client.py         # httpx-based; accepts a ServiceConfig
-│       ├── kafka_client.py        # confluent-kafka-python based
-│       └── db_client.py           # Dispatches to registered driver plugins
+│       ├── http_client.py         # httpx-based (lazy import); accepts a ServiceConfig
+│       ├── kafka_client.py        # confluent-kafka based (lazy import)
+│       ├── db_client.py           # Dispatches to registered driver plugins
+│       ├── db_driver_protocol.py  # DBDriver Protocol
+│       └── db_drivers/
+│           └── postgresql.py      # Built-in psycopg-backed driver (lazy import)
 │
 ├── tests/
 │   ├── unit/
@@ -1310,13 +1329,20 @@ description = "Agent-facing CLI harness for testing distributed systems"
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.1",
-    "httpx>=0.27",
     "pyyaml>=6.0",
     "pydantic>=2.0",
-    "confluent-kafka>=2.4",
-    "psycopg[binary]>=3.1",
-    "jq>=1.6",
 ]
+
+# Protocol libraries are OPTIONAL EXTRAS so users install only what they need
+# and the package imports fast. Each client lazy-imports its library at construct
+# time; a missing extra surfaces as a ConfigError pointing at the right
+# `pip install 'agctl[...]'` rather than an opaque ImportError.
+[project.optional-dependencies]
+http = ["httpx>=0.27"]
+kafka = ["confluent-kafka>=2.4", "jq>=1.6"]
+db = ["psycopg[binary]>=3.1", "jq>=1.6"]
+dev = ["pytest>=8.0"]
+integration = ["testcontainers", "agctl[db,kafka,http]", "pytest>=8.0"]
 
 [project.scripts]
 agctl = "agctl.cli:cli"
@@ -1368,6 +1394,8 @@ def emit(
 
 `output.emit()` is the **only** permitted stdout write path. Every command calls it exactly once before exiting. Any intermediate logging goes to stderr. The sole exception is `http ping`, which streams newline-delimited objects (one per ping plus a final summary) for background/keepalive use — see §3.1.
 
+This is enforced structurally: each command callback is split into a thin Click command and a `_core` function, and the `_core` is wrapped by an `@envelope(command)` decorator (`command.py`) that guarantees exactly one `emit()` — and one process exit code — on every code path (success, assertion failure, or error).
+
 ### stderr is not machine-readable
 
 Stderr is reserved for unexpected internal errors and stack traces. An agent must never parse stderr. If a stack trace reaches stderr, the command exits with code 2 and has already written a structured `InternalError` envelope to stdout.
@@ -1415,7 +1443,7 @@ AGCTL_DATABASE__CONNECTIONS__MAIN_DB__PASSWORD=supersecret
 AGCTL_SERVICES__ORDER_SERVICE__BASE_URL=http://order-svc:8080
 ```
 
-These overrides are applied after `${}` interpolation and have the highest precedence. (The `__` delimiter mirrors Pydantic Settings / Spring Boot and keeps keys containing single underscores unambiguous.)
+These overrides are applied after `${}` interpolation and have the highest precedence. Matching is case- and hyphen-insensitive against existing config keys, and requires at least two `__`-separated segments (so `AGCTL_CONFIG` is not mistaken for an override) — see §5. (The `__` delimiter mirrors Pydantic Settings / Spring Boot and keeps keys containing single underscores unambiguous.)
 
 ---
 
@@ -1477,7 +1505,7 @@ A registered mode is invoked via the `--assertion <name>` escape hatch on `agctl
 - `db assert --assertion <name>`: `context = {"rows": [...], "row_count": int, "sql": str, "params": {...}, "connection": str}`.
 - `kafka assert --assertion <name>`: `context = {"topic": str, "messages": [...], "count": int, "params": {...}}` (the full consumed lookback window).
 
-`passed: false` (or a raised `AssertionFailure`) yields an `AssertionError` exit 1; an unknown name yields `TemplateNotFound` exit 2. Built-in modes (`expect_rows`, `expectValue`, `contains`, `match`, `pattern`) have dedicated flags and are rejected via `--assertion` with a `ConfigError`.
+`passed: false` (or a raised `AssertionFailure`) yields an `AssertionError` exit 1; an unknown name yields `TemplateNotFound` exit 2. Built-in modes (`expect_rows`, `expectValue`, `contains`, `match`, `pattern`) have dedicated flags and are rejected via `--assertion` with a `ConfigError`. They are registered by name only for discoverability and clean unknown-mode rejection; their logic lives in the command layer (calling `evaluate` on one raises `NotImplementedError`), so only third-party modes are actually invoked through `evaluate(context)`.
 
 ---
 

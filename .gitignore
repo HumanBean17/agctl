@@ -1,8 +1,8 @@
 # macOS
 .DS_Store
 
-# Claude Code local state
-.claude/
+# Claude Code local state (project agents/ and shared settings.json ARE tracked)
+.claude/settings.local.json
 
 # Python
 __pycache__/
