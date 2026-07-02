@@ -275,6 +275,74 @@ def test_produce_offset_increments_across_calls():
 
 
 # ---------------------------------------------------------------------------
+# extra_conf — TLS/extra librdkafka keys merged into producer + consumer confs
+# ---------------------------------------------------------------------------
+
+
+def test_produce_merges_extra_conf():
+    """TLS/extra keys supplied via extra_conf land in the producer conf dict."""
+    fake = FakeProducer({})
+    extra = {
+        "security.protocol": "SSL",
+        "ssl.ca.location": "/ca.pem",
+        "ssl.certificate.location": "/client.crt",
+        "ssl.key.location": "/client.key",
+    }
+
+    def factory(conf):
+        fake.conf = conf  # capture the conf the client builds
+        return fake
+
+    client = KafkaClient(["host:9092"], producer_factory=factory, extra_conf=extra)
+
+    client.produce("t", {"a": 1})
+
+    assert fake.conf["bootstrap.servers"] == "host:9092"
+    assert fake.conf["security.protocol"] == "SSL"
+    assert fake.conf["ssl.ca.location"] == "/ca.pem"
+    assert fake.conf["ssl.certificate.location"] == "/client.crt"
+    assert fake.conf["ssl.key.location"] == "/client.key"
+
+
+def test_consume_merges_extra_conf():
+    """TLS/extra keys supplied via extra_conf land in the consumer conf dict."""
+    extra = {"security.protocol": "SSL", "ssl.ca.location": "/ca.pem"}
+    captured = {}
+
+    def factory(conf):
+        captured["conf"] = conf
+        return FakeConsumer(conf, messages=[])
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory, extra_conf=extra)
+
+    client.consume_window(
+        "t", lookback_seconds=30, timeout_seconds=0.02, from_beginning=True
+    )
+
+    conf = captured["conf"]
+    assert conf["bootstrap.servers"] == "host:9092"
+    assert conf["group.id"] == "agctl-consumer"
+    assert conf["security.protocol"] == "SSL"
+    assert conf["ssl.ca.location"] == "/ca.pem"
+
+
+def test_no_extra_conf_keeps_plaintext_conf():
+    """Without extra_conf the producer conf has no stray ssl.* keys — a
+    plaintext-broker user must never see TLS leakage from a default client."""
+    captured = {}
+
+    def factory(conf):
+        captured["conf"] = conf
+        return FakeProducer(conf)
+
+    client = KafkaClient(["host:9092"], producer_factory=factory)
+
+    client.produce("t", {"a": 1})
+
+    assert captured["conf"] == {"bootstrap.servers": "host:9092"}
+
+
+# ---------------------------------------------------------------------------
 # consume_window — from_beginning
 # ---------------------------------------------------------------------------
 

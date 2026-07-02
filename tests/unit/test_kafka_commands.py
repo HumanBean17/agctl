@@ -17,6 +17,7 @@ from confluent_kafka import OFFSET_END, TopicPartition
 
 from agctl.cli import cli
 from agctl.clients.kafka_client import KafkaClient
+from agctl.config.models import KafkaConfig, KafkaSSL
 from agctl.assertion_registry import Assertion
 from agctl.commands import kafka_commands
 
@@ -36,6 +37,87 @@ ENV = {
     "ANALYTICS_DB_USER": "au",
     "ANALYTICS_DB_PASSWORD": "ap",
 }
+
+
+# ---------------------------------------------------------------------------
+# _kafka_ssl_conf — typed kafka.ssl -> librdkafka conf dict translation
+# ---------------------------------------------------------------------------
+
+
+def _kcfg(**ssl_kwargs):
+    return KafkaConfig(ssl=KafkaSSL(**ssl_kwargs)) if ssl_kwargs else KafkaConfig()
+
+
+def test_ssl_conf_none_when_no_ssl():
+    assert kafka_commands._kafka_ssl_conf(KafkaConfig()) == {}
+    # An empty ssl block also yields nothing (no knobs -> no protocol inferred).
+    assert kafka_commands._kafka_ssl_conf(_kcfg()) == {}
+
+
+def test_ssl_conf_full_emits_all_keys_with_inferred_protocol():
+    conf = kafka_commands._kafka_ssl_conf(
+        _kcfg(
+            ca_location="/ca.pem",
+            certificate_location="/client.crt",
+            key_location="/client.key",
+            key_password="secret",
+            endpoint_identification_algorithm="none",
+        )
+    )
+    assert conf == {
+        "ssl.ca.location": "/ca.pem",
+        "ssl.certificate.location": "/client.crt",
+        "ssl.key.location": "/client.key",
+        "ssl.key.password": "secret",
+        "ssl.endpoint.identification.algorithm": "none",
+        # security.protocol inferred to SSL when any knob is set and not given.
+        "security.protocol": "SSL",
+    }
+
+
+def test_ssl_conf_explicit_security_protocol_honored():
+    conf = kafka_commands._kafka_ssl_conf(
+        _kcfg(ca_location="/ca.pem", security_protocol="SASL_SSL")
+    )
+    assert conf["security.protocol"] == "SASL_SSL"
+
+
+def test_ssl_conf_partial_emits_only_set_keys():
+    conf = kafka_commands._kafka_ssl_conf(_kcfg(ca_location="/ca.pem"))
+    # Only the CA knob plus the inferred protocol.
+    assert conf == {"ssl.ca.location": "/ca.pem", "security.protocol": "SSL"}
+
+
+def test_ssl_conf_skips_empty_string_values():
+    """Empty strings (from unresolved ${VAR:-}) count as unset: they must not
+    emit bogus ssl.*.location paths nor disable hostname verification via an
+    empty endpoint_identification_algorithm (librdkafka treats "" == "none")."""
+    conf = kafka_commands._kafka_ssl_conf(
+        _kcfg(
+            ca_location="/ca.pem",
+            certificate_location="",
+            key_location="",
+            key_password="",
+            endpoint_identification_algorithm="",
+        )
+    )
+    assert conf == {"ssl.ca.location": "/ca.pem", "security.protocol": "SSL"}
+    assert "ssl.endpoint.identification.algorithm" not in conf
+
+
+def test_ssl_conf_all_empty_strings_is_noop():
+    """A fully-unresolved ssl block (every field "") enables no TLS at all —
+    no empty paths, no inferred security.protocol."""
+    conf = kafka_commands._kafka_ssl_conf(
+        _kcfg(
+            ca_location="",
+            certificate_location="",
+            key_location="",
+            key_password="",
+            endpoint_identification_algorithm="",
+        )
+    )
+    assert conf == {}
 
 
 # ---------------------------------------------------------------------------
