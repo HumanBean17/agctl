@@ -5,6 +5,7 @@ from typing import Any
 
 import click
 
+from .commands.db_commands import db_assert, db_query
 from .commands.http_commands import http_call, http_ping, http_request
 from .config import ConfigError, load_config
 from .config.validator import validate_config
@@ -60,10 +61,20 @@ def http_group() -> None:
     """HTTP request commands (DESIGN §3.1)."""
 
 
+@cli.group(name="db")
+def db_group() -> None:
+    """Database query/assert commands (DESIGN §3.3)."""
+
+
 # Register subcommands on the http group.
 http_group.add_command(http_call)
 http_group.add_command(http_request)
 http_group.add_command(http_ping)
+
+
+# Register subcommands on the db group.
+db_group.add_command(db_query)
+db_group.add_command(db_assert)
 
 
 @config_group.command("validate")
