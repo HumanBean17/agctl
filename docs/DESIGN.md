@@ -1164,6 +1164,8 @@ agctl kafka assert \
   --timeout 5
 ```
 
+> Send-then-assert is reliable by default: `kafka assert` seeks back by `--lookback` (default = `--timeout`), so an event published just before the assert starts is still matched. See §3.2.
+
 #### Pattern 3: Full end-to-end: HTTP → Kafka → DB
 
 ```bash
@@ -1179,8 +1181,8 @@ agctl kafka assert \
 
 # 3. Assert DB row exists and has correct status
 agctl db assert \
-  --sql "SELECT 1 FROM orders WHERE id = \$order_id AND status = 'PENDING'" \
-  --params order_id=$ORDER_ID \
+  --sql "SELECT 1 FROM orders WHERE id = :order_id AND status = 'PENDING'" \
+  --param order_id=$ORDER_ID \
   --expect-rows 1
 ```
 
@@ -1188,8 +1190,8 @@ agctl db assert \
 
 ```bash
 agctl db query \
-  --sql "SELECT id, status, total_cents FROM orders WHERE id = \$order_id" \
-  --params order_id=ord-789
+  --sql "SELECT id, status, total_cents FROM orders WHERE id = :order_id" \
+  --param order_id=ord-789
 ```
 
 #### Pattern 5: Keep session alive during a long test
