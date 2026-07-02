@@ -26,6 +26,7 @@ def _env():
         "PAYMENT_SERVICE_TOKEN": "tok",
         "KAFKA_BROKER": "localhost",
         "DB_HOST": os.environ.get("AGCTL_TEST_PG_HOST", "localhost"),
+        "DB_PORT": os.environ.get("DB_PORT", "5432"),
         "DB_NAME": os.environ.get("AGCTL_TEST_PG_DB", "n"),
         "DB_USER": os.environ.get("AGCTL_TEST_PG_USER", "u"),
         "DB_PASSWORD": os.environ.get("AGCTL_TEST_PG_PASSWORD", "p"),

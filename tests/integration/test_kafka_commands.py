@@ -26,7 +26,7 @@ def _env(broker):
         "ORDER_SERVICE_URL": "http://localhost:8081",
         "PAYMENT_SERVICE_URL": "http://localhost:8082",
         "PAYMENT_SERVICE_TOKEN": "tok",
-        "KAFKA_BROKER": broker.split(":")[0],
+        "KAFKA_BROKER": broker,
         "DB_HOST": "localhost",
         "DB_NAME": "n",
         "DB_USER": "u",

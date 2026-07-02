@@ -30,12 +30,13 @@ def _import_kafka():
         from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 
         try:
-            from confluent_kafka import TopicPartition
-        except ImportError:  # pragma: no cover - TopicPartition always present
+            from confluent_kafka import OFFSET_END, TopicPartition
+        except ImportError:  # pragma: no cover - always present in confluent_kafka
+            OFFSET_END = -1
             TopicPartition = None
     except ImportError as exc:
         raise ConfigError(_KAFKA_EXTRA_MSG) from exc
-    return Consumer, Producer, TopicPartition, KafkaError, KafkaException
+    return Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END
 
 
 def _ms_to_iso8601z(ts_ms):
@@ -94,7 +95,7 @@ class KafkaClient:
         ``value`` is JSON-encoded; ``key`` and header values are encoded to
         bytes if they are strings.
         """
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
 
         if self._producer_factory is not None:
             producer = self._producer_factory({"bootstrap.servers": ",".join(self._brokers)})
@@ -126,7 +127,7 @@ class KafkaClient:
                 headers=header_pairs,
                 on_delivery=_on_delivery,
             )
-            producer.flush(timeout=30)
+            remaining = producer.flush(timeout=30)
         except KafkaException as exc:
             raise ConnectionFailure(message=str(exc)) from exc
         except Exception as exc:  # broker connection issues, etc.
@@ -135,6 +136,14 @@ class KafkaClient:
         err, msg = holder[0], holder[1]
         if err is not None:
             raise ConnectionFailure(message=str(err))
+        if remaining:
+            # flush() returns the count of messages still queued (undelivered). A
+            # non-zero count with no delivery-report error means the broker was
+            # unreachable within the timeout — fail loudly instead of reporting
+            # null partition/offset as a silent success.
+            raise ConnectionFailure(
+                message=f"{remaining} message(s) not delivered within flush timeout"
+            )
 
         ts_type, ts_ms = (None, None)
         if msg is not None:
@@ -169,7 +178,7 @@ class KafkaClient:
 
         Returns a list of normalized message dicts (DESIGN §4.2 message shape).
         """
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
 
         consumer = self._build_consumer()
 
@@ -217,7 +226,7 @@ class KafkaClient:
         Returns a ``(message, scanned_count)`` tuple so callers can report
         ``messages_scanned``; if no match, returns ``(None, scanned_count)``.
         """
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
 
         consumer = self._build_consumer()
 
@@ -254,7 +263,7 @@ class KafkaClient:
 
     def _build_consumer(self):
         """Build a consumer (real or via the test factory) with the standard conf."""
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
 
         group_id = self._group_id or "agctl-consumer"
         conf = {
@@ -273,7 +282,7 @@ class KafkaClient:
         window (or offset 0 when ``from_beginning``). Shared by
         :meth:`consume_window` and :meth:`find_in_window`.
         """
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
 
         try:
             consumer.subscribe([topic])
@@ -312,6 +321,19 @@ class KafkaClient:
                 if rtp.offset is not None and rtp.offset >= 0:
                     try:
                         consumer.seek(rtp)
+                    except KafkaException as exc:
+                        raise ConnectionFailure(message=str(exc)) from exc
+                else:
+                    # offsets_for_times returns -1 when the partition's newest
+                    # message is older than the window. Such a partition must NOT
+                    # be left at its default fetch position — with
+                    # auto.offset.reset=earliest it would re-read every stale
+                    # message, violating the lookback window. Seek it to the end
+                    # so it contributes nothing old (new messages still arrive).
+                    try:
+                        consumer.seek(
+                            TopicPartition(topic, rtp.partition, OFFSET_END)
+                        )
                     except KafkaException as exc:
                         raise ConnectionFailure(message=str(exc)) from exc
 

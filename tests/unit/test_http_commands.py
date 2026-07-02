@@ -120,6 +120,33 @@ def test_http_call_missing_template(mock_transport, captured):
     assert payload["error"]["type"] == "TemplateNotFound"
 
 
+def test_http_ping_malformed_body_is_internal_error():
+    """Malformed --body JSON in `http ping` yields a structured InternalError
+    envelope + exit 2, not a raw traceback (parity with @envelope commands)."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "ping",
+            "--service",
+            "order-service",
+            "--path",
+            "/x",
+            "--interval",
+            "1",
+            "--body",
+            "{not-json",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["command"] == "http.ping"
+    assert payload["error"]["type"] == "InternalError"
+
+
 def test_http_call_header_merge_caller_wins(mock_transport, captured):
     """Template headers are sent; --header overrides the same header."""
     result = _run(

@@ -7,12 +7,13 @@ built with these fakes, so no broker is required.
 """
 
 import json
+import math
 import time
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
-from confluent_kafka import TopicPartition
+from confluent_kafka import OFFSET_END, TopicPartition
 
 from agctl.cli import cli
 from agctl.clients.kafka_client import KafkaClient
@@ -124,9 +125,9 @@ class FakeConsumer:
 
     A partition is only "in window" once it has been seeked to a non-negative
     offset. ``offsets_for_times`` returns ``-1`` when no canned message falls
-    inside the requested window; the real client then skips the seek for that
-    partition, and this fake mirrors that by treating an un-seeked partition as
-    having no readable messages (rather than defaulting to offset 0).
+    inside the requested window; the real client then seeks that partition to
+    ``OFFSET_END`` so it contributes nothing stale, and this fake mirrors that
+    (an un-seeked partition likewise yields nothing).
     """
 
     def __init__(self, conf, messages=None):
@@ -160,7 +161,10 @@ class FakeConsumer:
         return out
 
     def seek(self, tp):
-        self._seek_offsets[(tp.topic, tp.partition)] = tp.offset
+        # OFFSET_END means "nothing at/after here" — model it as +inf so poll's
+        # `offset >= seek_off` test yields nothing for that partition.
+        off = math.inf if tp.offset == OFFSET_END else tp.offset
+        self._seek_offsets[(tp.topic, tp.partition)] = off
 
     def seek_to_beginning(self, *tps):
         for tp in tps:
