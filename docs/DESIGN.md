@@ -1040,15 +1040,16 @@ Returns the fully resolved config as a JSON object with secrets masked. Structur
 
 **If no config file is found and no `--config` or `AGCTL_CONFIG` is set**, the tool exits with code 2 and a `ConfigError` JSON object.
 
-**Env var override convention** (`AGCTL_<SECTION>_<KEY>`):
+**Env var override convention** (`AGCTL_<SECTION>__<KEY>` — double-underscore `__` separates path segments; a single `_` stays within a key segment):
 
 ```
-AGCTL_DEFAULTS_TIMEOUT_SECONDS=30
-AGCTL_KAFKA_DEFAULT_CONSUMER_GROUP=my-group
-AGCTL_DATABASE_MAIN_DB_PASSWORD=s3cr3t
+AGCTL_DEFAULTS__TIMEOUT_SECONDS=30
+AGCTL_KAFKA__DEFAULT_CONSUMER_GROUP=my-group
+AGCTL_DATABASE__CONNECTIONS__MAIN_DB__PASSWORD=s3cr3t
+AGCTL_SERVICES__ORDER_SERVICE__BASE_URL=http://order-svc:8080
 ```
 
-Nested keys are separated by `_`. Connection/service names with hyphens are uppercased and hyphens are converted to `_`.
+To map a config path to an env var: uppercase each path segment, convert hyphens to `_` within a segment, and join segments with `__`. Example: `services.order-service.base_url` → `AGCTL_SERVICES__ORDER_SERVICE__BASE_URL`. Parsing back is not guaranteed to reconstruct hyphens (a `_` could be a hyphen or a literal underscore); overrides are write-oriented, so this is acceptable. The `__` delimiter mirrors Pydantic Settings / Spring Boot and keeps keys containing single underscores unambiguous.
 
 ---
 
