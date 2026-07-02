@@ -1,5 +1,7 @@
 """Config loading pipeline: discovery, interpolation, validation (DESIGN §2.2, §5)."""
 
+import os
+import pathlib
 import re
 from typing import Any
 
@@ -52,3 +54,30 @@ def _interpolate_str(s: str, env: dict[str, str], unresolved: list[str]) -> str:
         return match.group(0)
 
     return _VAR_RE.sub(repl, s)
+
+
+def discover_config_path(explicit: str | None = None, env: dict[str, str] | None = None) -> pathlib.Path:
+    """Resolve the config path per DESIGN §5: --config > AGCTL_CONFIG > walk up."""
+    env = env if env is not None else os.environ
+
+    if explicit:
+        path = pathlib.Path(explicit)
+        if not path.is_file():
+            raise ConfigError(f"Config file not found: {explicit}", {"path": explicit})
+        return path
+
+    if "AGCTL_CONFIG" in env:
+        path = pathlib.Path(env["AGCTL_CONFIG"])
+        if not path.is_file():
+            raise ConfigError(f"Config file not found: {env['AGCTL_CONFIG']}", {"path": str(path)})
+        return path
+
+    cwd = pathlib.Path.cwd()
+    for directory in [cwd, *cwd.parents]:
+        candidate = directory / "agctl.yaml"
+        if candidate.is_file():
+            return candidate
+        if (directory / ".git").exists():
+            break
+
+    raise ConfigError("No agctl.yaml found (use --config or AGCTL_CONFIG, or add agctl.yaml)", {})
