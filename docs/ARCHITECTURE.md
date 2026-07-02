@@ -189,7 +189,7 @@ hand-reimplement the same try/except → emit + exit shape so the contract holds
 - **`discover`** has four `_core`s, each wrapped in its *own* envelope with a
   distinct tag (`discover.summary`/`.category`/`.item`/`.search`); the Click
   command selects one from the flags. Argument errors emit under `discover.summary` (exit 2).
-- **`config validate`/`show`** (in `cli.py`) do their own load + emit.
+- **`config validate`/`show`** (in `config_commands.py`) do their own load + emit; `config init` skips load (it bootstraps the file) and emits on its own.
 
 Config is loaded **per invocation** — no in-process cache; each command
 discovers, parses, and validates `agctl.yaml` from scratch. This is what makes
