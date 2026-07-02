@@ -1,0 +1,87 @@
+"""Click entry point (DESIGN §3, §7). Wires command groups and emits envelopes."""
+
+import time
+from typing import Any
+
+import click
+
+from .config import ConfigError, load_config
+from .output import emit
+
+_SECRET_FRAGMENTS = ("password", "token", "secret", "key")
+
+
+def _ms(start: float) -> int:
+    return int((time.monotonic() - start) * 1000)
+
+
+def _mask(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: ("***" if _is_secret(k) and v else _mask(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_mask(v) for v in obj]
+    return obj
+
+
+def _is_secret(key: str) -> bool:
+    lowered = key.lower()
+    return any(frag in lowered for frag in _SECRET_FRAGMENTS)
+
+
+def _emit_config_error(command: str, err: ConfigError, start: float) -> None:
+    errors = [{"message": err.message, **(err.detail or {})}]
+    emit(
+        ok=False,
+        command=command,
+        result={"valid": False, "errors": errors},
+        error={"type": "ConfigError", "message": err.message, "detail": err.detail},
+        duration_ms=_ms(start),
+    )
+
+
+@click.group()
+@click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
+@click.pass_context
+def cli(ctx: click.Context, config_path: str | None) -> None:
+    """agctl — agent-facing CLI harness for testing distributed systems."""
+    ctx.ensure_object(dict)
+    ctx.obj["config_path"] = config_path
+
+
+@cli.group(name="config")
+def config_group() -> None:
+    """Config introspection."""
+
+
+@config_group.command("validate")
+@click.option("--config", "config_path", default=None)
+def config_validate(config_path: str | None) -> None:
+    """Parse and validate agctl.yaml (DESIGN §3.5). Exit 2 on any error."""
+    start = time.monotonic()
+    try:
+        load_config(config_path)
+    except ConfigError as err:
+        _emit_config_error("config.validate", err, start)
+        raise SystemExit(2)
+    emit(ok=True, command="config.validate", result={"valid": True}, duration_ms=_ms(start))
+
+
+@config_group.command("show")
+@click.option("--config", "config_path", default=None)
+@click.option("--unmask", is_flag=True, default=False)
+def config_show(config_path: str | None, unmask: bool) -> None:
+    """Dump the resolved config as JSON, secrets masked (DESIGN §3.5)."""
+    start = time.monotonic()
+    try:
+        cfg = load_config(config_path)
+    except ConfigError as err:
+        _emit_config_error("config.show", err, start)
+        raise SystemExit(2)
+    data = cfg.model_dump()
+    if not unmask:
+        data = _mask(data)
+    emit(ok=True, command="config.show", result=data, duration_ms=_ms(start))
+
+
+if __name__ == "__main__":
+    cli()
