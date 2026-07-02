@@ -1298,7 +1298,7 @@ dependencies = [
 
 [project.scripts]
 agctl = "agctl.cli:cli"
-agctl = "agctl.cli:cli"
+agt = "agctl.cli:cli"
 
 [project.entry-points."agctl.db_drivers"]
 postgresql = "agctl.clients.db_drivers.postgresql:PostgreSQLDriver"
