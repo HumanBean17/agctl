@@ -95,27 +95,46 @@ kafka:
       match: '.eventType == "PAYMENT_FAILED"'
 
 # ---------------------------------------------------------------------------
-# database — named connection profiles.
-# All fields support ${ENV_VAR} interpolation.
-# Currently supported types: postgresql (extensible via plugins, see §9).
+# database — named connection profiles and SQL query templates.
+# All fields support ${ENV_VAR} interpolation (see §2.2).
+# Connection types: postgresql (extensible via plugins, see §9).
 # ---------------------------------------------------------------------------
 database:
-  main-db:
-    type: postgresql
-    host: "${DB_HOST}"
-    port: 5432
-    dbname: "${DB_NAME}"
-    user: "${DB_USER}"
-    password: "${DB_PASSWORD}"
-    default: true                               # used when --connection is omitted
+  connections:
+    main-db:
+      type: postgresql
+      host: "${DB_HOST}"
+      port: 5432
+      dbname: "${DB_NAME}"
+      user: "${DB_USER}"
+      password: "${DB_PASSWORD}"
+      default: true                               # used when --connection is omitted
 
-  analytics-db:
-    type: postgresql
-    host: "${ANALYTICS_DB_HOST}"
-    port: 5432
-    dbname: "analytics"
-    user: "${ANALYTICS_DB_USER}"
-    password: "${ANALYTICS_DB_PASSWORD}"
+    analytics-db:
+      type: postgresql
+      host: "${ANALYTICS_DB_HOST}"
+      port: 5432
+      dbname: "analytics"
+      user: "${ANALYTICS_DB_USER}"
+      password: "${ANALYTICS_DB_PASSWORD}"
+
+  # templates — named SQL queries. `connection` is optional (falls back to
+  # defaults.database_connection). `sql` uses :paramName named params (JDBC-style).
+  templates:
+    find-order:
+      description: "Fetch a single order by ID"
+      connection: main-db
+      sql: "SELECT id, status, total_cents, created_at FROM orders WHERE id = :orderId"
+
+    orders-by-status:
+      description: "List orders in a given status, optionally filtered by customer"
+      connection: main-db
+      sql: "SELECT id, status FROM orders WHERE status = :status AND customer_id = :customerId"
+
+    count-failed-payments:
+      description: "Count failed payments after a given timestamp"
+      connection: main-db
+      sql: "SELECT COUNT(*) AS cnt FROM payments WHERE status = 'FAILED' AND created_at > :since"
 
 # ---------------------------------------------------------------------------
 # templates — named HTTP request templates.
@@ -163,28 +182,6 @@ templates:
     method: GET
     service: payment-service
     path: "/api/v1/payments/{order_id}/status"
-
-# ---------------------------------------------------------------------------
-# database.templates — named SQL query templates.
-# connection: optional; falls back to defaults.database_connection
-# sql:        query string using :paramName for named parameters (JDBC-style)
-# ---------------------------------------------------------------------------
-database:
-  templates:
-    find-order:
-      description: "Fetch a single order by ID"
-      connection: main-db
-      sql: "SELECT id, status, total_cents, created_at FROM orders WHERE id = :orderId"
-
-    orders-by-status:
-      description: "List orders in a given status, optionally filtered by customer"
-      connection: main-db
-      sql: "SELECT id, status FROM orders WHERE status = :status AND customer_id = :customerId"
-
-    count-failed-payments:
-      description: "Count failed payments after a given timestamp"
-      connection: main-db
-      sql: "SELECT COUNT(*) AS cnt FROM payments WHERE status = 'FAILED' AND created_at > :since"
 
 # ---------------------------------------------------------------------------
 # defaults — project-wide fallbacks.
