@@ -5,6 +5,12 @@ import pathlib
 import re
 from typing import Any
 
+import yaml
+from pydantic import ValidationError
+
+from .models import Config
+from .resolver import apply_env_overrides
+
 _VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(:-([^}]*))?\}")
 
 
@@ -81,3 +87,30 @@ def discover_config_path(explicit: str | None = None, env: dict[str, str] | None
             break
 
     raise ConfigError("No agctl.yaml found (use --config or AGCTL_CONFIG, or add agctl.yaml)", {})
+
+
+TOOL_MAJOR_VERSION = "1"
+
+
+def load_config(path: str | None = None, env: dict[str, str] | None = None):
+    """Full pipeline: discover -> parse -> interpolate -> override -> validate."""
+    env = env if env is not None else os.environ
+    config_path = discover_config_path(explicit=path, env=env)
+    raw = yaml.safe_load(config_path.read_text()) or {}
+    interpolated = interpolate(raw, env)
+    with_overrides = apply_env_overrides(interpolated, env)
+    _check_version(with_overrides)
+    try:
+        return Config.model_validate(with_overrides)
+    except ValidationError as exc:
+        raise ConfigError("Invalid configuration", {"validation_errors": exc.errors()}) from exc
+
+
+def _check_version(data: dict) -> None:
+    version = str(data.get("version", "")).strip()
+    major = version.split(".")[0] if version else ""
+    if major != TOOL_MAJOR_VERSION:
+        raise ConfigError(
+            f"Version mismatch: config major '{major}' != tool major '{TOOL_MAJOR_VERSION}'",
+            {"config_version": version, "tool_major": TOOL_MAJOR_VERSION},
+        )

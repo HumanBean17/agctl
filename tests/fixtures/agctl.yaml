@@ -1,0 +1,38 @@
+version: "1"
+services:
+  order-service:
+    base_url: "${ORDER_SERVICE_URL}"
+    health_path: "/actuator/health"
+kafka:
+  brokers:
+    - "${KAFKA_BROKER}:9092"
+  default_consumer_group: "agctl-consumer"
+  schema_registry_url: "${SCHEMA_REGISTRY_URL:-}"
+  patterns:
+    order-created:
+      topic: orders.created
+      match: '.eventType == "ORDER_CREATED"'
+database:
+  connections:
+    main-db:
+      type: postgresql
+      host: "${DB_HOST}"
+      port: 5432
+      dbname: "${DB_NAME}"
+      user: "${DB_USER}"
+      password: "${DB_PASSWORD}"
+      default: true
+  templates:
+    find-order:
+      connection: main-db
+      sql: "SELECT id, status FROM orders WHERE id = :orderId"
+templates:
+  create-order:
+    method: POST
+    service: order-service
+    path: "/api/v1/orders"
+    body:
+      customer_id: "{customer_id}"
+defaults:
+  timeout_seconds: 10
+  database_connection: main-db
