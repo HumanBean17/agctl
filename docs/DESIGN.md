@@ -248,9 +248,9 @@ agctl http call create-order \
   --param customer_id=cust-42 \
   --param sku=WIDGET-001 \
   --body '{"priority": "high"}'
+```
 
 **Body merge:** when `--body '{...}'` is supplied, it is deep-merged into the template's body — nested objects merge recursively, arrays are replaced wholesale, and scalar leaves from `--body` override the template. The template body is the base; `--body` only adds or overrides fields.
-```
 
 #### `agctl http request`
 
@@ -440,9 +440,9 @@ agctl kafka assert \
 agctl kafka assert \
   --pattern payment-failed \
   --timeout 15
+```
 
 **Offset & timing model (consume and assert):** By default the consumer seeks each partition to the timestamp `now - --lookback` (via `offsets_for_times`) and reads forward, rather than subscribing at "latest". This makes the common send-then-assert pattern reliable: an event published a moment before the command starts still falls inside the window. `--lookback` defaults to the resolved `--timeout` (look back as far as you wait forward); `--from-beginning` overrides to the earliest offset. For `assert`, committed offsets are ignored — each invocation re-seeks by time, so repeated asserts are independent and deterministic. On high-volume topics, narrow with `--match`/`--contains` to avoid matching stale events from prior runs.
-```
 
 ---
 
@@ -552,9 +552,9 @@ agctl db assert \
   --expect-value \
   --path ".status" \
   --equals "CONFIRMED"
+```
 
 **Value coercion (`--equals`):** The argument is parsed as JSON when it is valid JSON (`"0"` → number 0, `"true"` → bool, `"null"` → null, `"[1,2]"` → array); otherwise it is treated as a plain string (e.g. `CONFIRMED`). The DB result value is coerced to a JSON-native type before comparison — numbers → number, booleans → bool, timestamps/dates → ISO 8601 string, null → null. Comparison is strict and type-aware: a number never equals a string (`0` ≠ `"0"`). To match a timestamp column, write `--equals "2026-06-29T14:22:00Z"`.
-```
 
 ---
 
