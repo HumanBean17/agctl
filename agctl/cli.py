@@ -5,6 +5,7 @@ from typing import Any
 
 import click
 
+from .commands.check_commands import check_ready
 from .commands.db_commands import db_assert, db_query
 from .commands.http_commands import http_call, http_ping, http_request
 from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
@@ -72,6 +73,11 @@ def kafka_group() -> None:
     """Kafka produce/consume/assert commands (DESIGN §3.2)."""
 
 
+@cli.group(name="check")
+def check_group() -> None:
+    """Health/readiness checks (DESIGN §3.4)."""
+
+
 # Register subcommands on the http group.
 http_group.add_command(http_call)
 http_group.add_command(http_request)
@@ -87,6 +93,10 @@ db_group.add_command(db_assert)
 kafka_group.add_command(kafka_produce)
 kafka_group.add_command(kafka_consume)
 kafka_group.add_command(kafka_assert)
+
+
+# Register subcommands on the check group.
+check_group.add_command(check_ready)
 
 
 @config_group.command("validate")
