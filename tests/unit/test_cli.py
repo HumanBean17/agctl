@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
 
+import yaml
 from click.testing import CliRunner
 
 from agctl.cli import cli
+from agctl.commands.config_commands import _load_sample
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "agctl.yaml"
 
@@ -135,3 +137,75 @@ def test_show_does_not_mask_ssl_key_path(tmp_path):
     assert ssl["certificate_location"] == "/etc/ssl/client.crt"
     assert ssl["key_location"] == "/etc/ssl/client.key"      # path, NOT masked
     assert ssl["key_password"] == "***"                      # secret, masked
+
+
+# --- config init -----------------------------------------------------------
+
+
+def test_config_init_writes_sample(tmp_path):
+    dest = tmp_path / "agctl.yaml"
+    result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    assert payload["command"] == "config.init"
+    assert payload["result"]["created"] is True
+    assert payload["result"]["path"] == str(dest)
+    # file content is the packaged sample, verbatim, and parses as YAML
+    assert dest.read_text() == _load_sample()
+    yaml.safe_load(dest.read_text())
+
+
+def test_config_init_generates_valid_config(tmp_path):
+    """The generated sample is a clean baseline: it validates with no env vars."""
+    dest = tmp_path / "agctl.yaml"
+    CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
+    result = CliRunner().invoke(cli, ["config", "validate", "--config", str(dest)], env={})
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    assert payload["result"]["valid"] is True
+
+
+def test_config_init_refuses_overwrite(tmp_path):
+    dest = tmp_path / "agctl.yaml"
+    dest.write_text("existing: real-config\n")
+    result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
+    payload = json.loads(result.output)
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["result"]["created"] is False
+    assert "--force" in payload["error"]["message"]
+    # existing file is left untouched
+    assert dest.read_text() == "existing: real-config\n"
+
+
+def test_config_init_force_overwrites(tmp_path):
+    dest = tmp_path / "agctl.yaml"
+    dest.write_text("OLD\n")
+    result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest), "--force"])
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    assert payload["result"]["created"] is True
+    assert dest.read_text() == _load_sample()
+
+
+def test_config_init_default_path():
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli, ["config", "init"])
+        payload = json.loads(result.output)
+        assert result.exit_code == 0
+        assert payload["result"]["path"].endswith("agctl.yaml")
+        assert Path("agctl.yaml").exists()
+
+
+def test_sample_matches_readme_block():
+    """Drift guard: the packaged sample must stay byte-identical to the
+    copy-paste block in README.md, so users never see two diverging samples."""
+    readme = Path(__file__).parent.parent.parent / "README.md"
+    text = readme.read_text()
+    start = text.index("```yaml", text.index("Complete, copy-paste-ready config"))
+    fence_start = start + len("```yaml")
+    fence_end = text.index("```", fence_start)
+    readme_block = text[fence_start:fence_end]
+    assert readme_block.strip() == _load_sample().strip()

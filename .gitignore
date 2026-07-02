@@ -20,3 +20,6 @@ venv/
 # env files (keep .env.example tracked)
 .env
 .env.local
+
+# UV package manager
+uv.lock

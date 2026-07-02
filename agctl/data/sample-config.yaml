@@ -1,0 +1,134 @@
+# agctl.yaml
+# Version tracks the agctl MAJOR version only (currently "1").
+version: "1"
+
+# --- services: named HTTP base URLs for services under test -----------------
+services:
+  order-service:
+    base_url: "http://localhost:8081"
+    health_path: "/actuator/health"   # used by `agctl check ready`
+    timeout_seconds: 10               # optional; overrides defaults.timeout_seconds
+
+  payment-service:
+    base_url: "http://localhost:8082"
+    health_path: "/health"
+    timeout_seconds: 15
+
+# --- kafka: broker config --------------------------------------------------
+kafka:
+  brokers:
+    - "localhost:9092"
+  default_consumer_group: "agctl-consumer"
+  schema_registry_url: ""              # optional; omit/leave empty if unused
+  timeout_seconds: 30                  # default consume/assert timeout
+
+  # Optional TLS/mTLS — uncomment for brokers that require SSL. Setting ANY
+  # field to a non-empty value enables TLS (security.protocol defaults to "SSL").
+  # ca_location is optional: unset → librdkafka uses the system trust store
+  # (fine for publicly-trusted brokers; pin a CA for private-PKI brokers).
+  # Hostname verification stays ON unless endpoint_identification_algorithm: "none".
+  # ssl:
+  #   ca_location: ""
+  #   certificate_location: ""          # path to client cert (mTLS)
+  #   key_location: ""                  # path to client private key (mTLS)
+  #   key_password: ""                  # optional private-key password
+  #   # endpoint_identification_algorithm: "none"   # disable hostname verification
+  #   # security_protocol: "SSL"                     # default; set SASL_SSL when adding SASL
+
+  # patterns: named Kafka filters, analogous to HTTP templates.
+  #   topic: Kafka topic
+  #   match: jq boolean predicate over each message value;
+  #          supports {placeholder} substitution via --param at assert time
+  patterns:
+    order-created:
+      description: "An ORDER_CREATED event for a specific order"
+      topic: orders.created
+      match: '.eventType == "ORDER_CREATED" and .payload.orderId == "{orderId}"'
+
+    payment-failed:
+      description: "Any PAYMENT_FAILED event regardless of order"
+      topic: payments.events
+      match: '.eventType == "PAYMENT_FAILED"'
+
+# --- database: named connection profiles and SQL templates ------------------
+database:
+  connections:
+    main-db:
+      type: postgresql                 # extensible via plugins (entry point agctl.db_drivers)
+      host: "localhost"
+      port: 5432
+      dbname: "app"
+      user: "app"
+      password: "app"
+      default: true                    # used when --connection is omitted
+
+    analytics-db:
+      type: postgresql
+      host: "localhost"
+      port: 5432
+      dbname: "analytics"
+      user: "analytics"
+      password: "analytics"
+
+  # templates: named SQL queries. `connection` is optional (falls back to
+  # defaults.database_connection). Use :paramName named params (JDBC-style).
+  templates:
+    find-order:
+      description: "Fetch a single order by ID"
+      connection: main-db
+      sql: "SELECT id, status, total_cents, created_at FROM orders WHERE id = :orderId"
+
+    orders-by-status:
+      description: "List orders in a given status, optionally filtered by customer"
+      connection: main-db
+      sql: "SELECT id, status FROM orders WHERE status = :status AND customer_id = :customerId"
+
+    count-failed-payments:
+      description: "Count failed payments after a given timestamp"
+      connection: main-db
+      sql: "SELECT COUNT(*) AS cnt FROM payments WHERE status = 'FAILED' AND created_at > :since"
+
+# --- templates: named HTTP request templates --------------------------------
+templates:
+  create-order:
+    description: "Submit a new order for a customer"
+    method: POST
+    service: order-service
+    path: "/api/v1/orders"
+    headers:
+      Content-Type: "application/json"
+      X-Request-Source: "agctl"
+    body:
+      customer_id: "{customer_id}"
+      items:
+        - sku: "{sku}"
+          quantity: 1
+
+  get-order:
+    description: "Fetch a single order by ID"
+    method: GET
+    service: order-service
+    path: "/api/v1/orders/{order_id}"
+
+  charge-payment:
+    description: "Trigger payment charge for an order"
+    method: POST
+    service: payment-service
+    path: "/api/v1/payments"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer ${PAYMENT_SERVICE_TOKEN:-change-me}"   # optional env var (has a default)
+    body:
+      order_id: "{order_id}"
+      amount_cents: "{amount_cents}"
+
+  get-payment-status:
+    description: "Fetch payment status by order ID"
+    method: GET
+    service: payment-service
+    path: "/api/v1/payments/{order_id}/status"
+
+# --- defaults: project-wide fallbacks --------------------------------------
+defaults:
+  timeout_seconds: 10
+  database_connection: main-db

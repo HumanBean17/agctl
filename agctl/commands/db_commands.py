@@ -147,7 +147,7 @@ def db_query(
     param: tuple[str, ...],
     connection: str | None,
 ) -> None:
-    """Run a DB query and return the rows (DESIGN §3.3)."""
+    """Run a DB query and return the rows."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     _db_query_envelope(config_path, template, sql, param, connection)
 
@@ -295,7 +295,7 @@ def _db_assert_core(
     "--assertion",
     "assertion",
     default=None,
-    help="Named custom assertion mode (DESIGN §9.3)",
+    help="Named custom assertion mode",
 )
 @click.pass_context
 def db_assert(
@@ -310,7 +310,7 @@ def db_assert(
     equals: str | None,
     assertion: str | None,
 ) -> None:
-    """Run a DB query and assert on its result (DESIGN §3.3, D8, §9.3)."""
+    """Run a DB query and assert on its result."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     _db_assert_envelope(
         config_path,

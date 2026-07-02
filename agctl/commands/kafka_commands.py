@@ -140,7 +140,7 @@ def kafka_produce(
     key: str | None,
     header: tuple[str, ...],
 ) -> None:
-    """Produce one message to a Kafka topic (DESIGN §3.2)."""
+    """Produce one message to a Kafka topic."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     _kafka_produce_envelope(config_path, topic, message, key, header)
 
@@ -248,7 +248,7 @@ def kafka_consume(
     from_beginning: bool,
     consumer_group: str | None,
 ) -> None:
-    """Consume messages from a Kafka topic window (DESIGN §3.2, D6, D10)."""
+    """Consume messages from a Kafka topic window."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     _kafka_consume_envelope(
         config_path,
@@ -447,7 +447,7 @@ def _kafka_assert_core(
     "--assertion",
     "assertion",
     default=None,
-    help="Named custom assertion mode (DESIGN §9.3)",
+    help="Named custom assertion mode",
 )
 @click.pass_context
 def kafka_assert(
@@ -464,7 +464,7 @@ def kafka_assert(
     consumer_group: str | None,
     assertion: str | None,
 ) -> None:
-    """Assert a matching message exists in a Kafka window (DESIGN §3.2, D6, D10, §9.3)."""
+    """Assert a matching message exists in a Kafka window."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     _kafka_assert_envelope(
         config_path,

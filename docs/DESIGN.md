@@ -621,6 +621,16 @@ agctl config show
     [--unmask]                  # disable masking (use only in secured environments)
 ```
 
+#### `agctl config init`
+
+Write a sample `agctl.yaml` to the filesystem. The sample is a clean baseline that validates with no environment variables (all optional fields have defaults). Refuses to overwrite an existing file unless `--force` is passed. Does not accept `--config` (it bootstraps the config file itself).
+
+```
+agctl config init
+    [--output <path>]           # default: ./agctl.yaml
+    [--force]                   # overwrite if exists
+```
+
 ---
 
 ### 3.6 `agctl discover` — Lazy Scoped Discovery
@@ -1048,6 +1058,41 @@ Shape varies by category. All items share `name`, `description`, `params[]`, and
 
 Returns the fully resolved config as a JSON object with secrets masked. Structure mirrors the YAML schema.
 
+#### `config.init`
+
+Success (file created):
+
+```json
+{
+  "ok": true,
+  "command": "config.init",
+  "result": {
+    "path": "./agctl.yaml",
+    "created": true,
+    "bytes": 4815
+  },
+  "duration_ms": 1.2
+}
+```
+
+Refused to overwrite (without `--force`):
+
+```json
+{
+  "ok": false,
+  "command": "config.init",
+  "result": {
+    "path": "./agctl.yaml",
+    "created": false
+  },
+  "error": {
+    "type": "ConfigError",
+    "message": "Refusing to overwrite existing ./agctl.yaml (pass --force to overwrite)."
+  },
+  "duration_ms": 0.8
+}
+```
+
 ---
 
 ## 5. Configuration Resolution Order
@@ -1278,7 +1323,7 @@ agctl/                         # Repository root
 │   │   ├── kafka_commands.py      # `agctl kafka produce / consume / assert`
 │   │   ├── db_commands.py         # `agctl db query` and `agctl db assert`
 │   │   ├── check_commands.py      # `agctl check ready`
-│   │   ├── config_commands.py     # `agctl config validate` and `agctl config show`
+│   │   ├── config_commands.py     # `agctl config validate` / `show` / `init`
 │   │   └── discover_commands.py   # `agctl discover` (summary / category / item / search)
 │   │
 │   ├── config/                    # Config loading pipeline
@@ -1767,5 +1812,6 @@ agctl kafka assert   --topic orders.created   --match '.payload.customerId == "c
 | Assert a specific DB field value | `agctl db assert --template --expect-value --path --equals` |
 | Inspect raw DB state for debugging | `agctl db query --template / --sql` |
 | Check services are up before testing | `agctl check ready --all` |
+| Bootstrap a starter config | `agctl config init` |
 | Debug config resolution | `agctl config show` |
 | Validate config before committing | `agctl config validate` |

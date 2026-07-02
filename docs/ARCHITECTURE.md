@@ -116,7 +116,10 @@ agctl/
 │   ├── kafka_commands.py       # kafka produce / consume / assert
 │   ├── db_commands.py          # db query / assert
 │   ├── check_commands.py       # check ready
+│   ├── config_commands.py      # config validate / show / init
 │   └── discover_commands.py    # discover summary / category / item / search
+├── data/
+│   └── sample-config.yaml      # packaged starter config (read via importlib.resources)
 └── clients/
     ├── http_client.py          # httpx wrapper (lazy import)
     ├── kafka_client.py         # confluent-kafka wrapper (lazy import)
@@ -126,7 +129,6 @@ agctl/
 ```
 
 > DESIGN §7's structure sketch predates several modules; §14 lists the deltas.
-> `config validate`/`show` are defined in `cli.py`, not a `config_commands.py`.
 
 **Dependency direction (inward-only, no cycles):** `cli → commands → {config,
 clients, resolution, assertions, params, errors, command, output}`; `clients →
@@ -187,7 +189,7 @@ hand-reimplement the same try/except → emit + exit shape so the contract holds
 - **`discover`** has four `_core`s, each wrapped in its *own* envelope with a
   distinct tag (`discover.summary`/`.category`/`.item`/`.search`); the Click
   command selects one from the flags. Argument errors emit under `discover.summary` (exit 2).
-- **`config validate`/`show`** (in `cli.py`) do their own load + emit.
+- **`config validate`/`show`** (in `config_commands.py`) do their own load + emit; `config init` skips load (it bootstraps the file) and emits on its own.
 
 Config is loaded **per invocation** — no in-process cache; each command
 discovers, parses, and validates `agctl.yaml` from scratch. This is what makes

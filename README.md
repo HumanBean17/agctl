@@ -75,10 +75,13 @@ agctl --help
 agt --help
 ```
 
-Drop a config file named `agctl.yaml` at your repo root (or anywhere up the
-directory tree). Confirm it loads and validates:
+Scaffold a config file you can edit. `agctl config init` writes a sample
+`agctl.yaml` at your repo root with concrete localhost values — replace them with
+your own services, topics, and connections. (It refuses to overwrite an existing
+file; pass `--force` to replace one.) Confirm it loads and validates:
 
 ```bash
+agctl config init        # writes ./agctl.yaml (edit the values it contains)
 agctl config validate
 ```
 
@@ -108,6 +111,7 @@ auto-discovered from the current directory upward).
 | **`check`** | `ready` | Hit `health_path` for one (`--service`) or all services; 2xx = ready |
 | **`config`** | `validate` | Validate schema, env vars, cross-references, version |
 | | `show` | Dump fully-resolved config as JSON (secrets masked) |
+| | `init` | Write a sample `agctl.yaml` to edit (refuses to clobber; `--force`) |
 | **`discover`** | *(top-level)* | Three levels: summary → `--category` → `--name`; plus `--search` |
 
 **Composing commands** — the core pattern is *send, then assert*:
@@ -185,10 +189,11 @@ AGCTL_SERVICES__ORDER_SERVICE__BASE_URL=http://order-svc:8080
 
 ### Complete, copy-paste-ready config
 
-Below is a full `agctl.yaml` with **concrete localhost values and no required env
-vars** — drop it at your repo root and `agctl config validate` passes as-is. (The
-production version is the same file with secrets/hosts moved into `${...}` and
-sourced from a `.env` — see the note after it.)
+`agctl config init` writes exactly this file — shown here for reference and for
+browsing on GitHub without installing. It has **concrete localhost values and no
+required env vars**, so `agctl config validate` passes as-is. (The production
+version is the same file with secrets/hosts moved into `${...}` and sourced from a
+`.env` — see the note after it.)
 
 ```yaml
 # agctl.yaml
@@ -310,7 +315,7 @@ templates:
     path: "/api/v1/payments"
     headers:
       Content-Type: "application/json"
-      Authorization: "Bearer ${PAYMENT_SERVICE_TOKEN}"   # required env var
+      Authorization: "Bearer ${PAYMENT_SERVICE_TOKEN:-change-me}"   # optional env var (has a default)
     body:
       order_id: "{order_id}"
       amount_cents: "{amount_cents}"
@@ -327,10 +332,10 @@ defaults:
   database_connection: main-db
 ```
 
-> **Note:** `charge-payment` references `${PAYMENT_SERVICE_TOKEN}` (a *required*
-> env var), so `config validate` will report it as unresolved until you export it.
-> Either `export PAYMENT_SERVICE_TOKEN=...` or remove that template for a clean
-> baseline.
+> **Note:** `charge-payment` uses the `${PAYMENT_SERVICE_TOKEN:-change-me}` form —
+> an *optional* env var with a literal default — so `config validate` passes even
+> with nothing exported. For production, `export PAYMENT_SERVICE_TOKEN=<real token>`
+> (or move the whole value into `${...}` sourced from a `.env`); see below.
 
 **Moving to environment-driven config** — replace the concrete values above with
 `${...}` and source them from a `.env` (agctl resolves them at load time):
