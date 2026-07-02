@@ -551,6 +551,8 @@ agctl db assert \
   --expect-value \
   --path ".status" \
   --equals "CONFIRMED"
+
+**Value coercion (`--equals`):** The argument is parsed as JSON when it is valid JSON (`"0"` → number 0, `"true"` → bool, `"null"` → null, `"[1,2]"` → array); otherwise it is treated as a plain string (e.g. `CONFIRMED`). The DB result value is coerced to a JSON-native type before comparison — numbers → number, booleans → bool, timestamps/dates → ISO 8601 string, null → null. Comparison is strict and type-aware: a number never equals a string (`0` ≠ `"0"`). To match a timestamp column, write `--equals "2026-06-29T14:22:00Z"`.
 ```
 
 ---
@@ -772,7 +774,7 @@ Every template and pattern in `agctl.yaml` should have a `description` field. `a
 
 ### 4.1 Envelope
 
-Every invocation writes exactly one JSON object to stdout:
+Every invocation writes exactly one JSON object to stdout (the sole exception is `http ping`, which streams one JSON object per ping plus a final summary — see §3.1):
 
 ```json
 {
@@ -809,13 +811,13 @@ Every invocation writes exactly one JSON object to stdout:
 
 **Error types:**
 
-| Type | Exit code | Description |
+| Type | Exit code | Applies when |
 |---|---|---|
-| `AssertionError` | 1 | An assertion was evaluated and failed |
-| `ConfigError` | 2 | Config file missing, invalid, or env vars unresolved |
+| `AssertionError` | 1 | An assertion was evaluated and failed — including `kafka assert` timing out (no matching message within the window) and `kafka consume --expect-count` receiving fewer than expected |
+| `ConfigError` | 2 | Config missing/invalid, an unresolvable **required** env var, or a major-version mismatch |
 | `ConnectionError` | 2 | Could not reach a service, broker, or database |
-| `TimeoutError` | 1 | Operation exceeded the configured timeout |
-| `TemplateNotFound` | 2 | Named template does not exist in config |
+| `TimeoutError` | 1 | A non-assertion operation exceeded its time budget (e.g. a slow HTTP request or a hung DB query) |
+| `TemplateNotFound` | 2 | Named template/pattern/connection does not exist in config |
 | `InternalError` | 2 | Unexpected error in `agctl` itself |
 
 ### 4.2 Result Shapes by Command Group
