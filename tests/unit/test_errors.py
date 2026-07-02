@@ -8,7 +8,7 @@ from agctl.errors import (
     ConfigError as ConfigErrorFromErrors,
     ConnectionFailure,
     OperationTimeout,
-    TemplateMissing,
+    TemplateNotFound,
 )
 from agctl.config import ConfigError as ConfigErrorFromConfig
 
@@ -22,7 +22,7 @@ from agctl.config import ConfigError as ConfigErrorFromConfig
         (ConfigErrorFromErrors, "ConfigError", 2),
         (ConnectionFailure, "ConnectionError", 2),
         (OperationTimeout, "TimeoutError", 1),
-        (TemplateMissing, "TemplateNotFound", 2),
+        (TemplateNotFound, "TemplateNotFound", 2),
     ],
 )
 def test_subclass_table(cls, type_name, exit_code):
@@ -55,7 +55,7 @@ def test_detail_none_becomes_empty_dict():
 
 
 def test_message_and_detail_attributes():
-    err = TemplateMissing("missing", {"name": "foo"})
+    err = TemplateNotFound("missing", {"name": "foo"})
     assert err.message == "missing"
     assert err.detail == {"name": "foo"}
 
@@ -67,7 +67,7 @@ def test_instance_exit_codes():
     assert ConfigErrorFromErrors("y").exit_code == 2
     assert ConnectionFailure("z").exit_code == 2
     assert OperationTimeout("w").exit_code == 1
-    assert TemplateMissing("v").exit_code == 2
+    assert TemplateNotFound("v").exit_code == 2
 
 
 # --- inheritance / identity ---------------------------------------------------

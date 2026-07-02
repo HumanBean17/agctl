@@ -21,6 +21,11 @@ _SECRET_FRAGMENTS = ("password", "token", "secret", "key")
 #: Entry-point group for third-party protocol plugins (DESIGN §9.2).
 PLUGIN_ENTRY_POINT_GROUP = "agctl.plugins"
 
+#: Plugins successfully loaded at import time (DESIGN §9.2). Populated by
+#: :func:`_load_plugins`; consulted by ``agctl config validate`` so each plugin
+#: can validate its own config section (see :func:`_plugin_validation_errors`).
+_LOADED_PLUGINS: list[Any] = []
+
 
 def _entry_points(group: str) -> list:
     """Return the entry points registered under ``group`` (3.11+ shim).
@@ -41,10 +46,15 @@ def _load_plugins(cli_group: click.Group) -> None:
     """Load ``agctl.plugins`` entry points onto ``cli_group`` (DESIGN §9.2).
 
     Each plugin object exposes ``.command_group`` (a :class:`click.Group`) and
-    optionally ``.validate_config(config)``. Each load+register is wrapped in
-    try/except so a broken plugin logs to stderr and is skipped rather than
-    bricking the CLI. An empty/missing ``agctl.plugins`` group is a clean no-op.
+    optionally ``.name`` (subcommand name) and ``.validate_config(config)``
+    (consulted by ``agctl config validate`` — see :func:`_plugin_validation_errors`).
+    Each load+register is wrapped in try/except so a broken plugin logs to stderr
+    and is skipped rather than bricking the CLI. An empty/missing ``agctl.plugins``
+    group is a clean no-op. Successfully loaded plugins are recorded in
+    ``_LOADED_PLUGINS`` so config validation can delegate to them.
     """
+    global _LOADED_PLUGINS
+    _LOADED_PLUGINS = []
     try:
         for ep in _entry_points(PLUGIN_ENTRY_POINT_GROUP):
             try:
@@ -54,8 +64,11 @@ def _load_plugins(cli_group: click.Group) -> None:
                 continue
             command_group = getattr(obj, "command_group", None)
             if isinstance(command_group, click.Group):
-                name = command_group.name or ep.name
+                # DESIGN §9.2: `.name` is the subcommand name; fall back to the
+                # group's own name, then the entry-point name.
+                name = getattr(obj, "name", None) or command_group.name or ep.name
                 cli_group.add_command(command_group, name=name)
+                _LOADED_PLUGINS.append(obj)
             else:
                 print(
                     f"agctl: plugin {ep.name} has no valid command_group; skipping",
@@ -63,6 +76,32 @@ def _load_plugins(cli_group: click.Group) -> None:
                 )
     except Exception as exc:  # noqa: BLE001 - never let the loader crash the CLI
         print(f"agctl: plugin loader error: {exc}", file=sys.stderr)
+
+
+def _plugin_validation_errors(plugins: list, config_dict: dict) -> list[dict]:
+    """Ask each loaded plugin to validate its own config section (DESIGN §9.2).
+
+    Each plugin's ``validate_config(config_dict)`` (if present) returns a list of
+    human-readable error strings. Those are folded into ``{path, message}`` error
+    records under ``plugin.<name>``. A plugin that raises is isolated: its error
+    becomes a single record rather than crashing ``config validate``.
+    """
+    errors: list[dict] = []
+    for plugin in plugins:
+        validate = getattr(plugin, "validate_config", None)
+        if not callable(validate):
+            continue
+        plugin_name = getattr(plugin, "name", None) or "unknown"
+        try:
+            returned = validate(config_dict) or []
+        except Exception as exc:  # noqa: BLE001 - plugin isolation
+            errors.append(
+                {"path": f"plugin.{plugin_name}", "message": f"plugin raised: {exc}"}
+            )
+            continue
+        for msg in returned:
+            errors.append({"path": f"plugin.{plugin_name}", "message": str(msg)})
+    return errors
 
 
 def _ms(start: float) -> int:
@@ -170,8 +209,10 @@ def config_validate(ctx: click.Context, config_path: str | None) -> None:
         _emit_config_error("config.validate", err, start)
         raise SystemExit(2)
     errors, warnings = validate_config(cfg)
+    # Let loaded plugins validate their own config sections (DESIGN §9.2).
+    errors = errors + _plugin_validation_errors(_LOADED_PLUGINS, cfg.model_dump())
     if errors:
-        summary = f"Configuration has {len(errors)} structural error(s)"
+        summary = f"Configuration has {len(errors)} error(s)"
         emit(
             ok=False,
             command="config.validate",

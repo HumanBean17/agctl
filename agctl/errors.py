@@ -41,6 +41,6 @@ class OperationTimeout(AgctlError):
     exit_code = 1
 
 
-class TemplateMissing(AgctlError):
+class TemplateNotFound(AgctlError):
     type_name = "TemplateNotFound"
     exit_code = 2

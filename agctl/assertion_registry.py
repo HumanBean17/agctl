@@ -11,7 +11,7 @@ the command modules (``db_commands.py`` / ``kafka_commands.py``) — those modes
 are also registered here by NAME so that:
 
 (a) known built-in mode names are discoverable (``registry.names()``),
-(b) an unknown mode resolves to a clear :class:`TemplateMissing` error, and
+(b) an unknown mode resolves to a clear :class:`TemplateNotFound` error, and
 (c) third-party entry points can extend the set of available modes.
 
 The registry guarantees ``registry.get(name)`` returns an :class:`Assertion`
@@ -25,7 +25,7 @@ from __future__ import annotations
 import importlib.metadata
 from typing import Any, Iterable, Union
 
-from .errors import TemplateMissing
+from .errors import TemplateNotFound
 
 #: Entry-point group for third-party assertion modes (DESIGN §9.3).
 ASSERTION_ENTRY_POINT_GROUP = "agctl.assertions"
@@ -123,13 +123,13 @@ class AssertionRegistry:
     def get(self, name: str) -> Assertion:
         """Resolve a mode by name.
 
-        Raises :class:`TemplateMissing` (DESIGN §4.1) for unknown modes so the
+        Raises :class:`TemplateNotFound` (DESIGN §4.1) for unknown modes so the
         command layer's existing error handling maps it to a clean envelope.
         """
         try:
             return self._modes[name]
         except KeyError:
-            raise TemplateMissing(
+            raise TemplateNotFound(
                 f"Unknown assertion mode: {name}", {"mode": name}
             )
 
@@ -193,3 +193,51 @@ def get_default_registry() -> AssertionRegistry:
         reg.load_entry_points()
         _DEFAULT_REGISTRY = reg
     return _DEFAULT_REGISTRY
+
+
+def evaluate_custom(name: str, context: dict, registry: "AssertionRegistry | None" = None):
+    """Resolve ``name`` and run its ``evaluate(context)`` (DESIGN §9.3).
+
+    This is the bridge that makes third-party ``agctl.assertions`` modes
+    reachable from ``db assert --assertion <name>`` / ``kafka assert --assertion
+    <name>``. ``context`` is a free-form dict the command builds for the mode
+    (rows/messages + metadata).
+
+    Returns ``(True, detail)`` on success. Raises:
+    - :class:`TemplateNotFound` (exit 2) for an unknown mode name.
+    - :class:`ConfigError` (exit 2) if ``name`` is a built-in mode (those have
+      dedicated flags and intentionally raise NotImplementedError from
+      ``evaluate``).
+    - :class:`AssertionFailure` (exit 1) if the mode returns ``passed=False``
+      or itself raises.
+
+    ``registry`` defaults to :func:`get_default_registry` (monkeypatchable).
+    """
+    from .errors import AssertionFailure, ConfigError
+
+    reg = registry if registry is not None else get_default_registry()
+    mode = reg.get(name)  # TemplateNotFound for unknown name
+    try:
+        result = mode.evaluate(context)
+    except AssertionFailure:
+        raise
+    except NotImplementedError:
+        raise ConfigError(
+            f"Built-in assertion mode '{name}' has dedicated flags; "
+            "do not invoke it via --assertion",
+            {"mode": name},
+        )
+    except Exception as exc:  # noqa: BLE001 - third-party mode isolation
+        raise AssertionFailure(f"assertion '{name}' raised: {exc}", {"mode": name})
+
+    if not isinstance(result, dict):
+        raise AssertionFailure(
+            f"assertion '{name}' returned a non-dict result", {"mode": name}
+        )
+    detail = {k: v for k, v in result.items() if k != "passed"}
+    if not result.get("passed"):
+        raise AssertionFailure(
+            result.get("message") or f"assertion '{name}' did not pass",
+            {"mode": name, **detail},
+        )
+    return True, detail

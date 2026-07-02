@@ -26,7 +26,7 @@ from typing import Any
 import click
 
 from ..command import envelope, load_config_or_raise
-from ..errors import ConfigError, TemplateMissing
+from ..errors import ConfigError, TemplateNotFound
 
 __all__ = ["discover"]
 
@@ -174,14 +174,19 @@ def _item_core(config_path: str | None, category: str, name: str) -> dict:
 
     if category == "services":
         if name not in cfg.services:
-            raise TemplateMissing(
+            raise TemplateNotFound(
                 f"Unknown service: {name}", {"path": f"services.{name}"}
             )
         svc = cfg.services[name]
+        # DESIGN §4.2: every discover.item carries name/params/example. Services
+        # take no params, but emit an empty list + a ready-to-use check command
+        # so the shape is uniform across categories.
         item: dict = {
             "category": "services",
             "name": name,
             "base_url": svc.base_url,
+            "params": [],
+            "example": f"agctl check ready --service {name}",
         }
         if svc.health_path is not None:
             item["health_path"] = svc.health_path
@@ -189,7 +194,7 @@ def _item_core(config_path: str | None, category: str, name: str) -> dict:
 
     if category == "http-templates":
         if name not in cfg.templates:
-            raise TemplateMissing(
+            raise TemplateNotFound(
                 f"Unknown HTTP template: {name}", {"path": f"templates.{name}"}
             )
         tpl = cfg.templates[name]
@@ -207,7 +212,7 @@ def _item_core(config_path: str | None, category: str, name: str) -> dict:
 
     if category == "kafka-patterns":
         if name not in cfg.kafka.patterns:
-            raise TemplateMissing(
+            raise TemplateNotFound(
                 f"Unknown kafka pattern: {name}", {"path": f"kafka.patterns.{name}"}
             )
         pat = cfg.kafka.patterns[name]
@@ -226,7 +231,7 @@ def _item_core(config_path: str | None, category: str, name: str) -> dict:
 
     # category == "db-templates"
     if name not in cfg.database.templates:
-        raise TemplateMissing(
+        raise TemplateNotFound(
             f"Unknown database template: {name}",
             {"path": f"database.templates.{name}"},
         )

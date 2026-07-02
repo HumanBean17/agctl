@@ -448,7 +448,7 @@ agctl kafka assert \
 
 ### 3.3 `agctl db` — Database Operations
 
-All `db` commands use the connection specified by `--connection`, falling back to `defaults.database_connection` in config.
+All `db` commands resolve their connection with the following precedence: an explicit `--connection`, then the template's own `connection` field (when using `--template`), then `defaults.database_connection` in config.
 
 Supports two input modes:
 - `--template <name>` — use a named SQL template from `database.templates` in config (preferred)
@@ -958,12 +958,15 @@ Every invocation writes exactly one JSON object to stdout (the sole exception is
       "ready": false,
       "status_code": null,
       "url": "http://localhost:8082/health",
+      "response_time_ms": null,
       "error": "Connection refused"
     }
   },
   "all_ready": false
 }
 ```
+
+Every service entry always includes `response_time_ms` (an integer on success, `null` when the request failed or did not complete); `error` is present only when `ready` is false.
 
 #### `discover.summary`
 
@@ -1440,7 +1443,7 @@ class Plugin(Protocol):
     # Returns a list of error strings; empty list = valid
 ```
 
-`cli.py` iterates `entry_points(group="agctl.plugins")` and registers each `command_group` onto the root `cli` group. No changes to core code are needed.
+`cli.py` iterates `entry_points(group="agctl.plugins")` and registers each `command_group` onto the root `cli` group (using `.name` as the subcommand, falling back to `command_group.name`). During `agctl config validate`, each loaded plugin's `validate_config(config)` is invoked with the fully-resolved config dict; any error strings it returns are folded into the validation result (exit 2). No changes to core code are needed.
 
 ### 9.3 Custom Assertion Types
 
@@ -1450,6 +1453,13 @@ For `agctl db assert` and `agctl kafka assert`, new assertion modes are added by
 [project.entry-points."agctl.assertions"]
 json_schema = "agctl_jsonschema:JSONSchemaAssertion"
 ```
+
+A registered mode is invoked via the `--assertion <name>` escape hatch on `agctl db assert` and `agctl kafka assert` (mutually exclusive with the built-in modes). The mode's `evaluate(context)` receives a free-form context dict and returns `{"passed": bool, ...}` (or raises `AssertionFailure`):
+
+- `db assert --assertion <name>`: `context = {"rows": [...], "row_count": int, "sql": str, "params": {...}, "connection": str}`.
+- `kafka assert --assertion <name>`: `context = {"topic": str, "messages": [...], "count": int, "params": {...}}` (the full consumed lookback window).
+
+`passed: false` (or a raised `AssertionFailure`) yields an `AssertionError` exit 1; an unknown name yields `TemplateNotFound` exit 2. Built-in modes (`expect_rows`, `expectValue`, `contains`, `match`, `pattern`) have dedicated flags and are rejected via `--assertion` with a `ConfigError`.
 
 ---
 

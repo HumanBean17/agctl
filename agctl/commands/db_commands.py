@@ -17,7 +17,7 @@ import click
 
 from ..assertions import coerce_db_value, jq_value, parse_equals, type_aware_equal
 from ..command import envelope, load_config_or_raise
-from ..errors import AssertionFailure, ConfigError, TemplateMissing
+from ..errors import AssertionFailure, ConfigError, TemplateNotFound
 from ..params import parse_params
 
 __all__ = ["db_query", "db_assert", "new_db_client", "resolve_db_request"]
@@ -48,7 +48,7 @@ def resolve_db_request(
     - ``template`` and ``sql`` are mutually exclusive: exactly one must be given
       (else :class:`ConfigError`).
     - If ``template``: look it up in ``cfg.database.templates``; missing ->
-      :class:`TemplateMissing`. ``sql_text`` comes from the template; the
+      :class:`TemplateNotFound`. ``sql_text`` comes from the template; the
       template's own ``connection`` may inform connection resolution.
     - If ``sql``: ``sql_text`` is the free-form caller SQL.
     - ``params = parse_params(param_tuple)``.
@@ -69,7 +69,7 @@ def resolve_db_request(
     template_connection: str | None = None
     if template is not None:
         if template not in cfg.database.templates:
-            raise TemplateMissing(
+            raise TemplateNotFound(
                 f"Unknown database template: {template}",
                 {"path": f"database.templates.{template}"},
             )
@@ -160,6 +160,31 @@ _db_query_envelope = envelope("db.query")(_db_query_core)
 # --------------------------------------------------------------------------- #
 
 
+def _run_db_custom_assertion(name, rows, sql_text, params, conn_name):
+    """DESIGN §9.3: dispatch ``--assertion <name>`` to a registered Assertion mode.
+
+    The mode receives the query result as ``context`` and returns
+    ``{"passed": bool, ...}``; see :func:`agctl.assertion_registry.evaluate_custom`.
+    """
+    from ..assertion_registry import evaluate_custom
+
+    context = {
+        "rows": rows,
+        "row_count": len(rows),
+        "sql": sql_text,
+        "params": params,
+        "connection": conn_name,
+    }
+    _, detail = evaluate_custom(name, context)
+    return {
+        "assertion_type": name,
+        "passed": True,
+        "sql": sql_text,
+        "connection": conn_name,
+        **detail,
+    }
+
+
 def _db_assert_core(
     config_path: str | None,
     template: str | None,
@@ -170,6 +195,7 @@ def _db_assert_core(
     expect_value: bool,
     path: str | None,
     equals: str | None,
+    assertion: str | None,
 ) -> dict:
     cfg = load_config_or_raise(config_path)
     sql_text, params, conn_name = resolve_db_request(
@@ -185,14 +211,19 @@ def _db_assert_core(
     # rather than wasting a connection and surfacing a ConnectionError.
     rows_mode = expect_rows is not None
     value_mode = expect_value
-    if rows_mode == value_mode:  # both True or both False
+    custom_mode = assertion is not None
+    if rows_mode + value_mode + custom_mode != 1:
         raise ConfigError(
-            "Exactly one of --expect-rows and --expect-value must be given", {}
+            "Exactly one of --expect-rows, --expect-value, or --assertion must be given",
+            {},
         )
     if value_mode and (not path or equals is None):
         raise ConfigError("--expect-value requires --path and --equals", {})
 
     rows = _execute(cfg, sql_text, params, conn_name)
+
+    if custom_mode:
+        return _run_db_custom_assertion(assertion, rows, sql_text, params, conn_name)
 
     if rows_mode:
         expected = int(expect_rows)  # type: ignore[arg-type]
@@ -260,6 +291,12 @@ def _db_assert_core(
 )
 @click.option("--path", "path", default=None, help="jq path to the cell (expect-value)")
 @click.option("--equals", "equals", default=None, help="Expected value (expect-value)")
+@click.option(
+    "--assertion",
+    "assertion",
+    default=None,
+    help="Named custom assertion mode (DESIGN §9.3)",
+)
 @click.pass_context
 def db_assert(
     ctx: click.Context,
@@ -271,8 +308,9 @@ def db_assert(
     expect_value: bool,
     path: str | None,
     equals: str | None,
+    assertion: str | None,
 ) -> None:
-    """Run a DB query and assert on its result (DESIGN §3.3, D8)."""
+    """Run a DB query and assert on its result (DESIGN §3.3, D8, §9.3)."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     _db_assert_envelope(
         config_path,
@@ -284,6 +322,7 @@ def db_assert(
         expect_value,
         path,
         equals,
+        assertion,
     )
 
 

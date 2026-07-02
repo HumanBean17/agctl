@@ -25,7 +25,7 @@ import click
 
 from ..assertions import jq_bool, jq_value, json_subset
 from ..command import envelope, load_config_or_raise
-from ..errors import AssertionFailure, ConfigError, TemplateMissing
+from ..errors import AssertionFailure, ConfigError, TemplateNotFound
 from ..params import parse_params
 from ..resolution import fill_placeholders
 
@@ -140,18 +140,23 @@ def _kafka_consume_core(
     resolved_lookback = float(lookback) if lookback is not None else resolved_timeout
     group = _resolve_group(consumer_group, cfg.kafka)
 
+    # Build the optional jq filter as an inline predicate so consume_window can
+    # apply it incrementally AND short-circuit as soon as --expect-count matching
+    # messages arrive (DESIGN §3.2 "whichever comes first").
+    predicate = None
+    if match_expr is not None:
+        def predicate(msg, _expr=match_expr):
+            return jq_bool(msg["value"], _expr)
+
     client = new_kafka_client(cfg.kafka, group_id=group)
-    msgs = client.consume_window(
+    matched = client.consume_window(
         topic,
         lookback_seconds=resolved_lookback,
         timeout_seconds=resolved_timeout,
         from_beginning=from_beginning,
+        predicate=predicate,
+        expect_count=expect_count,
     )
-
-    if match_expr is not None:
-        matched = [m for m in msgs if jq_bool(m["value"], match_expr)]
-    else:
-        matched = list(msgs)
 
     # D10: consume-count-miss is an AssertionError (exit 1).
     if expect_count is not None and len(matched) < expect_count:
@@ -164,9 +169,9 @@ def _kafka_consume_core(
             },
         )
 
-    # timed_out: simplest documented heuristic — when expect-count is set and
-    # unmet the window is treated as having elapsed; otherwise False (the window
-    # ran to completion by construction).
+    # timed_out: the window elapsed without satisfying --expect-count. When the
+    # count was met, consume_window short-circuited (not timed out); without an
+    # expect-count the window always runs to completion by design (not a failure).
     timed_out = bool(expect_count is not None and len(matched) < expect_count)
 
     return {
@@ -268,6 +273,30 @@ def _build_assert_predicate(
     return predicate
 
 
+def _run_kafka_custom_assertion(name, topic, messages, params):
+    """DESIGN §9.3: dispatch ``--assertion <name>`` to a registered Assertion mode.
+
+    The mode receives the consumed window's messages as ``context`` and returns
+    ``{"passed": bool, ...}``; see :func:`agctl.assertion_registry.evaluate_custom`.
+    """
+    from ..assertion_registry import evaluate_custom
+
+    context = {
+        "topic": topic,
+        "messages": messages,
+        "count": len(messages),
+        "params": params,
+    }
+    _, detail = evaluate_custom(name, context)
+    return {
+        "topic": topic,
+        "assertion_type": name,
+        "passed": True,
+        "count": len(messages),
+        **detail,
+    }
+
+
 def _kafka_assert_core(
     config_path: str | None,
     topic: str | None,
@@ -280,15 +309,26 @@ def _kafka_assert_core(
     timeout: float,
     from_beginning: bool,
     consumer_group: str | None,
+    assertion: str | None,
 ) -> dict:
     cfg = load_config_or_raise(config_path)
     params = parse_params(param)
+
+    # DESIGN §9.3: a custom assertion mode is mutually exclusive with the
+    # built-in match modes.
+    if assertion is not None and (
+        contains is not None or match is not None or pattern is not None
+    ):
+        raise ConfigError(
+            "--assertion is mutually exclusive with --contains/--match/--pattern",
+            {},
+        )
 
     pattern_match: str | None = None
     inferred_topic: str | None = topic
     if pattern is not None:
         if pattern not in cfg.kafka.patterns:
-            raise TemplateMissing(
+            raise TemplateNotFound(
                 f"Unknown kafka pattern: {pattern}",
                 {"path": f"kafka.patterns.{pattern}"},
             )
@@ -306,6 +346,17 @@ def _kafka_assert_core(
     resolved_timeout = float(timeout)
     resolved_lookback = float(lookback) if lookback is not None else resolved_timeout
     group = _resolve_group(consumer_group, cfg.kafka)
+
+    # DESIGN §9.3: a custom assertion mode evaluates the full consumed window.
+    if assertion is not None:
+        client = new_kafka_client(cfg.kafka, group_id=group)
+        messages = client.consume_window(
+            inferred_topic,
+            lookback_seconds=resolved_lookback,
+            timeout_seconds=resolved_timeout,
+            from_beginning=from_beginning,
+        )
+        return _run_kafka_custom_assertion(assertion, inferred_topic, messages, params)
 
     predicate = _build_assert_predicate(
         contains=contains,
@@ -352,6 +403,12 @@ def _kafka_assert_core(
 @click.option("--timeout", "timeout", type=float, required=True, help="Poll timeout (s)")
 @click.option("--from-beginning", "from_beginning", is_flag=True, default=False)
 @click.option("--consumer-group", "consumer_group", default=None, help="Consumer group override")
+@click.option(
+    "--assertion",
+    "assertion",
+    default=None,
+    help="Named custom assertion mode (DESIGN §9.3)",
+)
 @click.pass_context
 def kafka_assert(
     ctx: click.Context,
@@ -365,8 +422,9 @@ def kafka_assert(
     timeout: float,
     from_beginning: bool,
     consumer_group: str | None,
+    assertion: str | None,
 ) -> None:
-    """Assert a matching message exists in a Kafka window (DESIGN §3.2, D6, D10)."""
+    """Assert a matching message exists in a Kafka window (DESIGN §3.2, D6, D10, §9.3)."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     _kafka_assert_envelope(
         config_path,
@@ -380,6 +438,7 @@ def kafka_assert(
         timeout,
         from_beginning,
         consumer_group,
+        assertion,
     )
 
 

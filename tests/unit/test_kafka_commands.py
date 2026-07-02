@@ -17,6 +17,7 @@ from confluent_kafka import OFFSET_END, TopicPartition
 
 from agctl.cli import cli
 from agctl.clients.kafka_client import KafkaClient
+from agctl.assertion_registry import Assertion
 from agctl.commands import kafka_commands
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "agctl.yaml"
@@ -477,6 +478,38 @@ def test_kafka_consume_match_and_filter_key_both_given_errors(install_fake):
     assert payload["error"]["type"] == "ConfigError"
 
 
+def test_kafka_consume_expect_count_stops_early(install_fake):
+    """DESIGN §3.2 'whichever comes first': consume returns as soon as
+    --expect-count is satisfied, NOT after the full --timeout. A message is
+    available immediately (FakeConsumer), expect-count 1, timeout 2s -> the
+    command must return far sooner than 2s."""
+    install_fake([_msg("t", {"a": 1}, "k1")])
+
+    t0 = time.monotonic()
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "kafka",
+            "consume",
+            "--topic",
+            "t",
+            "--timeout",
+            "2",
+            "--lookback",
+            "10",
+            "--expect-count",
+            "1",
+        ]
+    )
+    elapsed = time.monotonic() - t0
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["result"]["count"] == 1
+    assert elapsed < 1.0  # did NOT wait the full 2s window
+
+
 # --------------------------------------------------------------------------- #
 # kafka assert
 # --------------------------------------------------------------------------- #
@@ -750,3 +783,88 @@ def test_kafka_assert_early_stops_on_first_match(install_fake):
     # Only one message was scanned (early stop after the first match).
     assert payload["result"]["messages_scanned"] == 1
     assert payload["result"]["matching_message"]["key"] == "first"
+
+
+# --------------------------------------------------------------------------- #
+# DESIGN §9.3: `kafka assert --assertion <name>` dispatches to a registered mode
+# --------------------------------------------------------------------------- #
+
+
+def _install_custom_registry(monkeypatch, mode_cls):
+    import agctl.assertion_registry as ar
+    from agctl.assertion_registry import AssertionRegistry
+
+    reg = AssertionRegistry()
+    reg.register(mode_cls)
+    monkeypatch.setattr(ar, "get_default_registry", lambda: reg)
+
+
+def test_kafka_assert_custom_mode_passes(monkeypatch, install_fake):
+    class _AtLeastTwo(Assertion):
+        name = "at_least_two"
+
+        def evaluate(self, context):
+            return {"passed": context["count"] >= 2, "count": context["count"]}
+
+    _install_custom_registry(monkeypatch, _AtLeastTwo)
+    install_fake([_msg("t", {"i": 1}, "a"), _msg("t", {"i": 2}, "b")])
+
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "kafka", "assert",
+            "--topic", "t",
+            "--assertion", "at_least_two",
+            "--timeout", "0.02",
+            "--lookback", "10",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["result"]["assertion_type"] == "at_least_two"
+    assert payload["result"]["count"] == 2
+
+
+def test_kafka_assert_custom_mode_fails_exit1(monkeypatch, install_fake):
+    class _NeedsThree(Assertion):
+        name = "needs_three"
+
+        def evaluate(self, context):
+            return {"passed": context["count"] >= 3}
+
+    _install_custom_registry(monkeypatch, _NeedsThree)
+    install_fake([_msg("t", {"i": 1}, "a")])
+
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "kafka", "assert",
+            "--topic", "t",
+            "--assertion", "needs_three",
+            "--timeout", "0.02",
+            "--lookback", "10",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 1
+    assert payload["error"]["type"] == "AssertionError"
+
+
+def test_kafka_assert_custom_mode_mutually_exclusive_with_match(install_fake):
+    install_fake([_msg("t", {"a": 1}, "k1")])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "kafka", "assert",
+            "--topic", "t",
+            "--match", ".a==1",
+            "--assertion", "x",
+            "--timeout", "0.02",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
