@@ -1344,7 +1344,7 @@ def emit(
 
 ### One JSON object per invocation
 
-`output.emit()` is the **only** permitted stdout write path. Every command calls it exactly once before exiting. Any intermediate logging goes to stderr.
+`output.emit()` is the **only** permitted stdout write path. Every command calls it exactly once before exiting. Any intermediate logging goes to stderr. The sole exception is `http ping`, which streams newline-delimited objects (one per ping plus a final summary) for background/keepalive use — see §3.1.
 
 ### stderr is not machine-readable
 
@@ -1353,6 +1353,10 @@ Stderr is reserved for unexpected internal errors and stack traces. An agent mus
 ### Stateless invocations
 
 No session files, no lock files, no local state databases. Each invocation is fully self-contained. Kafka consumer groups are used for offset tracking when needed; that state lives in Kafka, not on disk.
+
+### Windowed assertions (reliable send-then-assert)
+
+`kafka assert`/`consume` seek to `now - --lookback` and read forward, rather than subscribing at "latest". This makes the send-then-assert pattern reliable without subscribe-before-produce gymnastics: the lookback window catches events published just before the command started. See §3.2.
 
 ### Fail fast, fail loudly
 
@@ -1371,25 +1375,25 @@ All flags use full words with hyphens: `--expect-rows`, `--filter-key`, `--from-
 ### Env var override convention
 
 ```
-AGCTL_<SECTION>_<KEY>=<value>
+AGCTL_<SECTION>__<KEY>=<value>      # double-underscore __ separates path segments
 ```
 
 Mapping rules:
-- Section and key are uppercased.
-- Hyphens in YAML keys become underscores: `main-db` → `MAIN_DB`.
-- Nested keys are flattened with `_`: `database.main-db.password` → `AGCTL_DATABASE_MAIN_DB_PASSWORD`.
+- Each path segment is uppercased.
+- Hyphens within a segment become underscores: `main-db` → `MAIN_DB`.
+- Path segments are joined with `__` (double underscore), so a single `_` unambiguously belongs to a key: `database.connections.main-db.password` → `AGCTL_DATABASE__CONNECTIONS__MAIN_DB__PASSWORD`.
 
 Full examples:
 
 ```bash
-AGCTL_DEFAULTS_TIMEOUT_SECONDS=30
-AGCTL_KAFKA_DEFAULT_CONSUMER_GROUP=ci-consumer
-AGCTL_DATABASE_MAIN_DB_HOST=localhost
-AGCTL_DATABASE_MAIN_DB_PASSWORD=supersecret
-AGCTL_SERVICES_ORDER_SERVICE_BASE_URL=http://order-svc:8080
+AGCTL_DEFAULTS__TIMEOUT_SECONDS=30
+AGCTL_KAFKA__DEFAULT_CONSUMER_GROUP=ci-consumer
+AGCTL_DATABASE__CONNECTIONS__MAIN_DB__HOST=localhost
+AGCTL_DATABASE__CONNECTIONS__MAIN_DB__PASSWORD=supersecret
+AGCTL_SERVICES__ORDER_SERVICE__BASE_URL=http://order-svc:8080
 ```
 
-These overrides are applied after `${}` interpolation and have the highest precedence.
+These overrides are applied after `${}` interpolation and have the highest precedence. (The `__` delimiter mirrors Pydantic Settings / Spring Boot and keeps keys containing single underscores unambiguous.)
 
 ---
 
