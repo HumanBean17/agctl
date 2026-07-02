@@ -49,7 +49,8 @@
 ```yaml
 # agctl.yaml
 # ---------------
-# Version must match the agctl major version that loaded this file.
+# Version tracks the agctl MAJOR version only (currently "1"). A major-version
+# mismatch is a ConfigError (exit 2); minor/patch are not tracked.
 version: "1"
 
 # ---------------------------------------------------------------------------
@@ -193,12 +194,13 @@ defaults:
 
 ### 2.2 Environment Variable Interpolation
 
-Any YAML string value containing `${VAR_NAME}` is resolved at load time:
+Any YAML string value containing `${...}` is resolved at load time. Three forms are supported:
 
-1. Look up `VAR_NAME` in the process environment.
-2. If missing, emit a config error (exit 2) listing all unresolved variables — do not silently substitute empty string.
+1. `${VAR_NAME}` — **required**. Look up `VAR_NAME` in the process environment. If missing, emit a config error (exit 2) listing all unresolved variables. Never silently substitute an empty string.
+2. `${VAR_NAME:-default}` — **optional with default**. If `VAR_NAME` is missing, substitute the literal `default`.
+3. `${VAR_NAME:-}` — **optional, empty**. If `VAR_NAME` is missing, substitute an empty string (no error). Use this for fields that are not always set, e.g. `schema_registry_url: "${SCHEMA_REGISTRY_URL:-}"`.
 
-The `${VAR_NAME}` syntax is only supported in string scalar values, not in keys.
+The `${...}` syntax is only supported in string scalar values, not in keys.
 
 ### 2.3 Path Parameter Syntax
 
@@ -574,7 +576,7 @@ agctl check ready --all
 
 #### `agctl config validate`
 
-Parse and validate `agctl.yaml`. Reports schema errors, unresolvable env vars, and dangling service references in templates. Exits 2 on any error.
+Parse and validate `agctl.yaml`. Reports schema errors, unresolvable required env vars, dangling service/connection references in templates, and major-version mismatches. Exits 2 on any error.
 
 ```
 agctl config validate
