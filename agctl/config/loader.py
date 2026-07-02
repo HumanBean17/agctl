@@ -8,19 +8,11 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
+from ..errors import ConfigError
 from .models import Config
 from .resolver import apply_env_overrides
 
 _VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(:-([^}]*))?\}")
-
-
-class ConfigError(Exception):
-    """Raised for any config problem. Maps to exit code 2 (DESIGN §4.1)."""
-
-    def __init__(self, message: str, detail: dict | None = None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.detail = detail or {}
 
 
 def interpolate(obj: Any, env: dict[str, str]) -> Any:

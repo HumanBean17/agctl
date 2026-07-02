@@ -1,17 +1,33 @@
 version: "1"
+
 services:
   order-service:
     base_url: "${ORDER_SERVICE_URL}"
     health_path: "/actuator/health"
+    timeout_seconds: 10
+
+  payment-service:
+    base_url: "${PAYMENT_SERVICE_URL}"
+    health_path: "/health"
+    timeout_seconds: 15
+
 kafka:
   brokers:
     - "${KAFKA_BROKER}:9092"
   default_consumer_group: "agctl-consumer"
   schema_registry_url: "${SCHEMA_REGISTRY_URL:-}"
+  timeout_seconds: 30
   patterns:
     order-created:
+      description: "An ORDER_CREATED event for a specific order"
       topic: orders.created
-      match: '.eventType == "ORDER_CREATED"'
+      match: '.eventType == "ORDER_CREATED" and .payload.orderId == "{orderId}"'
+
+    payment-failed:
+      description: "Any PAYMENT_FAILED event regardless of order"
+      topic: payments.events
+      match: '.eventType == "PAYMENT_FAILED"'
+
 database:
   connections:
     main-db:
@@ -22,17 +38,70 @@ database:
       user: "${DB_USER}"
       password: "${DB_PASSWORD}"
       default: true
+
+    analytics-db:
+      type: postgresql
+      host: "${ANALYTICS_DB_HOST}"
+      port: 5432
+      dbname: "analytics"
+      user: "${ANALYTICS_DB_USER}"
+      password: "${ANALYTICS_DB_PASSWORD}"
+
   templates:
     find-order:
+      description: "Fetch a single order by ID"
       connection: main-db
-      sql: "SELECT id, status FROM orders WHERE id = :orderId"
+      sql: "SELECT id, status, total_cents, created_at FROM orders WHERE id = :orderId"
+
+    orders-by-status:
+      description: "List orders in a given status, optionally filtered by customer"
+      connection: main-db
+      sql: "SELECT id, status FROM orders WHERE status = :status AND customer_id = :customerId"
+
+    count-failed-payments:
+      description: "Count failed payments after a given timestamp"
+      connection: main-db
+      sql: "SELECT COUNT(*) AS cnt FROM payments WHERE status = 'FAILED' AND created_at > :since"
+
 templates:
   create-order:
+    description: "Submit a new order for a customer"
     method: POST
     service: order-service
     path: "/api/v1/orders"
+    headers:
+      Content-Type: "application/json"
+      X-Request-Source: "agctl"
     body:
       customer_id: "{customer_id}"
+      items:
+        - sku: "{sku}"
+          quantity: 1
+
+  get-order:
+    description: "Fetch a single order by ID"
+    method: GET
+    service: order-service
+    path: "/api/v1/orders/{order_id}"
+
+  charge-payment:
+    description: "Trigger payment charge for an order"
+    method: POST
+    service: payment-service
+    path: "/api/v1/payments"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer ${PAYMENT_SERVICE_TOKEN}"
+    body:
+      order_id: "{order_id}"
+      amount_cents: "{amount_cents}"
+
+  get-payment-status:
+    description: "Fetch payment status by order ID"
+    method: GET
+    service: payment-service
+    path: "/api/v1/payments/{order_id}/status"
+
 defaults:
   timeout_seconds: 10
   database_connection: main-db

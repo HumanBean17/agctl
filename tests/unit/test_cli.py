@@ -9,11 +9,16 @@ FIXTURE = Path(__file__).parent.parent / "fixtures" / "agctl.yaml"
 
 ENV = {
     "ORDER_SERVICE_URL": "http://localhost:8081",
+    "PAYMENT_SERVICE_URL": "http://localhost:8082",
+    "PAYMENT_SERVICE_TOKEN": "tok",
     "KAFKA_BROKER": "localhost",
     "DB_HOST": "h",
     "DB_NAME": "n",
     "DB_USER": "u",
     "DB_PASSWORD": "secret",
+    "ANALYTICS_DB_HOST": "ah",
+    "ANALYTICS_DB_USER": "au",
+    "ANALYTICS_DB_PASSWORD": "ap",
 }
 
 
@@ -23,7 +28,8 @@ def test_validate_ok():
     assert result.exit_code == 0
     assert payload["ok"] is True
     assert payload["command"] == "config.validate"
-    assert payload["result"] == {"valid": True}
+    assert payload["result"]["valid"] is True
+    assert payload["result"]["warnings"] is not None
 
 
 def test_validate_fails_on_missing_env():
@@ -32,6 +38,47 @@ def test_validate_fails_on_missing_env():
     assert result.exit_code == 2
     assert payload["ok"] is False
     assert payload["error"]["type"] == "ConfigError"
+
+
+def _write_config(tmp_path, text):
+    p = tmp_path / "agctl.yaml"
+    p.write_text(text)
+    return p
+
+
+def test_validate_structural_error_envelope(tmp_path):
+    cfg_path = _write_config(
+        tmp_path,
+        """
+version: "1"
+services:
+  order-service:
+    base_url: "http://localhost:8081"
+templates:
+  create-order:
+    method: POST
+    service: ghost
+    path: "/api/v1/orders"
+""",
+    )
+    result = CliRunner().invoke(cli, ["config", "validate", "--config", str(cfg_path)])
+    payload = json.loads(result.output)
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["command"] == "config.validate"
+    assert payload["result"]["valid"] is False
+    assert payload["result"]["errors"]  # non-empty
+    assert payload["result"]["warnings"] is not None
+    assert payload["error"]["type"] == "ConfigError"
+    assert "structural error" in payload["error"]["message"]
+
+
+def test_validate_good_fixture_no_structural_errors():
+    result = CliRunner().invoke(cli, ["config", "validate", "--config", str(FIXTURE)], env=ENV)
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    assert payload["result"]["valid"] is True
+    assert isinstance(payload["result"]["warnings"], list)
 
 
 def test_show_masks_password():
@@ -54,7 +101,7 @@ def test_global_config_flag_is_honored():
     payload = json.loads(result.output)
     assert result.exit_code == 0
     assert payload["ok"] is True
-    assert payload["result"] == {"valid": True}
+    assert payload["result"]["valid"] is True
 
 
 def test_show_preserves_non_secret_values():
