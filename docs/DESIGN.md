@@ -333,12 +333,14 @@ Consume messages from a topic. Returns as soon as `--expect-count` matching mess
 agctl kafka consume
     --topic <name>
     [--timeout <seconds>]       # default: kafka.timeout_seconds from config
+    [--lookback <seconds>]      # seek to now - lookback before reading; default: = --timeout
     [--match <jq-expr>]         # jq boolean predicate; only messages where the expression
                                 #   is true are counted/returned
     [--filter-key <jq-expr>]    # DEPRECATED alias for --match; prefer --match
-    [--expect-count <n>]        # if set, exit 1 if fewer than n matching messages received
-    [--from-beginning]          # consume from earliest offset (default: latest)
-    [--consumer-group <name>]   # override default_consumer_group
+    [--expect-count <n>]        # if set, exit 1 (AssertionError) if fewer than n matching
+                                #   messages are received within the window
+    [--from-beginning]          # seek to earliest offset (default: seek to now - lookback)
+    [--consumer-group <name>]   # override default consumer group (default: agctl-consumer)
 ```
 
 `--match` is a jq boolean expression evaluated against each message value. Messages where the expression returns `false` or raises an error are silently skipped. This enables partial matching — you do not need to know the full message structure.
@@ -389,7 +391,7 @@ agctl kafka produce \
 
 #### `agctl kafka assert`
 
-Assert that a message matching a predicate or pattern appears on a topic within a timeout. Fails (exit 1) if no matching message arrives in time.
+Assert that a message matching a predicate or pattern appears on a topic within a timeout. Fails with `AssertionError` (exit 1) if no matching message arrives within the window.
 
 Supports three matching modes, usable together:
 - `--contains` — JSON subset match against the full message value
@@ -406,9 +408,10 @@ agctl kafka assert
     [--pattern <name>]          # use a named pattern from config
     [--param key=value]         # repeatable; fills {placeholder} in pattern match expression
     [--path <jq-path>]          # narrow --contains match to a sub-path, e.g. ".event_type"
-    --timeout <seconds>
-    [--from-beginning]
-    [--consumer-group <name>]
+    [--lookback <seconds>]      # seek to now - lookback; default: = --timeout
+    --timeout <seconds>         # assert fails (AssertionError) if no match within this window
+    [--from-beginning]          # seek to earliest offset (default: seek to now - lookback)
+    [--consumer-group <name>]   # override default consumer group (default: agctl-consumer)
 ```
 
 **Examples:**
@@ -436,6 +439,8 @@ agctl kafka assert \
 agctl kafka assert \
   --pattern payment-failed \
   --timeout 15
+
+**Offset & timing model (consume and assert):** By default the consumer seeks each partition to the timestamp `now - --lookback` (via `offsets_for_times`) and reads forward, rather than subscribing at "latest". This makes the common send-then-assert pattern reliable: an event published a moment before the command starts still falls inside the window. `--lookback` defaults to the resolved `--timeout` (look back as far as you wait forward); `--from-beginning` overrides to the earliest offset. For `assert`, committed offsets are ignored — each invocation re-seeks by time, so repeated asserts are independent and deterministic. On high-volume topics, narrow with `--match`/`--contains` to avoid matching stale events from prior runs.
 ```
 
 ---
