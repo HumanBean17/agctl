@@ -344,7 +344,7 @@ def discover(
     search: str | None,
     config_path: str | None,
 ) -> None:
-    """Discover configured services, templates, patterns (DESIGN §3.6, D9)."""
+    """Discover configured services, templates, patterns."""
     resolved_config = config_path or (ctx.obj.get("config_path") if ctx.obj else None)
 
     # Mutual exclusion: --category + --search together is an error.

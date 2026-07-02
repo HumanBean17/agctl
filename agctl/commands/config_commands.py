@@ -1,10 +1,12 @@
-"""`agctl config validate` and `agctl config show` commands (DESIGN §3.5).
+"""`agctl config validate`, `show`, and `init` commands (DESIGN §3.5).
 
 - ``validate`` loads the fully-resolved config and reports schema / cross-reference
   / plugin errors (exit 2 on any). It also folds in each loaded protocol plugin's
   own ``validate_config`` (DESIGN §9.2).
 - ``show`` dumps the resolved config as JSON with secret-looking values masked
   (unless ``--unmask``).
+- ``init`` writes a starter ``agctl.yaml`` (a clean baseline that validates as-is)
+  for the user to edit, so no one has to copy-paste the sample from the README.
 
 These commands are plain ``@click.command``s registered onto the ``config`` group
 in :mod:`agctl.cli`. The list of loaded plugins is injected from
@@ -16,7 +18,9 @@ one-directional (``cli → config_commands``) and avoids a circular import.
 
 from __future__ import annotations
 
+import importlib.resources
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 import click
@@ -25,7 +29,7 @@ from ..config import ConfigError, load_config
 from ..config.validator import validate_config
 from ..output import emit
 
-__all__ = ["config_validate", "config_show", "set_plugins_provider"]
+__all__ = ["config_init", "config_validate", "config_show", "set_plugins_provider"]
 
 # --- masking ---------------------------------------------------------------
 
@@ -120,7 +124,7 @@ def _emit_config_error(command: str, err: ConfigError, start: float) -> None:
 @click.option("--config", "config_path", default=None)
 @click.pass_context
 def config_validate(ctx: click.Context, config_path: str | None) -> None:
-    """Parse and validate agctl.yaml (DESIGN §3.5). Exit 2 on any error."""
+    """Parse and validate agctl.yaml. Exit 2 on any error."""
     start = time.monotonic()
     path = config_path or ctx.obj.get("config_path")
     try:
@@ -161,7 +165,7 @@ def config_validate(ctx: click.Context, config_path: str | None) -> None:
 @click.option("--unmask", is_flag=True, default=False)
 @click.pass_context
 def config_show(ctx: click.Context, config_path: str | None, unmask: bool) -> None:
-    """Dump the resolved config as JSON, secrets masked (DESIGN §3.5)."""
+    """Dump the resolved config as JSON, secrets masked."""
     start = time.monotonic()
     path = config_path or ctx.obj.get("config_path")
     try:
@@ -173,3 +177,76 @@ def config_show(ctx: click.Context, config_path: str | None, unmask: bool) -> No
     if not unmask:
         data = _mask(data)
     emit(ok=True, command="config.show", result=data, duration_ms=_ms(start))
+
+
+# --- config init -----------------------------------------------------------
+
+#: Packaged starter config — the single source of truth for the sample
+#: ``agctl.yaml``. Kept byte-identical to the block in README.md (a drift-guard
+#: test enforces this) and written as a clean baseline that validates with no
+#: environment variables, so ``config init && config validate`` passes as-is.
+_SAMPLE_RESOURCE = ("data", "sample-config.yaml")
+
+
+def _load_sample() -> str:
+    """Read the packaged sample config text.
+
+    Read via :mod:`importlib.resources` so it resolves under both an installed
+    wheel and an editable (``-e``) install. Raises if the package data is missing
+    (e.g. an incomplete build); callers surface that as an exit-2 error.
+    """
+    try:
+        root = importlib.resources.files("agctl")
+        return (root.joinpath(*_SAMPLE_RESOURCE)).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError) as err:
+        raise ConfigError(
+            f"Sample config not found in the agctl package: {err}",
+            detail={"resource": "/".join(_SAMPLE_RESOURCE)},
+        ) from err
+
+
+@click.command("init")
+@click.option(
+    "--output",
+    "-o",
+    "output",
+    default=None,
+    help="Destination path (default: ./agctl.yaml).",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite an existing file instead of refusing.",
+)
+@click.pass_context
+def config_init(ctx: click.Context, output: str | None, force: bool) -> None:
+    """Write a sample agctl.yaml to edit. Exit 2 if it already exists (use --force)."""
+    start = time.monotonic()
+    dest = Path(output) if output else Path.cwd() / "agctl.yaml"
+    if dest.exists() and not force:
+        msg = f"Refusing to overwrite existing {dest} (pass --force to overwrite)."
+        emit(
+            ok=False,
+            command="config.init",
+            result={"path": str(dest), "created": False},
+            error={"type": "ConfigError", "message": msg},
+            duration_ms=_ms(start),
+        )
+        raise SystemExit(2)
+    try:
+        content = _load_sample()
+    except ConfigError as err:
+        _emit_config_error("config.init", err, start)
+        raise SystemExit(2)
+    dest.write_text(content, encoding="utf-8")
+    emit(
+        ok=True,
+        command="config.init",
+        result={
+            "path": str(dest),
+            "created": True,
+            "bytes": len(content.encode("utf-8")),
+        },
+        duration_ms=_ms(start),
+    )

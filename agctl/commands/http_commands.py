@@ -143,7 +143,7 @@ def http_call(
     header: tuple[str, ...],
     timeout: float | None,
 ) -> None:
-    """Resolve and send a named HTTP template (DESIGN §3.1)."""
+    """Resolve and send a named HTTP template."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     _http_call_envelope(config_path, template_name, param, body, header, timeout)
 
@@ -208,7 +208,7 @@ def http_request(
     header: tuple[str, ...],
     timeout: float | None,
 ) -> None:
-    """Send a free-form HTTP request against a configured service (DESIGN §3.1)."""
+    """Send a free-form HTTP request against a configured service."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     _http_request_envelope(config_path, service, method, path, body, header, timeout)
 
@@ -402,7 +402,7 @@ def http_ping(
     timeout: float | None,
     param: tuple[str, ...],
 ) -> None:
-    """Repeatedly send an HTTP request, streaming NDJSON ping lines (DESIGN §3.1)."""
+    """Repeatedly send an HTTP request, streaming NDJSON ping lines."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     start = time.monotonic()
 

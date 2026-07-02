@@ -107,7 +107,7 @@ def check_ready(
     timeout: float | None,
     config_path: str | None,
 ) -> None:
-    """Probe configured service health endpoints (DESIGN §3.4, D7)."""
+    """Probe configured service health endpoints."""
     path = config_path or (ctx.obj.get("config_path") if ctx.obj else None)
     _check_ready_envelope(path, service, all_services, timeout)
 

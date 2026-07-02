@@ -15,6 +15,7 @@ import click
 
 from .commands.check_commands import check_ready
 from .commands.config_commands import (
+    config_init,
     config_show,
     config_validate,
     set_plugins_provider,
@@ -101,27 +102,28 @@ def config_group() -> None:
 
 @cli.group(name="http")
 def http_group() -> None:
-    """HTTP request commands (DESIGN §3.1)."""
+    """HTTP request commands."""
 
 
 @cli.group(name="db")
 def db_group() -> None:
-    """Database query/assert commands (DESIGN §3.3)."""
+    """Database query/assert commands."""
 
 
 @cli.group(name="kafka")
 def kafka_group() -> None:
-    """Kafka produce/consume/assert commands (DESIGN §3.2)."""
+    """Kafka produce/consume/assert commands."""
 
 
 @cli.group(name="check")
 def check_group() -> None:
-    """Health/readiness checks (DESIGN §3.4)."""
+    """Health/readiness checks."""
 
 
 # Register subcommands on the config group (commands live in config_commands.py).
 config_group.add_command(config_validate)
 config_group.add_command(config_show)
+config_group.add_command(config_init)
 
 # Register subcommands on the http group.
 http_group.add_command(http_call)
