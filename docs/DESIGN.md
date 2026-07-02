@@ -247,6 +247,8 @@ agctl http call create-order \
   --param customer_id=cust-42 \
   --param sku=WIDGET-001 \
   --body '{"priority": "high"}'
+
+**Body merge:** when `--body '{...}'` is supplied, it is deep-merged into the template's body — nested objects merge recursively, arrays are replaced wholesale, and scalar leaves from `--body` override the template. The template body is the base; `--body` only adds or overrides fields.
 ```
 
 #### `agctl http request`
