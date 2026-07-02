@@ -7,10 +7,11 @@ tested without a broker.
 """
 
 import json
+import math
 import time
 
 import pytest
-from confluent_kafka import TopicPartition
+from confluent_kafka import OFFSET_END, TopicPartition
 
 from agctl.clients.kafka_client import KafkaClient
 from agctl.errors import ConfigError, ConnectionFailure
@@ -71,6 +72,20 @@ class FakeErrProducer(FakeProducer):
         )
         if on_delivery is not None:
             on_delivery(object(), None)  # err is truthy/not None
+
+
+class FakeTimeoutProducer(FakeProducer):
+    """Producer that models an unreachable broker: the delivery callback never
+    fires and ``flush`` times out with messages still queued."""
+
+    def produce(self, topic, value, key=None, headers=None, on_delivery=None):
+        self.calls.append(
+            {"topic": topic, "value": value, "key": key, "headers": headers}
+        )
+        # do NOT invoke on_delivery — broker unreachable, callback never fires
+
+    def flush(self, timeout):
+        return 1  # one message still queued after the flush timeout
 
 
 class FakeCMsg:
@@ -156,7 +171,10 @@ class FakeConsumer:
         return out
 
     def seek(self, tp):
-        self._seek_offsets[(tp.topic, tp.partition)] = tp.offset
+        # OFFSET_END means "nothing at/after here" — model it as +inf so poll's
+        # `offset >= seek_off` test yields nothing for that partition.
+        off = math.inf if tp.offset == OFFSET_END else tp.offset
+        self._seek_offsets[(tp.topic, tp.partition)] = off
 
     def seek_to_beginning(self, *tps):
         for tp in tps:
@@ -229,6 +247,16 @@ def test_produce_value_can_be_list():
 
 def test_produce_delivery_error_raises_connection_failure():
     fake = FakeErrProducer({})
+    client = KafkaClient(["host:9092"], producer_factory=lambda c: fake)
+
+    with pytest.raises(ConnectionFailure):
+        client.produce("t", {"a": 1})
+
+
+def test_produce_flush_timeout_raises_connection_failure():
+    """A flush that leaves messages undelivered (broker unreachable within the
+    timeout) is a connection failure, not a silent null-partition/offset success."""
+    fake = FakeTimeoutProducer({})
     client = KafkaClient(["host:9092"], producer_factory=lambda c: fake)
 
     with pytest.raises(ConnectionFailure):
@@ -311,6 +339,34 @@ def test_consume_window_lookback_excludes_old_messages():
     keys = {m["key"] for m in result}
     assert "old" not in keys
     assert keys == {"mid", "new"}
+
+
+def test_consume_window_lookback_stale_partition_seeked_to_end():
+    """A partition whose every message is older than the window (offsets_for_times
+    returns -1) must be seeked past, not re-read via auto.offset.reset=earliest."""
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        # partition 0 has an in-window message
+        FakeCMsg(topic, 0, 0, "fresh0", b'{"i":0}', now_ms - 1_000),
+        # partition 1 has ONLY a stale message (older than the window)
+        FakeCMsg(topic, 1, 0, "stale1", b'{"i":1}', now_ms - 60_000),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+
+    result = client.consume_window(
+        topic, lookback_seconds=10, timeout_seconds=0.02, from_beginning=False
+    )
+
+    keys = {m["key"] for m in result}
+    assert keys == {"fresh0"}
+    assert "stale1" not in keys
 
 
 # ---------------------------------------------------------------------------

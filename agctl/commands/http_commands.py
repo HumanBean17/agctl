@@ -430,6 +430,18 @@ def http_ping(
         emit(ok=False, command="http.ping", error=err.to_dict(),
              duration_ms=int((time.monotonic() - start) * 1000))
         raise SystemExit(err.exit_code)
+    except Exception as exc:
+        # Non-agctl startup errors (e.g. malformed ``--body`` JSON, which
+        # json.loads raises as ValueError) -> InternalError envelope + exit 2,
+        # mirroring the @envelope fallback so http ping never leaks a raw
+        # traceback like its sibling commands do not.
+        emit(
+            ok=False,
+            command="http.ping",
+            error={"type": "InternalError", "message": str(exc), "detail": {}},
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        raise SystemExit(2)
 
     def send_one(i: int) -> dict:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
