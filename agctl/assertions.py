@@ -1,0 +1,115 @@
+"""Assertion primitives backing Kafka/DB checks.
+
+DESIGN §3.2 (jq predicate/value evaluation, silent skip on error),
+and D8 (equals coercion + type-aware comparison rules).
+"""
+
+import datetime
+import decimal
+import json
+import uuid
+
+import jq
+
+
+def jq_bool(value, expr: str) -> bool:
+    """Evaluate a jq predicate against value; True only if the result is truthy.
+
+    A jq compile/runtime error OR a falsy/empty result -> False (silently skipped
+    per DESIGN §3.2). Never raises.
+    """
+    try:
+        outputs = jq.compile(expr).input(value).all()
+    except Exception:
+        return False
+    return any(bool(o) for o in outputs)
+
+
+def jq_value(value, expr: str):
+    """Evaluate a jq path/value expression (e.g. '.status'). Returns the first
+    output value, or None if the expression errors or yields nothing. Never raises."""
+    try:
+        outputs = jq.compile(expr).input(value).all()
+    except Exception:
+        return None
+    if not outputs:
+        return None
+    return outputs[0]
+
+
+def json_subset(needle, haystack) -> bool:
+    """DESIGN --contains: True if every key/element in needle is present-and-equal
+    in haystack, recursively for nested dict/list. Subset, not equality.
+
+    - dict needle: every key in needle must exist in haystack with a
+      json_subset-equal value.
+    - list needle: every element of needle must be json_subset-matched by SOME
+      element of haystack (order-independent).
+    - scalar needle: needle == haystack.
+    """
+    if isinstance(needle, dict):
+        if not isinstance(haystack, dict):
+            return False
+        return all(
+            k in haystack and json_subset(v, haystack[k]) for k, v in needle.items()
+        )
+    if isinstance(needle, list):
+        if not isinstance(haystack, list):
+            return False
+        # each needle element must match at least one haystack element
+        return all(
+            any(json_subset(n, h) for h in haystack) for n in needle
+        )
+    # scalar
+    return needle == haystack
+
+
+def parse_equals(text: str):
+    """DESIGN D8 step 1-2: try json.loads(text); if it parses, return the typed
+    value ('0'->int 0, 'true'->bool True, 'null'->None, '[1,2]'->[1,2]); else
+    return the raw string."""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text
+
+
+def coerce_db_value(value):
+    """DESIGN D8 step 3: coerce a DB cell to a JSON-native type before comparison.
+
+    - None -> None
+    - bool -> bool (checked BEFORE int; bool is a subclass of int in Python)
+    - decimal.Decimal -> int if integral else float
+    - datetime.datetime/datetime.date/datetime.time -> .isoformat()
+    - uuid.UUID -> str(value)
+    - int/float/str -> unchanged
+    - everything else -> unchanged
+    """
+    if value is None:
+        return None
+    # bool MUST be checked before int (bool subclasses int)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, decimal.Decimal):
+        if value % 1 == 0:
+            return int(value)
+        return float(value)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    return value
+
+
+def type_aware_equal(expected, actual) -> bool:
+    """DESIGN D8 step 4: strict, type-aware equality. 0 != '0' (number vs string).
+
+    A number never equals a string of the same digits. Otherwise compares with ==,
+    recursing element-wise for dict/list.
+    """
+    # number-vs-string mismatch (in either order) -> never equal
+    if isinstance(expected, (int, float, decimal.Decimal, bool)) and isinstance(actual, str):
+        return False
+    if isinstance(actual, (int, float, decimal.Decimal, bool)) and isinstance(expected, str):
+        return False
+    return expected == actual
