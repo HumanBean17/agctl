@@ -1,0 +1,1698 @@
+# `agctl` — CLI Design Document
+
+**Version:** 0.5-draft  
+**Last updated:** 2026-07-02  
+**Status:** Foundation design — ready for implementation
+
+---
+
+## Table of Contents
+
+1. [Goals & Non-Goals](#1-goals--non-goals)
+2. [Configuration Schema](#2-configuration-schema)
+3. [CLI Command Design](#3-cli-command-design) *(includes `agctl discover` §3.6)*
+4. [Output Schema](#4-output-schema)
+5. [Configuration Resolution Order](#5-configuration-resolution-order)
+6. [AGENTS.md Template](#6-agentsmd-template)
+7. [Project Structure](#7-project-structure)
+8. [Key Design Principles](#8-key-design-principles)
+9. [Extension Points](#9-extension-points)
+10. [Open Questions / Future Work](#10-open-questions--future-work)
+11. [Agentic Workflow Use Cases](#11-agentic-workflow-use-cases)
+
+---
+
+## 1. Goals & Non-Goals
+
+### Goals
+
+- **System-agnostic.** The tool ships with zero knowledge of any particular project. All system-specific configuration lives in `agctl.yaml` in the consuming repo.
+- **Agent-friendly.** Every invocation produces exactly one JSON object on stdout. Exit codes are deterministic and machine-readable. No ANSI color, no progress spinners, no banner text.
+- **Composable.** Commands are narrow and orthogonal. An agent chains them together — send a request, then assert a Kafka message, then assert a DB row — rather than relying on a monolithic "run scenario" command.
+- **Maintainable.** The codebase has one responsibility per module. Adding a new database driver or protocol does not require touching core logic.
+- **Fail loudly.** A wrong assertion always exits non-zero with a structured error. Silent false-positives are the worst possible failure mode for an agent harness.
+
+### Non-Goals
+
+- **Human-facing UI or formatted output.** Pretty-printing, tables, and color are explicitly out of scope for the initial design. A thin wrapper script can format JSON for humans if needed.
+- **Auto-generating tests.** `agctl` runs assertions; it does not inspect a codebase and write test cases.
+- **Mocking / service virtualization.** No built-in mock server. Use a dedicated tool (WireMock, LocalStack, etc.) and point `agctl` at it via config.
+- **Orchestrating multi-step scenarios as a first-class primitive.** An agent can chain commands in a shell script or inline code; `agctl` does not need a built-in scenario runner to be useful. This is deferred (see §10).
+- **Managing infrastructure lifecycle.** Starting, stopping, or provisioning services is out of scope.
+
+---
+
+## 2. Configuration Schema
+
+### 2.1 Schema Reference
+
+```yaml
+# agctl.yaml
+# ---------------
+# Version must match the agctl major version that loaded this file.
+version: "1"
+
+# ---------------------------------------------------------------------------
+# services — named HTTP base URLs for services under test.
+# base_url supports ${ENV_VAR} interpolation.
+# ---------------------------------------------------------------------------
+services:
+  order-service:
+    base_url: "${ORDER_SERVICE_URL}"           # e.g. http://localhost:8081
+    health_path: "/actuator/health"             # used by `agctl check ready`
+    timeout_seconds: 10                         # optional, overrides defaults.timeout_seconds
+
+  payment-service:
+    base_url: "${PAYMENT_SERVICE_URL}"
+    health_path: "/health"
+    timeout_seconds: 15
+
+# ---------------------------------------------------------------------------
+# kafka — broker configuration.
+# ---------------------------------------------------------------------------
+kafka:
+  brokers:
+    - "${KAFKA_BROKER_HOST}:9092"
+  default_consumer_group: "agctl-consumer"  # optional
+  schema_registry_url: "${SCHEMA_REGISTRY_URL}" # optional; omit if not used
+  timeout_seconds: 30                            # default consume/assert timeout
+
+# ---------------------------------------------------------------------------
+# kafka.patterns — named Kafka filter patterns, analogous to HTTP templates.
+# topic:   Kafka topic name
+# match:   jq predicate expression evaluated against each message value;
+#          supports {placeholder} substitution via --param at assert time
+# ---------------------------------------------------------------------------
+  patterns:
+    order-created:
+      description: "An ORDER_CREATED event for a specific order"
+      topic: orders.created
+      match: '.eventType == "ORDER_CREATED" and .payload.orderId == "{orderId}"'
+
+    payment-failed:
+      description: "Any PAYMENT_FAILED event regardless of order"
+      topic: payments.events
+      match: '.eventType == "PAYMENT_FAILED"'
+
+# ---------------------------------------------------------------------------
+# database — named connection profiles.
+# All fields support ${ENV_VAR} interpolation.
+# Currently supported types: postgresql (extensible via plugins, see §9).
+# ---------------------------------------------------------------------------
+database:
+  main-db:
+    type: postgresql
+    host: "${DB_HOST}"
+    port: 5432
+    dbname: "${DB_NAME}"
+    user: "${DB_USER}"
+    password: "${DB_PASSWORD}"
+    default: true                               # used when --connection is omitted
+
+  analytics-db:
+    type: postgresql
+    host: "${ANALYTICS_DB_HOST}"
+    port: 5432
+    dbname: "analytics"
+    user: "${ANALYTICS_DB_USER}"
+    password: "${ANALYTICS_DB_PASSWORD}"
+
+# ---------------------------------------------------------------------------
+# templates — named HTTP request templates.
+# method:   HTTP verb (GET, POST, PUT, PATCH, DELETE)
+# service:  must match a key under `services`
+# path:     supports {placeholder} path parameters resolved via --param
+# headers:  static headers merged with any --header overrides at call time
+# body:     JSON body; can reference path params (see note below)
+# ---------------------------------------------------------------------------
+templates:
+  create-order:
+    description: "Submit a new order for a customer"
+    method: POST
+    service: order-service
+    path: "/api/v1/orders"
+    headers:
+      Content-Type: "application/json"
+      X-Request-Source: "agctl"
+    body:
+      customer_id: "{customer_id}"
+      items:
+        - sku: "{sku}"
+          quantity: 1
+
+  get-order:
+    description: "Fetch a single order by ID"
+    method: GET
+    service: order-service
+    path: "/api/v1/orders/{order_id}"
+
+  charge-payment:
+    description: "Trigger payment charge for an order"
+    method: POST
+    service: payment-service
+    path: "/api/v1/payments"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer ${PAYMENT_SERVICE_TOKEN}"
+    body:
+      order_id: "{order_id}"
+      amount_cents: "{amount_cents}"
+
+  get-payment-status:
+    description: "Fetch payment status by order ID"
+    method: GET
+    service: payment-service
+    path: "/api/v1/payments/{order_id}/status"
+
+# ---------------------------------------------------------------------------
+# database.templates — named SQL query templates.
+# connection: optional; falls back to defaults.database_connection
+# sql:        query string using :paramName for named parameters (JDBC-style)
+# ---------------------------------------------------------------------------
+database:
+  templates:
+    find-order:
+      description: "Fetch a single order by ID"
+      connection: main-db
+      sql: "SELECT id, status, total_cents, created_at FROM orders WHERE id = :orderId"
+
+    orders-by-status:
+      description: "List orders in a given status, optionally filtered by customer"
+      connection: main-db
+      sql: "SELECT id, status FROM orders WHERE status = :status AND customer_id = :customerId"
+
+    count-failed-payments:
+      description: "Count failed payments after a given timestamp"
+      connection: main-db
+      sql: "SELECT COUNT(*) AS cnt FROM payments WHERE status = 'FAILED' AND created_at > :since"
+
+# ---------------------------------------------------------------------------
+# defaults — project-wide fallbacks.
+# ---------------------------------------------------------------------------
+defaults:
+  timeout_seconds: 10
+  database_connection: main-db
+```
+
+### 2.2 Environment Variable Interpolation
+
+Any YAML string value containing `${VAR_NAME}` is resolved at load time:
+
+1. Look up `VAR_NAME` in the process environment.
+2. If missing, emit a config error (exit 2) listing all unresolved variables — do not silently substitute empty string.
+
+The `${VAR_NAME}` syntax is only supported in string scalar values, not in keys.
+
+### 2.3 Path Parameter Syntax
+
+Template `path` and `body` values use `{placeholder}` (single braces) for runtime substitution via `--param key=value`. This is distinct from env var interpolation (`${...}`), which is resolved at config load time.
+
+---
+
+## 3. CLI Command Design
+
+All commands share these global flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config <path>` | auto-discovered | Explicit path to `agctl.yaml` |
+| `--timeout <seconds>` | from config `defaults` | Override request/operation timeout |
+
+### 3.1 `agctl http` — HTTP Requests
+
+#### `agctl http call <template-name>`
+
+Execute a named template from config.
+
+```
+agctl http call <template-name>
+    [--param key=value]     # repeatable; fills {placeholders} in path and body
+    [--body '{...}']        # override or extend the template body (merged, not replaced)
+    [--header key=value]    # repeatable; merged with template headers; caller wins on conflict
+    [--timeout <seconds>]
+```
+
+**Examples:**
+
+```bash
+# Create an order
+agctl http call create-order \
+  --param customer_id=cust-42 \
+  --param sku=WIDGET-001
+
+# Fetch a specific order
+agctl http call get-order --param order_id=ord-789
+
+# Override a body field
+agctl http call create-order \
+  --param customer_id=cust-42 \
+  --param sku=WIDGET-001 \
+  --body '{"priority": "high"}'
+```
+
+#### `agctl http request`
+
+Free-form HTTP request — escape hatch for cases not covered by templates.
+
+```
+agctl http request
+    --service <name>        # must match a services key in config
+    --method GET|POST|PUT|PATCH|DELETE
+    --path <path>           # e.g. /api/v1/orders/ord-123
+    [--body '{...}']
+    [--header key=value]    # repeatable
+    [--timeout <seconds>]
+```
+
+**Example:**
+
+```bash
+agctl http request \
+  --service order-service \
+  --method GET \
+  --path /api/v1/orders/ord-789
+```
+
+#### `agctl http ping`
+
+Send a repeated HTTP request at a fixed interval, emitting one JSON line per ping to stdout. Designed for session-keepalive scenarios (e.g. heartbeat endpoints that require periodic calls to prevent logout).
+
+Unlike all other `agt` commands, `agctl http ping` emits one JSON object **per ping** (newline-delimited) rather than a single envelope. This allows the agent to stream results while running the command in the background.
+
+```
+agctl http ping
+    <template-name> | --service <name> --path <path>
+    --interval <seconds>           # delay between pings (e.g. 5)
+    [--method GET|POST|...]        # default: GET (or template method)
+    [--body '{...}']
+    [--header key=value]
+    [--duration <seconds>]         # stop after this many seconds; mutually exclusive with --until-stopped
+    [--until-stopped]              # run until SIGTERM/SIGINT (default if --duration is omitted)
+    [--timeout <seconds>]          # per-request timeout
+```
+
+Each emitted line:
+
+```json
+{"ping": 1, "ok": true, "status_code": 200, "duration_ms": 34, "timestamp": "2026-06-29T14:22:05Z"}
+{"ping": 2, "ok": true, "status_code": 200, "duration_ms": 31, "timestamp": "2026-06-29T14:22:10Z"}
+{"ping": 3, "ok": false, "status_code": 401, "duration_ms": 12, "timestamp": "2026-06-29T14:22:15Z", "error": "Unexpected status 401"}
+```
+
+On `SIGTERM`/`SIGINT`, the command emits a final summary line and exits 0 (if all pings succeeded) or 1 (if any ping failed):
+
+```json
+{"summary": true, "total_pings": 3, "failed_pings": 1, "duration_ms": 15034}
+```
+
+**Usage pattern (agent running a test while keeping session alive):**
+
+```bash
+# Start heartbeat in background
+agctl http ping heartbeat --interval 5 --until-stopped &
+HEARTBEAT_PID=$!
+
+# ... run test scenario ...
+agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001
+agctl kafka assert --topic orders.created --contains '{"customer_id": "cust-42"}' --timeout 10
+
+# Stop heartbeat
+kill $HEARTBEAT_PID
+```
+
+---
+
+### 3.2 `agctl kafka` — Kafka Operations
+
+#### `agctl kafka consume`
+
+Consume messages from a topic. Returns as soon as `--expect-count` matching messages are received or `--timeout` elapses, whichever comes first.
+
+```
+agctl kafka consume
+    --topic <name>
+    [--timeout <seconds>]       # default: kafka.timeout_seconds from config
+    [--match <jq-expr>]         # jq boolean predicate; only messages where the expression
+                                #   is true are counted/returned
+    [--filter-key <jq-expr>]    # DEPRECATED alias for --match; prefer --match
+    [--expect-count <n>]        # if set, exit 1 if fewer than n matching messages received
+    [--from-beginning]          # consume from earliest offset (default: latest)
+    [--consumer-group <name>]   # override default_consumer_group
+```
+
+`--match` is a jq boolean expression evaluated against each message value. Messages where the expression returns `false` or raises an error are silently skipped. This enables partial matching — you do not need to know the full message structure.
+
+**Examples:**
+
+```bash
+# Wait up to 10s for at least 1 order.created event (any content)
+agctl kafka consume \
+  --topic orders.created \
+  --timeout 10 \
+  --expect-count 1
+
+# Only count messages where orderId matches, ignoring all others
+agctl kafka consume \
+  --topic orders.created \
+  --match '.payload.orderId == "ord-789"' \
+  --timeout 10 \
+  --expect-count 1
+
+# Filter by eventType without caring about other fields
+agctl kafka consume \
+  --topic orders.created \
+  --match '.eventType == "ORDER_CREATED" and .payload.customerId != null' \
+  --timeout 15
+```
+
+#### `agctl kafka produce`
+
+Publish a single message.
+
+```
+agctl kafka produce
+    --topic <name>
+    --message '{...}'           # JSON string; value is published as-is
+    [--key <string>]            # optional Kafka message key
+    [--header key=value]        # repeatable; Kafka message headers
+```
+
+**Example:**
+
+```bash
+agctl kafka produce \
+  --topic payments.commands \
+  --key ord-789 \
+  --message '{"order_id": "ord-789", "command": "refund"}'
+```
+
+#### `agctl kafka assert`
+
+Assert that a message matching a predicate or pattern appears on a topic within a timeout. Fails (exit 1) if no matching message arrives in time.
+
+Supports three matching modes, usable together:
+- `--contains` — JSON subset match against the full message value
+- `--match` — jq boolean predicate for partial/complex filtering (preferred for real systems)
+- `--pattern` — reference a named pattern from `kafka.patterns` in config
+
+When multiple modes are combined, all conditions must be satisfied.
+
+```
+agctl kafka assert
+    [--topic <name>]            # required unless --pattern is used (topic inferred from pattern)
+    [--contains '{...}']        # JSON subset that must be present in the message value
+    [--match <jq-expr>]         # jq boolean predicate; more flexible than --contains
+    [--pattern <name>]          # use a named pattern from config
+    [--param key=value]         # repeatable; fills {placeholder} in pattern match expression
+    [--path <jq-path>]          # narrow --contains match to a sub-path, e.g. ".event_type"
+    --timeout <seconds>
+    [--from-beginning]
+    [--consumer-group <name>]
+```
+
+**Examples:**
+
+```bash
+# Simple subset match
+agctl kafka assert \
+  --topic orders.created \
+  --contains '{"order_id": "ord-789"}' \
+  --timeout 5
+
+# Predicate match — partial, no need to know full message structure
+agctl kafka assert \
+  --topic orders.created \
+  --match '.payload.orderId == "ord-789" and .eventType != null' \
+  --timeout 5
+
+# Named pattern with param substitution (topic inferred from pattern)
+agctl kafka assert \
+  --pattern order-created \
+  --param orderId=ord-789 \
+  --timeout 10
+
+# Named pattern, no params needed
+agctl kafka assert \
+  --pattern payment-failed \
+  --timeout 15
+```
+
+---
+
+### 3.3 `agctl db` — Database Operations
+
+All `db` commands use the connection specified by `--connection`, falling back to `defaults.database_connection` in config.
+
+Supports two input modes:
+- `--template <name>` — use a named SQL template from `database.templates` in config (preferred)
+- `--sql "..."` — free-form SQL (escape hatch)
+
+Both modes accept `--param key=value`. In templates, named parameters use `:paramName` syntax (JDBC-style). In free-form SQL, use `$paramName`.
+
+#### `agctl db query`
+
+Execute a SQL query and return all rows.
+
+```
+agctl db query
+    [--template <name>]         # named template from database.templates
+    [--sql "SELECT ..."]        # free-form SQL; mutually exclusive with --template
+    [--param key=value]         # repeatable; fills :paramName (template) or $paramName (sql)
+    [--connection <name>]       # overrides template's connection and defaults
+```
+
+**Examples:**
+
+```bash
+# Using a named template (preferred)
+agctl db query \
+  --template find-order \
+  --param orderId=ord-789
+
+# Free-form SQL (escape hatch)
+agctl db query \
+  --sql "SELECT status FROM orders WHERE id = \$orderId" \
+  --param orderId=ord-789
+```
+
+#### `agctl db assert --expect-rows`
+
+Assert that a query returns exactly N rows. Exits 1 if the count does not match.
+
+```
+agctl db assert
+    [--template <name>]
+    [--sql "SELECT ..."]
+    --expect-rows <n>
+    [--param key=value]
+    [--connection <name>]
+```
+
+**Examples:**
+
+```bash
+# Using a named template
+agctl db assert \
+  --template find-order \
+  --param orderId=ord-789 \
+  --expect-rows 1
+
+# Free-form SQL
+agctl db assert \
+  --sql "SELECT 1 FROM orders WHERE id = \$orderId AND status = 'CONFIRMED'" \
+  --param orderId=ord-789 \
+  --expect-rows 1
+```
+
+#### `agctl db assert --expect-value`
+
+Assert that a specific field in the first result row equals a given value.
+
+```
+agctl db assert
+    [--template <name>]
+    [--sql "SELECT ..."]
+    --expect-value              # flag indicating value-assertion mode
+    --path <jq-path>            # jq path into the first row object, e.g. ".status"
+    --equals <value>            # expected value as a JSON-compatible string
+    [--param key=value]
+    [--connection <name>]
+```
+
+**Examples:**
+
+```bash
+# Template + value assertion
+agctl db assert \
+  --template find-order \
+  --param orderId=ord-789 \
+  --expect-value \
+  --path ".status" \
+  --equals "CONFIRMED"
+
+# Aggregate template assertion
+agctl db assert \
+  --template count-failed-payments \
+  --param since=2026-06-01T00:00:00Z \
+  --expect-value \
+  --path ".cnt" \
+  --equals "0"
+
+# Free-form SQL
+agctl db assert \
+  --sql "SELECT status FROM orders WHERE id = \$orderId" \
+  --param orderId=ord-789 \
+  --expect-value \
+  --path ".status" \
+  --equals "CONFIRMED"
+```
+
+---
+
+### 3.4 `agctl check` — Service Health
+
+#### `agctl check ready`
+
+Hit health endpoints for one or all configured services.
+
+```
+agctl check ready
+    [--service <name>]          # check a single service
+    [--all]                     # check all services defined in config
+    [--timeout <seconds>]
+```
+
+A service is considered ready if its `health_path` returns HTTP 2xx. If `health_path` is not configured for a service, a `GET /` is attempted.
+
+**Examples:**
+
+```bash
+agctl check ready --service order-service
+agctl check ready --all
+```
+
+---
+
+### 3.5 `agctl config` — Config Introspection
+
+#### `agctl config validate`
+
+Parse and validate `agctl.yaml`. Reports schema errors, unresolvable env vars, and dangling service references in templates. Exits 2 on any error.
+
+```
+agctl config validate
+    [--config <path>]
+```
+
+#### `agctl config show`
+
+Dump the fully resolved configuration as JSON. All secret-looking values (password, token, key fields) are masked to `"***"`. Intended for debugging config resolution — **not** for agent discovery (use `agctl discover` instead).
+
+```
+agctl config show
+    [--config <path>]
+    [--unmask]                  # disable masking (use only in secured environments)
+```
+
+---
+
+### 3.6 `agctl discover` — Lazy Scoped Discovery
+
+The discovery subsystem lets an agent understand what is available in the system **without loading everything into context at once**. It is structured as three progressive levels: a summary, a category listing, and a single-item detail. The agent fetches only what the current task requires.
+
+> **Design principle:** discovery is a map, not a dump. The agent navigates to the detail it needs rather than receiving everything upfront.
+
+#### Level 0 — System summary
+
+Run once at the start of a session to understand system shape. Returns only counts and category names — no templates, no params, no SQL.
+
+```bash
+agctl discover
+```
+
+```json
+{
+  "ok": true,
+  "command": "discover.summary",
+  "result": {
+    "services": 4,
+    "http_templates": 12,
+    "kafka_patterns": 5,
+    "db_templates": 8,
+    "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates"
+  },
+  "duration_ms": 1
+}
+```
+
+#### Level 1 — Category listing
+
+Returns names and one-line descriptions for all items in a category. No params, no examples, no SQL.
+
+```bash
+agctl discover --category <name>
+# <name>: services | http-templates | kafka-patterns | db-templates
+```
+
+**Example — `agctl discover --category http-templates`:**
+
+```json
+{
+  "ok": true,
+  "command": "discover.category",
+  "result": {
+    "category": "http-templates",
+    "count": 3,
+    "items": [
+      { "name": "create-order",       "description": "Create a new order for a customer" },
+      { "name": "get-payment-status", "description": "Fetch payment status by order ID" },
+      { "name": "cancel-order",       "description": "Cancel an existing order" }
+    ],
+    "hint": "Run 'agctl discover --category http-templates --name <name>' for full detail"
+  },
+  "duration_ms": 1
+}
+```
+
+#### Level 2 — Single item detail
+
+Returns the full schema for one named item: method, path, required params, and a ready-to-use example command with placeholder values. The agent fetches this immediately before using a template it has not seen before.
+
+```bash
+agctl discover --category <name> --name <item-name>
+```
+
+**Example — `agctl discover --category http-templates --name create-order`:**
+
+```json
+{
+  "ok": true,
+  "command": "discover.item",
+  "result": {
+    "category": "http-templates",
+    "name": "create-order",
+    "description": "Create a new order for a customer",
+    "method": "POST",
+    "service": "order-service",
+    "path": "/api/v1/orders",
+    "params": ["customer_id", "sku"],
+    "example": "agctl http call create-order --param customer_id=X --param sku=Y"
+  },
+  "duration_ms": 1
+}
+```
+
+**Example — `agctl discover --category db-templates --name find-order`:**
+
+```json
+{
+  "ok": true,
+  "command": "discover.item",
+  "result": {
+    "category": "db-templates",
+    "name": "find-order",
+    "description": "Fetch a single order by ID",
+    "connection": "main-db",
+    "params": ["orderId"],
+    "example": "agctl db query --template find-order --param orderId=X"
+  },
+  "duration_ms": 1
+}
+```
+
+**Example — `agctl discover --category kafka-patterns --name order-created`:**
+
+```json
+{
+  "ok": true,
+  "command": "discover.item",
+  "result": {
+    "category": "kafka-patterns",
+    "name": "order-created",
+    "description": "An ORDER_CREATED event for a specific order",
+    "topic": "orders.created",
+    "params": ["orderId"],
+    "example": "agctl kafka assert --pattern order-created --param orderId=X --timeout 10"
+  },
+  "duration_ms": 1
+}
+```
+
+#### `--search` — Cross-category keyword search
+
+When the agent does not know which category to look in, it searches across all categories by name and description. Returns a flat list of matching items at the name+description level only (no detail). The agent follows up with a Level 2 call for the item it wants to use.
+
+```bash
+agctl discover --search <term>
+```
+
+**Example — `agctl discover --search payment`:**
+
+```json
+{
+  "ok": true,
+  "command": "discover.search",
+  "result": {
+    "query": "payment",
+    "matches": [
+      { "category": "http-templates",  "name": "get-payment-status",   "description": "Fetch payment status by order ID" },
+      { "category": "kafka-patterns",  "name": "payment-failed",        "description": "Any PAYMENT_FAILED event regardless of order" },
+      { "category": "db-templates",    "name": "count-failed-payments", "description": "Count failed payments after a given timestamp" }
+    ],
+    "hint": "Run 'agctl discover --category <category> --name <name>' for full detail on any match"
+  },
+  "duration_ms": 2
+}
+```
+
+#### Discovery workflow the agent must follow
+
+The `AGENTS.md` template (§6) prescribes this exact sequence:
+
+1. **Start of session:** run `agctl discover` → understand system size and available categories
+2. **Before starting a task:** run `agctl discover --category <X>` for the relevant category only
+3. **Before using any template:** run `agctl discover --category <X> --name <Y>` to get params and example
+4. **When unsure which category:** run `agctl discover --search <term>`, then do step 3
+5. **Never** load categories not relevant to the current task
+
+#### `description` field requirement
+
+Every template and pattern in `agctl.yaml` should have a `description` field. `agctl config validate` emits a **warning** (not an error) for any item missing a description, since discovery output degrades significantly without it.
+
+---
+
+## 4. Output Schema
+
+### 4.1 Envelope
+
+Every invocation writes exactly one JSON object to stdout:
+
+```json
+{
+  "ok": true,
+  "command": "http.call",
+  "result": {},
+  "error": null,
+  "duration_ms": 142
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `ok` | boolean | `true` if the command succeeded and all assertions passed |
+| `command` | string | Dot-separated command path, e.g. `http.call`, `kafka.assert`, `db.query` |
+| `result` | object or null | Command-specific payload; null when `ok` is false and no partial result exists |
+| `error` | object or null | Populated on any failure; null on success |
+| `duration_ms` | integer | Wall-clock time for the operation in milliseconds |
+
+**Error object:**
+
+```json
+{
+  "type": "AssertionError",
+  "message": "Expected 1 row, got 0",
+  "detail": {
+    "sql": "SELECT 1 FROM orders WHERE id = $order_id AND status = 'CONFIRMED'",
+    "params": {"order_id": "ord-789"},
+    "actual_rows": 0,
+    "expected_rows": 1
+  }
+}
+```
+
+**Error types:**
+
+| Type | Exit code | Description |
+|---|---|---|
+| `AssertionError` | 1 | An assertion was evaluated and failed |
+| `ConfigError` | 2 | Config file missing, invalid, or env vars unresolved |
+| `ConnectionError` | 2 | Could not reach a service, broker, or database |
+| `TimeoutError` | 1 | Operation exceeded the configured timeout |
+| `TemplateNotFound` | 2 | Named template does not exist in config |
+| `InternalError` | 2 | Unexpected error in `agctl` itself |
+
+### 4.2 Result Shapes by Command Group
+
+#### `http.call` / `http.request`
+
+```json
+{
+  "status_code": 201,
+  "response_time_ms": 87,
+  "headers": {
+    "content-type": "application/json",
+    "x-request-id": "7f3a1c9e"
+  },
+  "body": {
+    "order_id": "ord-789",
+    "status": "PENDING",
+    "total_cents": 4999
+  },
+  "url": "http://localhost:8081/api/v1/orders",
+  "method": "POST"
+}
+```
+
+#### `kafka.consume`
+
+```json
+{
+  "topic": "orders.created",
+  "messages": [
+    {
+      "key": "ord-789",
+      "value": {
+        "order_id": "ord-789",
+        "event_type": "ORDER_CREATED",
+        "customer_id": "cust-42",
+        "timestamp": "2026-06-29T14:22:01Z"
+      },
+      "partition": 2,
+      "offset": 10043,
+      "timestamp": "2026-06-29T14:22:01Z",
+      "headers": {}
+    }
+  ],
+  "count": 1,
+  "timed_out": false
+}
+```
+
+#### `kafka.produce`
+
+```json
+{
+  "topic": "payments.commands",
+  "partition": 0,
+  "offset": 5512,
+  "key": "ord-789",
+  "timestamp": "2026-06-29T14:22:05Z"
+}
+```
+
+#### `kafka.assert`
+
+```json
+{
+  "topic": "orders.created",
+  "matched": true,
+  "matching_message": {
+    "key": "ord-789",
+    "value": {
+      "order_id": "ord-789",
+      "event_type": "ORDER_CREATED"
+    },
+    "partition": 2,
+    "offset": 10043,
+    "timestamp": "2026-06-29T14:22:01Z",
+    "headers": {}
+  },
+  "messages_scanned": 3,
+  "elapsed_ms": 340
+}
+```
+
+#### `db.query`
+
+```json
+{
+  "rows": [
+    {
+      "id": "ord-789",
+      "status": "CONFIRMED",
+      "total_cents": 4999,
+      "created_at": "2026-06-29T14:22:00Z"
+    }
+  ],
+  "row_count": 1,
+  "connection": "main-db"
+}
+```
+
+#### `db.assert`
+
+```json
+{
+  "assertion_type": "expect_rows",
+  "expected": 1,
+  "actual": 1,
+  "passed": true,
+  "sql": "SELECT 1 FROM orders WHERE id = $order_id AND status = 'CONFIRMED'",
+  "connection": "main-db"
+}
+```
+
+```json
+{
+  "assertion_type": "expect_value",
+  "path": ".status",
+  "expected": "CONFIRMED",
+  "actual": "CONFIRMED",
+  "passed": true,
+  "connection": "main-db"
+}
+```
+
+#### `check.ready`
+
+```json
+{
+  "services": {
+    "order-service": {
+      "ready": true,
+      "status_code": 200,
+      "url": "http://localhost:8081/actuator/health",
+      "response_time_ms": 12
+    },
+    "payment-service": {
+      "ready": false,
+      "status_code": null,
+      "url": "http://localhost:8082/health",
+      "error": "Connection refused"
+    }
+  },
+  "all_ready": false
+}
+```
+
+#### `discover.summary`
+
+```json
+{
+  "services": 4,
+  "http_templates": 12,
+  "kafka_patterns": 5,
+  "db_templates": 8,
+  "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates"
+}
+```
+
+#### `discover.category`
+
+```json
+{
+  "category": "http-templates",
+  "count": 3,
+  "items": [
+    { "name": "create-order",       "description": "Create a new order for a customer" },
+    { "name": "get-payment-status", "description": "Fetch payment status by order ID" }
+  ],
+  "hint": "Run 'agctl discover --category http-templates --name <name>' for full detail"
+}
+```
+
+#### `discover.item`
+
+Shape varies by category. All items share `name`, `description`, `params[]`, and `example`. HTTP templates add `method`, `service`, `path`; Kafka patterns add `topic` and `match`; DB templates add `connection` (SQL is omitted from discovery output to keep responses small).
+
+#### `discover.search`
+
+```json
+{
+  "query": "payment",
+  "matches": [
+    { "category": "http-templates", "name": "get-payment-status",   "description": "Fetch payment status by order ID" },
+    { "category": "kafka-patterns", "name": "payment-failed",        "description": "Any PAYMENT_FAILED event regardless of order" },
+    { "category": "db-templates",   "name": "count-failed-payments", "description": "Count failed payments after a given timestamp" }
+  ],
+  "hint": "Run 'agctl discover --category <category> --name <name>' for full detail on any match"
+}
+```
+
+#### `config.validate`
+
+```json
+{
+  "valid": false,
+  "errors": [
+    {
+      "path": "services.order-service.base_url",
+      "message": "Unresolved environment variable: ORDER_SERVICE_URL"
+    }
+  ]
+}
+```
+
+#### `config.show`
+
+Returns the fully resolved config as a JSON object with secrets masked. Structure mirrors the YAML schema.
+
+---
+
+## 5. Configuration Resolution Order
+
+`agctl` resolves its configuration through the following precedence chain (highest to lowest):
+
+1. **`--config <path>` CLI flag** — if provided, only this file is loaded; no discovery walk is performed.
+2. **`AGCTL_CONFIG` environment variable** — if set, used as the config file path. Ignored when `--config` is explicitly passed.
+3. **Auto-discovery** — search for `agctl.yaml` starting in the current working directory, walking up parent directories until the filesystem root or a `.git` directory is found (whichever is first). The first `agctl.yaml` found wins.
+4. **`${ENV_VAR}` interpolation within YAML values** — after the file is located and parsed, all `${VAR}` references in string values are resolved from the process environment.
+5. **`AGCTL_<SECTION>_<KEY>` environment variable overrides** — after file loading and `${}` interpolation, specific values can be overridden by structured env vars (see §8 for the exact convention).
+
+**If no config file is found and no `--config` or `AGCTL_CONFIG` is set**, the tool exits with code 2 and a `ConfigError` JSON object.
+
+**Env var override convention** (`AGCTL_<SECTION>_<KEY>`):
+
+```
+AGCTL_DEFAULTS_TIMEOUT_SECONDS=30
+AGCTL_KAFKA_DEFAULT_CONSUMER_GROUP=my-group
+AGCTL_DATABASE_MAIN_DB_PASSWORD=s3cr3t
+```
+
+Nested keys are separated by `_`. Connection/service names with hyphens are uppercased and hyphens are converted to `_`.
+
+---
+
+## 6. AGENTS.md Template
+
+The following is a ready-to-paste `AGENTS.md` section. Teams should customize the placeholder lines (marked `# CUSTOMIZE`) and commit it to their repository root.
+
+````markdown
+## Testing with `agctl` (`agt`)
+
+This repo uses [`agctl`](https://github.com/your-org/agenttest) — a CLI testing
+harness designed for use by AI coding agents. It is your primary tool for verifying
+that code changes work correctly against running services.
+
+### Setup
+
+`agctl` reads `agctl.yaml` at the project root. Required environment variables
+are listed in `.env.example`. Ensure they are set before running any `agctl` command.
+
+### Discovering Available Resources
+
+Use the three-level discovery workflow to orient yourself without consuming unnecessary context.
+
+**Step 1 — System summary (always run first):**
+
+```bash
+agctl discover
+```
+
+Returns only counts and category names. Cheap — run it at the start of every session.
+
+**Step 2 — List a category (only the category you need):**
+
+```bash
+agctl discover --category http-templates    # available HTTP request templates
+agctl discover --category kafka-patterns    # available Kafka filter patterns
+agctl discover --category db-templates      # available SQL query templates
+agctl discover --category services          # registered services and base URLs
+```
+
+Returns names and one-line descriptions only — no params, no SQL.
+
+**Step 3 — Get full detail for a specific item (before using it):**
+
+```bash
+agctl discover --category http-templates --name <template-name>
+agctl discover --category db-templates --name <template-name>
+agctl discover --category kafka-patterns --name <pattern-name>
+```
+
+Returns method, path, required params, and a ready-to-use example command.
+
+**When you don't know which category to look in:**
+
+```bash
+agctl discover --search <keyword>
+```
+
+Searches names and descriptions across all categories. Returns name+description only — follow up with Step 3 for the item you want.
+
+**Rules:**
+- Never use `agctl config show` for discovery — it dumps raw config and is context-expensive
+- Only load the category relevant to your current task
+- Always run Step 3 before using a template you have not seen in this session
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0`  | Command succeeded; all assertions passed |
+| `1`  | An assertion was evaluated and **failed** — the system is not in the expected state |
+| `2`  | Tool or configuration error — do not interpret as an assertion result |
+
+Exit code `2` means something is wrong with the environment or command invocation, not
+with the system under test. Fix the command or environment before re-running.
+
+### Interpreting Output
+
+Every command returns a single JSON object. Always check `"ok": true` before using
+`"result"`. On failure, `"error"` contains `"type"`, `"message"`, and `"detail"`.
+
+```json
+{ "ok": false, "command": "db.assert", "result": null,
+  "error": { "type": "AssertionError", "message": "Expected 1 row, got 0",
+             "detail": { "actual_rows": 0, "expected_rows": 1 } },
+  "duration_ms": 18 }
+```
+
+### Common Testing Patterns
+
+#### Pattern 1: Send a request and check the HTTP response
+
+```bash
+# Use a named template whenever one exists
+agctl http call create-order \
+  --param customer_id=cust-42 \
+  --param sku=WIDGET-001
+
+# Check the response in your shell / code using the returned JSON
+```
+
+#### Pattern 2: Trigger an action and assert a downstream Kafka event
+
+```bash
+# 1. Send the triggering request
+agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001
+
+# 2. Assert that an order.created event appears within 5 seconds
+agctl kafka assert \
+  --topic orders.created \
+  --contains '{"customer_id": "cust-42"}' \
+  --timeout 5
+```
+
+#### Pattern 3: Full end-to-end: HTTP → Kafka → DB
+
+```bash
+# 1. Create order
+ORDER=$(agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001)
+ORDER_ID=$(echo $ORDER | jq -r '.result.body.order_id')
+
+# 2. Assert Kafka event published
+agctl kafka assert \
+  --topic orders.created \
+  --contains "{\"order_id\": \"$ORDER_ID\"}" \
+  --timeout 10
+
+# 3. Assert DB row exists and has correct status
+agctl db assert \
+  --sql "SELECT 1 FROM orders WHERE id = \$order_id AND status = 'PENDING'" \
+  --params order_id=$ORDER_ID \
+  --expect-rows 1
+```
+
+#### Pattern 4: Query DB state for debugging
+
+```bash
+agctl db query \
+  --sql "SELECT id, status, total_cents FROM orders WHERE id = \$order_id" \
+  --params order_id=ord-789
+```
+
+#### Pattern 5: Keep session alive during a long test
+
+```bash
+# Start heartbeat in background (5-second interval, run until killed)
+agctl http ping heartbeat --interval 5 --until-stopped &
+HEARTBEAT_PID=$!
+
+# Run full test scenario
+ORDER=$(agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001)
+ORDER_ID=$(echo $ORDER | jq -r '.result.body.order_id')
+agctl kafka assert --pattern order-created --param orderId=$ORDER_ID --timeout 10
+agctl db assert --template find-order --param orderId=$ORDER_ID --expect-value --path ".status" --equals "PENDING"
+
+# Stop heartbeat
+kill $HEARTBEAT_PID
+```
+
+### Rules
+
+- **Prefer templates over free-form requests.** Use `agctl http call <template>` unless no
+  suitable template exists. Templates encode the correct service, path, and headers.
+- **Do not swallow non-zero exit codes.** Treat exit code `1` as a test failure. Stop
+  and diagnose before proceeding.
+- **Do not assume service availability.** Run `agctl check ready --all` at the start of
+  any test session if services may not be running.
+- **Do not parse stderr.** All machine-readable output is on stdout. Stderr is for
+  `agctl` internal errors and stack traces only.
+- **Do not run `agctl config show --unmask` in CI.** The `--unmask` flag exposes secrets.
+````
+
+---
+
+## 7. Project Structure
+
+```
+agctl/                         # Repository root
+│
+├── agctl/                     # Main Python package
+│   ├── __init__.py
+│   ├── cli.py                     # Click entry point; registers command groups
+│   ├── output.py                  # JSON envelope builder; all stdout writes go here
+│   │
+│   ├── commands/                  # One module per command group
+│   │   ├── __init__.py
+│   │   ├── http_commands.py       # `agctl http call` and `agctl http request`
+│   │   ├── kafka_commands.py      # `agctl kafka consume/produce/assert`
+│   │   ├── db_commands.py         # `agctl db query` and `agctl db assert`
+│   │   ├── check_commands.py      # `agctl check ready`
+│   │   ├── config_commands.py     # `agctl config validate` and `agctl config show`
+│   │   └── discover_commands.py   # `agctl discover` (summary / category / item / search)
+│   │
+│   ├── config/                    # Config loading pipeline
+│   │   ├── __init__.py
+│   │   ├── loader.py              # Discovery walk, file parsing, env var interpolation
+│   │   ├── validator.py           # Schema validation (jsonschema or pydantic)
+│   │   └── resolver.py            # AGCTL_* env var override layer
+│   │
+│   └── clients/                   # Protocol clients; each is independently instantiable
+│       ├── __init__.py
+│       ├── http_client.py         # httpx-based; accepts a ServiceConfig
+│       ├── kafka_client.py        # confluent-kafka-python based
+│       └── db_client.py           # Dispatches to registered driver plugins
+│
+├── tests/
+│   ├── unit/
+│   │   ├── test_config_loader.py
+│   │   ├── test_config_resolver.py
+│   │   ├── test_output.py
+│   │   └── test_template_resolution.py
+│   └── integration/               # Require running services (Docker Compose)
+│       ├── conftest.py
+│       ├── test_http_commands.py
+│       ├── test_kafka_commands.py
+│       └── test_db_commands.py
+│
+├── pyproject.toml
+├── agctl.yaml                 # Example config for this repo's own integration tests
+└── AGENTS.md                      # Drop-in template (see §6)
+```
+
+### `pyproject.toml` skeleton
+
+```toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agctl"
+version = "0.1.0"
+description = "Agent-facing CLI harness for testing distributed systems"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "confluent-kafka>=2.4",
+    "psycopg[binary]>=3.1",
+    "jq>=1.6",
+]
+
+[project.scripts]
+agctl = "agctl.cli:cli"
+agctl = "agctl.cli:cli"
+
+[project.entry-points."agctl.db_drivers"]
+postgresql = "agctl.clients.db_drivers.postgresql:PostgreSQLDriver"
+
+[project.entry-points."agctl.plugins"]
+# Third-party plugins register here, e.g.:
+# grpc = "agctl_grpc:GRPCPlugin"
+```
+
+### `output.py` interface
+
+```python
+# agctl/output.py
+
+import json
+import sys
+import time
+from typing import Any
+
+def emit(
+    ok: bool,
+    command: str,
+    result: Any = None,
+    error: dict | None = None,
+    duration_ms: int = 0,
+) -> None:
+    """Write the JSON envelope to stdout and flush. Call exactly once per invocation."""
+    payload = {
+        "ok": ok,
+        "command": command,
+        "result": result,
+        "error": error,
+        "duration_ms": duration_ms,
+    }
+    sys.stdout.write(json.dumps(payload, default=str))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+```
+
+---
+
+## 8. Key Design Principles
+
+### One JSON object per invocation
+
+`output.emit()` is the **only** permitted stdout write path. Every command calls it exactly once before exiting. Any intermediate logging goes to stderr.
+
+### stderr is not machine-readable
+
+Stderr is reserved for unexpected internal errors and stack traces. An agent must never parse stderr. If a stack trace reaches stderr, the command exits with code 2 and has already written a structured `InternalError` envelope to stdout.
+
+### Stateless invocations
+
+No session files, no lock files, no local state databases. Each invocation is fully self-contained. Kafka consumer groups are used for offset tracking when needed; that state lives in Kafka, not on disk.
+
+### Fail fast, fail loudly
+
+- Unresolvable env vars at config load time → immediate exit 2, never an empty string substitution.
+- A failed assertion always exits 1, never 0. There is no "soft fail" mode.
+- A template reference to a non-existent service key → exit 2 at startup, not at request time.
+
+### Ten focused commands over fifty overlapping ones
+
+The command surface area is intentionally small. Before adding a new command, verify it cannot be composed from existing ones.
+
+### Self-documenting flag names
+
+All flags use full words with hyphens: `--expect-rows`, `--filter-key`, `--from-beginning`. No single-letter flags except where established convention demands it (none currently).
+
+### Env var override convention
+
+```
+AGCTL_<SECTION>_<KEY>=<value>
+```
+
+Mapping rules:
+- Section and key are uppercased.
+- Hyphens in YAML keys become underscores: `main-db` → `MAIN_DB`.
+- Nested keys are flattened with `_`: `database.main-db.password` → `AGCTL_DATABASE_MAIN_DB_PASSWORD`.
+
+Full examples:
+
+```bash
+AGCTL_DEFAULTS_TIMEOUT_SECONDS=30
+AGCTL_KAFKA_DEFAULT_CONSUMER_GROUP=ci-consumer
+AGCTL_DATABASE_MAIN_DB_HOST=localhost
+AGCTL_DATABASE_MAIN_DB_PASSWORD=supersecret
+AGCTL_SERVICES_ORDER_SERVICE_BASE_URL=http://order-svc:8080
+```
+
+These overrides are applied after `${}` interpolation and have the highest precedence.
+
+---
+
+## 9. Extension Points
+
+### 9.1 Database Driver Plugins
+
+`agctl` discovers DB drivers via the `agctl.db_drivers` entry point group. Each driver must implement the `DBDriver` protocol:
+
+```python
+# agctl/clients/db_driver_protocol.py
+from typing import Protocol, Any
+
+class DBDriver(Protocol):
+    def connect(self, config: dict) -> None: ...
+    def execute(self, sql: str, params: dict) -> list[dict[str, Any]]: ...
+    def close(self) -> None: ...
+```
+
+To add a MySQL driver in a separate package:
+
+```toml
+# In agctl-mysql/pyproject.toml
+[project.entry-points."agctl.db_drivers"]
+mysql = "agctl_mysql:MySQLDriver"
+```
+
+`agctl` loads all registered drivers at startup and selects the correct one based on the `type` field in a `database` connection config.
+
+### 9.2 Protocol Plugins
+
+New top-level command groups (e.g., gRPC, GraphQL, WebSocket) are registered via the `agctl.plugins` entry point group. Each plugin must implement the `Plugin` protocol:
+
+```python
+# agctl/plugin_protocol.py
+import click
+from typing import Protocol
+
+class Plugin(Protocol):
+    name: str                         # used as the subcommand name, e.g. "grpc"
+    command_group: click.Group        # the Click group to register
+    def validate_config(self, config: dict) -> list[str]: ...
+    # Returns a list of error strings; empty list = valid
+```
+
+`cli.py` iterates `entry_points(group="agctl.plugins")` and registers each `command_group` onto the root `cli` group. No changes to core code are needed.
+
+### 9.3 Custom Assertion Types
+
+For `agctl db assert` and `agctl kafka assert`, new assertion modes are added by subclassing `Assertion` and registering via `agctl.assertions`:
+
+```toml
+[project.entry-points."agctl.assertions"]
+json_schema = "agctl_jsonschema:JSONSchemaAssertion"
+```
+
+---
+
+## 10. Open Questions / Future Work
+
+These items are intentionally deferred. Do not implement them until the core design is stable.
+
+| Item | Notes |
+|---|---|
+| **Schema Registry integration** | `kafka.assert` should optionally decode Avro/Protobuf messages using the configured schema registry. Currently, all Kafka values are treated as raw JSON. |
+| **Message ordering assertions** | `agctl kafka assert --ordered` to verify a sequence of messages in partition order. Requires careful offset tracking. |
+| **Multi-step scenario chaining** | A lightweight `scenarios` section in YAML that sequences named steps. Enables atomic pass/fail over a workflow without shell scripting. The JSON output envelope would add a `steps` array. |
+| **MCP server wrapper** | Expose `agctl` as an MCP (Model Context Protocol) tool server so agents that support MCP can call it without shell access. The JSON output schema maps cleanly to MCP tool results. |
+| **Retry / polling DSL** | `agctl db assert --retry-until-pass --max-attempts 5 --interval-ms 500` for assertions against eventually-consistent state. Currently, callers must implement polling themselves. |
+| **Template variable validation** | Warn (or error) at call time if a template defines `{placeholder}` variables that are not supplied via `--param`. Currently, unsupplied placeholders are left as literal strings. |
+| **gRPC support** | First-class `agctl grpc call` command via a plugin. The plugin protocol is designed; implementation is deferred. |
+| **Secret backends** | Pull secrets from Vault or AWS Secrets Manager instead of environment variables. Would be implemented as a resolver plugin hooked into the config resolution pipeline (§5). |
+| **Parallel command execution** | `agctl run --parallel step1.sh step2.sh` for agents that want to fire multiple requests concurrently and assert on all results. |
+| **OpenTelemetry trace propagation** | Inject `traceparent` headers automatically when a trace context is available, enabling distributed traces that span `agctl` invocations. |
+
+---
+
+## 11. Agentic Workflow Use Cases
+
+This section shows how `agctl` fits into real agentic development workflows end-to-end. Each use case describes the agent's goal, the discovery and testing sequence it follows, and the commands it runs. These are not scripts to copy verbatim — they are reference patterns for understanding how the CLI composes into coherent agent behavior.
+
+---
+
+### UC-1: Implement a new feature and verify it end-to-end
+
+**Context:** The agent has been asked to implement a new endpoint (e.g. `POST /orders/bulk`) and verify that it works correctly against the running local environment.
+
+**Agent workflow:**
+
+```
+1. Write and compile the code
+2. Orient: agctl discover
+3. Find relevant templates: agctl discover --category http-templates
+4. Find relevant DB templates: agctl discover --category db-templates
+5. Call the new endpoint (free-form, since no template exists yet)
+6. Assert the HTTP response
+7. Assert that events were published to Kafka
+8. Assert that the DB reflects the new state
+9. Report results
+```
+
+**Commands:**
+
+```bash
+# Step 2 — orient
+agctl discover
+
+# Step 3–4 — discover what already exists
+agctl discover --category http-templates
+agctl discover --category db-templates
+
+# Step 5–6 — call the new endpoint and assert the response
+RESULT=$(agctl http request   --service order-service   --method POST   --path /api/v1/orders/bulk   --body '{"customer_id": "cust-42", "items": [{"sku": "WIDGET-001", "qty": 2}]}')
+
+echo $RESULT | jq '.ok'                        # must be true
+echo $RESULT | jq '.result.status_code'        # expect 201
+ORDER_ID=$(echo $RESULT | jq -r '.result.body.order_id')
+
+# Step 7 — assert Kafka event published
+agctl kafka assert   --topic orders.created   --match ".payload.orderId == "$ORDER_ID""   --timeout 10
+
+# Step 8 — assert DB state
+agctl db assert   --template find-order   --param orderId=$ORDER_ID   --expect-rows 1
+
+agctl db assert   --template find-order   --param orderId=$ORDER_ID   --expect-value --path ".status" --equals "PENDING"
+```
+
+**What makes this work well:** the agent discovers what templates already exist before reaching for free-form commands. Free-form is only used for the new endpoint which has no template yet — after the feature is merged, a template should be added to `agctl.yaml`.
+
+---
+
+### UC-2: Reproduce and verify a bug fix
+
+**Context:** A bug report says that cancelling an order that is already in `CANCELLED` state returns HTTP 200 instead of HTTP 409. The agent must reproduce the bug, fix the code, and verify the fix.
+
+**Agent workflow:**
+
+```
+1. Orient and find the cancel-order template
+2. Create an order (to get a valid order ID)
+3. Cancel it once (happy path — should succeed)
+4. Cancel it again (should now return 409)
+5. Fix the code
+6. Repeat steps 2–4 to verify the fix
+```
+
+**Commands:**
+
+```bash
+# Step 1 — find the relevant template
+agctl discover --category http-templates
+agctl discover --category http-templates --name cancel-order
+
+# Step 2 — create an order
+CREATE=$(agctl http call create-order   --param customer_id=cust-bug-repro   --param sku=WIDGET-001)
+ORDER_ID=$(echo $CREATE | jq -r '.result.body.order_id')
+
+# Step 3 — first cancel (expect 200)
+agctl http call cancel-order --param order_id=$ORDER_ID
+# assert ok=true, status_code=200
+
+# Step 4 — second cancel (bug: returns 200, should return 409)
+SECOND=$(agctl http call cancel-order --param order_id=$ORDER_ID)
+echo $SECOND | jq '.result.status_code'
+# actual: 200  ← bug confirmed
+
+# ... agent fixes the code, restarts the service ...
+
+# Step 6 — reproduce with fixed code
+CREATE2=$(agctl http call create-order   --param customer_id=cust-bug-verify   --param sku=WIDGET-001)
+ORDER_ID2=$(echo $CREATE2 | jq -r '.result.body.order_id')
+
+agctl http call cancel-order --param order_id=$ORDER_ID2
+# expect 200 ✓
+
+RETRY=$(agctl http call cancel-order --param order_id=$ORDER_ID2)
+echo $RETRY | jq '.result.status_code'
+# expect 409 ✓ — fix verified
+```
+
+---
+
+### UC-3: Session-aware test with heartbeat
+
+**Context:** The system requires a heartbeat HTTP call every 5 seconds or the session expires and subsequent requests return 401. The agent must run a multi-step test scenario without losing the session.
+
+**Agent workflow:**
+
+```
+1. Authenticate and obtain a session token
+2. Start the heartbeat in the background
+3. Run the full test scenario (may take 30–120 seconds)
+4. Stop the heartbeat
+5. Assert final state
+```
+
+**Commands:**
+
+```bash
+# Step 1 — authenticate (free-form, result contains session token)
+AUTH=$(agctl http request   --service auth-service   --method POST   --path /api/v1/auth/login   --body '{"username": "test-agent", "password": "test"}')
+TOKEN=$(echo $AUTH | jq -r '.result.body.token')
+
+# Step 2 — start heartbeat in background, inject auth header
+agctl http ping heartbeat   --header "Authorization=Bearer $TOKEN"   --interval 5   --until-stopped &
+HEARTBEAT_PID=$!
+
+# Step 3 — run the scenario (agent chains multiple steps here)
+agctl http call create-order   --param customer_id=cust-session-test   --param sku=WIDGET-001   --header "Authorization=Bearer $TOKEN"
+
+# ... additional steps ...
+
+agctl kafka assert   --pattern order-created   --param orderId=<order_id>   --timeout 15
+
+# Step 4 — stop heartbeat
+kill $HEARTBEAT_PID
+
+# Step 5 — final DB assertion
+agctl db assert   --template find-order   --param orderId=<order_id>   --expect-value --path ".status" --equals "CONFIRMED"
+```
+
+---
+
+### UC-4: Regression sweep after a refactor
+
+**Context:** A core service has been refactored. The agent must verify that all key flows still work correctly. It uses named Kafka patterns and DB templates to keep assertions stable and readable.
+
+**Agent workflow:**
+
+```
+1. Discover all templates and patterns
+2. Run all critical HTTP flows via templates
+3. Assert expected Kafka events for each flow
+4. Assert DB state after each flow
+5. Report any failures
+```
+
+**Commands:**
+
+```bash
+# Step 1 — discover all categories
+agctl discover --category http-templates
+agctl discover --category kafka-patterns
+agctl discover --category db-templates
+
+# Flow 1: order creation
+O1=$(agctl http call create-order --param customer_id=cust-r1 --param sku=WIDGET-001)
+OID1=$(echo $O1 | jq -r '.result.body.order_id')
+agctl kafka assert --pattern order-created --param orderId=$OID1 --timeout 10
+agctl db assert --template find-order --param orderId=$OID1 --expect-rows 1
+
+# Flow 2: payment processing
+agctl http call process-payment --param order_id=$OID1 --param amount_cents=4999
+agctl kafka assert --topic payments.events   --match ".orderId == "$OID1" and .status == "SUCCESS""   --timeout 10
+agctl db assert --template find-order --param orderId=$OID1   --expect-value --path ".status" --equals "PAID"
+
+# Flow 3: order cancellation
+O2=$(agctl http call create-order --param customer_id=cust-r2 --param sku=WIDGET-002)
+OID2=$(echo $O2 | jq -r '.result.body.order_id')
+agctl http call cancel-order --param order_id=$OID2
+agctl db assert --template find-order --param orderId=$OID2   --expect-value --path ".status" --equals "CANCELLED"
+
+# Flow 4: assert no unexpected failures in DB
+agctl db assert   --template count-failed-payments   --param since=$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)   --expect-value --path ".cnt" --equals "0"
+```
+
+---
+
+### UC-5: Diagnosing a flaky test
+
+**Context:** A test passes sometimes and fails sometimes. The agent suspects a race condition between the HTTP response and the Kafka event. It uses `kafka consume` to inspect what is actually being published, and `db query` to check raw state at each step.
+
+**Agent workflow:**
+
+```
+1. Run the action
+2. Consume Kafka with a wide timeout and inspect all messages
+3. Query DB directly to see raw state
+4. Adjust timing assumptions or find the actual bug
+```
+
+**Commands:**
+
+```bash
+# Step 1 — trigger the action
+agctl http call create-order   --param customer_id=cust-flaky   --param sku=WIDGET-001
+
+# Step 2 — consume broadly to see what actually arrived and when
+agctl kafka consume   --topic orders.created   --timeout 30   --match '.payload.customerId == "cust-flaky"'
+# Inspect: how many messages? what timestamps? what fields?
+
+# Step 3 — query raw DB state immediately
+agctl db query   --sql "SELECT id, status, created_at, updated_at FROM orders WHERE customer_id = \$cid ORDER BY created_at DESC LIMIT 5"   --param cid=cust-flaky
+# Inspect: is the row there? what status? any timing anomaly?
+
+# Step 4 — re-run assertion with a longer timeout to confirm it's a timing issue
+agctl kafka assert   --topic orders.created   --match '.payload.customerId == "cust-flaky"'   --timeout 30
+# If this passes but --timeout 5 fails: confirmed race condition, increase default timeout
+```
+
+---
+
+### Summary: which command for which agent intent
+
+| Agent intent | Primary command |
+|---|---|
+| Understand what the system offers | `agctl discover` (levels 0→1→2) |
+| Send a known request type | `agctl http call <template>` |
+| Send an ad-hoc request | `agctl http request --service ... --path ...` |
+| Keep a session alive during a long test | `agctl http ping <template> --interval N --until-stopped` |
+| Verify an event was published | `agctl kafka assert --pattern / --match` |
+| Inspect what was actually published | `agctl kafka consume --match` |
+| Assert DB row exists / count | `agctl db assert --template --expect-rows` |
+| Assert a specific DB field value | `agctl db assert --template --expect-value --path --equals` |
+| Inspect raw DB state for debugging | `agctl db query --template / --sql` |
+| Check services are up before testing | `agctl check ready --all` |
+| Debug config resolution | `agctl config show` |
+| Validate config before committing | `agctl config validate` |
