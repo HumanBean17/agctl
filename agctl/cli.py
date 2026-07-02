@@ -1,5 +1,7 @@
 """Click entry point (DESIGN §3, §7). Wires command groups and emits envelopes."""
 
+import importlib.metadata
+import sys
 import time
 from typing import Any
 
@@ -15,6 +17,52 @@ from .config.validator import validate_config
 from .output import emit
 
 _SECRET_FRAGMENTS = ("password", "token", "secret", "key")
+
+#: Entry-point group for third-party protocol plugins (DESIGN §9.2).
+PLUGIN_ENTRY_POINT_GROUP = "agctl.plugins"
+
+
+def _entry_points(group: str) -> list:
+    """Return the entry points registered under ``group`` (3.11+ shim).
+
+    Factored out so tests can monkeypatch discovery. Returns ``[]`` on any
+    failure (a broken importlib state must never crash the CLI).
+    """
+    try:
+        eps = importlib.metadata.entry_points()
+        if hasattr(eps, "select"):
+            return list(eps.select(group=group))
+        return list(eps.get(group, []))
+    except Exception:
+        return []
+
+
+def _load_plugins(cli_group: click.Group) -> None:
+    """Load ``agctl.plugins`` entry points onto ``cli_group`` (DESIGN §9.2).
+
+    Each plugin object exposes ``.command_group`` (a :class:`click.Group`) and
+    optionally ``.validate_config(config)``. Each load+register is wrapped in
+    try/except so a broken plugin logs to stderr and is skipped rather than
+    bricking the CLI. An empty/missing ``agctl.plugins`` group is a clean no-op.
+    """
+    try:
+        for ep in _entry_points(PLUGIN_ENTRY_POINT_GROUP):
+            try:
+                obj = ep.load()
+            except Exception as exc:  # noqa: BLE001 - plugin isolation
+                print(f"agctl: failed to load plugin {ep.name}: {exc}", file=sys.stderr)
+                continue
+            command_group = getattr(obj, "command_group", None)
+            if isinstance(command_group, click.Group):
+                name = command_group.name or ep.name
+                cli_group.add_command(command_group, name=name)
+            else:
+                print(
+                    f"agctl: plugin {ep.name} has no valid command_group; skipping",
+                    file=sys.stderr,
+                )
+    except Exception as exc:  # noqa: BLE001 - never let the loader crash the CLI
+        print(f"agctl: plugin loader error: {exc}", file=sys.stderr)
 
 
 def _ms(start: float) -> int:
@@ -102,6 +150,11 @@ check_group.add_command(check_ready)
 
 # Register the top-level `discover` command directly on the root group.
 cli.add_command(discover)
+
+
+# Load third-party protocol plugins (DESIGN §9.2). A clean no-op today since no
+# plugins are registered; guarded so a broken plugin/importlib never bricks the CLI.
+_load_plugins(cli)
 
 
 @config_group.command("validate")

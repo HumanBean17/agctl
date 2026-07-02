@@ -23,6 +23,13 @@ dev = ["pytest>=8.0"]
 agctl = "agctl.cli:cli"
 agt = "agctl.cli:cli"
 
+[project.entry-points."agctl.db_drivers"]
+postgresql = "agctl.clients.db_drivers.postgresql:PostgreSQLDriver"
+
+[project.entry-points."agctl.plugins"]
+# Third-party protocol plugins register here, e.g.:
+# grpc = "agctl_grpc:GRPCPlugin"
+
 [tool.hatch.build.targets.wheel]
 packages = ["agctl"]
 
