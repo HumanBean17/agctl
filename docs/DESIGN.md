@@ -202,7 +202,7 @@ The `${VAR_NAME}` syntax is only supported in string scalar values, not in keys.
 
 ### 2.3 Path Parameter Syntax
 
-Template `path` and `body` values use `{placeholder}` (single braces) for runtime substitution via `--param key=value`. This is distinct from env var interpolation (`${...}`), which is resolved at config load time.
+HTTP template `path` and `body` values use `{placeholder}` (single braces) for runtime substitution via `--param key=value`. SQL (templates and free-form) uses `:paramName` (JDBC-style) instead — `{...}` is avoided in SQL to prevent collisions with JSON literals. Both are distinct from env var interpolation (`${...}`), which is resolved at config load time.
 
 ---
 
@@ -444,7 +444,7 @@ Supports two input modes:
 - `--template <name>` — use a named SQL template from `database.templates` in config (preferred)
 - `--sql "..."` — free-form SQL (escape hatch)
 
-Both modes accept `--param key=value`. In templates, named parameters use `:paramName` syntax (JDBC-style). In free-form SQL, use `$paramName`.
+Both modes accept `--param key=value`. Named parameters use `:paramName` (JDBC-style) in both templates and free-form SQL; agctl translates `:paramName` to the driver's native bind syntax at execution time. (`{placeholder}` is reserved for HTTP path/body params — see §2.3 — and is not used in SQL to avoid colliding with JSON literals like `'{"a":1}'::jsonb`.)
 
 #### `agctl db query`
 
@@ -454,7 +454,7 @@ Execute a SQL query and return all rows.
 agctl db query
     [--template <name>]         # named template from database.templates
     [--sql "SELECT ..."]        # free-form SQL; mutually exclusive with --template
-    [--param key=value]         # repeatable; fills :paramName (template) or $paramName (sql)
+    [--param key=value]         # repeatable; fills :paramName named params (templates and SQL)
     [--connection <name>]       # overrides template's connection and defaults
 ```
 
@@ -468,7 +468,7 @@ agctl db query \
 
 # Free-form SQL (escape hatch)
 agctl db query \
-  --sql "SELECT status FROM orders WHERE id = \$orderId" \
+  --sql "SELECT status FROM orders WHERE id = :orderId" \
   --param orderId=ord-789
 ```
 
@@ -496,7 +496,7 @@ agctl db assert \
 
 # Free-form SQL
 agctl db assert \
-  --sql "SELECT 1 FROM orders WHERE id = \$orderId AND status = 'CONFIRMED'" \
+  --sql "SELECT 1 FROM orders WHERE id = :orderId AND status = 'CONFIRMED'" \
   --param orderId=ord-789 \
   --expect-rows 1
 ```
@@ -537,7 +537,7 @@ agctl db assert \
 
 # Free-form SQL
 agctl db assert \
-  --sql "SELECT status FROM orders WHERE id = \$orderId" \
+  --sql "SELECT status FROM orders WHERE id = :orderId" \
   --param orderId=ord-789 \
   --expect-value \
   --path ".status" \
@@ -789,7 +789,7 @@ Every invocation writes exactly one JSON object to stdout:
   "type": "AssertionError",
   "message": "Expected 1 row, got 0",
   "detail": {
-    "sql": "SELECT 1 FROM orders WHERE id = $order_id AND status = 'CONFIRMED'",
+    "sql": "SELECT 1 FROM orders WHERE id = :order_id AND status = 'CONFIRMED'",
     "params": {"order_id": "ord-789"},
     "actual_rows": 0,
     "expected_rows": 1
@@ -914,7 +914,7 @@ Every invocation writes exactly one JSON object to stdout:
   "expected": 1,
   "actual": 1,
   "passed": true,
-  "sql": "SELECT 1 FROM orders WHERE id = $order_id AND status = 'CONFIRMED'",
+  "sql": "SELECT 1 FROM orders WHERE id = :order_id AND status = 'CONFIRMED'",
   "connection": "main-db"
 }
 ```
@@ -1667,7 +1667,7 @@ agctl kafka consume   --topic orders.created   --timeout 30   --match '.payload.
 # Inspect: how many messages? what timestamps? what fields?
 
 # Step 3 — query raw DB state immediately
-agctl db query   --sql "SELECT id, status, created_at, updated_at FROM orders WHERE customer_id = \$cid ORDER BY created_at DESC LIMIT 5"   --param cid=cust-flaky
+agctl db query   --sql "SELECT id, status, created_at, updated_at FROM orders WHERE customer_id = :cid ORDER BY created_at DESC LIMIT 5"   --param cid=cust-flaky
 # Inspect: is the row there? what status? any timing anomaly?
 
 # Step 4 — re-run assertion with a longer timeout to confirm it's a timing issue
