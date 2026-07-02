@@ -1,8 +1,9 @@
 # `agctl` — CLI Design Document
 
-**Version:** 0.5-draft  
+**Version:** 0.6-draft  
 **Last updated:** 2026-07-02  
-**Status:** Foundation design — ready for implementation
+**Status:** Foundation design — hardened; ready for implementation  
+**Change spec:** [`docs/superpowers/specs/2026-07-02-agctl-design-hardening.md`](./superpowers/specs/2026-07-02-agctl-design-hardening.md)
 
 ---
 
