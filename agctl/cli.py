@@ -7,6 +7,7 @@ import click
 
 from .commands.db_commands import db_assert, db_query
 from .commands.http_commands import http_call, http_ping, http_request
+from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
 from .config import ConfigError, load_config
 from .config.validator import validate_config
 from .output import emit
@@ -66,6 +67,11 @@ def db_group() -> None:
     """Database query/assert commands (DESIGN §3.3)."""
 
 
+@cli.group(name="kafka")
+def kafka_group() -> None:
+    """Kafka produce/consume/assert commands (DESIGN §3.2)."""
+
+
 # Register subcommands on the http group.
 http_group.add_command(http_call)
 http_group.add_command(http_request)
@@ -75,6 +81,12 @@ http_group.add_command(http_ping)
 # Register subcommands on the db group.
 db_group.add_command(db_query)
 db_group.add_command(db_assert)
+
+
+# Register subcommands on the kafka group.
+kafka_group.add_command(kafka_produce)
+kafka_group.add_command(kafka_consume)
+kafka_group.add_command(kafka_assert)
 
 
 @config_group.command("validate")

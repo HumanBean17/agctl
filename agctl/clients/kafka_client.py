@@ -171,62 +171,11 @@ class KafkaClient:
         """
         Consumer, Producer, TopicPartition, KafkaError, KafkaException = _import_kafka()
 
-        group_id = self._group_id or "agctl-consumer"
-        conf = {
-            "bootstrap.servers": ",".join(self._brokers),
-            "group.id": group_id,
-            "auto.offset.reset": "earliest",
-            "enable.auto.commit": False,
-        }
-
-        if self._consumer_factory is not None:
-            consumer = self._consumer_factory(conf)
-        else:
-            consumer = Consumer(conf)
+        consumer = self._build_consumer()
 
         messages: list[dict] = []
         try:
-            try:
-                consumer.subscribe([topic])
-            except KafkaException as exc:
-                raise ConnectionFailure(message=str(exc)) from exc
-
-            # Assignment may be empty briefly after subscribe; poll a few
-            # times to allow it to populate.
-            assignment = consumer.assignment()
-            attempts = 0
-            while not assignment and attempts < 20:
-                consumer.poll(0.2)
-                assignment = consumer.assignment()
-                attempts += 1
-
-            if from_beginning:
-                for tp in assignment:
-                    if hasattr(consumer, "seek_to_beginning"):
-                        try:
-                            consumer.seek_to_beginning(tp)
-                        except KafkaException as exc:
-                            raise ConnectionFailure(message=str(exc)) from exc
-                    else:  # pragma: no cover - real consumer always has it
-                        consumer.seek(TopicPartition(tp.topic, tp.partition, 0))
-            else:
-                target_ms = int((time.time() - lookback_seconds) * 1000)
-                seek_tps = []
-                for tp in assignment:
-                    seek_tps.append(
-                        TopicPartition(topic, tp.partition, target_ms)
-                    )
-                try:
-                    resolved = consumer.offsets_for_times(seek_tps)
-                except KafkaException as exc:
-                    raise ConnectionFailure(message=str(exc)) from exc
-
-                for rtp in resolved:
-                    if rtp.offset is not None and rtp.offset >= 0:
-                        try:
-                            consumer.seek(rtp)
-                        except KafkaException as exc:
-                            raise ConnectionFailure(message=str(exc)) from exc
+            self._setup_seek(consumer, topic, lookback_seconds, from_beginning)
 
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
@@ -244,6 +193,127 @@ class KafkaClient:
                 pass
 
         return messages
+
+    # ------------------------------------------------------------------
+    # find_in_window  (D6 early-stop path for `kafka assert`)
+    # ------------------------------------------------------------------
+
+    def find_in_window(
+        self,
+        topic,
+        *,
+        predicate,
+        lookback_seconds,
+        timeout_seconds,
+        from_beginning=False,
+    ):
+        """Poll the window incrementally; return the first message dict for
+        which ``predicate(msg)`` is True, or ``None`` if the window elapses with
+        no match. Uses the SAME seek/lookback mechanics as :meth:`consume_window`
+        (``offsets_for_times`` seek to ``now - lookback_seconds``, or
+        ``from_beginning``). ``predicate`` is called on each normalized message
+        dict. Terminates promptly: stops polling the moment a match is found.
+
+        Returns a ``(message, scanned_count)`` tuple so callers can report
+        ``messages_scanned``; if no match, returns ``(None, scanned_count)``.
+        """
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException = _import_kafka()
+
+        consumer = self._build_consumer()
+
+        scanned = 0
+        try:
+            self._setup_seek(consumer, topic, lookback_seconds, from_beginning)
+
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                msg = consumer.poll(0.5)
+                if msg is None:
+                    continue
+                if msg.error():
+                    continue
+                normalized = self._normalize_message(msg)
+                scanned += 1
+                try:
+                    matched = predicate(normalized)
+                except Exception:
+                    matched = False
+                if matched:
+                    return normalized, scanned
+        finally:
+            try:
+                consumer.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        return None, scanned
+
+    # ------------------------------------------------------------------
+    # shared helpers
+    # ------------------------------------------------------------------
+
+    def _build_consumer(self):
+        """Build a consumer (real or via the test factory) with the standard conf."""
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException = _import_kafka()
+
+        group_id = self._group_id or "agctl-consumer"
+        conf = {
+            "bootstrap.servers": ",".join(self._brokers),
+            "group.id": group_id,
+            "auto.offset.reset": "earliest",
+            "enable.auto.commit": False,
+        }
+
+        if self._consumer_factory is not None:
+            return self._consumer_factory(conf)
+        return Consumer(conf)
+
+    def _setup_seek(self, consumer, topic, lookback_seconds, from_beginning):
+        """Subscribe, wait for assignment, then seek partitions to the lookback
+        window (or offset 0 when ``from_beginning``). Shared by
+        :meth:`consume_window` and :meth:`find_in_window`.
+        """
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException = _import_kafka()
+
+        try:
+            consumer.subscribe([topic])
+        except KafkaException as exc:
+            raise ConnectionFailure(message=str(exc)) from exc
+
+        # Assignment may be empty briefly after subscribe; poll a few
+        # times to allow it to populate.
+        assignment = consumer.assignment()
+        attempts = 0
+        while not assignment and attempts < 20:
+            consumer.poll(0.2)
+            assignment = consumer.assignment()
+            attempts += 1
+
+        if from_beginning:
+            for tp in assignment:
+                if hasattr(consumer, "seek_to_beginning"):
+                    try:
+                        consumer.seek_to_beginning(tp)
+                    except KafkaException as exc:
+                        raise ConnectionFailure(message=str(exc)) from exc
+                else:  # pragma: no cover - real consumer always has it
+                    consumer.seek(TopicPartition(tp.topic, tp.partition, 0))
+        else:
+            target_ms = int((time.time() - lookback_seconds) * 1000)
+            seek_tps = []
+            for tp in assignment:
+                seek_tps.append(TopicPartition(topic, tp.partition, target_ms))
+            try:
+                resolved = consumer.offsets_for_times(seek_tps)
+            except KafkaException as exc:
+                raise ConnectionFailure(message=str(exc)) from exc
+
+            for rtp in resolved:
+                if rtp.offset is not None and rtp.offset >= 0:
+                    try:
+                        consumer.seek(rtp)
+                    except KafkaException as exc:
+                        raise ConnectionFailure(message=str(exc)) from exc
 
     @staticmethod
     def _normalize_message(msg) -> dict:
