@@ -16,7 +16,7 @@ from .config import ConfigError, load_config
 from .config.validator import validate_config
 from .output import emit
 
-_SECRET_FRAGMENTS = ("password", "token", "secret", "key")
+_SECRET_FRAGMENTS = ("password", "token", "secret")
 
 #: Entry-point group for third-party protocol plugins (DESIGN §9.2).
 PLUGIN_ENTRY_POINT_GROUP = "agctl.plugins"
@@ -118,7 +118,12 @@ def _mask(obj: Any) -> Any:
 
 def _is_secret(key: str) -> bool:
     lowered = key.lower()
-    return any(frag in lowered for frag in _SECRET_FRAGMENTS)
+    if any(frag in lowered for frag in _SECRET_FRAGMENTS):
+        return True
+    # "key" is too broad as a substring (would mask non-secret paths like
+    # kafka.ssl.key_location, or names like key_id). Treat it as a secret only
+    # when it names the key itself: a bare ``key`` or an ``*_key`` suffix.
+    return lowered == "key" or lowered.endswith("_key")
 
 
 def _emit_config_error(command: str, err: ConfigError, start: float) -> None:

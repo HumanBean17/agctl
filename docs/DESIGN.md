@@ -79,6 +79,22 @@ kafka:
   schema_registry_url: "${SCHEMA_REGISTRY_URL}" # optional; omit if not used
   timeout_seconds: 30                            # default consume/assert timeout
 
+  # kafka.ssl — optional TLS/mTLS settings for brokers that require SSL.
+  #   Setting any field (to a non-empty value) enables TLS; security.protocol
+  #   defaults to "SSL" unless overridden. Hostname verification stays on
+  #   unless endpoint_identification_algorithm is set to "none" (self-signed/dev).
+  #   ca_location is optional: when unset, librdkafka falls back to the system
+  #   trust store (use it for publicly-trusted brokers like Confluent Cloud; pin
+  #   a CA for private-PKI brokers). All values support ${ENV_VAR} interpolation
+  #   and AGCTL_KAFKA__SSL__* overrides; an empty string counts as unset.
+  ssl:
+    ca_location: "${KAFKA_SSL_CA:-}"               # path to CA certificate (PEM); optional
+    certificate_location: "${KAFKA_SSL_CERT:-}"    # path to client certificate (mTLS)
+    key_location: "${KAFKA_SSL_KEY:-}"             # path to client private key (mTLS)
+    key_password: "${KAFKA_SSL_KEY_PASSWORD:-}"    # optional private-key password
+    # endpoint_identification_algorithm: "none"    # uncomment to disable hostname verification
+    # security_protocol: "SSL"                     # defaults to SSL; set SASL_SSL when adding SASL later
+
 # ---------------------------------------------------------------------------
 # kafka.patterns — named Kafka filter patterns, analogous to HTTP templates.
 # topic:   Kafka topic name
@@ -443,6 +459,8 @@ agctl kafka assert \
 ```
 
 **Offset & timing model (consume and assert):** By default the consumer seeks each partition to the timestamp `now - --lookback` (via `offsets_for_times`) and reads forward, rather than subscribing at "latest". This makes the common send-then-assert pattern reliable: an event published a moment before the command starts still falls inside the window. `--lookback` defaults to the resolved `--timeout` (look back as far as you wait forward); `--from-beginning` overrides to the earliest offset. For `assert`, committed offsets are ignored — each invocation re-seeks by time, so repeated asserts are independent and deterministic. On high-volume topics, narrow with `--match`/`--contains` to avoid matching stale events from prior runs.
+
+**TLS / transport model (produce, consume, assert):** All three commands connect to brokers using the `kafka.ssl` block (see §2.1). Setting any field to a non-empty value enables TLS and defaults `security.protocol` to `SSL` (mTLS); `ca_location` is optional and falls back to the system trust store when unset. Hostname verification is **on** by default (librdkafka default) — set `endpoint_identification_algorithm: "none"` only for self-signed or dev brokers. An empty string (e.g. an unresolved `${VAR:-}`) is treated as unset, so a partially-configured `ssl:` block never silently downgrades to plaintext nor disables verification. TLS configuration is unit-tested only; the live integration suite runs a plaintext broker.
 
 ---
 

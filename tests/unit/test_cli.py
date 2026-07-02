@@ -111,3 +111,27 @@ def test_show_preserves_non_secret_values():
     assert conn["password"] == "***"
     assert conn["host"] == "h"
     assert conn["dbname"] == "n"
+
+
+def test_show_does_not_mask_ssl_key_path(tmp_path):
+    """kafka.ssl.key_location is a file path, not a secret — it must NOT be
+    masked, while key_password (a real secret) must be. Regression guard: the
+    'key' fragment in _is_secret must not match the key_* prefix."""
+    cfg_path = _write_config(
+        tmp_path,
+        'version: "1"\n'
+        "kafka:\n"
+        "  brokers: [host:9092]\n"
+        "  ssl:\n"
+        "    ca_location: /etc/ssl/ca.pem\n"
+        "    certificate_location: /etc/ssl/client.crt\n"
+        "    key_location: /etc/ssl/client.key\n"
+        "    key_password: hunter2\n",
+    )
+    result = CliRunner().invoke(cli, ["config", "show", "--config", str(cfg_path)])
+    payload = json.loads(result.output)
+    ssl = payload["result"]["kafka"]["ssl"]
+    assert ssl["ca_location"] == "/etc/ssl/ca.pem"          # path, not masked
+    assert ssl["certificate_location"] == "/etc/ssl/client.crt"
+    assert ssl["key_location"] == "/etc/ssl/client.key"      # path, NOT masked
+    assert ssl["key_password"] == "***"                      # secret, masked

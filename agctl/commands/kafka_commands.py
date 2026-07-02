@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import click
 
 from ..assertions import jq_bool, jq_value, json_subset
 from ..command import envelope, load_config_or_raise
+
+if TYPE_CHECKING:
+    from ..config.models import KafkaConfig
 from ..errors import AssertionFailure, ConfigError, TemplateNotFound
 from ..params import parse_params
 from ..resolution import fill_placeholders
@@ -37,6 +40,39 @@ __all__ = [
 ]
 
 
+def _kafka_ssl_conf(cfg_kafka: "KafkaConfig") -> dict[str, str]:
+    """Translate ``cfg.kafka.ssl`` into librdkafka conf keys.
+
+    Returns an empty dict when no TLS knobs are configured. When any knob is
+    set, ``security.protocol`` defaults to ``"SSL"`` (mTLS) unless
+    ``ssl.security_protocol`` overrides it — so users can enable TLS by filling
+    in CA/cert/key without also remembering to flip the protocol. Hostname
+    verification is left to librdkafka's secure default unless
+    ``endpoint_identification_algorithm`` is set (e.g. ``"none"``).
+
+    Empty strings count as unset: ``${VAR:-}`` interpolation resolves an
+    absent env var to ``""``, and an empty ``ssl.endpoint.identification.algorithm``
+    must NOT flip verification off the way librdkafka treats ``""`` == ``"none"``.
+    """
+    ssl = cfg_kafka.ssl
+    if ssl is None:
+        return {}
+    conf: dict[str, str] = {}
+    if ssl.ca_location:
+        conf["ssl.ca.location"] = ssl.ca_location
+    if ssl.certificate_location:
+        conf["ssl.certificate.location"] = ssl.certificate_location
+    if ssl.key_location:
+        conf["ssl.key.location"] = ssl.key_location
+    if ssl.key_password:
+        conf["ssl.key.password"] = ssl.key_password
+    if ssl.endpoint_identification_algorithm:
+        conf["ssl.endpoint.identification.algorithm"] = ssl.endpoint_identification_algorithm
+    if conf:
+        conf["security.protocol"] = ssl.security_protocol or "SSL"
+    return conf
+
+
 def new_kafka_client(cfg_kafka, group_id=None):
     """Build a real :class:`KafkaClient` from ``cfg.kafka``.
 
@@ -47,7 +83,11 @@ def new_kafka_client(cfg_kafka, group_id=None):
     """
     from ..clients.kafka_client import KafkaClient
 
-    return KafkaClient(cfg_kafka.brokers, group_id=group_id)
+    return KafkaClient(
+        cfg_kafka.brokers,
+        group_id=group_id,
+        extra_conf=_kafka_ssl_conf(cfg_kafka),
+    )
 
 
 def _resolve_timeout(cli_timeout, cfg_kafka_timeout, fallback=30):

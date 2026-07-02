@@ -67,6 +67,11 @@ class KafkaClient:
     group_id:
         Optional consumer group id. Falls back to ``"agctl-consumer"`` when
         consuming if left ``None``.
+    extra_conf:
+        Optional mapping of extra confluent_kafka conf keys merged into both the
+        producer and consumer confs (e.g. ``security.protocol`` / ``ssl.*`` for
+        TLS). The client stays transport-agnostic; the command layer owns the
+        typed→librdkafka translation.
     consumer_factory / producer_factory:
         Test-injection seams. Each is a callable ``conf -> (Consumer|Producer)``
         used in place of the real confluent_kafka classes.
@@ -77,11 +82,13 @@ class KafkaClient:
         brokers,
         group_id=None,
         *,
+        extra_conf=None,
         consumer_factory=None,
         producer_factory=None,
     ):
         self._brokers = brokers if isinstance(brokers, list) else [brokers]
         self._group_id = group_id
+        self._extra_conf = dict(extra_conf or {})
         self._consumer_factory = consumer_factory
         self._producer_factory = producer_factory
 
@@ -97,10 +104,12 @@ class KafkaClient:
         """
         Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
 
+        producer_conf = {"bootstrap.servers": ",".join(self._brokers)}
+        producer_conf.update(self._extra_conf)
         if self._producer_factory is not None:
-            producer = self._producer_factory({"bootstrap.servers": ",".join(self._brokers)})
+            producer = self._producer_factory(producer_conf)
         else:
-            producer = Producer({"bootstrap.servers": ",".join(self._brokers)})
+            producer = Producer(producer_conf)
 
         value_bytes = json.dumps(value).encode("utf-8")
         key_bytes = key.encode("utf-8") if isinstance(key, str) else key
@@ -294,6 +303,7 @@ class KafkaClient:
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
         }
+        conf.update(self._extra_conf)
 
         if self._consumer_factory is not None:
             return self._consumer_factory(conf)
