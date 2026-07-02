@@ -403,3 +403,63 @@ def test_db_assert_expect_value_zero_rows(install_fake):
     assert result.exit_code == 1
     assert payload["ok"] is False
     assert payload["error"]["type"] == "AssertionError"
+
+
+# --------------------------------------------------------------------------- #
+# db assert — fail fast: invalid invocation must NOT hit the DB (Fix C)
+# --------------------------------------------------------------------------- #
+
+
+def test_db_assert_expect_value_missing_path_fails_fast_without_executing(install_fake):
+    """--expect-value WITHOUT --path -> ConfigError (exit 2) AND the query is
+    never executed (no DB round-trip on a malformed invocation)."""
+    fake = install_fake([{"status": "CONFIRMED"}])
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "db",
+            "assert",
+            "--sql",
+            "SELECT 1",
+            "--expect-value",
+            "--equals",
+            "X",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    # Fail-fast: validation happened BEFORE _execute, so the driver was untouched.
+    assert fake.executed == []
+
+
+def test_db_assert_both_modes_fails_fast_without_executing(install_fake):
+    """--expect-rows + --expect-value together -> ConfigError (exit 2) WITHOUT
+    executing the query (mutual exclusion is validated up front)."""
+    fake = install_fake([{"status": "CONFIRMED"}])
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "db",
+            "assert",
+            "--sql",
+            "SELECT 1",
+            "--expect-rows",
+            "1",
+            "--expect-value",
+            "--path",
+            ".status",
+            "--equals",
+            "CONFIRMED",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert fake.executed == []

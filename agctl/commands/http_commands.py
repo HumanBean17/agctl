@@ -23,7 +23,8 @@ from typing import Any, Callable
 import click
 
 from ..command import envelope, load_config_or_raise
-from ..errors import ConfigError, TemplateMissing
+from ..errors import AgctlError, ConfigError, TemplateMissing
+from ..output import emit
 from ..params import parse_params
 from ..resolution import deep_merge, fill_placeholders
 
@@ -395,9 +396,20 @@ def http_ping(
 ) -> None:
     """Repeatedly send an HTTP request, streaming NDJSON ping lines (DESIGN §3.1)."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
+    start = time.monotonic()
 
     if duration is not None and until_stopped:
-        # http ping is not wrapped in @envelope; ConfigError semantics -> exit 2.
+        # http ping is not wrapped in @envelope, so emit the error envelope directly.
+        emit(
+            ok=False,
+            command="http.ping",
+            error={
+                "type": "ConfigError",
+                "message": "--duration and --until-stopped are mutually exclusive",
+                "detail": {},
+            },
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
         raise SystemExit(2)
 
     try:
@@ -412,8 +424,12 @@ def http_ping(
             param,
             timeout,
         )
-    except ConfigError:
-        raise SystemExit(2)
+    except AgctlError as err:
+        # Startup config/template errors (ConfigError, TemplateMissing) -> structured
+        # envelope + exit code, before any ping line is streamed.
+        emit(ok=False, command="http.ping", error=err.to_dict(),
+             duration_ms=int((time.monotonic() - start) * 1000))
+        raise SystemExit(err.exit_code)
 
     def send_one(i: int) -> dict:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

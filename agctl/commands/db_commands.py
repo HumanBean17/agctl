@@ -179,15 +179,20 @@ def _db_assert_core(
         param_tuple=param,
         connection_name=connection,
     )
-    rows = _execute(cfg, sql_text, params, conn_name)
 
-    # Exactly one assertion mode must be active.
+    # Validate assertion mode + required flags BEFORE hitting the database, so a
+    # bad invocation fails fast with the right error category (ConfigError, exit 2)
+    # rather than wasting a connection and surfacing a ConnectionError.
     rows_mode = expect_rows is not None
     value_mode = expect_value
     if rows_mode == value_mode:  # both True or both False
         raise ConfigError(
             "Exactly one of --expect-rows and --expect-value must be given", {}
         )
+    if value_mode and (not path or equals is None):
+        raise ConfigError("--expect-value requires --path and --equals", {})
+
+    rows = _execute(cfg, sql_text, params, conn_name)
 
     if rows_mode:
         expected = int(expect_rows)  # type: ignore[arg-type]
@@ -211,15 +216,11 @@ def _db_assert_core(
             "connection": conn_name,
         }
 
-    # expect-value mode
+    # expect-value mode (--path/--equals already validated above)
     if not rows:
         raise AssertionFailure(
             "Expected a row but query returned none",
             {"sql": sql_text, "connection": conn_name},
-        )
-    if not path or equals is None:
-        raise ConfigError(
-            "--expect-value requires --path and --equals", {}
         )
     first_row = rows[0]
     actual = coerce_db_value(jq_value(first_row, path))

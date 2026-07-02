@@ -2,6 +2,8 @@ import datetime
 import uuid
 from decimal import Decimal
 
+import pytest
+
 from agctl.assertions import (
     coerce_db_value,
     jq_bool,
@@ -50,6 +52,22 @@ def test_jq_value_missing_path():
 
 def test_jq_value_bad_expr():
     assert jq_value({}, ")(") is None
+
+
+# --- jq lazy import (Fix A) ------------------------------------------------
+def test_jq_missing_raises_config_error(monkeypatch):
+    """When the optional `jq` library is unavailable, jq_bool/jq_value surface a
+    ConfigError (exit 2) rather than crashing at import time."""
+    import sys
+    from agctl.errors import ConfigError
+
+    monkeypatch.setitem(sys.modules, "jq", None)  # block the lazy `import jq`
+    from agctl import assertions
+
+    with pytest.raises(ConfigError):
+        assertions.jq_bool({"a": 1}, ".a==1")
+    with pytest.raises(ConfigError):
+        assertions.jq_value({"a": 1}, ".a")
 
 
 # --- json_subset -----------------------------------------------------------

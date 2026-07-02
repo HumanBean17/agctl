@@ -422,3 +422,67 @@ def test_http_ping_non_2xx_carries_error(monkeypatch):
         assert result.exit_code == 1
     finally:
         http_commands.set_default_transport(None)
+
+
+# --------------------------------------------------------------------------- #
+# http ping — startup error envelope (Fix B)
+# --------------------------------------------------------------------------- #
+
+
+def test_http_ping_bad_template_emits_structured_error(monkeypatch):
+    """A bad template name fails before any ping with a structured envelope:
+    TemplateNotFound -> exit 2. No MockTransport needed (it errors at resolve)."""
+
+    def fake_run_pings(*args, **kwargs):
+        raise AssertionError("should not reach the loop")
+
+    monkeypatch.setattr(http_commands, "_run_pings", fake_run_pings)
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "ping",
+            "no-such-template",
+            "--interval",
+            "1",
+            "--until-stopped",
+        ]
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["ok"] is False
+    assert data["error"]["type"] == "TemplateNotFound"
+
+
+def test_http_ping_duration_and_until_stopped_emits_config_error(monkeypatch):
+    """--duration + --until-stopped together -> ConfigError -> exit 2, with a
+    structured envelope (no uncaught traceback)."""
+
+    def fake_run_pings(*args, **kwargs):
+        raise AssertionError("should not reach the loop")
+
+    monkeypatch.setattr(http_commands, "_run_pings", fake_run_pings)
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "ping",
+            "--service",
+            "order-service",
+            "--path",
+            "/x",
+            "--interval",
+            "1",
+            "--duration",
+            "1",
+            "--until-stopped",
+        ]
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["ok"] is False
+    assert data["error"]["type"] == "ConfigError"

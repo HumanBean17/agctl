@@ -9,17 +9,34 @@ import decimal
 import json
 import uuid
 
-import jq
+from .errors import ConfigError
+
+
+def _jq():
+    """Lazily import jq so the package imports without the optional extra.
+    jq is only needed for match/path assertions (Kafka --match/--path, DB --path).
+    A missing library is a configuration problem -> ConfigError (exit 2), distinct
+    from a jq *expression* error (handled by callers as a silent skip per §3.2)."""
+    try:
+        import jq
+    except ImportError as exc:  # pragma: no cover - exercised via sys.modules in tests
+        raise ConfigError(
+            "jq is required for match/path assertions: pip install 'agctl[db]' or 'agctl[kafka]'",
+            {},
+        ) from exc
+    return jq
 
 
 def jq_bool(value, expr: str) -> bool:
     """Evaluate a jq predicate against value; True only if the result is truthy.
 
     A jq compile/runtime error OR a falsy/empty result -> False (silently skipped
-    per DESIGN §3.2). Never raises.
+    per DESIGN §3.2). A missing jq library -> ConfigError (propagates, exit 2).
     """
     try:
-        outputs = jq.compile(expr).input(value).all()
+        outputs = _jq().compile(expr).input(value).all()
+    except ConfigError:
+        raise
     except Exception:
         return False
     return any(bool(o) for o in outputs)
@@ -27,9 +44,12 @@ def jq_bool(value, expr: str) -> bool:
 
 def jq_value(value, expr: str):
     """Evaluate a jq path/value expression (e.g. '.status'). Returns the first
-    output value, or None if the expression errors or yields nothing. Never raises."""
+    output value, or None if the expression errors or yields nothing. A missing jq
+    library -> ConfigError (propagates, exit 2)."""
     try:
-        outputs = jq.compile(expr).input(value).all()
+        outputs = _jq().compile(expr).input(value).all()
+    except ConfigError:
+        raise
     except Exception:
         return None
     if not outputs:
