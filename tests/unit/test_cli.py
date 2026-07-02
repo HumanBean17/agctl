@@ -9,11 +9,16 @@ FIXTURE = Path(__file__).parent.parent / "fixtures" / "agctl.yaml"
 
 ENV = {
     "ORDER_SERVICE_URL": "http://localhost:8081",
+    "PAYMENT_SERVICE_URL": "http://localhost:8082",
+    "PAYMENT_SERVICE_TOKEN": "tok",
     "KAFKA_BROKER": "localhost",
     "DB_HOST": "h",
     "DB_NAME": "n",
     "DB_USER": "u",
     "DB_PASSWORD": "secret",
+    "ANALYTICS_DB_HOST": "ah",
+    "ANALYTICS_DB_USER": "au",
+    "ANALYTICS_DB_PASSWORD": "ap",
 }
 
 
