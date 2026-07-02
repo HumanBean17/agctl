@@ -35,6 +35,10 @@ postgresql = "agctl.clients.db_drivers.postgresql:PostgreSQLDriver"
 # Third-party protocol plugins register here, e.g.:
 # grpc = "agctl_grpc:GRPCPlugin"
 
+[project.entry-points."agctl.assertions"]
+# Third-party assertion modes register here, e.g.:
+# json_schema = "agctl_jsonschema:JSONSchemaAssertion"
+
 [tool.hatch.build.targets.wheel]
 packages = ["agctl"]
 

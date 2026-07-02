@@ -2,7 +2,7 @@
 
 The registry is the extension point for pluggable assertion modes on
 ``db assert`` / ``kafka assert``. Built-in mode names are registered so they
-are discoverable; unknown modes raise :class:`TemplateMissing`. Third-party
+are discoverable; unknown modes raise :class:`TemplateNotFound`. Third-party
 modes are loaded from the ``agctl.assertions`` entry-point group, with each
 load isolated so a broken entry point is skipped rather than fatal.
 """
@@ -12,9 +12,10 @@ import pytest
 from agctl.assertion_registry import (
     Assertion,
     AssertionRegistry,
+    evaluate_custom,
     get_default_registry,
 )
-from agctl.errors import TemplateMissing
+from agctl.errors import AssertionFailure, ConfigError, TemplateNotFound
 
 
 # --- built-in modes are present & discoverable ------------------------------
@@ -33,7 +34,7 @@ def test_default_registry_resolves_built_in_mode(mode):
 
 def test_unknown_mode_raises_template_missing():
     reg = get_default_registry()
-    with pytest.raises(TemplateMissing) as exc_info:
+    with pytest.raises(TemplateNotFound) as exc_info:
         reg.get("no_such_mode")
     assert exc_info.value.message == "Unknown assertion mode: no_such_mode"
     assert exc_info.value.detail == {"mode": "no_such_mode"}
@@ -73,7 +74,7 @@ def test_register_accepts_instance_or_class():
 
 def test_empty_registry_get_raises_template_missing():
     reg = AssertionRegistry()
-    with pytest.raises(TemplateMissing):
+    with pytest.raises(TemplateNotFound):
         reg.get("anything")
 
 
@@ -157,3 +158,64 @@ def test_load_entry_points_ignores_non_assertion_object(monkeypatch):
 def test_default_registry_is_cached():
     """get_default_registry returns the same instance on repeat calls."""
     assert get_default_registry() is get_default_registry()
+
+
+# --- evaluate_custom: the command-layer bridge to registered modes (§9.3) ---
+
+
+class _PassMode(Assertion):
+    name = "passmode"
+
+    def evaluate(self, context):
+        return {"passed": True, "row_count": context["row_count"]}
+
+
+class _FailMode(Assertion):
+    name = "failmode"
+
+    def evaluate(self, context):
+        return {"passed": False, "message": "no good", "row_count": context["row_count"]}
+
+
+class _BoomMode(Assertion):
+    name = "boommode"
+
+    def evaluate(self, context):
+        raise ValueError("kaboom")
+
+
+def test_evaluate_custom_pass_returns_detail():
+    reg = AssertionRegistry()
+    reg.register(_PassMode)
+    passed, detail = evaluate_custom("passmode", {"row_count": 3}, registry=reg)
+    assert passed is True
+    assert detail == {"row_count": 3}
+
+
+def test_evaluate_custom_fail_raises_assertion_failure():
+    reg = AssertionRegistry()
+    reg.register(_FailMode)
+    with pytest.raises(AssertionFailure) as exc_info:
+        evaluate_custom("failmode", {"row_count": 1}, registry=reg)
+    assert exc_info.value.message == "no good"
+    assert exc_info.value.detail["mode"] == "failmode"
+    assert exc_info.value.detail["row_count"] == 1
+
+
+def test_evaluate_custom_unknown_raises_template_missing():
+    with pytest.raises(TemplateNotFound):
+        evaluate_custom("nope", {}, registry=AssertionRegistry())
+
+
+def test_evaluate_custom_builtin_raises_config_error():
+    """Built-in modes have dedicated flags; --assertion refuses to invoke them."""
+    with pytest.raises(ConfigError):
+        evaluate_custom("expect_rows", {}, registry=get_default_registry())
+
+
+def test_evaluate_custom_raising_mode_is_assertion_failure():
+    reg = AssertionRegistry()
+    reg.register(_BoomMode)
+    with pytest.raises(AssertionFailure) as exc_info:
+        evaluate_custom("boommode", {}, registry=reg)
+    assert "kaboom" in exc_info.value.message

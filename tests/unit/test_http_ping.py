@@ -146,6 +146,38 @@ def test_ping_loop_stop_event_halts():
     assert len(collected) <= 3
 
 
+def test_ping_loop_stop_event_interrupts_sleep():
+    """DESIGN §3.1: a stop_event set DURING the inter-ping sleep breaks the loop
+    PROMPTLY, without waiting for the full interval. (The sleep must be
+    interruptible, not a fixed time.sleep.)"""
+    import threading
+    import time as _time
+
+    collected = []
+    stop_event = threading.Event()
+
+    def send_one(i):
+        if i == 1:
+            # Flip the stop event partway through the upcoming 2s sleep.
+            threading.Timer(0.05, stop_event.set).start()
+        return {"ping": i, "ok": True, "status_code": 200, "duration_ms": 1}
+
+    t0 = _time.monotonic()
+    ping_loop(
+        send_one,
+        interval=2.0,
+        max_pings=100,
+        stop_event=stop_event,
+        emit_line=collected.append,
+    )
+    elapsed = _time.monotonic() - t0
+
+    # The stop arrived ~0.05s into a 2.0s sleep; the loop must wake promptly,
+    # not after the full 2s. (Old behavior blocked in time.sleep for 2s.)
+    assert elapsed < 1.0
+    assert len(collected) == 1
+
+
 def test_ping_loop_duration_bounds():
     collected = []
 

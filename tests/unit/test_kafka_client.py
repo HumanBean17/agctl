@@ -453,3 +453,77 @@ def test_consume_window_empty_returns_empty_list():
 
     assert result == []
     assert consumer.closed is True
+
+
+# ---------------------------------------------------------------------------
+# consume_window — early-stop on --expect-count (DESIGN §3.2 "whichever comes first")
+# ---------------------------------------------------------------------------
+
+
+def test_consume_window_stops_early_on_expect_count():
+    """With expect_count=1, consume_window returns as soon as one matching message
+    is collected — it does NOT drain the full window (which would yield all 3)."""
+    topic = "orders"
+    messages = _canned(topic)  # 3 canned messages
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+
+    result = client.consume_window(
+        topic, lookback_seconds=30, timeout_seconds=2.0,
+        from_beginning=True, expect_count=1,
+    )
+
+    assert len(result) == 1  # early stop after the first match, not all 3
+
+
+def test_consume_window_expect_count_returns_before_timeout():
+    """A satisfied expect_count returns well before the full timeout elapses."""
+    topic = "orders"
+    messages = _canned(topic)
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+
+    t0 = time.monotonic()
+    client.consume_window(
+        topic, lookback_seconds=30, timeout_seconds=2.0,
+        from_beginning=True, expect_count=1,
+    )
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 1.0  # did NOT wait the full 2.0s window
+
+
+def test_consume_window_predicate_filters_and_early_stops():
+    """A predicate filters messages AND expect_count short-circuits once enough
+    matches are in hand — here 2 matches exist but expect_count=1 yields just 1."""
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(topic, 0, 0, "a", b'{"x":0}', now_ms - 1000),
+        FakeCMsg(topic, 0, 1, "b", b'{"x":1}', now_ms - 900),
+        FakeCMsg(topic, 1, 0, "c", b'{"x":1}', now_ms - 800),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+
+    result = client.consume_window(
+        topic, lookback_seconds=30, timeout_seconds=2.0, from_beginning=True,
+        predicate=lambda m: m["value"].get("x") == 1, expect_count=1,
+    )
+
+    assert [m["key"] for m in result] == ["b"]  # stopped after the first match

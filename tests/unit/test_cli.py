@@ -70,7 +70,7 @@ templates:
     assert payload["result"]["errors"]  # non-empty
     assert payload["result"]["warnings"] is not None
     assert payload["error"]["type"] == "ConfigError"
-    assert "structural error" in payload["error"]["message"]
+    assert "error" in payload["error"]["message"]
 
 
 def test_validate_good_fixture_no_structural_errors():

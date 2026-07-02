@@ -23,7 +23,7 @@ from typing import Any, Callable
 import click
 
 from ..command import envelope, load_config_or_raise
-from ..errors import AgctlError, ConfigError, TemplateMissing
+from ..errors import AgctlError, ConfigError, TemplateNotFound
 from ..output import emit
 from ..params import parse_params
 from ..resolution import deep_merge, fill_placeholders
@@ -88,7 +88,7 @@ def _http_call_core(
     cfg = load_config_or_raise(config_path)
 
     if template_name not in cfg.templates:
-        raise TemplateMissing(
+        raise TemplateNotFound(
             f"Unknown HTTP template: {template_name}", {"name": template_name}
         )
     tpl = cfg.templates[template_name]
@@ -271,8 +271,16 @@ def ping_loop(
         if duration is not None and (monotonic() - start) >= duration:
             break
 
-        # Sleep between pings (skip after the last one is irrelevant; we loop).
-        sleep_fn(interval)
+        # Sleep between pings. When a stop_event is wired (the signal-handler
+        # path), wait on it so a SIGTERM/SIGINT received DURING the sleep is
+        # acted on promptly (DESIGN §3.1: emit the summary line without blocking
+        # up to a full interval). Without a stop_event, fall back to the
+        # injectable sleep_fn (the test seam).
+        if stop_event is not None:
+            if stop_event.wait(interval):
+                break  # event set during the wait -> stop promptly
+        else:
+            sleep_fn(interval)
 
     total_ms = int((monotonic() - start) * 1000)
     return ping_lines, total_ms
@@ -297,7 +305,7 @@ def _resolve_ping_request(
 
     if template_name is not None:
         if template_name not in cfg.templates:
-            raise TemplateMissing(
+            raise TemplateNotFound(
                 f"Unknown HTTP template: {template_name}", {"name": template_name}
             )
         tpl = cfg.templates[template_name]
@@ -425,7 +433,7 @@ def http_ping(
             timeout,
         )
     except AgctlError as err:
-        # Startup config/template errors (ConfigError, TemplateMissing) -> structured
+        # Startup config/template errors (ConfigError, TemplateNotFound) -> structured
         # envelope + exit code, before any ping line is streamed.
         emit(ok=False, command="http.ping", error=err.to_dict(),
              duration_ms=int((time.monotonic() - start) * 1000))

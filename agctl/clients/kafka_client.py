@@ -168,13 +168,22 @@ class KafkaClient:
         lookback_seconds,
         timeout_seconds,
         from_beginning=False,
+        predicate=None,
+        expect_count=None,
     ) -> list[dict]:
         """Seek each partition to the lookback window and read forward.
 
         With ``from_beginning=True`` partitions are seeked to offset 0.
         Otherwise each partition is seeked to the earliest offset at/after
         ``now - lookback_seconds`` (via ``offsets_for_times``). The poll loop
-        runs until ``timeout_seconds`` of wall-clock time elapses.
+        runs until ``timeout_seconds`` of wall-clock time elapses, OR — per
+        DESIGN §3.2 ("whichever comes first") — until ``expect_count`` matching
+        messages have been collected.
+
+        ``predicate`` (optional) filters messages: only messages for which it
+        returns truthy are counted/collected; a predicate that raises is treated
+        as a non-match (silently skipped, DESIGN §3.2). ``expect_count`` (optional)
+        stops the loop as soon as that many (matched) messages are in hand.
 
         Returns a list of normalized message dicts (DESIGN §4.2 message shape).
         """
@@ -194,7 +203,20 @@ class KafkaClient:
                 if msg.error():
                     # Skip individual poll errors; a silent window yields [].
                     continue
-                messages.append(self._normalize_message(msg))
+                normalized = self._normalize_message(msg)
+                if predicate is not None:
+                    try:
+                        if not predicate(normalized):
+                            continue
+                    except Exception:
+                        # Predicate error -> silently skip this message (DESIGN §3.2).
+                        continue
+                messages.append(normalized)
+                # DESIGN §3.2: return as soon as --expect-count matching messages
+                # are received — "whichever comes first" (count satisfied or the
+                # timeout window elapses).
+                if expect_count is not None and len(messages) >= expect_count:
+                    break
         finally:
             try:
                 consumer.close()

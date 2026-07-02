@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from agctl.cli import cli
 from agctl.clients.db_client import DbClient
+from agctl.assertion_registry import Assertion
 from agctl.commands import db_commands
 from agctl.config.models import DatabaseConnection
 from agctl.resolution import convert_sql_params
@@ -463,3 +464,104 @@ def test_db_assert_both_modes_fails_fast_without_executing(install_fake):
     assert payload["ok"] is False
     assert payload["error"]["type"] == "ConfigError"
     assert fake.executed == []
+
+
+# --------------------------------------------------------------------------- #
+# DESIGN §9.3: `db assert --assertion <name>` dispatches to a registered mode
+# --------------------------------------------------------------------------- #
+
+
+def _install_custom_registry(monkeypatch, mode_cls):
+    """Point the default registry at a fresh registry containing `mode_cls`."""
+    import agctl.assertion_registry as ar
+    from agctl.assertion_registry import AssertionRegistry
+
+    reg = AssertionRegistry()
+    reg.register(mode_cls)
+    monkeypatch.setattr(ar, "get_default_registry", lambda: reg)
+
+
+def test_db_assert_custom_mode_passes(monkeypatch, install_fake):
+    class _StatusOK(Assertion):
+        name = "status_ok"
+
+        def evaluate(self, context):
+            ok = bool(context["rows"]) and context["rows"][0].get("status") == "OK"
+            return {"passed": ok, "row_count": context["row_count"]}
+
+    _install_custom_registry(monkeypatch, _StatusOK)
+    install_fake([{"status": "OK"}])
+
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "assert",
+            "--sql", "SELECT 'OK' AS status",
+            "--assertion", "status_ok",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["result"]["assertion_type"] == "status_ok"
+    assert payload["result"]["passed"] is True
+    assert payload["result"]["row_count"] == 1
+
+
+def test_db_assert_custom_mode_fails_exit1(monkeypatch, install_fake):
+    class _StatusOK(Assertion):
+        name = "status_ok"
+
+        def evaluate(self, context):
+            return {"passed": False, "message": "status not OK"}
+
+    _install_custom_registry(monkeypatch, _StatusOK)
+    install_fake([{"status": "BAD"}])
+
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "assert",
+            "--sql", "SELECT 'BAD' AS status",
+            "--assertion", "status_ok",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 1
+    assert payload["error"]["type"] == "AssertionError"
+    assert payload["error"]["detail"]["mode"] == "status_ok"
+
+
+def test_db_assert_custom_mode_unknown_is_template_not_found(install_fake):
+    install_fake([{"a": 1}])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "assert",
+            "--sql", "SELECT 1",
+            "--assertion", "does_not_exist",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "TemplateNotFound"
+
+
+def test_db_assert_assertion_mutually_exclusive_with_expect_rows(install_fake):
+    fake = install_fake([{"a": 1}])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "assert",
+            "--sql", "SELECT 1",
+            "--expect-rows", "1",
+            "--assertion", "status_ok",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+    assert fake.executed == []  # mode validation fails fast before any query

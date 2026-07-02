@@ -1,8 +1,8 @@
 """DBDriver protocol (DESIGN §9.1).
 
 A minimal structural protocol describing the contract every database driver
-must satisfy. Drivers are registered as entry points (``agctl.db.drivers``)
-and selected by the ``DbClient`` based on the ``driver`` config field.
+must satisfy. Drivers are registered as entry points (``agctl.db_drivers``)
+and selected by the ``DbClient`` based on the connection's ``type`` config field.
 """
 
 from __future__ import annotations
