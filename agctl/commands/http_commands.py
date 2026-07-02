@@ -14,7 +14,11 @@ result, not an assertion failure.
 from __future__ import annotations
 
 import json
-from typing import Any
+import signal
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 import click
 
@@ -23,7 +27,14 @@ from ..errors import ConfigError, TemplateMissing
 from ..params import parse_params
 from ..resolution import deep_merge, fill_placeholders
 
-__all__ = ["http_call", "http_request", "resolve_timeout", "set_default_transport"]
+__all__ = [
+    "http_call",
+    "http_request",
+    "http_ping",
+    "ping_loop",
+    "resolve_timeout",
+    "set_default_transport",
+]
 
 # Test seam: tests inject an ``httpx.MockTransport`` here without touching the
 # network. ``None`` (the default) means "use the real transport".
@@ -202,3 +213,286 @@ def http_request(
 
 
 _http_request_envelope = envelope("http.request")(_http_request_core)
+
+
+# --------------------------------------------------------------------------- #
+# http ping  (DESIGN §3.1, M5 streaming exception)
+# --------------------------------------------------------------------------- #
+
+
+def _emit_stdout_line(line: dict) -> None:
+    """Write one NDJSON ping/summary line directly to stdout (NOT via emit)."""
+    import sys
+
+    sys.stdout.write(json.dumps(line))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def ping_loop(
+    send_one: Callable[[int], dict],
+    *,
+    interval: float,
+    max_pings: int | None = None,
+    stop_event: threading.Event | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    duration: float | None = None,
+    emit_line: Callable[[dict], None] = _emit_stdout_line,
+) -> tuple[list[dict], int]:
+    """Drive the ping loop.
+
+    ``send_one(i)`` performs a single request and returns the per-ping line
+    dict (already including ``ping: i``). Between pings the loop sleeps
+    ``interval`` seconds via ``sleep_fn``. It stops when:
+
+    - ``max_pings`` pings have been sent (if set), OR
+    - ``duration`` wall-clock seconds have elapsed (if set), OR
+    - ``stop_event`` is set (e.g. by a signal handler).
+
+    Each produced line is passed to ``emit_line`` as it happens (streaming).
+    Returns ``(ping_lines, total_duration_ms)``.
+    """
+    start = monotonic()
+    ping_lines: list[dict] = []
+    i = 0
+    while True:
+        i += 1
+        line = send_one(i)
+        ping_lines.append(line)
+        emit_line(line)
+
+        # Stop conditions evaluated after each ping.
+        if max_pings is not None and i >= max_pings:
+            break
+        if stop_event is not None and stop_event.is_set():
+            break
+        if duration is not None and (monotonic() - start) >= duration:
+            break
+
+        # Sleep between pings (skip after the last one is irrelevant; we loop).
+        sleep_fn(interval)
+
+    total_ms = int((monotonic() - start) * 1000)
+    return ping_lines, total_ms
+
+
+def _resolve_ping_request(
+    config_path: str | None,
+    template_name: str | None,
+    service: str | None,
+    path: str | None,
+    method: str | None,
+    body: str | None,
+    header: tuple[str, ...],
+    param: tuple[str, ...],
+    timeout: float | None,
+):
+    """Resolve the request components for a ping (template OR free-form).
+
+    Returns ``(client, method, path, headers, body_dict_or_None)``.
+    """
+    cfg = load_config_or_raise(config_path)
+
+    if template_name is not None:
+        if template_name not in cfg.templates:
+            raise TemplateMissing(
+                f"Unknown HTTP template: {template_name}", {"name": template_name}
+            )
+        tpl = cfg.templates[template_name]
+        if tpl.service not in cfg.services:
+            raise ConfigError(
+                f"Template '{template_name}' references unknown service '{tpl.service}'",
+                {"service": tpl.service},
+            )
+
+        params = parse_params(param)
+        resolved_path = fill_placeholders(tpl.path, params)
+
+        filled_body = fill_placeholders(tpl.body, params)
+        if body is not None:
+            caller_body = json.loads(body)
+            resolved_body = (
+                caller_body if filled_body is None else deep_merge(filled_body, caller_body)
+            )
+        else:
+            resolved_body = filled_body
+
+        base_headers = fill_placeholders(dict(tpl.headers), params)
+        caller_headers = _parse_headers(header)
+        resolved_headers = {**base_headers, **caller_headers}
+
+        resolved_method = method or tpl.method
+        svc = cfg.services[tpl.service]
+    else:
+        if not service or not path:
+            raise ConfigError(
+                "http ping requires either a template name or --service + --path",
+                {},
+            )
+        if service not in cfg.services:
+            raise ConfigError(f"Unknown service: {service}", {"service": service})
+
+        resolved_body = json.loads(body) if body is not None else None
+        resolved_headers = _parse_headers(header)
+        resolved_path = path
+        resolved_method = method or "GET"
+        svc = cfg.services[service]
+
+    effective_timeout = resolve_timeout(
+        timeout, svc.timeout_seconds, cfg.defaults.timeout_seconds
+    )
+    client = new_client(svc.base_url, effective_timeout)
+    return client, resolved_method, resolved_path, resolved_headers, resolved_body
+
+
+def _run_pings(send_one, *, emit_line=_emit_stdout_line, **loop_kwargs):
+    """Default loop runner used by the Click command.
+
+    Runs :func:`ping_loop` (which streams each ping line via ``emit_line``) and
+    returns ``(total_pings, failed_pings, total_duration_ms)``. The final
+    summary line is emitted by the Click command, NOT here, so test fakes only
+    need to emit ping lines and return counts.
+    """
+    ping_lines, total_ms = ping_loop(
+        send_one, emit_line=emit_line, **loop_kwargs
+    )
+    failed = sum(1 for p in ping_lines if not p.get("ok"))
+    return len(ping_lines), failed, total_ms
+
+
+@click.command("ping")
+@click.argument("template_name", required=False)
+@click.option("--service", "service", default=None)
+@click.option("--path", "path", default=None)
+@click.option("--interval", "interval", type=float, required=True, help="Seconds between pings")
+@click.option(
+    "--method",
+    "method",
+    type=click.Choice(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+    default=None,
+)
+@click.option("--body", "body", default=None, help="JSON body")
+@click.option("--header", "header", multiple=True, help="k=v header")
+@click.option("--duration", "duration", type=float, default=None, help="Stop after N seconds")
+@click.option("--until-stopped", "until_stopped", is_flag=True, default=False)
+@click.option("--timeout", "timeout", type=float, default=None, help="Per-request timeout")
+@click.option("--param", "param", multiple=True, help="k=v placeholder")
+@click.pass_context
+def http_ping(
+    ctx: click.Context,
+    template_name: str | None,
+    service: str | None,
+    path: str | None,
+    interval: float,
+    method: str | None,
+    body: str | None,
+    header: tuple[str, ...],
+    duration: float | None,
+    until_stopped: bool,
+    timeout: float | None,
+    param: tuple[str, ...],
+) -> None:
+    """Repeatedly send an HTTP request, streaming NDJSON ping lines (DESIGN §3.1)."""
+    config_path = ctx.obj.get("config_path") if ctx.obj else None
+
+    if duration is not None and until_stopped:
+        # http ping is not wrapped in @envelope; ConfigError semantics -> exit 2.
+        raise SystemExit(2)
+
+    try:
+        client, rmethod, rpath, rheaders, rbody = _resolve_ping_request(
+            config_path,
+            template_name,
+            service,
+            path,
+            method,
+            body,
+            header,
+            param,
+            timeout,
+        )
+    except ConfigError:
+        raise SystemExit(2)
+
+    def send_one(i: int) -> dict:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        req_start = time.monotonic()
+        try:
+            result = client.request(
+                rmethod, rpath, headers=rheaders or None, body=rbody
+            )
+        except Exception as exc:  # connection/timeout failure for this ping
+            elapsed = int((time.monotonic() - req_start) * 1000)
+            return {
+                "ping": i,
+                "ok": False,
+                "status_code": None,
+                "duration_ms": elapsed,
+                "timestamp": ts,
+                "error": str(exc),
+            }
+        elapsed = int((time.monotonic() - req_start) * 1000)
+        status = result["status_code"]
+        ok = 200 <= status < 300
+        line = {
+            "ping": i,
+            "ok": ok,
+            "status_code": status,
+            "duration_ms": elapsed,
+            "timestamp": ts,
+        }
+        if not ok:
+            line["error"] = f"Unexpected status {status}"
+        return line
+
+    # Signal handling: install SIGTERM/SIGINT handlers that set a stop event.
+    # Guard for non-main-thread contexts (degrades gracefully).
+    stop_event = threading.Event()
+    prev_term = None
+    prev_int = None
+
+    def _handler(signum, frame):
+        stop_event.set()
+
+    try:
+        prev_term = signal.getsignal(signal.SIGTERM)
+        prev_int = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGTERM, _handler)
+        signal.signal(signal.SIGINT, _handler)
+    except (ValueError, OSError):
+        pass
+
+    loop_kwargs: dict[str, Any] = {
+        "interval": interval,
+        "stop_event": stop_event,
+        "sleep_fn": time.sleep,
+    }
+    if duration is not None:
+        loop_kwargs["duration"] = duration
+    # If neither duration nor until-stopped is given, until-stopped is implied:
+    # the loop runs until a signal flips stop_event (no max_pings set).
+
+    try:
+        total_pings, failed, total_ms = _run_pings(
+            send_one, emit_line=_emit_stdout_line, **loop_kwargs
+        )
+    finally:
+        # Restore previous signal handlers.
+        try:
+            if prev_term is not None:
+                signal.signal(signal.SIGTERM, prev_term)
+            if prev_int is not None:
+                signal.signal(signal.SIGINT, prev_int)
+        except (ValueError, OSError):
+            pass
+
+    summary = {
+        "summary": True,
+        "total_pings": total_pings,
+        "failed_pings": failed,
+        "duration_ms": total_ms,
+    }
+    _emit_stdout_line(summary)
+
+    raise SystemExit(0 if failed == 0 else 1)

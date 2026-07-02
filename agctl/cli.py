@@ -5,7 +5,7 @@ from typing import Any
 
 import click
 
-from .commands.http_commands import http_call, http_request
+from .commands.http_commands import http_call, http_ping, http_request
 from .config import ConfigError, load_config
 from .config.validator import validate_config
 from .output import emit
@@ -63,6 +63,7 @@ def http_group() -> None:
 # Register subcommands on the http group.
 http_group.add_command(http_call)
 http_group.add_command(http_request)
+http_group.add_command(http_ping)
 
 
 @config_group.command("validate")
