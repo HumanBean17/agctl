@@ -13,7 +13,7 @@ services:
 
 kafka:
   brokers:
-    - "${KAFKA_BROKER}:9092"
+    - "${KAFKA_BROKER}"
   default_consumer_group: "agctl-consumer"
   schema_registry_url: "${SCHEMA_REGISTRY_URL:-}"
   timeout_seconds: 30
@@ -33,7 +33,7 @@ database:
     main-db:
       type: postgresql
       host: "${DB_HOST}"
-      port: 5432
+      port: "${DB_PORT:-5432}"
       dbname: "${DB_NAME}"
       user: "${DB_USER}"
       password: "${DB_PASSWORD}"
@@ -42,7 +42,7 @@ database:
     analytics-db:
       type: postgresql
       host: "${ANALYTICS_DB_HOST}"
-      port: 5432
+      port: "${ANALYTICS_PORT:-5432}"
       dbname: "analytics"
       user: "${ANALYTICS_DB_USER}"
       password: "${ANALYTICS_DB_PASSWORD}"
