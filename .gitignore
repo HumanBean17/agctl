@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Claude Code local state
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# env files (keep .env.example tracked)
+.env
+.env.local
