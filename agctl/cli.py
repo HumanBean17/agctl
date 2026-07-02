@@ -5,6 +5,7 @@ from typing import Any
 
 import click
 
+from .commands.http_commands import http_call, http_request
 from .config import ConfigError, load_config
 from .config.validator import validate_config
 from .output import emit
@@ -52,6 +53,16 @@ def cli(ctx: click.Context, config_path: str | None) -> None:
 @cli.group(name="config")
 def config_group() -> None:
     """Config introspection."""
+
+
+@cli.group(name="http")
+def http_group() -> None:
+    """HTTP request commands (DESIGN §3.1)."""
+
+
+# Register subcommands on the http group.
+http_group.add_command(http_call)
+http_group.add_command(http_request)
 
 
 @config_group.command("validate")
