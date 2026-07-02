@@ -46,3 +46,21 @@ def test_show_unmask_exposes_password():
     result = CliRunner().invoke(cli, args, env=ENV)
     payload = json.loads(result.output)
     assert payload["result"]["database"]["connections"]["main-db"]["password"] == "secret"
+
+
+def test_global_config_flag_is_honored():
+    args = ["--config", str(FIXTURE), "config", "validate"]
+    result = CliRunner().invoke(cli, args, env=ENV)
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    assert payload["result"] == {"valid": True}
+
+
+def test_show_preserves_non_secret_values():
+    result = CliRunner().invoke(cli, ["config", "show", "--config", str(FIXTURE)], env=ENV)
+    payload = json.loads(result.output)
+    conn = payload["result"]["database"]["connections"]["main-db"]
+    assert conn["password"] == "***"
+    assert conn["host"] == "h"
+    assert conn["dbname"] == "n"

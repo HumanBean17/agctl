@@ -55,11 +55,13 @@ def config_group() -> None:
 
 @config_group.command("validate")
 @click.option("--config", "config_path", default=None)
-def config_validate(config_path: str | None) -> None:
+@click.pass_context
+def config_validate(ctx: click.Context, config_path: str | None) -> None:
     """Parse and validate agctl.yaml (DESIGN §3.5). Exit 2 on any error."""
     start = time.monotonic()
+    path = config_path or ctx.obj.get("config_path")
     try:
-        load_config(config_path)
+        load_config(path)
     except ConfigError as err:
         _emit_config_error("config.validate", err, start)
         raise SystemExit(2)
@@ -69,11 +71,13 @@ def config_validate(config_path: str | None) -> None:
 @config_group.command("show")
 @click.option("--config", "config_path", default=None)
 @click.option("--unmask", is_flag=True, default=False)
-def config_show(config_path: str | None, unmask: bool) -> None:
+@click.pass_context
+def config_show(ctx: click.Context, config_path: str | None, unmask: bool) -> None:
     """Dump the resolved config as JSON, secrets masked (DESIGN §3.5)."""
     start = time.monotonic()
+    path = config_path or ctx.obj.get("config_path")
     try:
-        cfg = load_config(config_path)
+        cfg = load_config(path)
     except ConfigError as err:
         _emit_config_error("config.show", err, start)
         raise SystemExit(2)
