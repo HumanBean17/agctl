@@ -564,11 +564,11 @@ Hit health endpoints for one or all configured services.
 ```
 agctl check ready
     [--service <name>]          # check a single service
-    [--all]                     # check all services defined in config
+    [--all]                     # check all services defined in config (default when neither flag is given)
     [--timeout <seconds>]
 ```
 
-A service is considered ready if its `health_path` returns HTTP 2xx. If `health_path` is not configured for a service, a `GET /` is attempted.
+With neither `--service` nor `--all`, every configured service is checked (equivalent to `--all`). A service is considered ready if its `health_path` returns HTTP 2xx. If `health_path` is not configured for a service, a `GET /` is attempted.
 
 **Examples:**
 
@@ -699,6 +699,7 @@ agctl discover --category <name> --name <item-name>
     "name": "find-order",
     "description": "Fetch a single order by ID",
     "connection": "main-db",
+    "sql": "SELECT id, status, total_cents, created_at FROM orders WHERE id = :orderId",
     "params": ["orderId"],
     "example": "agctl db query --template find-order --param orderId=X"
   },
@@ -989,7 +990,7 @@ Every invocation writes exactly one JSON object to stdout:
 
 #### `discover.item`
 
-Shape varies by category. All items share `name`, `description`, `params[]`, and `example`. HTTP templates add `method`, `service`, `path`; Kafka patterns add `topic` and `match`; DB templates add `connection` (SQL is omitted from discovery output to keep responses small).
+Shape varies by category. All items share `name`, `description`, `params[]`, and `example`. HTTP templates add `method`, `service`, `path`; Kafka patterns add `topic` and `match`; DB templates add `connection` and `sql` (so an agent can read a query's result columns before writing a `--path` value assertion).
 
 #### `discover.search`
 
