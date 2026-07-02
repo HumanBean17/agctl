@@ -6,6 +6,7 @@ from typing import Any
 import click
 
 from .config import ConfigError, load_config
+from .config.validator import validate_config
 from .output import emit
 
 _SECRET_FRAGMENTS = ("password", "token", "secret", "key")
@@ -61,11 +62,31 @@ def config_validate(ctx: click.Context, config_path: str | None) -> None:
     start = time.monotonic()
     path = config_path or ctx.obj.get("config_path")
     try:
-        load_config(path)
+        cfg = load_config(path)
     except ConfigError as err:
         _emit_config_error("config.validate", err, start)
         raise SystemExit(2)
-    emit(ok=True, command="config.validate", result={"valid": True}, duration_ms=_ms(start))
+    errors, warnings = validate_config(cfg)
+    if errors:
+        summary = f"Configuration has {len(errors)} structural error(s)"
+        emit(
+            ok=False,
+            command="config.validate",
+            result={"valid": False, "errors": errors, "warnings": warnings},
+            error={
+                "type": "ConfigError",
+                "message": summary,
+                "detail": {"errors": errors, "warnings": warnings},
+            },
+            duration_ms=_ms(start),
+        )
+        raise SystemExit(2)
+    emit(
+        ok=True,
+        command="config.validate",
+        result={"valid": True, "warnings": warnings},
+        duration_ms=_ms(start),
+    )
 
 
 @config_group.command("show")
