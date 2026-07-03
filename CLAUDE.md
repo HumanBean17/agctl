@@ -2,11 +2,12 @@
 
 Agentic CLI interface for system under test.
 
-## Docs
+## Project Structure
 
 [docs/](./docs) - documentation
   - [DESIGN.md](./docs/DESIGN.md) - project design doc (intent & spec)
   - [ARCHITECTURE.md](./docs/ARCHITECTURE.md) - as-built architecture (source of truth: module layout, runtime flow, extension points)
+[skills/](./skills) - portable skill artifacts for agctl's *users*, not this project (consumers should copy this to `.claude/skills/`)
 
 ## Docs Sync
 
