@@ -1,0 +1,464 @@
+"""Tests for agctl mock run command (Task 8)."""
+
+import json
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+from click.testing import CliRunner
+
+from agctl.cli import cli
+from agctl.commands.mock_commands import mock_run, new_mock_engine
+
+
+@pytest.fixture
+def temp_config(tmp_path):
+    """Create a temporary agctl.yaml config."""
+    config_path = tmp_path / "agctl.yaml"
+    return config_path
+
+
+@pytest.fixture
+def fake_engine():
+    """A fake MockEngine that records calls and returns a canned exit code."""
+    engine = MagicMock()
+    engine.start = MagicMock()
+    engine.run = MagicMock(return_value=0)
+    engine.shutdown = MagicMock()
+    return engine
+
+
+class TestMockRunCommand:
+    """Test the mock run command with various scenarios."""
+
+    def test_only_http_with_stubs(self, temp_config, fake_engine):
+        """--only http with 2-stub mocks.http -> run_http=True, run_kafka=False, kafka_client=None."""
+        config_content = """
+version: "1.0"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test1
+        response:
+          status: 200
+          body: '{"result": "ok"}'
+      stub2:
+        method: POST
+        path: /test2
+        response:
+          status: 201
+          body: '{"created": true}'
+"""
+        temp_config.write_text(config_content)
+
+        with patch("agctl.commands.mock_commands.new_mock_engine", return_value=fake_engine) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            # Verify exit code from fake engine
+            assert result.exit_code == 0
+
+            # Verify new_mock_engine was called with correct parameters
+            mock_factory.assert_called_once()
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs["run_http"] is True
+            assert call_kwargs["run_kafka"] is False
+            assert call_kwargs["kafka_client"] is None
+
+            # Verify engine lifecycle
+            fake_engine.start.assert_called_once()
+            fake_engine.run.assert_called_once()
+
+    def test_only_kafka_with_reactors(self, temp_config, fake_engine):
+        """--only kafka with reactors + kafka.brokers -> run_kafka=True, kafka_client is KafkaClient."""
+        config_content = """
+version: "1.0"
+kafka:
+  brokers:
+    - "localhost:9092"
+mocks:
+  kafka:
+    reactors:
+      reactor1:
+        topic: test-topic
+        consumer_group: test-group
+        reaction:
+          topic: output-topic
+          value: {"result": "reacted"}
+"""
+        temp_config.write_text(config_content)
+
+        with patch("agctl.commands.mock_commands.new_mock_engine", return_value=fake_engine) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "kafka"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+
+            # Verify new_mock_engine parameters
+            mock_factory.assert_called_once()
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs["run_http"] is False
+            assert call_kwargs["run_kafka"] is True
+
+            # Verify kafka_client is a KafkaClient instance
+            from agctl.clients.kafka_client import KafkaClient
+            assert isinstance(call_kwargs["kafka_client"], KafkaClient)
+
+    def test_only_http_without_mocks_http(self, temp_config):
+        """--only http with no mocks.http -> exit 2, ConfigError envelope."""
+        config_content = """
+version: "1.0"
+mocks:
+  kafka:
+    reactors:
+      reactor1:
+        topic: test-topic
+        reaction:
+          topic: output-topic
+          value: {}
+"""
+        temp_config.write_text(config_content)
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(temp_config), "mock", "run", "--only", "http"],
+        )
+
+        assert result.exit_code == 2
+
+        # Verify structured error envelope
+        output_lines = [line for line in result.output.split("\n") if line.strip()]
+        assert len(output_lines) == 1
+        envelope = json.loads(output_lines[0])
+        assert envelope["ok"] is False
+        assert envelope["command"] == "mock.run"
+        assert envelope["error"]["type"] == "ConfigError"
+        assert "no mocks.http configured" in envelope["error"]["message"]
+
+    def test_no_mocks_section_no_only(self, temp_config, fake_engine):
+        """No mocks section, no --only -> exit 0, no-op engine (run_http=False, run_kafka=False)."""
+        config_content = """
+version: "1.0"
+kafka:
+  brokers:
+    - "localhost:9092"
+"""
+        temp_config.write_text(config_content)
+
+        with patch("agctl.commands.mock_commands.new_mock_engine", return_value=fake_engine) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+
+            # Verify no-op engine parameters
+            mock_factory.assert_called_once()
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs["run_http"] is False
+            assert call_kwargs["run_kafka"] is False
+
+    def test_kafka_reactors_without_brokers(self, temp_config):
+        """mocks.kafka reactors present but no kafka.brokers -> exit 2, ConfigError envelope."""
+        config_content = """
+version: "1.0"
+kafka:
+  brokers: []
+mocks:
+  kafka:
+    reactors:
+      reactor1:
+        topic: test-topic
+        reaction:
+          topic: output-topic
+          value: {}
+"""
+        temp_config.write_text(config_content)
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(temp_config), "mock", "run"],
+        )
+
+        assert result.exit_code == 2
+
+        # Verify structured error envelope
+        output_lines = [line for line in result.output.split("\n") if line.strip()]
+        assert len(output_lines) == 1
+        envelope = json.loads(output_lines[0])
+        assert envelope["ok"] is False
+        assert envelope["command"] == "mock.run"
+        assert envelope["error"]["type"] == "ConfigError"
+        assert "kafka.brokers" in envelope["error"]["message"]
+
+    def test_duration_and_until_stopped_mutually_exclusive(self, temp_config):
+        """--duration and --until-stopped together -> exit 2, ConfigError envelope."""
+        config_content = """
+version: "1.0"
+"""
+        temp_config.write_text(config_content)
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(temp_config), "mock", "run", "--duration", "10", "--until-stopped"],
+        )
+
+        assert result.exit_code == 2
+
+        # Verify structured error envelope
+        output_lines = [line for line in result.output.split("\n") if line.strip()]
+        assert len(output_lines) == 1
+        envelope = json.loads(output_lines[0])
+        assert envelope["ok"] is False
+        assert envelope["command"] == "mock.run"
+        assert envelope["error"]["type"] == "ConfigError"
+        assert "mutually exclusive" in envelope["error"]["message"]
+
+    def test_engine_start_raises_connection_failure(self, temp_config):
+        """Engine start() raises ConnectionFailure -> mock.run envelope with ConnectionError, exit 2."""
+        config_content = """
+version: "1.0"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+"""
+        temp_config.write_text(config_content)
+
+        from agctl.errors import ConnectionFailure
+
+        def failing_start():
+            raise ConnectionFailure("broker unreachable", {})
+
+        fake_engine = MagicMock()
+        fake_engine.start = failing_start
+
+        with patch("agctl.commands.mock_commands.new_mock_engine", return_value=fake_engine):
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run"],
+            )
+
+            assert result.exit_code == 2
+
+            # Verify structured error envelope
+            output_lines = [line for line in result.output.split("\n") if line.strip()]
+            assert len(output_lines) == 1
+            envelope = json.loads(output_lines[0])
+            assert envelope["ok"] is False
+            assert envelope["command"] == "mock.run"
+            assert envelope["error"]["type"] == "ConnectionError"
+
+    def test_http_listen_override(self, temp_config, fake_engine):
+        """--http-listen 127.0.0.1:9999 overrides config listen -> engine called with http_listen."""
+        config_content = """
+version: "1.0"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+"""
+        temp_config.write_text(config_content)
+
+        with patch("agctl.commands.mock_commands.new_mock_engine", return_value=fake_engine) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--http-listen", "127.0.0.1:9999"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+
+            # Verify http_listen override
+            mock_factory.assert_called_once()
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs["http_listen"] == "127.0.0.1:9999"
+
+    def test_http_listen_bad_value(self, temp_config):
+        """--http-listen 'bad:no-port' -> exit 2 (parse_listen fails)."""
+        config_content = """
+version: "1.0"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+"""
+        temp_config.write_text(config_content)
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(temp_config), "mock", "run", "--http-listen", "bad:no-port"],
+        )
+
+        assert result.exit_code == 2
+
+        # Verify structured error envelope
+        output_lines = [line for line in result.output.split("\n") if line.strip()]
+        assert len(output_lines) == 1
+        envelope = json.loads(output_lines[0])
+        assert envelope["ok"] is False
+        assert envelope["command"] == "mock.run"
+        assert envelope["error"]["type"] == "ConfigError"
+
+    def test_started_line_emitted(self, temp_config, fake_engine):
+        """Config with mocks.http, --only http -> stdout's first line is the engine's started."""
+        config_content = """
+version: "1.0"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+"""
+        temp_config.write_text(config_content)
+
+        # Make the fake engine emit a started line
+        def fake_run():
+            # Emit started line (simulating what the real engine does)
+            import sys
+            started = {"event": "started", "http": {"listen": "0.0.0.0:18080", "stubs": 1}}
+            sys.stdout.write(json.dumps(started) + "\n")
+            sys.stdout.flush()
+            return 0
+
+        fake_engine.run = fake_run
+
+        with patch("agctl.commands.mock_commands.new_mock_engine", return_value=fake_engine):
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+
+            # Verify first line is the started event
+            lines = [line for line in result.output.split("\n") if line.strip()]
+            assert len(lines) >= 1
+            first_line = json.loads(lines[0])
+            assert first_line["event"] == "started"
+            assert "http" in first_line
+
+    def test_fail_fast_flag_passed(self, temp_config, fake_engine):
+        """--fail-fast flag is passed to the engine."""
+        config_content = """
+version: "1.0"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+"""
+        temp_config.write_text(config_content)
+
+        with patch("agctl.commands.mock_commands.new_mock_engine", return_value=fake_engine) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--fail-fast"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+
+            # Verify fail_fast is passed
+            mock_factory.assert_called_once()
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs["fail_fast"] is True
+
+    def test_duration_flag_passed(self, temp_config, fake_engine):
+        """--duration flag is passed to the engine."""
+        config_content = """
+version: "1.0"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+"""
+        temp_config.write_text(config_content)
+
+        with patch("agctl.commands.mock_commands.new_mock_engine", return_value=fake_engine) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--duration", "42.5"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+
+            # Verify duration is passed
+            mock_factory.assert_called_once()
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs["duration"] == 42.5
+
+    def test_exit_code_from_engine(self, temp_config):
+        """Engine returns non-zero exit code -> process exits with that code."""
+        config_content = """
+version: "1.0"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+"""
+        temp_config.write_text(config_content)
+
+        fake_engine = MagicMock()
+        fake_engine.run = MagicMock(return_value=1)
+
+        with patch("agctl.commands.mock_commands.new_mock_engine", return_value=fake_engine):
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 1
