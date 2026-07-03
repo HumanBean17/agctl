@@ -98,9 +98,11 @@ def test_category_db_templates(monkeypatch):
     payload = _payload(result)
     res = payload["result"]
     assert res["count"] == 4
-    # Listing is name + description only — no sql/params.
+    # Listing is name + description + mode only — no sql/params.
     for item in res["items"]:
-        assert set(item.keys()) == {"name", "description"}
+        assert set(item.keys()) == {"name", "description", "mode"}
+        assert isinstance(item["description"], str)
+        assert item["mode"] in ["read", "write"]
 
 
 def test_category_kafka_patterns(monkeypatch):
@@ -233,3 +235,81 @@ def test_category_and_search_mutually_exclusive(monkeypatch):
     assert result.exit_code == 2
     payload = _payload(result)
     assert payload["error"]["type"] == "ConfigError"
+
+
+# --------------------------------------------------------------------------- #
+# Task 8: mode marker tests
+# --------------------------------------------------------------------------- #
+
+
+def test_db_templates_category_mode_field(monkeypatch):
+    """Task 8 Test 1: discover --category db-templates Level-1: every item has a mode key."""
+    result = _run(["--category", "db-templates"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["count"] == 4
+
+    # Build a lookup of item -> mode
+    modes_by_name = {item["name"]: item["mode"] for item in res["items"]}
+
+    # Specific templates have specific modes
+    assert modes_by_name["find-order"] == "read"
+    assert modes_by_name["orders-by-status"] == "read"
+    assert modes_by_name["count-failed-payments"] == "read"
+    assert modes_by_name["seed-order"] == "write"
+
+
+def test_db_template_item_write_mode_example(monkeypatch):
+    """Task 8 Test 2: discover --category db-templates --name seed-order Level-2: mode is write, example uses db execute."""
+    result = _run(["--category", "db-templates", "--name", "seed-order"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["category"] == "db-templates"
+    assert res["name"] == "seed-order"
+    assert res["mode"] == "write"
+    # Write mode example starts with db execute --write
+    assert res["example"].startswith("agctl db execute --template seed-order --write")
+    # sql is present
+    assert "sql" in res
+    assert res["sql"] == (
+        "INSERT INTO agctl_seed (id, status) VALUES (:orderId, :status) ON CONFLICT (id) DO NOTHING RETURNING id, status"
+    )
+    # params are extracted
+    assert res["params"] == ["orderId", "status"]
+
+
+def test_db_template_item_read_mode_example(monkeypatch):
+    """Task 8 Test 3: discover --category db-templates --name find-order Level-2: mode is read, example uses db query."""
+    result = _run(["--category", "db-templates", "--name", "find-order"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["category"] == "db-templates"
+    assert res["name"] == "find-order"
+    assert res["mode"] == "read"
+    # Read mode example starts with db query (unchanged behavior)
+    assert res["example"].startswith("agctl db query --template find-order")
+
+
+def test_search_includes_mode_field(monkeypatch):
+    """Task 8 Test 4: discover --search order: matches include mode field for db-templates."""
+    result = _run(["--search", "order"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["query"] == "order"
+    matches = res["matches"]
+
+    # Build a lookup for db-templates
+    db_matches = {m["name"]: m for m in matches if m["category"] == "db-templates"}
+
+    # seed-order and find-order should both appear
+    assert "seed-order" in db_matches
+    assert "find-order" in db_matches
+
+    # seed-order has mode write
+    assert db_matches["seed-order"]["mode"] == "write"
+    # find-order has mode read
+    assert db_matches["find-order"]["mode"] == "read"
