@@ -195,5 +195,8 @@ def mock_run(
     # Run the engine (blocks until stop)
     code = engine.run()
 
+    # Shutdown to emit summary line
+    engine.shutdown()
+
     # Exit with the engine's exit code
     raise SystemExit(code)
