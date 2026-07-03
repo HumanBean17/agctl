@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -230,31 +230,61 @@ class TestChunkedBody:
     def test_chunked_body_match(
         self, emit_event: callable, event_sink: list[dict[str, Any]]
     ) -> None:
-        """Chunked request body is de-chunked and matches body filter."""
+        """A genuine chunked POST (no Content-Length) is de-chunked and matched.
+
+        Sends raw chunked bytes over a socket so the wire format is fully
+        controlled: ``Transfer-Encoding: chunked`` with NO ``Content-Length``.
+        Proves the read loop (readline + read(n)) neither deadlocks nor
+        mis-parses: the de-chunked body satisfies the stub's ``match.body``
+        filter and the templated response is returned. Under the old
+        ``rfile.read(65536)`` impl this would hang until the socket timeout.
+        """
         stubs = {
             "upload": HttpStub(
                 method="POST",
                 path="/upload",
                 match=HttpMatch(body={"data": "test"}),
-                response=HttpResponse(status=200),
+                response=HttpResponse(
+                    status=200,
+                    body={"received": "{data}"},
+                ),
             )
         }
 
         server = start_server(stubs, emit_event)
         port = server.server_port
 
-        try:
-            with httpx.Client() as client:
-                # httpx handles chunked encoding when streaming
-                response = client.post(
-                    f"http://127.0.0.1:{port}/upload",
-                    content=json.dumps({"data": "test"}),
-                    headers={"Content-Type": "application/json"},
-                )
+        payload = json.dumps({"data": "test"}).encode("utf-8")
+        # "{hex}\\r\\n{data}\\r\\n0\\r\\n\\r\\n"
+        chunked_body = b"%x\r\n%s\r\n0\r\n\r\n" % (len(payload), payload)
+        request = (
+            b"POST /upload HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+        ) + chunked_body
 
-            assert response.status_code == 200
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                sock.sendall(request)
+                response_data = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    response_data += chunk
+
+            # Matched: status is 200 and the de-chunked {data} populated the
+            # templated response body (proves body was de-chunked + filter hit).
+            status_line = response_data.split(b"\r\n", 1)[0].decode("ascii")
+            assert status_line.split()[1] == "200"
+            assert b'"received": "test"' in response_data
+
             assert len(event_sink) == 1
             assert event_sink[0]["event"] == "http.hit"
+            assert event_sink[0]["stub"] == "upload"
         finally:
             server.shutdown()
 
@@ -294,36 +324,40 @@ class TestConcurrencyCap:
     def test_concurrency_cap_overflow_returns_429(
         self, emit_event: callable, event_sink: list[dict[str, Any]]
     ) -> None:
-        """Concurrency cap overflow returns 429."""
+        """Concurrency cap overflow returns 429 deterministically.
+
+        Pre-acquires the single permit so the next ``acquire(blocking=False)``
+        in the handler must fail immediately — no wall-clock timing dependency
+        (the old 2-thread/50ms-window variant could let both win on slow CI).
+        Also asserts the 429 returns well under ``delay_ms`` (prompt failure).
+        """
+        delay_ms = 50
         stubs = {
             "slow": HttpStub(
                 method="GET",
                 path="/slow",
                 response=HttpResponse(body="done"),
-                delay_ms=50,
+                delay_ms=delay_ms,
             )
         }
 
         server = start_server(stubs, emit_event, concurrency_cap=1)
         port = server.server_port
 
+        # Exhaust the single permit -> next request overflows immediately.
+        server.semaphore.acquire()
+
         try:
-            results = []
+            start = time.monotonic()
+            with httpx.Client() as client:
+                response = client.get(f"http://127.0.0.1:{port}/slow")
+            elapsed_ms = (time.monotonic() - start) * 1000
 
-            def make_request() -> tuple[int, int]:
-                with httpx.Client() as client:
-                    response = client.get(f"http://127.0.0.1:{port}/slow")
-                return response.status_code, int(time.time() * 1000)
-
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = [executor.submit(make_request) for _ in range(2)]
-                results = [f.result() for f in futures]
-
-            # One should succeed, one should get 429
-            statuses = [r[0] for r in results]
-            assert 200 in statuses
-            assert 429 in statuses
+            assert response.status_code == 429
+            # 429 must be prompt, never wait for delay_ms
+            assert elapsed_ms < delay_ms
         finally:
+            server.semaphore.release()
             server.shutdown()
 
 
@@ -363,12 +397,55 @@ class TestBodyParseSkipped:
             assert parse_skipped["stub"] == "echo"
             assert parse_skipped["method"] == "POST"
             assert parse_skipped["path"] == "/echo"
-            assert parse_skipped["reason"] == "non-JSON body; response has unresolved placeholders"
+            assert parse_skipped["reason"] == "body did not parse to a dict; response has unresolved placeholders"
 
             # Also verify http.hit was emitted
             hit_events = [e for e in event_sink if e["event"] == "http.hit"]
             assert len(hit_events) == 1
             assert hit_events[0]["stub"] == "echo"
+        finally:
+            server.shutdown()
+
+    def test_body_parse_skipped_on_list_body(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """A JSON body that parses to a list (not dict) -> body_parse_skipped.
+
+        A list/scalar body parses but exposes no capturable keys, so a
+        {placeholder} referencing a body field stays unresolved -- the broadened
+        condition (not a dict) must fire just like the non-JSON case.
+        """
+        stubs = {
+            "echo": HttpStub(
+                method="POST",
+                path="/echo",
+                response=HttpResponse(body="Item: {item}"),
+            )
+        }
+
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/echo",
+                    content=json.dumps(["a", "b"]),
+                    headers={"Content-Type": "application/json"},
+                )
+
+            assert response.status_code == 200
+            # Placeholder unresolved: list body has no capturable keys
+            assert response.text == "Item: {item}"
+
+            parse_skipped = [
+                e for e in event_sink if e["event"] == "http.body_parse_skipped"
+            ]
+            assert len(parse_skipped) == 1
+            assert parse_skipped[0]["stub"] == "echo"
+
+            hit_events = [e for e in event_sink if e["event"] == "http.hit"]
+            assert len(hit_events) == 1
         finally:
             server.shutdown()
 
@@ -423,6 +500,32 @@ class TestContentTypeDefault:
             assert response.status_code == 200
             assert response.headers["content-type"] == "text/plain"
             assert response.text == "plain text"
+        finally:
+            server.shutdown()
+
+    def test_none_body_is_empty(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """An unset (None) response.body yields an empty body, not the text "None"."""
+        stubs = {
+            "empty": HttpStub(
+                method="GET",
+                path="/empty",
+                response=HttpResponse(),  # body defaults to None
+            )
+        }
+
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+
+        try:
+            with httpx.Client() as client:
+                response = client.get(f"http://127.0.0.1:{port}/empty")
+
+            assert response.status_code == 200
+            assert response.content == b""
+            assert response.headers["content-length"] == "0"
+            assert response.headers["content-type"] == "text/plain"
         finally:
             server.shutdown()
 

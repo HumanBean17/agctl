@@ -76,45 +76,67 @@ def make_handler(
         protocol_version = "HTTP/1.1"
 
         def _read_body(self) -> bytes:
-            """Read request body honoring Content-Length or Transfer-Encoding: chunked."""
-            # Check for Transfer-Encoding: chunked
+            """Read request body honoring Transfer-Encoding or Content-Length.
+
+            Transfer-Encoding: chunked takes precedence over Content-Length
+            (RFC 7230 §3.3.3): when both are present only the chunked body is
+            read (the prior code computed/returned ``body`` twice in that case).
+            """
             transfer_encoding = self.headers.get("Transfer-Encoding", "")
             if "chunked" in transfer_encoding.lower():
-                # Read all available data and de-chunk
-                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-                # For chunked, we need to read until we get the terminal chunk
-                # This is a simplification - stdlib doesn't give us raw access
-                # We'll read based on Content-Length if available
-                content_length = self.headers.get("Content-Length")
-                if content_length:
-                    body = self.rfile.read(int(content_length))
-                else:
-                    # Read until EOF (limited to avoid blocking)
-                    body = self.rfile.read(65536)
-                return _decode_chunked(body)
+                return self._read_chunked_body()
 
-            # Use Content-Length if present
             content_length = self.headers.get("Content-Length")
             if content_length:
                 return self.rfile.read(int(content_length))
 
             return b""
 
+        def _read_chunked_body(self) -> bytes:
+            """Read a Transfer-Encoding: chunked body without blocking.
+
+            Uses ``readline()`` for each hex chunk-size line and ``read(n)`` for
+            the chunk data + trailing CRLF, looping until the 0-size terminator.
+            This avoids the ``rfile.read(N)`` deadlock that blocks until N bytes
+            or EOF arrive — neither comes under HTTP/1.1 keep-alive, so the old
+            ``read(65536)`` hung the handler thread until the client timed out.
+            The raw chunked bytes are reassembled and handed to
+            :func:`_decode_chunked` (verified correct on well-formed input).
+            """
+            buf = bytearray()
+            while True:
+                size_line = self.rfile.readline()
+                if not size_line:  # connection closed mid-stream
+                    break
+                buf += size_line
+                try:
+                    chunk_size = int(size_line.strip(), 16)
+                except ValueError:
+                    break  # malformed chunk-size line
+                if chunk_size == 0:
+                    # Drain the trailer section + terminating blank line so a
+                    # subsequent keep-alive request on this connection aligns.
+                    while True:
+                        trailer = self.rfile.readline()
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                # Chunk data + the trailing CRLF that follows it
+                buf += self.rfile.read(chunk_size + 2)
+            return _decode_chunked(bytes(buf))
+
         def _parse_json_body(self, body: bytes) -> Any:
-            """Parse body as JSON; return None if not JSON."""
-            content_type = self.headers.get("Content-Type", "")
+            """Parse body as JSON; return None if empty or unparseable.
 
-            # Check if content-type indicates JSON
-            is_json_ct = "application/json" in content_type
-
+            Content-Type is intentionally ignored: a body is JSON iff it parses
+            as JSON, so stubs can match JSON sent without the header (and a
+            scalar/list body parses but yields no capturable keys).
+            """
             if not body:
                 return None
-
-            # Try to parse as JSON
             try:
                 return json.loads(body.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
-                # If content-type said JSON but parse failed, still return None
                 return None
 
         def _has_unresolved_placeholders(self, value: Any) -> bool:
@@ -130,23 +152,27 @@ def make_handler(
         def _send_json_response(
             self, status: int, body: Any, headers: dict[str, str] | None = None
         ) -> None:
-            """Send HTTP response with JSON body and Content-Length."""
+            """Send HTTP response; always emit Content-Length (HTTP/1.1 keep-alive).
+
+            Serialization: dict/list -> JSON bytes; ``None`` -> empty body (not
+            the literal ``"None"``); other scalars -> ``str()`` utf-8. Content-Type
+            defaults to application/json for dict/list and text/plain otherwise,
+            unless the caller supplies an explicit Content-Type.
+            """
             response_headers = (headers or {}).copy()
 
-            # Default Content-Type based on body type
-            if "content-type" not in {k.lower() for k in response_headers}:
-                if isinstance(body, (dict, list)):
-                    response_headers["Content-Type"] = "application/json"
-                    body_bytes = json.dumps(body).encode("utf-8")
-                else:
-                    response_headers["Content-Type"] = "text/plain"
-                    body_bytes = str(body).encode("utf-8")
+            if isinstance(body, (dict, list)):
+                body_bytes = json.dumps(body).encode("utf-8")
+                default_ct = "application/json"
+            elif body is None:
+                body_bytes = b""
+                default_ct = "text/plain"
             else:
-                # Use explicit Content-Type
-                if isinstance(body, (dict, list)):
-                    body_bytes = json.dumps(body).encode("utf-8")
-                else:
-                    body_bytes = str(body).encode("utf-8")
+                body_bytes = str(body).encode("utf-8")
+                default_ct = "text/plain"
+
+            if "content-type" not in {k.lower() for k in response_headers}:
+                response_headers["Content-Type"] = default_ct
 
             # Always send Content-Length (required for HTTP/1.1 keep-alive)
             response_headers["Content-Length"] = str(len(body_bytes))
@@ -211,13 +237,9 @@ def make_handler(
                 captures = path_captures.copy()
                 break
 
-            # Step 4: Build capture context
-            if isinstance(parsed_body, dict):
-                # Merge top-level body keys via str(v) stringification
-                for key, value in parsed_body.items():
-                    captures[key] = str(value)
-
-            # Step 5: No match -> 404
+            # Step 4: No match -> 404. The capture-context build is skipped on
+            # this path: it is only needed for a matched stub, so building it
+            # here would be wasted work whose result is immediately discarded.
             if matched_stub is None:
                 self._send_json_response(
                     404,
@@ -234,9 +256,15 @@ def make_handler(
                 )
                 return
 
-            # Step 6: React
+            # Step 5: Build capture context for the matched stub only.
+            # Path params are already in `captures`; merge top-level body keys
+            # when the body parsed to a dict (str(v) stringification).
             stub_name, stub = matched_stub
+            if isinstance(parsed_body, dict):
+                for key, value in parsed_body.items():
+                    captures[key] = str(value)
 
+            # Step 6: React
             # Render response via fill_placeholders
             rendered_body = fill_placeholders(stub.response.body, captures)
             rendered_headers = (
@@ -245,8 +273,12 @@ def make_handler(
                 else {}
             )
 
-            # Check for body_parse_skipped condition (AFTER substitution)
-            if parsed_body is None and self._has_unresolved_placeholders(
+            # Emit body_parse_skipped when the body did not parse to a dict
+            # (None, list, or scalar) AND a {placeholder} referencing a body
+            # field remains unresolved in the rendered response. A list/scalar
+            # body parses but exposes no capturable keys, so such placeholders
+            # stay unresolved just like a non-JSON body.
+            if not isinstance(parsed_body, dict) and self._has_unresolved_placeholders(
                 rendered_body
             ):
                 emit_event(
@@ -255,7 +287,7 @@ def make_handler(
                         "stub": stub_name,
                         "method": self.command,
                         "path": self.path,
-                        "reason": "non-JSON body; response has unresolved placeholders",
+                        "reason": "body did not parse to a dict; response has unresolved placeholders",
                     }
                 )
 
