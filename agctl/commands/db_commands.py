@@ -20,7 +20,7 @@ from ..command import envelope, load_config_or_raise
 from ..errors import AssertionFailure, ConfigError, TemplateNotFound
 from ..params import parse_params
 
-__all__ = ["db_query", "db_assert", "new_db_client", "resolve_db_request"]
+__all__ = ["db_query", "db_assert", "db_execute", "new_db_client", "resolve_db_request"]
 
 
 def new_db_client(connection_obj: Any):
@@ -108,6 +108,29 @@ def _execute(cfg, sql_text: str, params: dict, conn_name: str):
     finally:
         client.close()
     return rows
+
+
+def _check_template_mode(cfg, template_name: str | None, forbidden: str) -> None:
+    """Check if a template's mode is forbidden.
+
+    If ``template_name`` is not None and the template's ``mode`` equals
+    ``forbidden``, raise :class:`ConfigError`. This is a shared helper for
+    commands that need to reject read-mode or write-mode templates.
+    """
+    if template_name is None:
+        return
+    if template_name not in cfg.database.templates:
+        # This should already be caught by resolve_db_request, but defensive
+        raise ConfigError(
+            f"Unknown database template: {template_name}",
+            {"path": f"database.templates.{template_name}"},
+        )
+    template = cfg.database.templates[template_name]
+    if template.mode == forbidden:
+        raise ConfigError(
+            f"Template '{template_name}' has mode '{forbidden}', which is not allowed for this operation",
+            {"template": template_name, "mode": forbidden},
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -327,3 +350,88 @@ def db_assert(
 
 
 _db_assert_envelope = envelope("db.assert")(_db_assert_core)
+
+
+# --------------------------------------------------------------------------- #
+# db execute
+# --------------------------------------------------------------------------- #
+
+
+def _db_execute_core(
+    config_path: str | None,
+    template: str | None,
+    sql: str | None,
+    param: tuple[str, ...],
+    connection: str | None,
+    write: bool,
+) -> dict:
+    # Step 1: Load config
+    cfg = load_config_or_raise(config_path)
+
+    # Step 2: Resolve SQL, params, and connection (enforces template XOR sql,
+    # neither-given, unknown template, unknown connection)
+    sql_text, params, conn_name = resolve_db_request(
+        cfg,
+        template=template,
+        sql=sql,
+        param_tuple=param,
+        connection_name=connection,
+    )
+
+    # Step 3: Explicit-target rule (refuse implicit write to default)
+    if template is None and connection is None:
+        raise ConfigError(
+            "db execute requires --template or --connection to name the write target; refusing to write to the default connection implicitly (explicit target required)",
+            {},
+        )
+
+    # Step 4: Invocation gate (--write is required)
+    if not write:
+        raise ConfigError(
+            "db execute requires --write flag to confirm write intent",
+            {},
+        )
+
+    # Step 5: Mode check (reject read-mode templates)
+    _check_template_mode(cfg, template, forbidden="read")
+
+    # Step 6: Connection gate (reject non-writable connections)
+    if not cfg.database.connections[conn_name].writable:
+        raise ConfigError(
+            f"Connection '{conn_name}' is not writable (writable=false)",
+            {"connection": conn_name},
+        )
+
+    # Step 7: Execute the write
+    client = new_db_client(cfg.database.connections[conn_name])
+    try:
+        client.connect()
+        result = client.execute_write(sql_text, params)
+    finally:
+        client.close()
+
+    # Return result with connection and sql for echo/debug
+    return {**result, "connection": conn_name, "sql": sql_text}
+
+
+@click.command("execute")
+@click.option("--template", "template", default=None, help="Named DB template")
+@click.option("--sql", "sql", default=None, help="Free-form SQL text")
+@click.option("--param", "param", multiple=True, help="k=v query parameter")
+@click.option("--connection", "connection", default=None, help="Connection name override")
+@click.option("--write", "write", is_flag=True, default=False, help="Confirm write intent")
+@click.pass_context
+def db_execute(
+    ctx: click.Context,
+    template: str | None,
+    sql: str | None,
+    param: tuple[str, ...],
+    connection: str | None,
+    write: bool,
+) -> None:
+    """Execute a write SQL statement and return affected row count."""
+    config_path = ctx.obj.get("config_path") if ctx.obj else None
+    _db_execute_envelope(config_path, template, sql, param, connection, write)
+
+
+_db_execute_envelope = envelope("db.execute")(_db_execute_core)

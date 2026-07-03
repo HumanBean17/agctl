@@ -56,7 +56,7 @@ def test_summary_counts_and_hint(monkeypatch):
     assert counts["services"] == 2
     assert counts["http_templates"] == 4
     assert counts["kafka_patterns"] == 2
-    assert counts["db_templates"] == 3
+    assert counts["db_templates"] == 4
     assert "hint" in counts
 
 
@@ -97,7 +97,7 @@ def test_category_db_templates(monkeypatch):
     assert result.exit_code == 0
     payload = _payload(result)
     res = payload["result"]
-    assert res["count"] == 3
+    assert res["count"] == 4
     # Listing is name + description only — no sql/params.
     for item in res["items"]:
         assert set(item.keys()) == {"name", "description"}
