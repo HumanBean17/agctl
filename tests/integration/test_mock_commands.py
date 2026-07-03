@@ -391,10 +391,24 @@ class TestMockRunHTTP:
             # Check exit code
             assert proc.returncode == 0
 
-            # Verify response
-            # Note: The stub might not match due to chunked encoding body parsing limitations
-            # so we accept both 200 (matched) and 404 (unmatched)
-            assert response.status_code in [200, 404]
+            # Verify response - chunked POST should match the stub and return 200
+            assert response.status_code == 200, f"Expected 200, got {response.status_code}"
+            response_body = response.json()
+            assert response_body["uploaded"] is True
+            assert "size" in response_body
+
+            # Parse NDJSON events from stdout lines
+            events = []
+            for line in lines:
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+            # Verify http.hit event for the upload path
+            hit_events = [e for e in events if e.get("event") == "http.hit"]
+            upload_hits = [e for e in hit_events if "/upload" in e.get("path", "")]
+            assert len(upload_hits) >= 1, "Expected http.hit event for /upload path"
 
         except Exception as e:
             proc.terminate()
@@ -433,12 +447,11 @@ class TestMockRunKafka:
         events_topic = f"orders.events.{test_id}"
 
         # Create temp config with reactor
-        config_content = _build_config({
+        # Build the config inline to ensure testcontainers broker is used
+        config_content = json.dumps({
+            "version": "1.0",
             "kafka": {
-                "brokers": [broker]
-            },
-            "http": None,
-            "kafka": {
+                "brokers": [broker],
                 "reactors": {
                     "order-processor": {
                         "description": "Process order commands",

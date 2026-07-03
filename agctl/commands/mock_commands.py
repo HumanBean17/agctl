@@ -192,11 +192,12 @@ def mock_run(
         )
         raise SystemExit(2)
 
-    # Run the engine (blocks until stop)
-    code = engine.run()
-
-    # Shutdown to emit summary line
-    engine.shutdown()
+    # Run the engine (blocks until stop); ensure shutdown always runs
+    try:
+        code = engine.run()
+    finally:
+        # Shutdown to emit summary line (runs even if run() raises)
+        engine.shutdown()
 
     # Exit with the engine's exit code
     raise SystemExit(code)

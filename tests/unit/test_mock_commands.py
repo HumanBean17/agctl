@@ -73,6 +73,7 @@ mocks:
             # Verify engine lifecycle
             fake_engine.start.assert_called_once()
             fake_engine.run.assert_called_once()
+            fake_engine.shutdown.assert_called_once()
 
     def test_only_kafka_with_reactors(self, temp_config, fake_engine):
         """--only kafka with reactors + kafka.brokers -> run_kafka=True, kafka_client is KafkaClient."""
@@ -170,6 +171,11 @@ kafka:
             call_kwargs = mock_factory.call_args.kwargs
             assert call_kwargs["run_http"] is False
             assert call_kwargs["run_kafka"] is False
+
+            # Verify engine lifecycle
+            fake_engine.start.assert_called_once()
+            fake_engine.run.assert_called_once()
+            fake_engine.shutdown.assert_called_once()
 
     def test_kafka_reactors_without_brokers(self, temp_config):
         """mocks.kafka reactors present but no kafka.brokers -> exit 2, ConfigError envelope."""
