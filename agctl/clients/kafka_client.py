@@ -353,21 +353,10 @@ class KafkaClient:
         try:
             consumer.subscribe([topic], on_assign=on_assign, on_revoke=on_revoke)
 
-            # Track consecutive None polls to exit when no more messages are available
-            # (test scenario: all messages consumed, stop_event never set)
-            none_count = 0
-            max_none_polls = 2  # Exit after 2 consecutive None polls
-
             while not stop_event.is_set():
                 msg = consumer.poll(poll_timeout)
                 if msg is None:
-                    none_count += 1
-                    if none_count >= max_none_polls:
-                        # No more messages available, exit loop
-                        break
                     continue
-                none_count = 0  # Reset on successful poll
-
                 if msg.error():
                     # Skip individual poll errors
                     continue
@@ -397,19 +386,18 @@ class KafkaClient:
                     )
                     try:
                         consumer.seek(tp)
-                        # Re-poll the same message for next retry attempt
-                        msg = consumer.poll(poll_timeout)
-                        if msg is None or msg.error():
-                            # If re-poll fails, break to avoid infinite loop
-                            break
                     except KafkaException as exc:
                         raise ConnectionFailure(message=str(exc)) from exc
 
-        except KafkaException as exc:
-            raise ConnectionFailure(message=str(exc)) from exc
-        except Exception as exc:
-            # Broker connection issues, etc.
-            raise ConnectionFailure(message=str(exc)) from exc
+                    # Check stop_event before re-poll (Fix 3)
+                    if stop_event.is_set():
+                        return
+
+                    # Re-poll the same message for next retry attempt
+                    msg = consumer.poll(poll_timeout)
+                    if msg is None or msg.error():
+                        # If re-poll fails, break to avoid infinite loop
+                        break
         finally:
             try:
                 consumer.close()

@@ -669,6 +669,9 @@ def test_consume_loop_commits_all_messages():
 
     def handle(msg, *, attempt, final):
         handle_calls.append((msg["key"], attempt, final))
+        # Set stop_event after both messages are processed
+        if len(handle_calls) >= 2:
+            stop_event.set()
         return ReactionResult.COMMIT
 
     client.consume_loop(
@@ -715,6 +718,10 @@ def test_consume_loop_retries_then_commits():
         # Only retry the first message (k1), second message (k2) commits immediately
         if key == "k1" and attempt < 3:
             return ReactionResult.RETRY
+        # Set stop_event after both messages are fully processed
+        # (k1 gets 3 attempts, k2 gets 1 = 4 total handle calls)
+        if len(handle_calls) >= 4:
+            stop_event.set()
         return ReactionResult.COMMIT
 
     client.consume_loop(
@@ -759,6 +766,9 @@ def test_consume_loop_retry_on_final_treated_as_commit():
 
     def handle(msg, *, attempt, final):
         handle_calls.append((msg["key"], attempt, final))
+        # Set stop_event after both attempts (final attempt forced commit)
+        if len(handle_calls) >= 2:
+            stop_event.set()
         return ReactionResult.RETRY  # Even on final!
 
     client.consume_loop(
@@ -774,8 +784,9 @@ def test_consume_loop_retry_on_final_treated_as_commit():
     assert len(handle_calls) == 2
     assert handle_calls[0] == ("k1", 1, False)
     assert handle_calls[1] == ("k1", 2, True)
-    # Message was committed despite RETRY on final
+    # Message was committed despite RETRY on final (Fix 4: also assert store_offset)
     assert len(consumer.commit_calls) == 1
+    assert len(consumer.store_offset_calls) == 1  # Fix 4: assert store_offset was called
     assert consumer.closed is True
 
 
@@ -874,6 +885,8 @@ def test_consume_loop_uses_group_id_parameter():
     stop_event = threading.Event()
 
     def handle(msg, *, attempt, final):
+        # Set stop_event after first message
+        stop_event.set()
         return ReactionResult.COMMIT
 
     client.consume_loop(
