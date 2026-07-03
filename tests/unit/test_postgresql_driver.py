@@ -15,9 +15,10 @@ from agctl.errors import ConfigError, ConnectionFailure
 # --- Test seams -----------------------------------------------------------
 
 class FakeCursor:
-    def __init__(self, description, rows):
+    def __init__(self, description, rows, rowcount=1):
         self.description = description  # sequence of objects with .name
         self._rows = rows
+        self.rowcount = rowcount  # for write operations
         self.last_sql = None
         self.last_params = None
 
@@ -36,12 +37,20 @@ class FakeConn:
     def __init__(self, cursor):
         self._cursor = cursor
         self.closed = False
+        self.commit_called = False
+        self.rollback_called = False
 
     def cursor(self):
         return self._cursor
 
     def close(self):
         self.closed = True
+
+    def commit(self):
+        self.commit_called = True
+
+    def rollback(self):
+        self.rollback_called = True
 
 
 def _col(name):
@@ -181,3 +190,140 @@ def test_protocol_is_satisfied_by_postgresql_driver():
     assert hasattr(driver, "close")
     # DBDriver protocol is importable and usable.
     assert DBDriver is not None
+
+
+# --- execute_write() tests ---------------------------------------------------
+
+
+def test_execute_write_insert_with_returning_returns_rows_affected_and_returning_rows():
+    """Test 1: INSERT with RETURNING (rowcount==1, description present)."""
+    cols = [_col("id"), _col("status")]
+    rows = [(1, "pending")]
+    cur = FakeCursor(description=cols, rows=rows, rowcount=1)
+    conn = FakeConn(cur)
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.execute_write(
+        "INSERT INTO orders (total) VALUES (100) RETURNING id, status", {}
+    )
+
+    assert result == {"rows_affected": 1, "returning": [{"id": 1, "status": "pending"}]}
+    assert conn.commit_called is True
+    assert conn.rollback_called is False
+    assert cur.last_sql == "INSERT INTO orders (total) VALUES (100) RETURNING id, status"
+
+
+def test_execute_write_plain_write_no_returning():
+    """Test 2: Plain write no RETURNING (rowcount==3, description is None)."""
+    cur = FakeCursor(description=None, rows=[], rowcount=3)
+    conn = FakeConn(cur)
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.execute_write("UPDATE orders SET status = :status", {"status": "shipped"})
+
+    assert result == {"rows_affected": 3, "returning": []}
+    assert conn.commit_called is True
+    assert conn.rollback_called is False
+    assert cur.last_sql == "UPDATE orders SET status = %(status)s"
+    assert cur.last_params == {"status": "shipped"}
+
+
+def test_execute_write_no_count_statement_ddl():
+    """Test 3: No-count statement / DDL (rowcount==-1, description is None)."""
+    cur = FakeCursor(description=None, rows=[], rowcount=-1)
+    conn = FakeConn(cur)
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.execute_write("CREATE TABLE foo (id INT)", {})
+
+    assert result == {"rows_affected": None, "returning": []}
+    assert conn.commit_called is True
+    assert conn.rollback_called is False
+
+
+def test_execute_write_zero_affected_with_returning():
+    """Test 4: 0-affected (rowcount==0, description present)."""
+    cols = [_col("id")]
+    rows = []
+    cur = FakeCursor(description=cols, rows=rows, rowcount=0)
+    conn = FakeConn(cur)
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.execute_write(
+        "UPDATE orders SET status = 'shipped' WHERE id = :id RETURNING id", {"id": 999}
+    )
+
+    assert result == {"rows_affected": 0, "returning": []}
+    assert conn.commit_called is True
+    assert conn.rollback_called is False
+
+
+def test_execute_write_rollback_on_coercion_error():
+    """Test 5: Coercion-error ordering guarantee (non-psycopg exception)."""
+    cols = [_col("id")]
+
+    class BrokenCursor:
+        def __init__(self):
+            self.description = cols
+            self.rowcount = 1
+            self.last_sql = None
+            self.last_params = None
+
+        def execute(self, sql, params):
+            self.last_sql = sql
+            self.last_params = params
+
+        def fetchall(self):
+            raise RuntimeError("Coercion/materialization failure")
+
+        def close(self):
+            pass
+
+    cur = BrokenCursor()
+    conn = FakeConn(cur)
+    driver = PostgreSQLDriver(connectable=conn)
+
+    with pytest.raises(ConnectionFailure) as exc_info:
+        driver.execute_write("INSERT INTO orders VALUES (1) RETURNING id", {})
+
+    assert "Coercion/materialization failure" in str(exc_info.value)
+    assert conn.rollback_called is True
+    assert conn.commit_called is False
+
+
+def test_execute_write_rollback_on_execute_error():
+    """Test 6: Execute-error path (psycopg.Error)."""
+    import psycopg
+
+    class ErrorCursor:
+        def __init__(self):
+            self.description = None
+            self.rowcount = -1
+
+        def execute(self, sql, params):
+            raise psycopg.Error("Connection lost")
+
+        def close(self):
+            pass
+
+    cur = ErrorCursor()
+    conn = FakeConn(cur)
+    driver = PostgreSQLDriver(connectable=conn)
+
+    with pytest.raises(ConnectionFailure) as exc_info:
+        driver.execute_write("UPDATE orders SET status = 'shipped'", {})
+
+    assert "Connection lost" in str(exc_info.value)
+    assert conn.rollback_called is True
+    assert conn.commit_called is False
+
+
+def test_execute_write_does_not_close_injected_connection():
+    """Test 7: Injected connectable still not closed after a write."""
+    cur = FakeCursor(description=None, rows=[], rowcount=1)
+    conn = FakeConn(cur)
+    driver = PostgreSQLDriver(connectable=conn)
+
+    driver.execute_write("UPDATE orders SET status = 'shipped'", {})
+
+    assert conn.closed is False
