@@ -128,6 +128,17 @@ database:
       password: "${DB_PASSWORD}"
       default: true                               # used when --connection is omitted
 
+    main-db-writable:
+      # In production, use a separate least-privilege write-capable account
+      # (e.g., ${DB_WRITE_USER}/${DB_WRITE_PASSWORD}) per spec §3.
+      type: postgresql
+      host: "${DB_HOST}"
+      port: 5432
+      dbname: "${DB_NAME}"
+      user: "${DB_WRITE_USER:-${DB_USER}}"
+      password: "${DB_WRITE_PASSWORD:-${DB_PASSWORD}}"
+      writable: true                              # required for `agctl db execute --write`
+
     analytics-db:
       type: postgresql
       host: "${ANALYTICS_DB_HOST}"
@@ -138,6 +149,8 @@ database:
 
   # templates — named SQL queries. `connection` is optional (falls back to
   # defaults.database_connection). `sql` uses :paramName named params (JDBC-style).
+  # `mode` is optional; defaults to "read". Set `mode: write` for templates used
+  # with `agctl db execute --write` (write templates are rejected by `db query`/`db assert`).
   templates:
     find-order:
       description: "Fetch a single order by ID"
@@ -153,6 +166,12 @@ database:
       description: "Count failed payments after a given timestamp"
       connection: main-db
       sql: "SELECT COUNT(*) AS cnt FROM payments WHERE status = 'FAILED' AND created_at > :since"
+
+    insert-order:
+      description: "Create a new order (idempotent via ON CONFLICT)"
+      connection: main-db-writable
+      mode: write
+      sql: "INSERT INTO orders (id, customer_id, status) VALUES (:orderId, :customerId, 'PENDING') ON CONFLICT (id) DO NOTHING RETURNING *"
 
 # ---------------------------------------------------------------------------
 # templates — named HTTP request templates.
@@ -574,6 +593,47 @@ agctl db assert \
 
 **Value coercion (`--equals`):** The argument is parsed as JSON when it is valid JSON (`"0"` → number 0, `"true"` → bool, `"null"` → null, `"[1,2]"` → array); otherwise it is treated as a plain string (e.g. `CONFIRMED`). The DB result value is coerced to a JSON-native type before comparison — numbers → number, booleans → bool, timestamps/dates → ISO 8601 string, null → null. Comparison is strict and type-aware: a number never equals a string (`0` ≠ `"0"`). To match a timestamp column, write `--equals "2026-06-29T14:22:00Z"`.
 
+#### `agctl db execute`
+
+Execute a write SQL statement (INSERT/UPDATE/DELETE) and return the affected row count. This command has **two safety gates** to prevent accidental writes:
+
+```
+agctl db execute
+    [--template <name>]         # named template from database.templates (must have mode: write)
+    [--sql "INSERT ..."]        # free-form SQL; mutually exclusive with --template
+    [--param key=value]         # repeatable; fills :paramName named params (templates and SQL)
+    [--connection <name>]       # required when using --sql; when using --template, the template's
+                                #   connection is used if specified, otherwise defaults.database_connection
+    --write                     # required flag to confirm write intent
+```
+
+**Explicit-target rule:** `db execute` refuses to write to the default connection implicitly. You must pass either `--template <name>` (which specifies a connection) or `--connection <name>` to explicitly name the write target. This prevents accidental writes when you forget which connection is default.
+
+**Connection gate:** The target connection must have `writable: true` in config (validated by `agctl config validate`).
+
+**Invocation gate:** The `--write` flag is required. A no-op call without `--write` fails with `ConfigError` (exit 2).
+
+**Mode checking:** A template with `mode: read` is rejected by `db execute` (`ConfigError`, exit 2). Write templates should set `mode: write` to document intent and prevent accidental use in `db query`/`db assert`.
+
+**Examples:**
+
+```bash
+# Using a write template (recommended)
+agctl db execute --template insert-order \
+  --param orderId=ord-789 \
+  --param customerId=cust-42 \
+  --write
+
+# Free-form SQL with explicit connection
+agctl db execute \
+  --sql "UPDATE orders SET status = 'CANCELLED' WHERE id = :orderId" \
+  --param orderId=ord-789 \
+  --connection main-db-writable \
+  --write
+```
+
+**Idempotency:** `db execute` does NOT enforce idempotency. If you need repeatable writes (e.g., for flaky-test resilience), encode idempotency in the SQL using `ON CONFLICT` (PostgreSQL) or `ON DUPLICATE KEY UPDATE` (MySQL). Consider using `RETURNING` clauses to return inserted/updated rows for verification.
+
 ---
 
 ### 3.4 `agctl check` — Service Health
@@ -970,6 +1030,21 @@ Every invocation writes exactly one JSON object to stdout (the sole exception is
   "connection": "main-db"
 }
 ```
+
+#### `db.execute`
+
+```json
+{
+  "rows_affected": 1,
+  "returning": [
+    {"id": "ord-789", "status": "PENDING", "created_at": "2026-07-03T12:34:56Z"}
+  ],
+  "connection": "main-db",
+  "sql": "INSERT INTO orders (id, customer_id, status) VALUES (:orderId, :customerId, 'PENDING') ON CONFLICT (id) DO NOTHING RETURNING *"
+}
+```
+
+`rows_affected` is an integer count or `null` (for statements like DDL that don't report a row count). `returning` is a list of dict rows when the SQL includes a `RETURNING` clause, otherwise an empty array `[]`.
 
 #### `check.ready`
 

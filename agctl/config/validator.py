@@ -46,6 +46,21 @@ def validate_config(cfg: Config) -> tuple[list[dict], list[dict]]:
                     "message": f"Template references unknown connection '{tpl.connection}'",
                 }
             )
+        # Write-mode templates must target a writable connection.
+        if tpl.mode == "write":
+            # Resolve connection name: template's connection or default.
+            resolved_connection = tpl.connection or cfg.defaults.database_connection
+            if (
+                resolved_connection is None
+                or resolved_connection not in cfg.database.connections
+                or not cfg.database.connections[resolved_connection].writable
+            ):
+                errors.append(
+                    {
+                        "path": f"database.templates.{name}",
+                        "message": f"Write template '{name}' must target a writable connection",
+                    }
+                )
         if _missing_description(tpl.description):
             warnings.append(
                 {

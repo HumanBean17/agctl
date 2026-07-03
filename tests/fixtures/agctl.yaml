@@ -49,6 +49,18 @@ database:
       password: "${DB_PASSWORD}"
       default: true
 
+    main-db-writable:
+      # In production, this should point at a separate least-privilege write-capable account
+      # (e.g., ${DB_WRITE_USER}/${DB_WRITE_PASSWORD}). The test fixture reuses the shared
+      # testcontainer superuser because a testcontainer exposes a single superuser.
+      type: postgresql
+      host: "${DB_HOST}"
+      port: "${DB_PORT:-5432}"
+      dbname: "${DB_NAME}"
+      user: "${DB_USER}"
+      password: "${DB_PASSWORD}"
+      writable: true
+
     analytics-db:
       type: postgresql
       host: "${ANALYTICS_DB_HOST}"
@@ -72,6 +84,12 @@ database:
       description: "Count failed payments after a given timestamp"
       connection: main-db
       sql: "SELECT COUNT(*) AS cnt FROM payments WHERE status = 'FAILED' AND created_at > :since"
+
+    seed-order:
+      description: "Insert or ignore an order in the seed table"
+      mode: write
+      connection: main-db-writable
+      sql: "INSERT INTO agctl_seed (id, status) VALUES (:orderId, :status) ON CONFLICT (id) DO NOTHING RETURNING id, status"
 
 templates:
   create-order:

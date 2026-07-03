@@ -15,7 +15,13 @@ reconstruction from an underscored env name is not guaranteed — DESIGN §5).
 import copy
 from typing import Any
 
+from ..errors import ConfigError
+
 _PREFIX = "AGCTL_"
+
+# Leaf names that cannot be set via AGCTL_* env overrides (security:
+# writability must be declared in the reviewed config file, not flipped via env).
+_DENIED_LEAF_NAMES = frozenset({"writable", "mode"})
 
 
 def apply_env_overrides(data: dict[str, Any], env: dict[str, str]) -> dict[str, Any]:
@@ -80,5 +86,12 @@ def _deep_set(data: dict[str, Any], path: list[str], value: str) -> None:
             cur[key] = nxt
         cur = nxt
     last = path[-1]
+    # Security: denylist for leaf names that must be set in config file only
+    if last in _DENIED_LEAF_NAMES:
+        raise ConfigError(
+            f"Field '{last}' cannot be set via AGCTL_* environment override. "
+            f"Set it in agctl.yaml instead.",
+            detail={"field": last},
+        )
     key = _match_key(cur, last)
     cur[key if key is not None else last.lower()] = value

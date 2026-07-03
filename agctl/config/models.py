@@ -1,6 +1,6 @@
 """Pydantic v2 schema models for agctl.yaml (DESIGN §2)."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -73,12 +73,14 @@ class DatabaseConnection(BaseModel):
     user: str | None = None
     password: str | None = None
     default: bool = False
+    writable: bool = False
 
 
 class DatabaseTemplate(BaseModel):
     description: str | None = None
     connection: str | None = None
     sql: str
+    mode: Literal["read", "write"] = "read"
 
 
 class DatabaseConfig(BaseModel):

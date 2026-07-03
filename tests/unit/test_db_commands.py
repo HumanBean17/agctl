@@ -39,9 +39,11 @@ class FakeDriver:
     would dispatch.
     """
 
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, write_result=None):
         self.rows = rows if rows is not None else []
+        self.write_result = write_result if write_result is not None else {"rows_affected": 1, "returning": [{"id": "o1", "status": "PENDING"}]}
         self.executed = []
+        self.executed_write = []
         self.connected = False
         self.closed = False
 
@@ -53,16 +55,21 @@ class FakeDriver:
         self.executed.append((rewrite, params))
         return list(self.rows)
 
+    def execute_write(self, sql, params):
+        rewrite = convert_sql_params(sql)
+        self.executed_write.append((rewrite, params))
+        return self.write_result
+
     def close(self):
         self.closed = True
 
 
 @pytest.fixture
 def install_fake(monkeypatch):
-    """Return a factory: install_fake(rows=...) wires a FakeDriver-backed client."""
+    """Return a factory: install_fake(rows=..., write_result=...) wires a FakeDriver-backed client."""
 
-    def _install(rows):
-        fake = FakeDriver(rows=rows)
+    def _install(rows=None, write_result=None):
+        fake = FakeDriver(rows=rows, write_result=write_result)
 
         def factory(connection_obj):
             return DbClient(connection_obj, driver=fake)
@@ -565,3 +572,296 @@ def test_db_assert_assertion_mutually_exclusive_with_expect_rows(install_fake):
     assert result.exit_code == 2
     assert payload["error"]["type"] == "ConfigError"
     assert fake.executed == []  # mode validation fails fast before any query
+
+
+# --------------------------------------------------------------------------- #
+# db execute
+# --------------------------------------------------------------------------- #
+
+
+def test_db_execute_happy_path_template(install_fake):
+    """Happy path with template: seed-order write succeeds."""
+    fake = install_fake(write_result={"rows_affected": 1, "returning": [{"id": "o1", "status": "PENDING"}]})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "execute",
+            "--template", "seed-order",
+            "--param", "orderId=o1",
+            "--param", "status=PENDING",
+            "--write",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["command"] == "db.execute"
+    assert payload["ok"] is True
+    assert payload["result"]["rows_affected"] == 1
+    assert payload["result"]["returning"] == [{"id": "o1", "status": "PENDING"}]
+    assert payload["result"]["connection"] == "main-db-writable"
+    # The SQL in the result should have placeholders intact (:orderId, :status)
+    assert ":orderId" in payload["result"]["sql"]
+    assert ":status" in payload["result"]["sql"]
+    # The fake driver received the rewritten SQL (%(orderId)s, %(status)s) and params
+    assert len(fake.executed_write) == 1
+    recorded_sql, recorded_params = fake.executed_write[0]
+    assert "%(orderId)s" in recorded_sql
+    assert "%(status)s" in recorded_sql
+    assert ":orderId" not in recorded_sql
+    assert ":status" not in recorded_sql
+    assert recorded_params == {"orderId": "o1", "status": "PENDING"}
+
+
+def test_db_execute_happy_path_freeform_with_explicit_connection(install_fake):
+    """Happy path with free-form SQL and explicit connection."""
+    fake = install_fake(write_result={"rows_affected": 1, "returning": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "execute",
+            "--connection", "main-db-writable",
+            "--sql", "DELETE FROM t WHERE id = :i",
+            "--param", "i=9",
+            "--write",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["command"] == "db.execute"
+    assert payload["ok"] is True
+    assert payload["result"]["connection"] == "main-db-writable"
+
+
+def test_db_execute_zero_affected_success(install_fake):
+    """0 rows affected is still a successful write (no-op)."""
+    fake = install_fake(write_result={"rows_affected": 0, "returning": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "execute",
+            "--template", "seed-order",
+            "--param", "orderId=o1",
+            "--param", "status=PENDING",
+            "--write",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    assert payload["result"]["rows_affected"] == 0
+    assert payload["result"]["returning"] == []
+
+
+def test_db_execute_missing_write_flag_fails_fast(install_fake):
+    """Missing --write flag fails fast without touching the DB."""
+    fake = install_fake(write_result={"rows_affected": 1, "returning": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "execute",
+            "--template", "seed-order",
+            "--param", "orderId=o1",
+            "--param", "status=PENDING",
+            # Missing --write flag
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    # Fail-fast: execute_write was never called
+    assert fake.executed_write == []
+
+
+def test_db_execute_connection_gate_non_writable(install_fake):
+    """Connection gate: main-db is read-only, so execute is rejected."""
+    fake = install_fake(write_result={"rows_affected": 1, "returning": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "execute",
+            "--connection", "main-db",
+            "--sql", "DELETE FROM t",
+            "--write",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    # Fail-fast: execute_write was never called
+    assert fake.executed_write == []
+
+
+def test_db_execute_explicit_target_rule_refuses_implicit_write(install_fake):
+    """Explicit-target rule: refuse to write to default connection implicitly."""
+    fake = install_fake(write_result={"rows_affected": 1, "returning": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "execute",
+            "--sql", "DELETE FROM t",
+            "--write",
+            # No --template or --connection, should refuse to write to default
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert "explicit target" in payload["error"]["message"].lower()
+    # Fail-fast: execute_write was never called
+    assert fake.executed_write == []
+
+
+def test_db_execute_mode_check_rejects_read_template(install_fake):
+    """Mode check: read-mode template (find-order) is rejected for execute."""
+    fake = install_fake(write_result={"rows_affected": 1, "returning": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "execute",
+            "--template", "find-order",
+            "--write",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    # Fail-fast: execute_write was never called
+    assert fake.executed_write == []
+
+
+def test_db_execute_template_and_sql_mutually_exclusive(install_fake):
+    """Template and SQL are mutually exclusive (enforced by resolve_db_request)."""
+    fake = install_fake(write_result={"rows_affected": 1, "returning": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "execute",
+            "--template", "seed-order",
+            "--sql", "DELETE FROM t",
+            "--write",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    # Fail-fast: execute_write was never called
+    assert fake.executed_write == []
+
+
+def test_db_execute_bare_write_flag_needs_template_or_sql(install_fake):
+    """Bare --write flag without template or sql should fail (neither given)."""
+    fake = install_fake(write_result={"rows_affected": 1, "returning": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "execute",
+            "--write",
+            # No --template or --sql
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    # Fail-fast: execute_write was never called
+    assert fake.executed_write == []
+
+
+# --------------------------------------------------------------------------- #
+# Task 7: Read-side mode checks (db query / db assert refuse write-mode templates)
+# --------------------------------------------------------------------------- #
+
+
+def test_db_query_rejects_write_mode_template(install_fake):
+    """db query with write-mode template (seed-order) should raise ConfigError (exit 2)."""
+    fake = install_fake([{"id": "o1", "status": "PENDING"}])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "query",
+            "--template", "seed-order",
+            "--param", "orderId=o1",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert "mode 'write'" in payload["error"]["message"].lower()
+    # Fail-fast: execute was never called
+    assert fake.executed == []
+
+
+def test_db_assert_rejects_write_mode_template(install_fake):
+    """db assert with write-mode template (seed-order) should raise ConfigError (exit 2)."""
+    fake = install_fake([{"id": "o1", "status": "PENDING"}])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "assert",
+            "--template", "seed-order",
+            "--param", "orderId=o1",
+            "--expect-rows", "1",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert "mode 'write'" in payload["error"]["message"].lower()
+    # Fail-fast: execute was never called
+    assert fake.executed == []
+
+
+def test_db_query_read_mode_template_still_works(install_fake):
+    """Regression guard: db query with read-mode template (find-order) should still work."""
+    fake = install_fake([{"id": "o1", "status": "PENDING"}])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "query",
+            "--template", "find-order",
+            "--param", "orderId=o1",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    assert payload["result"]["row_count"] == 1
+    # The query should have executed
+    assert len(fake.executed) == 1
+
+
+def test_db_query_freeform_sql_still_works(install_fake):
+    """Regression guard: db query with free-form SQL should still work."""
+    fake = install_fake([{"x": 1}])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "query",
+            "--sql", "SELECT 1",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    # The query should have executed
+    assert len(fake.executed) == 1

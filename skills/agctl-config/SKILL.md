@@ -21,10 +21,11 @@ commands. Don't conflate them: `agctl` drives the CLI; `agctl-config` writes its
 | `http` | route / controller / OpenAPI doc | `templates:` (+ a `services:` entry if the service is new) |
 | `kafka` | producer / emitter / event class | `kafka.patterns:` |
 | `db` | SQL query / repo method | `database.templates:` (+ a `database.connections:` entry if new) |
+| `db` (write) | INSERT/UPDATE/DELETE / mutating repo method | `database.templates:` with `mode: write` (requires `writable: true` connection) |
 | `init` | the whole repo | a full `agctl.yaml` + `.env.example` |
 
 Then read the matching `reference/<mode>.md` in this skill's directory for extraction
-steps and stack snippets.
+steps and stack snippets. For write templates, see `reference/db-write-template.md`.
 
 ## Step 0 — locate the config (never guess)
 

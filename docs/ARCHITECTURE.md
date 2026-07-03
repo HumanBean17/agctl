@@ -114,7 +114,7 @@ agctl/
 ├── commands/                   # one module per command group
 │   ├── http_commands.py        # http call / request / ping
 │   ├── kafka_commands.py       # kafka produce / consume / assert
-│   ├── db_commands.py          # db query / assert
+│   ├── db_commands.py          # db query / assert / execute
 │   ├── check_commands.py       # check ready
 │   ├── config_commands.py      # config validate / show / init
 │   └── discover_commands.py    # discover summary / category / item / search
@@ -236,6 +236,11 @@ deep-merged with highest precedence. Two refinements beyond the spec:
   `order_service` sibling. No existing-key match → new key under the lowercased
   segment (write-oriented; hyphen reconstruction not guaranteed).
 
+**Resolver denylist** — certain config fields are excluded from env override to preserve safety-critical semantics. The following fields are denylisted and cannot be overridden via `AGCTL_*` env vars:
+
+- `database.connections.*.writable` — write safety gate must be set explicitly in config
+- `database.templates.*.mode` — read/write mode is a template authoring intent, not runtime config
+
 **Version guard** — major only, currently `"1"`; mismatch → `ConfigError`.
 
 **Typed validation** (`Config.model_validate`, `models.py`) — Pydantic v2 tree
@@ -319,6 +324,13 @@ timeout (`ConnectionFailure`, never a silent `null` success), zero or >1
 assertion mode on `db`/`kafka assert` (`ConfigError` before any network call),
 and a match-miss in `kafka assert` / `db assert` (`AssertionFailure`, exit 1).
 
+**`db execute` write-safety failures** — the command rejects writes at multiple
+gates, each surfacing as `ConfigError` (exit 2): missing `--write` flag, omitted
+explicit target (both `--template` and `--connection` absent), non-writable
+connection, or read-mode template. All fail before any database operation is
+attempted. Driver-level write errors (execute, rollback, commit failures) surface
+as `ConnectionFailure`.
+
 ---
 
 ## 8. Transport / Client Layer
@@ -383,6 +395,20 @@ skipped. The client delegates `connect`/`execute`/`close` and exposes DI seams
 does **not** own the connection and `close()` is a no-op. `execute` rewrites
 `:name`→`%(name)s` (protecting `::` casts), runs read-only (no commit), and runs
 each cell through `coerce_db_value` (§9).
+
+**Optional `execute_write` capability** — write support is an optional driver
+capability, not required by the `DBDriver` protocol. `DbClient.execute_write`
+probes the driver for a callable `execute_write` attribute and raises
+`ConfigError` if absent. `PostgreSQLDriver` implements this method; third-party
+drivers may omit it (read-only drivers remain valid).
+
+**Commit-after-materialize ordering** — `PostgreSQLDriver.execute_write`
+materializes `rows_affected` and `RETURNING` data *before* committing. The
+transaction commits only after all result data is successfully fetched and
+coerced. Any exception during execute, fetch, or coercion triggers a rollback
+and surfaces as `ConnectionFailure`. This guarantees that a reported success
+(`ok:true` with `rows_affected`) reflects a durable write, while a failure never
+leaves the transaction ambiguous.
 
 ---
 
@@ -453,7 +479,10 @@ and **skipped** — it never bricks the CLI, the registry, or driver discovery.
 
 - **DB drivers** — `DbClient` selects by `connection["type"]`; unknown →
   `ConfigError`. Built-in `postgresql` always wins over a registration gap.
-  Register in another package's `pyproject.toml`:
+  The `DBDriver` protocol requires `connect`/`execute`/`close`; `execute_write`
+  is optional. Drivers that only support read operations omit `execute_write`
+  — `DbClient.execute_write` probes for the method and raises `ConfigError` if
+  absent. Register in another package's `pyproject.toml`:
   ```toml
   [project.entry-points."agctl.db_drivers"]
   mysql = "agctl_mysql:MySQLDriver"

@@ -44,6 +44,7 @@ Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`.
 | Verify an event was published | `agctl kafka assert --topic T <mode> --timeout N` |
 | See what was published | `agctl kafka consume --topic T [--match <jq>]` |
 | Publish a message | `agctl kafka produce --topic T --message '{…}'` |
+| Execute a DB write | `agctl db execute (--template\|--sql) --write [--connection C]` |
 | Assert a DB row count | `agctl db assert (--template\|--sql) --expect-rows N` |
 | Assert a DB field value | `agctl db assert (…) --expect-value --path .x --equals v` |
 | Inspect raw DB state | `agctl db query (--template\|--sql)` |
@@ -65,8 +66,9 @@ agctl kafka assert [--topic T] <mode> [--param k=v]… [--path <jq>] --timeout N
 agctl kafka consume --topic T [--timeout N] [--match '<jq>'] [--expect-count N] [--from-beginning]
 agctl kafka produce --topic T --message '{…}' [--key K] [--header k=v]…
 
-agctl db query   (--template T | --sql "…") [--param k=v]… [--connection C]
-agctl db assert  (--template T | --sql "…") (--expect-rows N | --expect-value --path <jq> --equals V)
+agctl db query    (--template T | --sql "…") [--param k=v]… [--connection C]
+agctl db assert   (--template T | --sql "…") (--expect-rows N | --expect-value --path <jq> --equals V)
+agctl db execute  (--template T | --sql "…") [--param k=v]… [--connection C] --write
 
 agctl check ready [--service S | --all]
 agctl config validate | config show [--unmask]
@@ -106,6 +108,74 @@ agctl config validate | config show [--unmask]
 8. **No built-in "event did NOT arrive" assert.** `kafka consume --expect-count 0`
    is **not** it (it always exits 0). To check absence, run `kafka consume --topic
    T --timeout N [--match …]` and inspect `result.count` (0 = no match in window).
+9. **`db execute` requires two gates** — a `writable: true` connection AND the
+   `--write` flag. It also requires an explicit target (`--template` or
+   `--connection`), refusing to write to the default connection implicitly.
+
+## `db execute` — write operations
+
+`agctl db execute` runs INSERT/UPDATE/DELETE statements. It has **two safety gates**
+to prevent accidental writes:
+
+1. **Connection gate** — the connection must have `writable: true` in config
+   (caught by `agctl config validate`).
+2. **Invocation gate** — the `--write` flag is required (no-op flag is not enough).
+
+**Explicit-target rule:** `db execute` refuses to write to the default connection
+implicitly. You must pass `--template <name>` (which specifies a connection) or
+`--connection <name>` to name the write target. This prevents accidental writes
+when you forget which connection is default.
+
+**Result shape:**
+
+```json
+{
+  "ok": true,
+  "command": "db.execute",
+  "result": {
+    "rows_affected": 1,
+    "returning": [
+      {"id": "ord-789", "status": "PENDING", "created_at": "2026-07-03T12:34:56Z"}
+    ],
+    "connection": "main-db",
+    "sql": "INSERT INTO orders (id, customer_id, status) VALUES (:orderId, :customerId, 'PENDING') ON CONFLICT (id) DO NOTHING RETURNING *"
+  },
+  "duration_ms": 45
+}
+```
+
+- `rows_affected` — int or `null` (null for statements like DDL that don't report
+  a row count).
+- `returning` — list of dict rows when the SQL includes a `RETURNING` clause, else
+  `[]`.
+- `connection` — the connection name used (echoed for clarity).
+- `sql` — the SQL that was executed (echoed for debugging).
+
+**Mode checking:** A template with `mode: read` is rejected by `db execute`
+(ConfigError, exit 2). Write templates must set `mode: write` — see the
+`agctl-config` skill for authoring write templates.
+
+**Example:**
+
+```bash
+# Using a write template (recommended)
+agctl db execute --template insert-order \
+  --param orderId=ord-789 \
+  --param customerId=cust-42 \
+  --write
+
+# Free-form SQL with explicit connection
+agctl db execute \
+  --sql "UPDATE orders SET status = 'CANCELLED' WHERE id = :orderId" \
+  --param orderId=ord-789 \
+  --connection main-db-writable \
+  --write
+```
+
+**Idempotency:** `db execute` does NOT enforce idempotency. If you need repeatable
+writes (e.g., for flaky-test resilience), encode idempotency in the SQL using
+`ON CONFLICT` (PostgreSQL) or `ON DUPLICATE KEY UPDATE` (MySQL). The template
+author's job — see `agctl-config/reference/db-write-template.md`.
 
 ## Recipes
 
@@ -118,6 +188,9 @@ agctl kafka assert --topic orders.created --contains '{"customer_id":"cust-42"}'
 OID=$(agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001 | jq -r '.result.body.order_id')
 agctl kafka assert --topic orders.created --contains "{\"order_id\":\"$OID\"}" --timeout 10
 agctl db assert --sql "SELECT 1 FROM orders WHERE id = :order_id AND status = 'PENDING'" --param order_id="$OID" --expect-rows 1
+
+# Seed DB state before a test (idempotent write)
+agctl db execute --template upsert-customer --param customerId=cust-42 --param email=test@example.com --write
 
 # Keep a session alive during a long test (background it, capture PID, kill when done)
 agctl http ping heartbeat --interval 5 --until-stopped &

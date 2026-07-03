@@ -86,6 +86,56 @@ class PostgreSQLDriver:
             for row in rows
         ]
 
+    def execute_write(self, sql: str, params: dict) -> dict:
+        """Run a write query, returning rows affected and optional RETURNING data.
+
+        ``sql`` uses JDBC-style ``:name`` params; these are rewritten to psycopg
+        ``%(name)s`` form via :func:`convert_sql_params` before execution. Returns
+        ``{"rows_affected": int | None, "returning": list[dict]}`` where
+        ``rows_affected`` is ``None`` for statements that don't report a count
+        (e.g., DDL) and ``returning`` contains coerced dict rows when the query
+        includes a ``RETURNING`` clause. The transaction is committed after
+        result materialization; any exception during execute/fetch/coercion/commit
+        triggers a rollback and surfaces as :class:`ConnectionFailure`.
+        """
+        import psycopg
+
+        rewrite = convert_sql_params(sql)
+        cur = self._conn.cursor()
+        try:
+            # Execute the write query
+            cur.execute(rewrite, params)
+
+            # Materialize rows_affected before any fetch
+            rowcount = cur.rowcount
+            rows_affected = None if rowcount == -1 else rowcount
+
+            # Materialize returning data if present
+            returning = []
+            if cur.description is not None:
+                column_names = [desc.name for desc in cur.description]
+                rows = cur.fetchall()
+                returning = [
+                    {col: coerce_db_value(value) for col, value in zip(column_names, row)}
+                    for row in rows
+                ]
+
+            # Commit LAST, after materialization is complete
+            self._conn.commit()
+
+        except Exception as exc:
+            # Rollback on ANY exception (not just psycopg.Error)
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass  # Original exception surfaced below; failed rollback is safe to ignore
+            # Surface as ConnectionFailure
+            raise ConnectionFailure(message=str(exc)) from exc
+        finally:
+            cur.close()
+
+        return {"rows_affected": rows_affected, "returning": returning}
+
     def close(self) -> None:
         """Close the connection iff the driver owns it."""
         if self._conn is not None and self._owned:

@@ -90,5 +90,22 @@ class DbClient:
     def execute(self, sql: str, params: dict) -> list[dict]:
         return self._driver.execute(sql, params)
 
+    def execute_write(self, sql: str, params: dict) -> dict:
+        """Execute a write SQL statement via the driver's optional execute_write.
+
+        Probes the selected driver for a callable ``execute_write`` attribute.
+        Raises ConfigError if the driver lacks this optional capability.
+
+        Returns:
+            The dict returned by the driver's ``execute_write`` method.
+        """
+        execute_write_attr = getattr(self._driver, "execute_write", None)
+        if not callable(execute_write_attr):
+            raise ConfigError(
+                f"connection's driver ({self._conn_dict['type']}) does not support writes",
+                {"driver": self._conn_dict["type"]},
+            )
+        return self._driver.execute_write(sql, params)
+
     def close(self) -> None:
         self._driver.close()

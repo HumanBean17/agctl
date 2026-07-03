@@ -2,6 +2,7 @@
 
 from agctl.config.models import (
     Config,
+    DatabaseConnection,
     DatabaseConfig,
     DatabaseTemplate,
     Defaults,
@@ -171,3 +172,93 @@ def test_both_error_and_warning():
     assert errors[0]["path"] == "templates.t1.service"
     assert len(warnings) == 1
     assert warnings[0]["path"] == "templates.t1"
+
+
+# --- write template -> writable connection validation -----------------------
+
+
+def test_write_template_with_writable_connection_passes():
+    cfg = _cfg(
+        database=DatabaseConfig(
+            connections={
+                "main-db": DatabaseConnection(type="postgresql", writable=True)
+            },
+            templates={
+                "create-order": DatabaseTemplate(
+                    connection="main-db",
+                    sql="INSERT INTO orders",
+                    mode="write",
+                    description="Create an order",
+                )
+            },
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+    assert warnings == []
+
+
+def test_write_template_with_non_writable_connection_errors():
+    cfg = _cfg(
+        database=DatabaseConfig(
+            connections={
+                "read-only-db": DatabaseConnection(type="postgresql", writable=False)
+            },
+            templates={
+                "create-order": DatabaseTemplate(
+                    connection="read-only-db",
+                    sql="INSERT INTO orders",
+                    mode="write",
+                    description="Create an order",
+                )
+            },
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "database.templates.create-order"
+    assert "writable" in errors[0]["message"] or "write target" in errors[0]["message"]
+    assert warnings == []
+
+
+def test_write_template_with_no_resolvable_connection_errors():
+    cfg = _cfg(
+        database=DatabaseConfig(
+            connections={"main-db": DatabaseConnection(type="postgresql")},
+            templates={
+                "create-order": DatabaseTemplate(
+                    connection=None,
+                    sql="INSERT INTO orders",
+                    mode="write",
+                    description="Create an order",
+                )
+            },
+        ),
+        defaults=Defaults(database_connection=None),
+    )
+    errors, warnings = validate_config(cfg)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "database.templates.create-order"
+    assert warnings == []
+
+
+def test_read_mode_template_with_read_only_connection_no_error():
+    cfg = _cfg(
+        database=DatabaseConfig(
+            connections={
+                "read-only-db": DatabaseConnection(type="postgresql", writable=False)
+            },
+            templates={
+                "find-order": DatabaseTemplate(
+                    connection="read-only-db", sql="SELECT * FROM orders"
+                )
+            },
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    # read-mode templates should not trigger the writable connection rule
+    assert not any(
+        e["path"] == "database.templates.find-order"
+        and ("writable" in e["message"] or "write target" in e["message"])
+        for e in errors
+    )

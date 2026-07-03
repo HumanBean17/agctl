@@ -109,13 +109,21 @@ def _kafka_example(name: str, params: list[str]) -> str:
     return " ".join(pieces)
 
 
-def _db_example(name: str, params: list[str]) -> str:
-    if not params:
-        return f"agctl db query --template {name}"
-    pieces = [f"agctl db query --template {name}"]
-    for i, p in enumerate(params):
-        pieces.append(f"--param {p}={'Y' if i else 'X'}")
-    return " ".join(pieces)
+def _db_example(name: str, params: list[str], mode: str = "read") -> str:
+    if mode == "write":
+        if not params:
+            return f"agctl db execute --template {name} --write"
+        pieces = [f"agctl db execute --template {name} --write"]
+        for i, p in enumerate(params):
+            pieces.append(f"--param {p}={'Y' if i else 'X'}")
+        return " ".join(pieces)
+    else:
+        if not params:
+            return f"agctl db query --template {name}"
+        pieces = [f"agctl db query --template {name}"]
+        for i, p in enumerate(params):
+            pieces.append(f"--param {p}={'Y' if i else 'X'}")
+        return " ".join(pieces)
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +162,7 @@ def _category_core(config_path: str | None, category: str) -> dict:
             items.append({"name": name, "description": pat.description})
     elif category == "db-templates":
         for name, tpl in cfg.database.templates.items():
-            items.append({"name": name, "description": tpl.description})
+            items.append({"name": name, "description": tpl.description, "mode": tpl.mode})
 
     return {
         "category": category,
@@ -241,9 +249,10 @@ def _item_core(config_path: str | None, category: str, name: str) -> dict:
         "category": "db-templates",
         "name": name,
         "description": tpl.description,
+        "mode": tpl.mode,
         "sql": tpl.sql,  # D9: include verbatim sql
         "params": params,
-        "example": _db_example(name, params),
+        "example": _db_example(name, params, tpl.mode),
     }
     if tpl.connection is not None:
         item["connection"] = tpl.connection
@@ -294,6 +303,7 @@ def _search_core(config_path: str | None, term: str) -> dict:
                     "category": "db-templates",
                     "name": name,
                     "description": tpl.description,
+                    "mode": tpl.mode,
                 }
             )
 

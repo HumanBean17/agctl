@@ -1,4 +1,6 @@
+import pytest
 from agctl.config.resolver import apply_env_overrides
+from agctl.errors import ConfigError
 
 
 def test_sets_leaf_value():
@@ -68,3 +70,51 @@ def test_override_through_existing_scalar_replaces_with_dict():
     src = {"kafka": "scalar-blocking"}
     out = apply_env_overrides(src, {"AGCTL_KAFKA__BROKERS": "host:9092"})
     assert out["kafka"] == {"brokers": "host:9092"}
+
+
+# --- Task 2: Denylist for writable/mode leaves ---------------------------------
+
+
+def test_writable_leaf_raises_config_error():
+    """Override targeting a leaf named 'writable' raises ConfigError."""
+    src = {"database": {"connections": {"main-db": {"writable": False}}}}
+    with pytest.raises(ConfigError) as exc_info:
+        apply_env_overrides(src, {"AGCTL_DATABASE__CONNECTIONS__MAIN_DB__WRITABLE": "true"})
+    assert "writable" in str(exc_info.value.message).lower()
+
+
+def test_mode_leaf_raises_config_error():
+    """Override targeting a leaf named 'mode' raises ConfigError."""
+    src = {"database": {"templates": {"t": {"mode": "read"}}}}
+    with pytest.raises(ConfigError) as exc_info:
+        apply_env_overrides(src, {"AGCTL_DATABASE__TEMPLATES__T__MODE": "write"})
+    assert "mode" in str(exc_info.value.message).lower()
+
+
+def test_non_denylisted_override_applies():
+    """Positive control: non-denylisted override on same connection applies."""
+    src = {"database": {"connections": {"main-db": {"writable": False, "password": "old"}}}}
+    out = apply_env_overrides(src, {"AGCTL_DATABASE__CONNECTIONS__MAIN_DB__PASSWORD": "new"})
+    assert out["database"]["connections"]["main-db"]["password"] == "new"
+    # writable should remain unchanged since we can't override it
+    assert out["database"]["connections"]["main-db"]["writable"] is False
+
+
+def test_denylist_case_insensitive():
+    """Denylist matches leaf names case-insensitively."""
+    src = {"database": {"connections": {"main-db": {"writable": False}}}}
+    # All these should raise regardless of case
+    with pytest.raises(ConfigError):
+        apply_env_overrides(src, {"AGCTL_DATABASE__CONNECTIONS__MAIN_DB__WRITABLE": "true"})
+    with pytest.raises(ConfigError):
+        apply_env_overrides(src, {"AGCTL_DATABASE__CONNECTIONS__MAIN_DB__writable": "true"})
+    with pytest.raises(ConfigError):
+        apply_env_overrides(src, {"AGCTL_DATABASE__CONNECTIONS__MAIN_DB__WriTaBlE": "true"})
+
+
+def test_non_leaf_writable_allowed():
+    """When 'writable' is an intermediate segment (not the leaf), override is allowed."""
+    src = {"x": {"writable": {"foo": 1}}}
+    # The leaf is 'foo', not 'writable', so this should NOT raise
+    out = apply_env_overrides(src, {"AGCTL_X__WRITABLE__FOO": "2"})
+    assert out["x"]["writable"]["foo"] == "2"
