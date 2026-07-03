@@ -34,11 +34,12 @@ class FakeCursor:
 
 
 class FakeConn:
-    def __init__(self, cursor):
+    def __init__(self, cursor, commit_raises=False):
         self._cursor = cursor
         self.closed = False
         self.commit_called = False
         self.rollback_called = False
+        self._commit_raises = commit_raises
 
     def cursor(self):
         return self._cursor
@@ -48,6 +49,8 @@ class FakeConn:
 
     def commit(self):
         self.commit_called = True
+        if self._commit_raises:
+            raise RuntimeError("network failure")
 
     def rollback(self):
         self.rollback_called = True
@@ -318,8 +321,28 @@ def test_execute_write_rollback_on_execute_error():
     assert conn.commit_called is False
 
 
+def test_execute_write_rollback_on_commit_failure():
+    """Test 7: Commit failure after successful execute and materialization."""
+    cols = [_col("id"), _col("status")]
+    rows = [(1, "pending")]
+    cur = FakeCursor(description=cols, rows=rows, rowcount=1)
+    conn = FakeConn(cur, commit_raises=True)
+    driver = PostgreSQLDriver(connectable=conn)
+
+    with pytest.raises(ConnectionFailure) as exc_info:
+        driver.execute_write(
+            "INSERT INTO orders (total) VALUES (100) RETURNING id, status", {}
+        )
+
+    assert "network failure" in str(exc_info.value)
+    assert conn.rollback_called is True
+    assert conn.commit_called is True
+    assert isinstance(exc_info.value, ConnectionFailure)
+    assert not isinstance(exc_info.value.__cause__, ConnectionFailure)
+
+
 def test_execute_write_does_not_close_injected_connection():
-    """Test 7: Injected connectable still not closed after a write."""
+    """Test 8: Injected connectable still not closed after a write."""
     cur = FakeCursor(description=None, rows=[], rowcount=1)
     conn = FakeConn(cur)
     driver = PostgreSQLDriver(connectable=conn)
