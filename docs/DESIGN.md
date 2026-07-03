@@ -37,9 +37,10 @@
 
 - **Human-facing UI or formatted output.** Pretty-printing, tables, and color are explicitly out of scope for the initial design. A thin wrapper script can format JSON for humans if needed.
 - **Auto-generating tests.** `agctl` runs assertions; it does not inspect a codebase and write test cases.
-- **Mocking / service virtualization.** No built-in mock server. Use a dedicated tool (WireMock, LocalStack, etc.) and point `agctl` at it via config.
 - **Orchestrating multi-step scenarios as a first-class primitive.** An agent can chain commands in a shell script or inline code; `agctl` does not need a built-in scenario runner to be useful. This is deferred (see §10).
 - **Managing infrastructure lifecycle.** Starting, stopping, or provisioning services is out of scope.
+
+> **Mocking support:** `agctl` now includes a built-in mock server for HTTP and Kafka (see `agctl mock` in §3.3 and the `mocks:` config section in §2.1). This supersedes the earlier non-goal — local testing no longer requires external tools like WireMock or LocalStack for common HTTP stubbing and Kafka reaction patterns.
 
 ---
 
@@ -111,6 +112,53 @@ kafka:
       description: "Any PAYMENT_FAILED event regardless of order"
       topic: payments.events
       match: '.eventType == "PAYMENT_FAILED"'
+
+# ---------------------------------------------------------------------------
+# mocks — HTTP mock server and Kafka reactors (DESIGN §3.3).
+#   HTTP: agctl serves stubs; the SUT's HTTP client points at `listen`.
+#   Kafka: agctl joins as a consumer on the SUT's real broker and reacts.
+#   Supports ${ENV} interpolation at load, {placeholder} substitution at
+#   match/react time, and jq predicates for Kafka.
+# ---------------------------------------------------------------------------
+mocks:
+  http:
+    listen: "${AGCTL_MOCK_HTTP_HOST:-0.0.0.0}:${AGCTL_MOCK_HTTP_PORT:-18080}"
+    stubs:
+      create-order:
+        description: "Mock the downstream order API"
+        method: POST
+        path: "/api/v1/orders"
+        match:
+          body: { "priority": "high" }
+        response:
+          status: 201
+          headers: { Content-Type: "application/json" }
+          body:
+            order_id: "{customer_id}-mock"
+            status: "PENDING"
+        delay_ms: 0
+
+      get-order:
+        method: GET
+        path: "/api/v1/orders/{order_id}"
+        response:
+          status: 200
+          body: { order_id: "{order_id}", status: "CONFIRMED" }
+
+  kafka:
+    reactors:
+      order-command-handler:
+        description: "Mock the service that consumes order commands"
+        topic: orders.commands
+        consumer_group: agctl-mock-order-handler   # OPTIONAL; omit → unique per-run group
+        match: '.command == "CREATE_ORDER"'
+        reaction:
+          topic: orders.events
+          key: "{orderId}"
+          value:
+            eventType: "ORDER_CREATED"
+            orderId: "{orderId}"
+            status: "PENDING"
 
 # ---------------------------------------------------------------------------
 # database — named connection profiles and SQL query templates.
@@ -660,7 +708,80 @@ agctl check ready --all
 
 ---
 
-### 3.5 `agctl config` — Config Introspection
+### 3.5 `agctl mock` — Mock Server (HTTP & Kafka)
+
+#### `agctl mock run`
+
+Run an HTTP mock server and/or Kafka reactors, streaming NDJSON events to stdout. The mock is SUT-facing: the real application's HTTP client points at the mock's `listen` address, and Kafka reactors join the SUT's real broker as consumers. The command blocks until stopped (foreground process, designed for backgrounding via `&` like `http ping`).
+
+```
+agctl mock run
+    [--config <path>]            # auto-discovered by default
+    [--http-listen <host:port>]  # literal string (NO ${} interpolation); overrides mocks.http.listen
+    [--only http|kafka]          # run a single engine (HTTP-only needs no kafka extra)
+    [--fail-fast]                # exit non-zero on the FIRST runtime error (default: continue + summarize)
+    [--duration <seconds>]       # stop after N s; mutually exclusive with --until-stopped
+    [--until-stopped]            # default: run until SIGTERM/SIGINT
+```
+
+**Lifecycle:**
+- `--http-listen` is a **literal** `host:port` string (CLI args are not `${}`-interpolated, only YAML values).
+- `--only` restricts to one engine; `kafka`-extra / `kafka.brokers` checks are gated on engines actually started.
+- **No `mocks` section** → emits `started` + `summary` with zero counts and exits `0` (idempotent no-op).
+- **`--only <engine>` with that engine absent** → `ConfigError` (exit 2).
+- **Startup hazard:** when backgrounding, wrap with `nohup`/`setsid` so the mock is not killed by `SIGHUP` when the launching shell exits, and capture the PID.
+- **Port-in-use guard:** at startup, refuses to bind if the port is already in use (emits a `ConfigError` envelope with a hint to kill the stale mock).
+
+**NDJSON event stream (second streaming exception after `http ping`):**
+
+```json
+{"event":"started","http":{"listen":"0.0.0.0:18080","stubs":2},"kafka":{"reactors":[{"name":"order-command-handler","topic":"orders.commands","consumer_group":"agctl-mock-order-handler-<runid>"}]},"timestamp":"…"}
+{"event":"http.hit","stub":"create-order","method":"POST","path":"/api/v1/orders","status":201,"duration_ms":3,"timestamp":"…"}
+{"event":"http.unmatched","method":"GET","path":"/api/v1/unknown","status":404,"timestamp":"…"}
+{"event":"http.body_parse_skipped","stub":"oauth-token","method":"POST","path":"/oauth/token","reason":"non-JSON body; response has unresolved placeholders","timestamp":"…"}
+{"event":"kafka.reacted","reactor":"order-command-handler","topic":"orders.events","key":"ord-789","duration_ms":1,"timestamp":"…"}
+{"event":"kafka.skipped","reactor":"order-command-handler","topic":"orders.commands","reason":"non-object message value","count":3,"timestamp":"…"}
+{"event":"kafka.error","reactor":"order-command-handler","topic":"orders.commands","offset":1043,"partition":2,"error":"…","fatal":false,"timestamp":"…"}
+{"event":"summary","http_hits":7,"http_unmatched":1,"http_body_parse_skipped":0,"kafka_reactions":3,"kafka_skipped":3,"kafka_errors":0,"duration_ms":45213}
+```
+
+**Agent failure-stream protocol (load-bearing):**
+
+The mock's failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`) live **only** on stdout, and the exit-1-at-shutdown escalation arrives only on a clean `SIGTERM`. The background `&`/`kill` pattern loses both by default. Agents must follow this protocol:
+
+1. Redirect the mock's stdout to a log file: `agctl mock run > mock.log 2>&1 &`.
+2. **Poll** `mock.log` for the `started` line before running the SUT (do not sleep a fixed delay).
+3. Terminate with `SIGTERM` and `wait` — **never `SIGKILL`** (which skips shutdown/summary/exit-code).
+4. After the test, **grep the log for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` / `kafka.error`** regardless of the test result, and treat any hit as a failure.
+
+**`--fail-fast` synchronous alternative:**
+
+For foreground runs with `--duration`, `--fail-fast` exits `1` immediately on the first runtime error (first `kafka.error` or fatal reactor failure), avoiding the log-grep step.
+
+**Examples:**
+
+```bash
+# Start both HTTP and Kafka mocks in background
+agctl mock run &
+MOCK_PID=$!
+
+# ... run tests ...
+
+# Stop gracefully and check exit code
+kill $MOCK_PID
+wait $MOCK_PID
+EXIT_CODE=$?
+
+# HTTP-only mode (no kafka extra needed)
+agctl mock run --only http --http-listen 127.0.0.1:18080
+
+# Fail-fast synchronous run with duration
+agctl mock run --duration 30 --fail-fast
+```
+
+---
+
+### 3.6 `agctl config` — Config Introspection
 
 #### `agctl config validate`
 
@@ -693,7 +814,7 @@ agctl config init
 
 ---
 
-### 3.6 `agctl discover` — Lazy Scoped Discovery
+### 3.7 `agctl discover` — Lazy Scoped Discovery
 
 The discovery subsystem lets an agent understand what is available in the system **without loading everything into context at once**. It is structured as three progressive levels: a summary, a category listing, and a single-item detail. The agent fetches only what the current task requires.
 
@@ -1167,6 +1288,32 @@ Refused to overwrite (without `--force`):
   "duration_ms": 0.8
 }
 ```
+
+#### `mock.run` streaming output
+
+`mock run` is the second streaming exception (after `http ping`). It emits one JSON object per line (NDJSON) as events happen, plus a final `summary` line. Each line is a complete JSON object with an `event` field.
+
+**Event types (per-line vocabulary):**
+
+| Event | Description |
+|---|---|
+| `started` | Emitted once at startup after HTTP bind and Kafka probe succeed. Includes `http.listen`/`stubs` and `kafka.reactors[]`. |
+| `http.hit` | Emitted per matching HTTP stub hit. Includes `stub`, `method`, `path`, `status`, `duration_ms`. |
+| `http.unmatched` | Emitted per HTTP request that matched no stub (returned 404). Includes `method`, `path`, `status`. |
+| `http.body_parse_skipped` | Emitted when a stub matches but the request body doesn't parse as JSON and the response has unresolved placeholders. Includes `stub`, `method`, `path`, `reason`. |
+| `kafka.reacted` | Emitted per Kafka message that matched a reactor and produced a reaction. Includes `reactor`, `topic`, `key`, `duration_ms`. |
+| `kafka.skipped` | Emitted when messages are consumed but not matched (e.g., non-object value). Includes `reactor`, `topic`, `reason`, `count`. |
+| `kafka.error` | Emitted on a reaction produce failure or reactor error. Includes `reactor`, `topic`, `error`, `fatal`. Under `--fail-fast`, the run exits `1` immediately after a fatal error. |
+| `summary` | Emitted once at shutdown. Includes `http_hits`, `http_unmatched`, `http_body_parse_skipped`, `kafka_reactions`, `kafka_skipped`, `kafka_errors`, `duration_ms`. |
+
+**Agent protocol (load-bearing):** See `agctl mock` §3.5 for the background lifecycle protocol (redirect stdout → log, poll for `started`, SIGTERM+wait, grep log for errors). Without this, "fail loudly" is aspirational — a silent false-positive is possible.
+
+**Startup errors:** Like `http ping`, startup failures emit **one** structured envelope before any event line (with `command: "mock.run"` and `error.type`), then exit `2`.
+
+**Exit codes:**
+- `0` — clean shutdown, no runtime errors.
+- `1` — runtime errors occurred (`kafka_errors > 0` or fatal reactor failure) or `--fail-fast` triggered.
+- `2` — startup error (config, bind, broker probe, or missing `kafka` extra).
 
 ---
 
@@ -1645,6 +1792,29 @@ These items are intentionally deferred. Do not implement them until the core des
 | **Secret backends** | Pull secrets from Vault or AWS Secrets Manager instead of environment variables. Would be implemented as a resolver plugin hooked into the config resolution pipeline (§5). |
 | **Parallel command execution** | `agctl run --parallel step1.sh step2.sh` for agents that want to fire multiple requests concurrently and assert on all results. |
 | **OpenTelemetry trace propagation** | Inject `traceparent` headers automatically when a trace context is available, enabling distributed traces that span `agctl` invocations. |
+| **Mock: cross-transport reactions** | HTTP trigger → Kafka produce; Kafka trigger → HTTP callback. The trigger→reaction model admits this later without a rewrite. |
+| **Mock: stateful / scenario mocks** | Sequences, "Nth call → Y", reactor behavior change after N messages. |
+| **Mock: managed daemon** | `mock start/stop/status` with pidfile + control socket, behind `--detach`. |
+| **Mock: record / replay** | Record real traffic into stubs for later replay. |
+| **Mock: nested-field / header capture** | Capture from request headers or nested JSON fields (currently top-level keys only). |
+| **Mock: exactly-once reactor delivery** | Reaction retry/backoff on broker errors (today: at-least-once with idempotent reactions). |
+| **Mock: TLS / HTTPS mock** | Cert-pinned SUT clients cannot connect to a plaintext mock. |
+| **Mock: multiple HTTP servers / ports** | One server, many stubs (path-routed) is the only model today. |
+
+### Known-wrong-result / Not Covered (Mock MVP Limitations)
+
+The mock MVP covers **stateless, single-consumer, value-keyed, plaintext** flows. The following patterns are **not** mocked and tend toward a **plausible-but-wrong (false-green)** result rather than a clear failure. Use an external tool (WireMock/LocalStack) or wait for the deferred features for these:
+
+| Pattern | Why it's not covered | Failure mode |
+|---|---|---|
+| **Stateful flows** (OAuth/token exchange, create-then-GET lifecycle, idempotency-key replay, pagination cursors, 429-then-retry) | Static engine returns the same canned response regardless of prior calls. | State-propagation and dedupe logic go untested → false green. |
+| **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** | Plaintext mock only; cannot intercept HTTPS. | Integration is untested → false green (especially for payments/auth/healthcare). |
+| **Cross-transport sagas** (Kafka trigger → HTTP callback) | No causal linkage; requires manual orchestration. | End-to-end flow goes unexercised → false green. |
+| **Header-borne correlation IDs** (sync Kafka request/reply keyed by header; CloudEvents `ce-*`, `traceparent`) | Reactor cannot capture from headers (only top-level JSON keys). | Cannot produce correlatable reply → routes through SUT's reply-timeout fallback → false green. |
+| **Non-JSON Kafka values** (Avro/Protobuf/schema-registry-backed topics) | Emitted as `kafka.skipped` (visible), but topic is effectively un-mockable until decoding lands. | Topic appears idle → false green if consumer expects a reaction. |
+| **JSON-type pass-through in reactions** | Captured values are stringified before `{placeholder}` substitution (D11). | Strict downstream expecting numeric field may reject reaction → false failure (but type-tolerant reactions are fine). |
+| **Containerized SUT topology** (docker-compose) | `0.0.0.0` bind works, but operator must target `host.docker.internal` / host LAN IP and avoid a SUT that swallows connection errors. | SUT may silently fail to connect → false green if it treats network errors as "fallback worked." |
+| **Shared broker + pinned `consumer_group` reused across runs/devs** | Partition split or resume-past-messages. | Silently missing/old reactions → false green. (Mitigated by unique-per-run default.) |
 
 ---
 
