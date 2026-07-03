@@ -221,6 +221,25 @@ def test_reactor_prepare_propagates_connection_failure(sample_config, stop_event
         reactor.prepare()
 
 
+def test_reactor_close_is_callable_noop(sample_config, stop_event):
+    """close() is callable and a documented no-op (teardown contract).
+
+    prepare() opens no long-lived resource today (probe builds+closes its own
+    consumer), so close() must not raise and must release nothing.
+    """
+    client = FakeKafkaClient()
+    reactor = Reactor(
+        name="test",
+        config=sample_config,
+        client=client,
+        emit_event=lambda _: None,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-123",
+    )
+    assert reactor.close() is None  # callable, no-op
+
+
 def test_reactor_match_capture_react(emit_event, stop_event):
     """Match + capture + template reaction → kafka.reacted event."""
     config = KafkaReactor(

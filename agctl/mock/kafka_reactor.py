@@ -84,6 +84,19 @@ class KafkaReactor:
             group_id=self.resolved_group(),
         )
 
+    def close(self) -> None:
+        """Close any resource opened by :meth:`prepare`.
+
+        Currently a documented no-op: ``prepare()`` is probe-only (the probe
+        builds and closes its own consumer), and ``consume_loop`` owns its own
+        consumer. This method establishes the teardown contract so a future
+        ``prepare()`` that opens a long-lived resource has a documented place
+        to release it. ``MockEngine._shutdown_reactors`` calls this on each
+        prepared reactor when startup fails mid-probe.
+        """
+        # Intentionally empty: nothing owned across prepare()/run() today.
+        return None
+
     def run(self) -> None:
         """Run the consume loop until stop_event is set.
 

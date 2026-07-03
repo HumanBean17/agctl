@@ -100,12 +100,19 @@ class MockEngine:
         self._kafka_skipped = 0
         self._kafka_errors = 0
         self._runtime_error = False  # Track if any runtime error occurred
+        # Set True only after the started line is emitted; gates summary so a
+        # failed start (which never emitted started) cannot emit a spurious
+        # summary line.
+        self._started = False
 
         # Engine components (set during start())
         self._http_server: MockHTTPServer | None = None
         self._reactors: list[KafkaReactorClass] = []
         self._http_thread: threading.Thread | None = None
         self._reactor_threads: list[threading.Thread] = []
+        # Cancellable duration timer (threading.Timer); cancelled on shutdown
+        # so an early shutdown doesn't leave a sleeping timer for the duration.
+        self._duration_timer: threading.Timer | None = None
 
         # Startup time for duration_ms calculation
         self._start_time: float | None = None
@@ -223,6 +230,11 @@ class MockEngine:
 
             # Step 3: Emit started line
             self._emit_started_line()
+            # Mark started: only now may shutdown emit a summary. If start()
+            # fails before this point, the except handler calls shutdown(),
+            # which must NOT emit a spurious summary for a stream that never
+            # received a started line.
+            self._started = True
 
             # Record start time for duration_ms
             self._start_time = time.monotonic()
@@ -277,14 +289,12 @@ class MockEngine:
                     self._reactor_threads.append(t)
                     t.start()
 
-            # Arm duration timer (if set)
+            # Arm duration timer (if set) — a cancellable threading.Timer so an
+            # early shutdown cancels it rather than sleeping the full duration.
             if self._duration is not None:
-                def _duration_timer():
-                    time.sleep(self._duration)
-                    self._stop.set()
-
-                timer_thread = threading.Thread(target=_duration_timer, daemon=True)
-                timer_thread.start()
+                self._duration_timer = threading.Timer(self._duration, self._stop.set)
+                self._duration_timer.daemon = True
+                self._duration_timer.start()
 
             # Block until stop is set (or fail-fast triggered)
             while not self._stop.is_set():
@@ -295,8 +305,11 @@ class MockEngine:
                 # Wait for stop with a small timeout to check fail-fast condition
                 self._stop.wait(0.1)
 
-            # Determine exit code
-            if self._runtime_error:
+            # Determine exit code (DESIGN §11): exit 1 if ANY runtime error
+            # occurred (any kafka.error, fatal or not) or a fatal/fail-fast
+            # stop was triggered; else 0. The fail_fast immediate-exit-on-fatal
+            # mid-run behavior is preserved by the loop break above.
+            if self._kafka_errors > 0 or self._runtime_error:
                 return 1
             return 0
 
@@ -321,6 +334,12 @@ class MockEngine:
         # Signal stop (in case not already set)
         self._stop.set()
 
+        # Cancel the duration timer (if armed) so an early shutdown doesn't
+        # leave a sleeping timer for the full duration.
+        if self._duration_timer is not None:
+            self._duration_timer.cancel()
+            self._duration_timer = None
+
         # Stop HTTP server
         if self._http_server is not None:
             self._http_server.shutdown()
@@ -336,18 +355,22 @@ class MockEngine:
         for t in self._reactor_threads:
             t.join(timeout=2.0)
 
-        # Emit summary line
-        self._emit_summary_line()
+        # Emit summary line only if start() actually emitted started — a failed
+        # start (probe/bind error) must not produce a spurious summary for a
+        # stream that never received a started line.
+        if self._started:
+            self._emit_summary_line()
 
     def _shutdown_reactors(self) -> None:
-        """Close reactor consumers (called during startup probe failure)."""
+        """Close reactor resources (called during startup probe failure).
+
+        Invokes ``reactor.close()`` on each prepared reactor so any resource
+        ``prepare()`` opened is released. Today ``close()`` is a documented
+        no-op (probe builds+closes its own consumer), but the contract is
+        established for future reactor lifecycle changes.
+        """
         for reactor in self._reactors:
-            # Reactor.prepare() created the consumer; close it
-            # The reactor's consume_loop hasn't started yet, so we need to close the consumer
-            # However, KafkaReactor doesn't expose a close method - the consumer is owned
-            # by consume_loop which hasn't been called yet. The prepare() method just probes.
-            # So there's nothing to close at this stage - the probe just validates connectivity.
-            pass
+            reactor.close()
 
     def _emit_started_line(self) -> None:
         """Emit the started line with http/kafka details."""
@@ -355,8 +378,12 @@ class MockEngine:
 
         # Add HTTP details
         if self._run_http and self._http_server is not None:
+            # Report the BOUND address: if the caller bound port 0, the real
+            # port lives in server_address (updated by socketserver after
+            # bind). Fall back to the input string if no server is present.
+            bound_host, bound_port = self._http_server.server_address
             started_line["http"] = {
-                "listen": self._http_listen,
+                "listen": f"{bound_host}:{bound_port}",
                 "stubs": len(self._http_server.stubs),
             }
         else:
@@ -385,14 +412,26 @@ class MockEngine:
         if self._start_time is not None:
             duration_ms = int((time.monotonic() - self._start_time) * 1000)
 
+        # Snapshot the six counters under the lock so a reactor still emitting
+        # after a join-timeout can't produce a torn snapshot (counters read at
+        # different instants). The summary line itself is emitted atomically by
+        # emit_event (which re-acquires the lock) outside this block.
+        with self._emit_lock:
+            http_hits = self._http_hits
+            http_unmatched = self._http_unmatched
+            http_body_parse_skipped = self._http_body_parse_skipped
+            kafka_reactions = self._kafka_reactions
+            kafka_skipped = self._kafka_skipped
+            kafka_errors = self._kafka_errors
+
         summary_line = {
             "event": "summary",
-            "http_hits": self._http_hits,
-            "http_unmatched": self._http_unmatched,
-            "http_body_parse_skipped": self._http_body_parse_skipped,
-            "kafka_reactions": self._kafka_reactions,
-            "kafka_skipped": self._kafka_skipped,
-            "kafka_errors": self._kafka_errors,
+            "http_hits": http_hits,
+            "http_unmatched": http_unmatched,
+            "http_body_parse_skipped": http_body_parse_skipped,
+            "kafka_reactions": kafka_reactions,
+            "kafka_skipped": kafka_skipped,
+            "kafka_errors": kafka_errors,
             "duration_ms": duration_ms,
         }
 
