@@ -156,6 +156,38 @@ class FakeKafkaClientNonFatalError(FakeKafkaClient):
         stop_event.set()
 
 
+class FailingAndHealthyKafkaClient:
+    """Fake KafkaClient for the reactor-thread-death contract (spec §11).
+
+    One topic's ``consume_loop`` raises ``ConnectionFailure`` (simulating a
+    realistic mid-run broker death from commit/seek/subscribe); another topic's
+    runs until the engine signals stop. Used to verify that a propagating
+    exception emits a fatal ``kafka.error`` (→ exit 1) while sibling reactors
+    keep running.
+    """
+
+    def __init__(self, failing_topic, healthy_topic):
+        self.failing_topic = failing_topic
+        self.healthy_topic = healthy_topic
+        self.failing_consume_calls = 0
+        self.healthy_consume_calls = 0
+
+    def probe(self, topic, *, group_id, timeout=5.0):
+        """Connectivity probe always succeeds at startup."""
+        pass
+
+    def consume_loop(self, topic, *, group_id, stop_event, handle, **kwargs):
+        """Failing topic raises mid-run; healthy topic blocks until stop."""
+        if topic == self.failing_topic:
+            self.failing_consume_calls += 1
+            raise ConnectionFailure("broker died mid-run")
+        elif topic == self.healthy_topic:
+            self.healthy_consume_calls += 1
+            # Run until the engine signals stop — proves this thread was NOT
+            # aborted by the sibling reactor's death.
+            stop_event.wait(timeout=5.0)
+
+
 # =============================================================================
 # Test scenarios
 # =============================================================================
@@ -517,6 +549,92 @@ def test_non_fatal_kafka_error_returns_exit_1():
     errors = [l for l in captured_lines if l.get("event") == "kafka.error"]
     assert len(errors) == 1
     assert errors[0]["fatal"] is False
+
+
+def test_reactor_thread_death_emits_fatal_kafka_error_exit_1():
+    """Reactor thread death: a propagating exception from consume_loop emits a
+    fatal ``kafka.error`` (carrying reactor name + topic + error string) and
+    ``run()`` returns exit 1, while sibling reactors keep running (spec §11).
+
+    This is the load-bearing fail-loudly contract: ``KafkaReactor.run()`` →
+    ``KafkaClient.consume_loop`` propagates ``ConnectionFailure`` (from
+    commit/seek/subscribe — realistic mid-run broker failures) and any exception
+    from ``_handle`` outside its reaction try/except. Without exception handling
+    on the thread target that kills the thread with only a stderr traceback: no
+    ``kafka.error`` event, ``_runtime_error`` stays False, exit 0 — a false
+    green. The ``_run_reactor`` try/except in ``MockEngine.run()`` closes that
+    gap.
+
+    Reverting that try/except makes this test fail: the exception kills the
+    thread silently (no ``kafka.error`` emitted, ``_runtime_error`` stays False),
+    so ``run()`` returns exit 0 and no fatal ``kafka.error`` event appears.
+    """
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    failing_topic = "failing-topic"
+    healthy_topic = "healthy-topic"
+
+    fake_client = FailingAndHealthyKafkaClient(failing_topic, healthy_topic)
+
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "failing-reactor": KafkaReactor(
+                    topic=failing_topic,
+                    reaction=KafkaReaction(topic="out-topic", value={}),
+                ),
+                "healthy-reactor": KafkaReactor(
+                    topic=healthy_topic,
+                    reaction=KafkaReaction(topic="out-topic", value={}),
+                ),
+            }
+        )
+    )
+
+    engine = MockEngine(
+        mocks=mocks,
+        run_http=False,
+        run_kafka=True,
+        http_listen="127.0.0.1:0",
+        kafka_client=fake_client,
+        emit_fn=capture_emit,
+        run_id="test-run-thread-death",
+        fail_fast=False,  # default: other reactors must continue
+        duration=0.3,  # stop after a short window so the healthy reactor unblocks
+    )
+
+    engine.start()
+    exit_code = engine.run()
+    engine.shutdown()
+
+    # (a) A fatal kafka.error was emitted carrying the reactor name + topic + error.
+    errors = [l for l in captured_lines if l.get("event") == "kafka.error"]
+    fatal_errors = [e for e in errors if e.get("fatal") is True]
+    assert len(fatal_errors) >= 1, (
+        f"expected a fatal kafka.error from the dying reactor, got: {errors}"
+    )
+    err = fatal_errors[0]
+    assert err["reactor"] == "failing-reactor"
+    assert err["topic"] == failing_topic
+    assert "broker died mid-run" in err["error"], (
+        f"error string must carry the exception message, got: {err.get('error')!r}"
+    )
+
+    # (b) run() returned exit code 1 (fatal kafka.error → _runtime_error → exit 1).
+    assert exit_code == 1, f"expected exit 1 (runtime error), got {exit_code}"
+
+    # (c) The sibling reactor's consume_loop was entered and ran to completion
+    # (joined at shutdown, NOT aborted by the dying reactor's thread).
+    assert fake_client.failing_consume_calls == 1, (
+        "failing reactor consume_loop should have been entered exactly once"
+    )
+    assert fake_client.healthy_consume_calls == 1, (
+        "healthy reactor consume_loop was never called — a sibling reactor's "
+        "thread death must not abort other reactors"
+    )
 
 
 def test_summary_tally_counts_all_events():

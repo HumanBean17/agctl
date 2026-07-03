@@ -283,7 +283,25 @@ class MockEngine:
             if self._run_kafka:
                 for reactor in self._reactors:
                     def _run_reactor(r=reactor):
-                        r.run()
+                        try:
+                            r.run()
+                        except Exception as exc:
+                            # Reactor thread death (e.g. ConnectionFailure from
+                            # consume_loop's commit/seek/subscribe, or any
+                            # exception the reactor's _handle didn't catch): emit
+                            # the spec §11 fatal kafka.error so the run exits 1.
+                            # Do NOT set self._stop here — sibling reactors must
+                            # continue. emit_event's fatal-handling increments
+                            # _kafka_errors and sets _runtime_error (→ exit 1 at
+                            # shutdown; under fail_fast the run loop breaks
+                            # immediately via the _runtime_error check above).
+                            self.emit_event({
+                                "event": "kafka.error",
+                                "reactor": r._name,
+                                "topic": r._config.topic,
+                                "error": str(exc),
+                                "fatal": True,
+                            })
 
                     t = threading.Thread(target=_run_reactor, daemon=True)
                     self._reactor_threads.append(t)

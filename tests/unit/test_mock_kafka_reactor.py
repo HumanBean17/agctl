@@ -67,26 +67,24 @@ class FakeKafkaClient:
         for msg in self.messages:
             if stop_event.is_set():
                 break
-            # Deliver with retry logic
+            # Deliver with retry logic. Handler exceptions PROPAGATE — matching
+            # the real KafkaClient.consume_loop, which does NOT wrap handle() in
+            # try/except. The reactor's _handle catches its OWN reaction failures
+            # (produce errors) and returns a ReactionResult, so reaction-failure
+            # tests are unaffected; only unexpected exceptions propagate.
             for attempt in range(1, max_retries + 1):
                 final = attempt >= max_retries
-                try:
-                    result = handle(msg, attempt=attempt, final=final)
-                    if result == ReactionResult.COMMIT:
-                        break
-                    elif result == ReactionResult.STOP:
-                        stop_event.set()
-                        return
-                    elif result == ReactionResult.RETRY:
-                        if final:
-                            # RETRY on final should be treated as COMMIT
-                            break
-                        # else: continue to next attempt
-                except Exception:
-                    # Handle exceptions inside the handler
+                result = handle(msg, attempt=attempt, final=final)
+                if result == ReactionResult.COMMIT:
+                    break
+                elif result == ReactionResult.STOP:
+                    stop_event.set()
+                    return
+                elif result == ReactionResult.RETRY:
                     if final:
+                        # RETRY on final is treated as COMMIT (defensive)
                         break
-                    # else: continue retrying
+                    # else: continue to next attempt
 
     def probe(self, topic, *, group_id, timeout=5.0):
         """Record probe call or raise configured error."""
