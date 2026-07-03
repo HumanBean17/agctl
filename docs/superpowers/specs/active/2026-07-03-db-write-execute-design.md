@@ -1,9 +1,10 @@
 # Design: DB Write Support — `agctl db execute`
 
-**Status:** Approved (design) — ready for implementation plan
+**Status:** Approved (design, revised) — ready for implementation plan
 **Date:** 2026-07-03
+**Revised:** 2026-07-03 — applied spec-review findings (threat-model framing; `writable`/`mode` made non-env-overridable; `execute_write` made an optional driver capability; explicit write-target requirement; commit-after-materialize ordering; contract clarifications).
 **Author:** brainstorming session
-**Affects:** `agctl db` command group, `database` config schema, DB driver layer, discovery, `agctl-config` skill
+**Affects:** `agctl db` command group, `database` config schema, config resolver, DB driver layer, discovery, `agctl-config` skill
 **Relation to docs:** Adds a capability described here; on implementation, DESIGN.md §3.3 / §2.1 and ARCHITECTURE.md §8 / §3 are synced via `docs-watcher`.
 
 ---
@@ -12,66 +13,81 @@
 
 `agctl` can *observe* every system state but *create* none of its own database
 state. The two existing `db` commands (`db query`, `db assert`) are read-only,
-and that read-only-ness is not a missing flag — it is an active architectural
-property enforced at the driver layer:
-
-- `PostgreSQLDriver.execute()` (`agctl/clients/db_drivers/postgresql.py`) runs a
-  statement, calls `fetchall()`, and returns dict rows. It never commits. Under
-  psycopg3's default `autocommit=False`, the statement lives in an open
-  transaction that rolls back when the connection closes — so an
-  `INSERT`/`UPDATE`/`DELETE` passed to `db query` is silently discarded.
-- The result contract assumes a row set (`DBDriver.execute → list[dict]`,
-  `db query → {rows, row_count}`), which does not fit write statements that
-  produce an affected-row count rather than rows.
-- `database.templates[*].sql` is free-form text with nothing distinguishing a
-  read from a write, so discovery surfaces them identically and nothing in
-  config records intent.
+and that read-only-ness is enforced at the driver layer — `PostgreSQLDriver.execute()`
+runs a statement, returns dict rows, and **never commits**; under psycopg3's
+default `autocommit=False` the statement lives in a transaction that rolls back
+when the connection closes, so an `INSERT`/`UPDATE`/`DELETE` passed to `db query`
+is discarded (full mechanism in ARCHITECTURE §8). Additionally the read result
+contract assumes a row set, which does not fit write statements, and nothing in
+config distinguishes a read from a write.
 
 **Use case this blocks:** seeding test data to reproduce a test case or bug
-(e.g. insert a row in a known state, flip a row to a broken state, delete rows
-to reset between runs). This is a routine testing/debugging need that the
-current read-only stance makes impossible.
-
-This spec adds a first-class, deliberately-gated write path.
+(insert a row in a known state, flip a row to a broken state, delete rows to
+reset between runs). This spec adds a first-class, deliberately-gated write path.
 
 ## 2. Goals
 
 - Let an agent seed and mutate DB state (INSERT / UPDATE / DELETE) for the
   reproduce-a-bug workflow.
-- Provide two **independent** safety gates so a misconfigured, shared, or
-  production connection can never be written to by accident.
+- Provide a **multi-layer safety model — two runtime gates plus a CI-time lint**
+  — that targets misconfiguration and makes every write explicit, with DB user
+  privileges as the backstop against hostile environments (see §3).
 - Keep read and write on **type-distinct** code paths so an agent cannot run a
   write through the read path (or vice versa).
-- Leave the existing read path byte-for-byte unchanged — no regression to
-  anything that works today.
-- Make write templates **safe by construction**: a write template provably
-  targets a writable connection, enforced at config-load time.
+- Leave the existing read path byte-for-byte unchanged — no regression.
+- Make write templates **reviewable**: a write template targets a writable
+  connection, caught by `agctl config validate` before deploy.
 
-## 3. Non-Goals
+## 3. Threat Model
 
-- **Multi-statement batches or cross-invocation transactions.** Seeding is
-  naturally one statement per template; multi-step setup is the agent chaining
-  commands (agctl's existing model, DESIGN §11). Out of scope for v1.
-- **Idempotency magic.** agctl stays dumb; idempotency is the SQL author's job
-  (`ON CONFLICT`, `WHERE NOT EXISTS`, `MERGE`). The authoring skill carries the
-  pattern.
-- **SQL parsing / DDL blocking.** A statement parser is a fragile guardrail
-  (rejected alternative, §8). Safety comes from connection opt-in, not parsing.
-- **Typed per-verb commands** (`db insert`/`update`/`delete`). Rejected
-  alternative (§8); SQL already has those verbs.
-- **Changing the read path.** `db query`/`db assert` and `DBDriver.execute`
-  are untouched.
+`agctl` is invoked by an agent that has **shell access**. It is a convenience /
+orchestration layer, **not a security boundary**. A determined actor with shell
+access can bypass `agctl` entirely (`psql`, direct config edits, arbitrary env
+vars). This design does **not** attempt to stop such an actor — that is the job
+of **DB user privileges** (point `agctl` at a read-only account for
+prod/staging). `agctl`'s gates are complementary to, not a replacement for,
+least-privilege DB accounts.
 
-## 4. Decisions (recorded with rationale)
+What the model **does** target:
+
+1. **Misconfiguration** — a write reaching a connection that should be read-only
+   due to a typo, a wrong default, or a misrouted `--connection`.
+2. **Footgun-reduction** — every write is explicit (`--write`) and names an
+   explicit target, self-evident in transcripts.
+3. **Review-time catching** — write templates are provably routed to writable
+   connections, enforced by `agctl config validate` (§8).
+
+**Consequence for the gate model:** the two runtime gates (§6.1) are
+defense-in-depth against *mistakes*, not independent cryptographic factors
+against an *adversarial principal*. They are made **honest** by two rules:
+`writable`/`mode` are file-only properties not settable via `AGCTL_*` overrides
+(§7.2), so config-file review is truthful; and `db execute` must name its target
+explicitly (§6.3), so a write can never silently land on a default connection.
+
+## 4. Non-Goals
+
+- **Adversarial-agent containment.** Out of scope (§3); handled by DB privileges.
+- **Multi-statement batching as a feature.** One invocation commits one unit of
+  work — the SQL string as given (§13). No statement splitting/counting.
+- **Idempotency magic.** `agctl` stays dumb; idempotency is the SQL author's job.
+- **SQL parsing / DDL blocking.** A statement parser is a fragile guardrail;
+  safety comes from connection opt-in, not parsing.
+- **Typed per-verb commands** (`db insert`/`update`/`delete`).
+- **Changing the read path.** `db query`/`db assert` and `DBDriver.execute` are
+  untouched.
+
+## 5. Decisions (recorded with rationale)
 
 | # | Decision | Rationale |
 |---|---|---|
-| D1 | **Safety = opt-in per connection + per-invocation `--write` flag.** A connection must declare `writable: true`, and every invocation must carry `--write`. | Defense-in-depth independent of DB user privileges; fits agctl's fail-loudly ethos (DESIGN §1/§8). The connection flag is the seatbelt; `--write` is intentional friction + an audit signal in transcripts. Alternatives (privileges-only, flag-only, DML-parser) rejected in §8. |
-| D2 | **Command surface = one new `agctl db execute` command** (sibling to `query`/`assert`), not typed primitives, not an extension of `db query`. | Read/write stay on separate paths; the type-distinctness is itself part of the safety model. Honors DESIGN §8 ("ten focused commands"; a write cannot be composed from reads). |
-| D3 | **Config = optional `mode` field on `database.templates`, not a second section.** | One list, not two; read/write is a property of a template. |
-| D4 | **Driver = new `execute_write` method on the `DBDriver` protocol**, not a `commit=True` boolean on `execute`. | One method doing two things is the smell DESIGN §8 warns against; read `execute()` stays unchanged. |
+| D1 | **Safety = two runtime gates + a CI-time lint, targeting misconfiguration (§3).** Runtime gate 1: connection is `writable: true`. Runtime gate 2: invocation carries `--write`. CI lint: write templates route to writable connections (§8). | Honest defense-in-depth given the threat model. The connection flag is the primary guard against misrouting; `--write` is intentional friction + an audit signal; DB privileges are the adversarial backstop. |
+| D2 | **Command surface = one new `agctl db execute` command.** | Read/write stay on separate paths; the type-distinctness is itself part of the safety model. Honors DESIGN §8 (a write cannot be composed from reads). |
+| D3 | **Config = optional `mode` field on `database.templates`, not a second section.** | One list; read/write is a property of a template. |
+| D4 | **`execute_write` is an optional driver capability, not a required `DBDriver` Protocol method.** | The `DBDriver` Protocol is a published extension surface (DESIGN §9.1, ARCHITECTURE §10). A new *required* method would break out-of-tree drivers. Instead `DbClient` probes for the method and raises a clean error if absent (§9). |
+| D5 | **`db execute` must name an explicit target** (`--template` or `--connection`); a bare write to the default connection is refused (§6.3). | Closes the highest-blast-radius footgun: a destructive free-form write silently routing to `defaults.database_connection`. Asymmetric with `http request`; writes earn it. |
+| D6 | **`writable`/`mode` are non-overridable via `AGCTL_*` env** (resolver denylist, §7.2). | Writability is a deployment-time, file-only property; allowing env override makes config-file review misleading and collapses the connection gate (the same principal controls both). |
 
-## 5. Command Contract — `agctl db execute`
+## 6. Command Contract — `agctl db execute`
 
 ```
 agctl db execute
@@ -79,33 +95,54 @@ agctl db execute
     [--sql "..."]               # free-form write SQL (escape hatch); mutually exclusive with --template
     --write                     # REQUIRED confirmation flag
     [--param key=value]         # repeatable; fills :paramName named params
-    [--connection <name>]       # overrides template connection / defaults.database_connection
+    [--connection <name>]       # names the write target (REQUIRED with --sql; optional override with --template)
 ```
 
-Input resolution reuses the existing `resolve_db_request` machinery (template XOR
-free-form SQL, `--param` parsing, connection precedence: explicit arg → template
-`connection` → `defaults.database_connection`).
+Input resolution reuses `resolve_db_request` for sql/params/connection
+precedence (explicit `--connection` → template `connection` →
+`defaults.database_connection`). The mode gate (§6.2) reads the template's
+`mode` directly from the config object, not from the resolver (which does not
+surface it).
 
-### 5.1 Two safety gates (both required; checked before connecting)
+### 6.1 Two runtime gates
+
+Checked **before** opening a connection, in this order, after argument
+validation (template XOR sql; target-naming per §6.3):
 
 1. **Invocation gate** — `--write` must be present, else `ConfigError` (exit 2).
-2. **Connection gate** — the resolved connection must have `writable: true`, else
-   `ConfigError` (exit 2).
+2. **Connection gate** — the resolved connection must have `writable: true`,
+   else `ConfigError` (exit 2).
 
-A gate failure never opens a database connection (fail loudly, fail fast,
-ARCHITECTURE §7).
+(The mode check, §6.2, runs between the two gates.) A gate failure never opens a
+database connection (fail loudly, fail fast, ARCHITECTURE §7).
 
-### 5.2 Mode check (templated path only)
+### 6.2 Mode check (both read commands)
+
+The `mode` field is **author-declared** and not verified against the SQL text;
+authors are expected to put DML in `write`-mode templates (an expectation, not
+enforced).
 
 - `db execute` with a `read`-mode template → `ConfigError`.
-- `db query` with a `write`-mode template → `ConfigError`.
+- `db query` **or** `db assert` with a `write`-mode template → `ConfigError`.
 
-Free-form `--sql` carries no template, so it is gated by the two safety gates
-alone — consistent with `http request` being the less-guarded escape hatch
-relative to `http call`. (Read-only free-form writes via `db query --sql "INSERT..."`
-remain a no-op under today's transaction semantics; writes go through `db execute`.)
+Both read commands are covered, so a write template cannot be run through either
+read path.
 
-## 6. Config Schema Changes (`agctl/config/models.py`)
+### 6.3 Explicit target required
+
+`db execute` must resolve to an explicit write target:
+
+- `--template` names the target via the template's `connection` (optionally
+  overridden by `--connection`).
+- `--connection` names the target directly (required when using `--sql`).
+
+A bare `db execute --sql "..." --write` with **neither** `--template` nor
+`--connection` is a `ConfigError` ("db execute requires --template or
+--connection to name the write target; refusing to write to the default
+connection implicitly"). Free-form writes remain available — the operator must
+simply say *where*.
+
+## 7. Config Schema Changes (`agctl/config/models.py`)
 
 Two additive, backward-compatible fields.
 
@@ -113,15 +150,15 @@ Two additive, backward-compatible fields.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `writable` | `bool` | `False` | If `true`, this connection is eligible as a write target. Existing configs default to read-only — zero behavior change. |
+| `writable` | `bool` | `False` | If `true`, this connection is eligible as a write target. Existing configs default to read-only. |
 
 **`DatabaseTemplate`** gains:
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `mode` | `Literal["read", "write"]` | `"read"` | Whether the template's SQL mutates state. Determines which command may run it. |
+| `mode` | `Literal["read", "write"]` | `"read"` | Whether the template's SQL mutates state. Determines which command may run it. Pydantic rejects any other value at load. |
 
-### 6.1 Config contract (YAML)
+### 7.1 Config contract (YAML)
 
 ```yaml
 database:
@@ -134,7 +171,7 @@ database:
       password: "${DB_PASSWORD}"
       default: true
 
-    main-db-writable:              # explicit write target
+    main-db-writable:              # explicit write target (writable is file-only — not env-settable, §7.2)
       type: postgresql
       host: "${DB_HOST}"
       dbname: "${DB_NAME}"
@@ -152,11 +189,25 @@ database:
       connection: main-db-writable
       sql: >
         INSERT INTO orders (id, status, total_cents)
-        VALUES (:orderId, 'PENDING', :totalCents)
+        VALUES (:orderId, 'PENDING', :totalCents::int)
         ON CONFLICT (id) DO NOTHING
 ```
 
-## 7. Validation Rules (`agctl/config/validator.py`)
+> **Param typing note:** `--param` values are bound as **strings** (`parse_params`
+> yields `dict[str, str]`). Numeric/timestamp columns require an explicit
+> `::cast` in the SQL (e.g. `:totalCents::int`), an inherited read-path
+> constraint that applies equally to writes.
+
+### 7.2 Env-override denylist (`agctl/config/resolver.py::apply_env_overrides`)
+
+`writable` and `mode` are **denylisted** from `AGCTL_*` overrides. An override
+resolving to either leaf field raises `ConfigError` at load
+("writable/mode cannot be set via AGCTL_* override; set it in agctl.yaml").
+This keeps writability a truthful, reviewable, file-only property and prevents
+the connection gate from being collapsed by the same principal that supplies
+`--write` (§3). All other override behavior is unchanged.
+
+## 8. Validation Rules — CI-time lint (`agctl/config/validator.py`)
 
 One new cross-reference rule, alongside the existing DB-template→connection check:
 
@@ -165,59 +216,80 @@ One new cross-reference rule, alongside the existing DB-template→connection ch
 > must exist **and** have `writable == true`. Otherwise: config validation error
 > (exit 2).
 
-This is the "safe by construction" property: a write template cannot be defined
-against a read-only connection — load fails before any command runs. The existing
-read templates require no change. This rule is **complementary, not redundant**,
-to the runtime connection gate (§5.1 gate #2): the config rule statically
-guarantees declared write templates target a writable connection; the runtime
-gate additionally covers free-form `--sql` (which has no template to validate at
-load time) and re-confirms the connection at execution.
+**Scope — honest about when this runs:** this rule is evaluated by
+`agctl config validate` (the review/CI-time check). It is **not** wired into the
+per-command load path (`load_config` does not run `validate_config`). Therefore
+the **runtime connection gate (§6.1) is the real per-invocation guard**; this
+lint is a complementary review-time catch that surfaces misrouted write
+templates *before* deploy. (The static check is intentionally narrower than the
+runtime resolution: it cannot see `--connection`, which is a runtime flag — that
+case is covered by the runtime gate.)
 
-## 8. Driver Protocol Change (`agctl/clients/db_driver_protocol.py`)
+## 9. Driver Capability — optional `execute_write`
 
-The `DBDriver` Protocol gains a second method. The read method is unchanged.
+The **`DBDriver` Protocol is unchanged** (`connect` / `execute` / `close`).
+`execute_write` is an **optional capability method** that write-capable drivers
+implement; this adds nothing to the published extension contract, so out-of-tree
+read-only drivers need no changes.
+
+> **Read-path contract (inherited assumption):** the safety of free-form
+> `db query --sql "<write>"` resting inert relies on the driver honoring the
+> read-only `execute` contract (no autocommit). The built-in `PostgreSQLDriver`
+> guarantees this via psycopg3's default; **third-party drivers must honor it
+> too** — a driver that autocommits would turn `db query` into an ungated write
+> path. This is a documented driver obligation, not enforced by `agctl`.
+
+**`DbClient.execute_write`** probes for the method: if the selected driver lacks
+it, raise `ConfigError` ("connection's driver (<type>) does not support writes").
+The built-in `PostgreSQLDriver` implements it. `execute_write` lazy-imports
+psycopg exactly like the read `execute` (ARCHITECTURE §8) and is covered by the
+existing `db` optional-extra — no new packaging.
 
 **Contract:**
 
 ```
-execute(sql, params) -> list[dict]            # UNCHANGED — read-only, no commit
-execute_write(sql, params) -> {
-    "rows_affected": int,
-    "returning": list[dict]                   # coerced dict rows from a RETURNING clause; [] if absent
+execute_write(sql: str, params: dict) -> {
+    "rows_affected": int | None,             # driver-reported count; None when the driver reports no count (e.g. DDL)
+    "returning": list[dict]                  # coerced rows from a RETURNING clause (may be multi-row); [] if absent
 }
 ```
 
-`execute_write` semantics (contract only — implementation is the plan's job):
-- Named params use JDBC-style `:name`, rewritten to the driver's native bind
-  syntax via the existing `convert_sql_params` (`agctl/resolution.py`).
-- On success: the statement is committed.
-- On error: the transaction is rolled back, and the driver error maps to
-  `ConnectionFailure` (exit 2).
-- `RETURNING` rows are coerced cell-by-cell via the existing `coerce_db_value`
-  (`agctl/assertions.py`), identical to read rows.
+Semantics (contract only — implementation is the plan's job):
 
-`PostgreSQLDriver` (`agctl/clients/db_drivers/postgresql.py`) implements
-`execute_write` against psycopg3; the injected-`connectable` test rule mirrors
-the read path (the driver commits/rolls back but only `close()`s connections it
-owns). `DbClient` (`agctl/clients/db_client.py`) exposes a thin `execute_write`
-delegator alongside the existing `execute`.
+- Named params use JDBC-style `:name`, rewritten to psycopg's `%(name)s` via the
+  existing `convert_sql_params`. **Inherited limitation** (ARCHITECTURE §15):
+  `:name` inside a SQL string literal may be mis-rewritten; on the write path
+  this can corrupt data rather than mis-read. `::` casts are protected.
+- **Runs whatever SQL is given and commits** — including DDL. We deliberately do
+  not parse or block statement types (a parser is a fragile guardrail, §4). For
+  statements with no affected count, `rows_affected` is `None`.
+- `RETURNING` rows are coerced cell-by-cell via the existing `coerce_db_value`,
+  identical to read rows.
+- **Ordering (correctness contract):** materialize `rows_affected` and
+  `returning` (execute, fetch `RETURNING`, coerce) **before** committing; `commit()`
+  is the **last** step. Any error after `execute` but before `commit` triggers
+  `rollback()`, and the driver error maps to `ConnectionFailure`. This guarantees
+  **a reported failure (ok:false) means no commit landed** — so retries driven by
+  the envelope's failure signal are safe.
+- The injected-`connectable` test rule mirrors the read path: the driver
+  commits/rolls back but only `close()`s connections it owns.
 
-### 8.1 Rejected alternatives (ADR-style)
+### 9.1 Rejected alternatives (ADR-style)
 
-- **`commit=True` boolean on a single `execute`.** Rejected (D4): one method
-  serving two contracts is the smell DESIGN §8 warns against, and it risks the
-  read path regressing.
+- **`execute_write` as a required `DBDriver` Protocol method.** Rejected (D4):
+  breaks the published extension surface for out-of-tree drivers. Optional
+  capability + probe avoids this entirely.
+- **`commit=True` boolean on a single `execute`.** Rejected: one method serving
+  two contracts risks the read path and is the smell DESIGN §8 warns against.
 - **Typed `db insert|update|delete` primitives.** Rejected: reinvents the SQL
-  surface (bulk, WHERE, upsert/MERGE), largest command surface, fights §8.
+  surface, largest command surface.
 - **Extend `db query` with `--write`.** Rejected: read/write would share one
   path, erasing the type-distinctness the safety model relies on.
 - **Separate `database.write_templates` section.** Rejected: doubles config and
-  discovery surface for no gain; `mode` keeps one list.
-- **DB-privileges-only / flag-only / DDL-parser safety models.** Rejected (D1):
-  privileges-only and flag-only leave real prod-connection footguns; a DDL parser
-  is fragile and bypassable.
+  discovery surface; `mode` keeps one list.
+- **DDL/DML parser, privileges-only, flag-only safety models.** Rejected (D1/§3).
 
-## 9. Result Contract
+## 10. Result Contract
 
 `db.execute` envelope (`command: "db.execute"`):
 
@@ -238,89 +310,129 @@ delegator alongside the existing `execute`.
 }
 ```
 
-When the statement has no `RETURNING` clause, `returning` is `[]`. Success is
-always `ok: true`, exit 0.
+- **`rows_affected`** is the count reported by the driver (`cursor.rowcount`),
+  **informational, not authoritative**: for `RETURNING` statements it may reflect
+  *returned* rows rather than affected rows (driver-dependent). `null` when the
+  driver reports no count (e.g. DDL).
+- **`returning`** is `list[dict]` and may contain **multiple rows** for
+  multi-row `UPDATE...RETURNING` / multi-row `INSERT...RETURNING`; `[]` when the
+  statement has no `RETURNING`. Non-JSON-native cells that survive
+  `coerce_db_value` are stringified by the envelope's `json.dumps(default=str)`
+  (ARCHITECTURE §6), so emission does not fail on exotic types.
+- **`sql`** is the SQL text **as resolved** (the template's `sql` or the `--sql`
+  arg), with `:paramName` placeholders **intact** (not substituted) — matching
+  how `db.assert`'s error detail already echoes SQL. Bound params travel in
+  `--param`, not in the echoed `sql`.
+- **Terminology:** the read path uses `row_count` (rows returned); the write
+  path uses `rows_affected` (rows mutated). Different concepts, deliberately
+  different names.
 
-## 10. Discovery Changes (`agctl/commands/discover_commands.py`)
+Success is always `ok: true`, exit 0 — including the **0-rows-affected** case
+(e.g. an `UPDATE` matching nothing, or `ON CONFLICT DO NOTHING` on an existing
+row). 0-affected is a successful no-op write, not a failure.
 
-No new category. The `db-templates` category gains a `mode` marker:
+## 11. Discovery Changes (`agctl/commands/discover_commands.py`)
 
-- **Level 1 (category listing):** each item adds `"mode": "read" | "write"` so an
-  agent scanning the list sees writes at a glance.
-- **Level 2 (item detail):** a write template reports `mode: "write"` and an
-  example of the form `agctl db execute --template <name> --write`. A read
+No new category. The `db-templates` category gains a `mode` marker — a
+**purely additive** key (`{name, description}` → `{name, description, mode}`);
+existing keys are unchanged, so consumers ignoring unknown keys are unaffected.
+
+- **Level 1 (category listing):** each item adds `"mode": "read" | "write"`.
+- **Level 2 (item detail):** a write template reports `mode: "write"` with an
+  example of the form `agctl db execute --template <name> --write`; a read
   template keeps `agctl db query --template <name>`.
-- **Search:** matches carry `mode` as well.
+- **Search:** matches carry `mode`.
 
-This ensures an agent cannot discover a write template and run it through `db
-query` by mistake (the mode check in §5.2 refuses it regardless, but discovery
-makes intent visible first).
+## 12. Error & Exit-Code Model
 
-## 11. Error & Exit-Code Model
-
-No new error types. Existing types (`agctl/errors.py`) cover every path:
+No new error types. Existing types (`agctl/errors.py`) cover every path. Gate
+checks run in the order: **argument validation → invocation gate (`--write`) →
+mode check → connection gate**, all before connecting.
 
 | Failure | Type | Exit |
 |---|---|---|
+| `--template` and `--sql` both given (or neither) | `ConfigError` | 2 |
+| `db execute` with neither `--template` nor `--connection` (no explicit target) | `ConfigError` | 2 |
 | Missing `--write` | `ConfigError` | 2 |
+| Template `mode` mismatched to the command (read↔execute, on `query`/`assert`/`execute`) | `ConfigError` | 2 |
 | Resolved connection not `writable: true` | `ConfigError` | 2 |
-| Template `mode` mismatched to the command (read↔execute) | `ConfigError` | 2 |
-| Write template resolves to a non-writable connection (config load) | `ConfigError` | 2 |
-| Unknown template/connection | `TemplateNotFound` | 2 |
+| Connection's driver lacks `execute_write` | `ConfigError` | 2 |
+| `AGCTL_*` override targets `writable`/`mode` | `ConfigError` | 2 |
+| Unknown template | `TemplateNotFound` | 2 |
+| Unknown connection | `ConfigError` | 2 |
 | Write/commit failure, driver error | `ConnectionFailure` | 2 |
 
-`AssertionFailure` (exit 1) does not apply — `db execute` does not assert; a
-write succeeding is always exit 0.
+`AssertionFailure` (exit 1) does not apply — `db execute` does not assert.
 
-## 12. Transaction Semantics & Idempotency
+## 13. Transaction Semantics & Idempotency
 
-- **One statement per invocation.** Commit on success, rollback on error. This
-  is consistent with agctl's stateless, one-envelope-per-call model and the
-  `@envelope` contract (ARCHITECTURE §4/§6).
-- **Idempotency is the author's responsibility**, expressed in SQL. The
-  `agctl-config` authoring skill carries an idempotent-insert example (e.g.
-  `ON CONFLICT … DO NOTHING`) so re-runnable repros are the path of least
-  resistance.
+- **One invocation = one committed unit = the SQL string as given.** The driver
+  executes the SQL as a single unit and commits atomically. `agctl` does **not**
+  split, count, or reject multiple semicolon-joined statements — if the driver
+  runs them, they commit together as one unit. Multi-statement authoring is not a
+  *feature* and is not validated; the contract is simply "the SQL string commits
+  as one unit." This is consistent with the stateless, one-envelope-per-call model.
+- **Idempotency is the author's responsibility**, expressed in SQL (`ON
+  CONFLICT … DO NOTHING`, `WHERE NOT EXISTS`, `MERGE`). The `agctl-config`
+  authoring skill carries an idempotent-insert example so re-runnable repros are
+  the path of least resistance.
+- **State scope:** a committed write mutates **SUT** (database) state, not
+  `agctl`-local state — `agctl` remains stateless and writes nothing to disk
+  locally (ARCHITECTURE §2 invariant holds; the invariant concerns `agctl`-local
+  state, not the system under test).
 
-## 13. Testing Strategy
+## 14. Testing Strategy
 
 Mirrors the existing test architecture (ARCHITECTURE §12).
 
-**Unit (no DB):** inject a fake driver implementing `execute_write` via the
-existing seams (`db_commands.new_db_client`, `DbClient(driver=…)`). Cover:
-- Both gate failures: missing `--write`; non-writable connection.
-- Mode mismatches in both directions (read template → `execute`; write template → `query`).
-- Success path: `rows_affected` + `returning` shape; absent `RETURNING` → `[]`.
-- Error mapping: write/commit failure → `ConnectionFailure`.
+**Unit (no DB):** inject a fake driver via the existing seams
+(`db_commands.new_db_client`, `DbClient(driver=…)`). Cover:
+- Both runtime gate failures: missing `--write`; non-writable connection.
+- Explicit-target refusal: bare `db execute --sql … --write` with no target.
+- Mode mismatches in **all three** directions (read template → `execute`;
+  write template → `query`; write template → `assert`).
+- Optional-capability refusal: a driver without `execute_write` → `ConfigError`.
+- Env-override denylist: `AGCTL_*__WRITABLE` / `__MODE` → `ConfigError` at load.
+- Commit-after-materialize ordering: a write whose result coercion raises is
+  rolled back and reported `ok:false` with **no commit**.
+- Success path: `rows_affected` + `returning` shape; absent `RETURNING` → `[]`;
+  no-count statement → `rows_affected: null`; 0-affected → exit 0.
 - Config validation: new `mode`/`writable` fields; the write-template→
-  writable-connection cross-ref rule (both pass and fail).
+  writable-connection cross-ref rule (pass and fail).
 - Discovery: `mode` present in Level-1 listing, Level-2 detail, and search.
 
 **Integration (self-skipping):** via the existing `require_postgres` fixture
-(`tests/integration/conftest.py`) — a real `db execute` INSERT followed by a `db
-query`/`db assert` round-trip confirming the row landed, plus a rollback-on-error
-case. Skips automatically when no Postgres is reachable.
+(`tests/integration/conftest.py`) — a real `db execute` INSERT followed by a
+`db query`/`db assert` round-trip confirming the row landed and is visible, plus
+a rollback-on-error case. Skips automatically when no Postgres is reachable.
 
-## 14. Docs & Skill Impact
+## 15. Docs & Skill Impact
 
 - **DESIGN.md** — §2.1 gains the `writable` connection field and `mode` template
-  field; §3.3 gains the `db execute` command; §4.2 gains the `db.execute` result
-  shape.
-- **ARCHITECTURE.md** — §3 module map notes the new command; §8 documents the
-  `execute_write` driver method and `DbClient` delegator; §7 error rows.
+  field; §3.3 gains the `db execute` command (including the explicit-target and
+  `--write` rules); §4.2 gains the `db.execute` result shape.
+- **ARCHITECTURE.md** — §3 module map notes the new command; §5 documents the
+  resolver denylist (`writable`/`mode`); §8 documents the optional
+  `execute_write` capability + `DbClient` probe and the commit-after-materialize
+  ordering; §7 adds the new error rows; §10 notes `execute_write` is an optional
+  capability (Protocol unchanged).
 - **`skills/agctl-config`** — add `reference/db-write-template.md` and surface
-  write-template authoring in `SKILL.md`.
+  write-template authoring (incl. idempotent patterns and `::cast` param typing)
+  in `SKILL.md`.
 - **`skills/agctl/SKILL.md`** — add `db execute` usage and the seed/`--write`
   pattern.
 
 Doc sync is performed via the `docs-watcher` subagent after implementation
 (CLAUDE.md "Docs Sync").
 
-## 15. Open Questions / Out of Scope (deferred)
+## 16. Open Questions / Out of Scope (deferred)
 
-- **Batch / multi-statement seeding** — deferred to v2 if real usage demands it;
-  the agent-chains-commands model covers most cases today.
+- **Batch / multi-statement seeding as a feature** — deferred; the agent-chains-
+  commands model covers most cases, and the SQL-string-as-one-unit contract (§13)
+  handles the rest without new surface.
 - **Auto-rollback "seed + cleanup" primitive** (insert-then-delete pairing) —
-  deferred; idempotent SQL covers reproducibility without new surface.
-- **`--dry-run` / explain** — not in scope; a read-only `db query` against the
-  same data answers most "what will this touch" questions.
+  deferred; idempotent SQL covers reproducibility.
+- **`--dry-run` / explain** — not in scope; a read-only `db query` answers most
+  "what will this touch" questions.
+- **Env-overridable writability** — explicitly decided **against** (D6/§7.2); if
+  a future deployment genuinely needs env-controlled writability, revisit then.
