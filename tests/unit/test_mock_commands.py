@@ -76,6 +76,9 @@ mocks:
 
     def test_only_kafka_with_reactors(self, temp_config, fake_engine):
         """--only kafka with reactors + kafka.brokers -> run_kafka=True, kafka_client is KafkaClient."""
+        # Skip if confluent_kafka is not installed
+        pytest.importorskip("confluent_kafka")
+
         config_content = """
 version: "1.0"
 kafka:

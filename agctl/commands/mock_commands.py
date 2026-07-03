@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
 __all__ = ["mock_run", "new_mock_engine"]
 
+# Import from kafka_commands to avoid duplication (no circular import)
+from .kafka_commands import new_kafka_client
+
 
 # Test seam: tests monkeypatch this to return a fake MockEngine
 def new_mock_engine(
@@ -48,44 +51,6 @@ def new_mock_engine(
         fail_fast=fail_fast,
         duration=duration,
         until_stopped=until_stopped,
-    )
-
-
-def _kafka_ssl_conf(cfg_kafka: KafkaConfig) -> dict[str, str]:
-    """Translate cfg.kafka.ssl into librdkafka conf keys.
-
-    Copied from kafka_commands to avoid circular imports (command → command).
-    """
-    ssl = cfg_kafka.ssl
-    if ssl is None:
-        return {}
-    conf: dict[str, str] = {}
-    if ssl.ca_location:
-        conf["ssl.ca.location"] = ssl.ca_location
-    if ssl.certificate_location:
-        conf["ssl.certificate.location"] = ssl.certificate_location
-    if ssl.key_location:
-        conf["ssl.key.location"] = ssl.key_location
-    if ssl.key_password:
-        conf["ssl.key.password"] = ssl.key_password
-    if ssl.endpoint_identification_algorithm:
-        conf["ssl.endpoint.identification.algorithm"] = ssl.endpoint_identification_algorithm
-    if conf:
-        conf["security.protocol"] = ssl.security_protocol or "SSL"
-    return conf
-
-
-def new_kafka_client(cfg_kafka: KafkaConfig, group_id: str | None = None):
-    """Build a real KafkaClient from cfg.kafka.
-
-    Copied from kafka_commands to avoid circular imports (command → command).
-    """
-    from ..clients.kafka_client import KafkaClient
-
-    return KafkaClient(
-        cfg_kafka.brokers,
-        group_id=group_id,
-        extra_conf=_kafka_ssl_conf(cfg_kafka),
     )
 
 
@@ -208,12 +173,6 @@ def mock_run(
         # Start the engine (probes + binds — may raise ConfigError/ConnectionFailure)
         engine.start()
 
-        # Run the engine (blocks until stop)
-        code = engine.run()
-
-        # Exit with the engine's exit code
-        raise SystemExit(code)
-
     except AgctlError as err:
         # Startup errors → structured envelope + exit code
         emit(
@@ -232,3 +191,9 @@ def mock_run(
             duration_ms=int((time.monotonic() - start) * 1000),
         )
         raise SystemExit(2)
+
+    # Run the engine (blocks until stop)
+    code = engine.run()
+
+    # Exit with the engine's exit code
+    raise SystemExit(code)
