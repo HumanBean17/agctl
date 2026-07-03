@@ -27,6 +27,26 @@ class FakeDriver:
         self.closed = True
 
 
+class FakeDriverWithExecuteWrite(FakeDriver):
+    """Fake driver that supports writes."""
+
+    def execute_write(self, sql, params):
+        return {"rows_affected": 2, "returning": [{"id": "x"}]}
+
+
+class FakeDriverReadOnly(FakeDriver):
+    """Read-only fake driver without execute_write."""
+
+
+class FakeDriverWithNonCallableExecuteWrite(FakeDriver):
+    """Fake driver with non-callable execute_write attribute."""
+
+    def __init__(self):
+        super().__init__()
+        # Set execute_write to a non-callable value
+        self.execute_write = "not a method"
+
+
 class FakeDriverSubclass(FakeDriver):
     """Distinct class so tests can assert which driver was selected."""
 
@@ -114,3 +134,38 @@ class TestDriverSelection:
         )
         client.close()
         assert client._driver.closed is True
+
+
+class TestExecuteWrite:
+    """Tests for DbClient.execute_write with optional-capability probe."""
+
+    def test_driver_with_execute_write_delegates_and_returns_dict(self):
+        """Driver WITH execute_write: DbClient delegates and returns dict unchanged."""
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=FakeDriverWithExecuteWrite(),
+        )
+        result = client.execute_write("INSERT INTO t (x) VALUES (1)", {"x": 1})
+        assert result == {"rows_affected": 2, "returning": [{"id": "x"}]}
+
+    def test_driver_without_execute_write_raises_config_error(self):
+        """Driver WITHOUT execute_write: raises ConfigError with driver type."""
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=FakeDriverReadOnly(),
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            client.execute_write("INSERT INTO t (x) VALUES (1)", {"x": 1})
+        assert "does not support writes" in exc_info.value.message
+        assert exc_info.value.detail.get("driver") == "postgresql"
+
+    def test_driver_with_non_callable_execute_write_raises_config_error(self):
+        """Driver with non-callable execute_write attribute: also raises ConfigError."""
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=FakeDriverWithNonCallableExecuteWrite(),
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            client.execute_write("INSERT INTO t (x) VALUES (1)", {"x": 1})
+        assert "does not support writes" in exc_info.value.message
+        assert exc_info.value.detail.get("driver") == "postgresql"
