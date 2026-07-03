@@ -168,7 +168,7 @@ agctl db execute --template insert-order \
 agctl db execute \
   --sql "UPDATE orders SET status = 'CANCELLED' WHERE id = :orderId" \
   --param orderId=ord-789 \
-  --connection main-db \
+  --connection main-db-writable \
   --write
 ```
 

@@ -125,12 +125,12 @@ class PostgreSQLDriver:
 
         except Exception as exc:
             # Rollback on ANY exception (not just psycopg.Error)
-            self._conn.rollback()
-            # Surface as ConnectionFailure, using driver error message when applicable
-            if isinstance(exc, psycopg.Error):
-                raise ConnectionFailure(message=str(exc)) from exc
-            else:
-                raise ConnectionFailure(message=str(exc)) from exc
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass  # Original exception surfaced below; failed rollback is safe to ignore
+            # Surface as ConnectionFailure
+            raise ConnectionFailure(message=str(exc)) from exc
         finally:
             cur.close()
 

@@ -119,12 +119,7 @@ def _check_template_mode(cfg, template_name: str | None, forbidden: str) -> None
     """
     if template_name is None:
         return
-    if template_name not in cfg.database.templates:
-        # This should already be caught by resolve_db_request, but defensive
-        raise ConfigError(
-            f"Unknown database template: {template_name}",
-            {"path": f"database.templates.{template_name}"},
-        )
+    # template_name is guaranteed valid by resolve_db_request
     template = cfg.database.templates[template_name]
     if template.mode == forbidden:
         raise ConfigError(

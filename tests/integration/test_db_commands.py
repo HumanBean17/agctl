@@ -88,7 +88,8 @@ def test_db_execute_then_query_visible(require_postgres):
     assert result.exit_code == 0, result.output
     envelope = json.loads(result.output)
     assert envelope["ok"] is True
-    assert envelope["result"]["rows_affected"] >= 0  # DDL may report 0 or unknown
+    ra = envelope["result"]["rows_affected"]
+    assert ra is None or ra >= 0  # DDL reports None (cursor.rowcount == -1) or 0
 
     # Step 2: Seed via template (idempotent ON CONFLICT DO NOTHING)
     result = CliRunner().invoke(

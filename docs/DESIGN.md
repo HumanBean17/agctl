@@ -127,6 +127,16 @@ database:
       user: "${DB_USER}"
       password: "${DB_PASSWORD}"
       default: true                               # used when --connection is omitted
+
+    main-db-writable:
+      # In production, use a separate least-privilege write-capable account
+      # (e.g., ${DB_WRITE_USER}/${DB_WRITE_PASSWORD}) per spec §3.
+      type: postgresql
+      host: "${DB_HOST}"
+      port: 5432
+      dbname: "${DB_NAME}"
+      user: "${DB_WRITE_USER:-${DB_USER}}"
+      password: "${DB_WRITE_PASSWORD:-${DB_PASSWORD}}"
       writable: true                              # required for `agctl db execute --write`
 
     analytics-db:
@@ -159,7 +169,7 @@ database:
 
     insert-order:
       description: "Create a new order (idempotent via ON CONFLICT)"
-      connection: main-db
+      connection: main-db-writable
       mode: write
       sql: "INSERT INTO orders (id, customer_id, status) VALUES (:orderId, :customerId, 'PENDING') ON CONFLICT (id) DO NOTHING RETURNING *"
 
@@ -618,7 +628,7 @@ agctl db execute --template insert-order \
 agctl db execute \
   --sql "UPDATE orders SET status = 'CANCELLED' WHERE id = :orderId" \
   --param orderId=ord-789 \
-  --connection main-db \
+  --connection main-db-writable \
   --write
 ```
 
