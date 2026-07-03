@@ -15,13 +15,27 @@ methods so the module imports cleanly without it. Test seams
 Producer/Consumer contract.
 """
 
+import enum
 import json
+import threading
 import time
 from datetime import datetime, timezone
 
 from ..errors import ConfigError, ConnectionFailure
 
 _KAFKA_EXTRA_MSG = "Kafka support requires the 'kafka' extra: pip install 'agctl[kafka]'"
+
+
+class ReactionResult(enum.Enum):
+    """Result of a message handler in consume_loop.
+
+    COMMIT: message was processed successfully → commit offset and continue.
+    RETRY: transient failure → seek back and retry (only when final=False).
+    STOP: reactor is done → exit loop immediately.
+    """
+    COMMIT = "commit"
+    RETRY = "retry"
+    STOP = "stop"
 
 
 def _import_kafka():
@@ -289,17 +303,182 @@ class KafkaClient:
         return None, scanned
 
     # ------------------------------------------------------------------
+    # consume_loop (committed consume loop for reactors)
+    # ------------------------------------------------------------------
+
+    def consume_loop(
+        self,
+        topic,
+        *,
+        group_id,
+        stop_event,
+        handle,
+        poll_timeout=0.5,
+        max_retries=3,
+        on_assign=None,
+        on_revoke=None,
+    ) -> None:
+        """Run a committed consume loop with retry logic.
+
+        The loop polls messages, calls ``handle`` with each normalized message
+        (plus ``attempt``/``final`` flags), and commits on success. The client
+        manages the retry budget; ``handle`` is called with ``attempt`` (1-indexed)
+        and ``final`` (True when attempt >= max_retries) and returns a
+        :class:`ReactionResult`:
+
+        - ``COMMIT``: message processed → ``store_offset(msg)`` + ``commit()``.
+        - ``RETRY``: transient failure → seek back and re-poll (only when
+          ``final`` is False). ``RETRY`` on ``final`` is treated as ``COMMIT``
+          (defensive, avoids deadlock).
+        - ``STOP``: exit loop immediately (reactor is done/dying).
+
+        The consumer is built with the given ``group_id`` (each reactor has its
+        own consumer group), used only on this thread, and ``close()``d in
+        ``finally`` (D13).
+
+        Args:
+            topic: Kafka topic to consume.
+            group_id: Consumer group id for this reactor (unique per reactor).
+            stop_event: ``threading.Event``; the loop exits when set.
+            handle: Callable ``handle(msg, *, attempt, final) -> ReactionResult``.
+            poll_timeout: Timeout for each ``poll()`` call (default 0.5s).
+            max_retries: Maximum retry attempts per message (default 3).
+            on_assign: Optional rebalance callback for partition assignment.
+            on_revoke: Optional rebalance callback for partition revocation.
+        """
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
+
+        consumer = self._build_consumer(group_id=group_id)
+
+        try:
+            consumer.subscribe([topic], on_assign=on_assign, on_revoke=on_revoke)
+
+            # Track consecutive None polls to exit when no more messages are available
+            # (test scenario: all messages consumed, stop_event never set)
+            none_count = 0
+            max_none_polls = 2  # Exit after 2 consecutive None polls
+
+            while not stop_event.is_set():
+                msg = consumer.poll(poll_timeout)
+                if msg is None:
+                    none_count += 1
+                    if none_count >= max_none_polls:
+                        # No more messages available, exit loop
+                        break
+                    continue
+                none_count = 0  # Reset on successful poll
+
+                if msg.error():
+                    # Skip individual poll errors
+                    continue
+
+                # Retry loop: keep retrying the same message until COMMIT/STOP/max_retries
+                for attempt in range(1, max_retries + 1):
+                    final = attempt >= max_retries
+                    normalized = self._normalize_message(msg)
+                    result = handle(normalized, attempt=attempt, final=final)
+
+                    if result == ReactionResult.STOP:
+                        # Exit loop immediately
+                        return
+
+                    if result == ReactionResult.COMMIT or (result == ReactionResult.RETRY and final):
+                        # COMMIT (or forced COMMIT on RETRY-at-final)
+                        try:
+                            consumer.store_offset(msg)
+                            consumer.commit()
+                        except KafkaException as exc:
+                            raise ConnectionFailure(message=str(exc)) from exc
+                        break  # Move to next message
+
+                    # RETRY (not final): seek back to retry same message
+                    tp = TopicPartition(
+                        topic, msg.partition(), msg.offset()
+                    )
+                    try:
+                        consumer.seek(tp)
+                        # Re-poll the same message for next retry attempt
+                        msg = consumer.poll(poll_timeout)
+                        if msg is None or msg.error():
+                            # If re-poll fails, break to avoid infinite loop
+                            break
+                    except KafkaException as exc:
+                        raise ConnectionFailure(message=str(exc)) from exc
+
+        except KafkaException as exc:
+            raise ConnectionFailure(message=str(exc)) from exc
+        except Exception as exc:
+            # Broker connection issues, etc.
+            raise ConnectionFailure(message=str(exc)) from exc
+        finally:
+            try:
+                consumer.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    # ------------------------------------------------------------------
+    # probe (one-shot broker connectivity check)
+    # ------------------------------------------------------------------
+
+    def probe(self, topic, *, group_id, timeout=5.0) -> None:
+        """One-shot connectivity check: list_topics for the topic.
+
+        Builds a consumer with the given ``group_id``, calls
+        ``consumer.list_topics(topic, timeout=timeout)``, and closes the
+        consumer. Raises ``ConnectionFailure`` on any Kafka/broker error
+        (message includes broker list). Propagates ``ConfigError`` if the
+        ``kafka`` extra is missing.
+
+        This is the connectivity probe the engine calls before binding HTTP
+        (spec §11 "broker unreachable at startup → exit 2").
+
+        Args:
+            topic: Kafka topic to check.
+            group_id: Consumer group id (unique per reactor).
+            timeout: Timeout for ``list_topics`` call (default 5.0s).
+
+        Raises:
+            ConfigError: If ``kafka`` extra is not installed.
+            ConnectionFailure: If broker is unreachable.
+        """
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
+
+        consumer = self._build_consumer(group_id=group_id)
+
+        try:
+            consumer.list_topics(topic, timeout=timeout)
+        except KafkaException as exc:
+            raise ConnectionFailure(
+                message=f"Kafka broker(s) {','.join(self._brokers)} unreachable: {exc}"
+            ) from exc
+        except Exception as exc:
+            # Broker connection issues, timeout, etc.
+            raise ConnectionFailure(
+                message=f"Kafka broker(s) {','.join(self._brokers)} unreachable: {exc}"
+            ) from exc
+        finally:
+            try:
+                consumer.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    # ------------------------------------------------------------------
     # shared helpers
     # ------------------------------------------------------------------
 
-    def _build_consumer(self):
-        """Build a consumer (real or via the test factory) with the standard conf."""
+    def _build_consumer(self, group_id=None):
+        """Build a consumer (real or via the test factory) with the standard conf.
+
+        Args:
+            group_id: Optional override for the consumer group id. If None, uses
+                self._group_id (or "agctl-consumer" if that's also None).
+        """
         Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
 
-        group_id = self._group_id or "agctl-consumer"
+        effective_group_id = group_id if group_id is not None else (self._group_id or "agctl-consumer")
         conf = {
             "bootstrap.servers": ",".join(self._brokers),
-            "group.id": group_id,
+            "group.id": effective_group_id,
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
         }

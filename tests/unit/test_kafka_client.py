@@ -6,14 +6,16 @@ real confluent_kafka Consumer. This lets the seek-by-timestamp logic be unit
 tested without a broker.
 """
 
+import enum
 import json
 import math
+import threading
 import time
 
 import pytest
 from confluent_kafka import OFFSET_END, TopicPartition
 
-from agctl.clients.kafka_client import KafkaClient
+from agctl.clients.kafka_client import KafkaClient, ReactionResult
 from agctl.errors import ConfigError, ConnectionFailure
 
 
@@ -146,9 +148,25 @@ class FakeConsumer:
         self._topics = []
         self.closed = False
         self.poll_error = poll_error
+        # New for consume_loop/probe tests
+        self.subscribe_calls = []
+        self.store_offset_calls = []
+        self.commit_calls = []
+        self.seek_calls = []
+        self.list_topics_calls = []
+        self.list_topics_result = None
+        self.on_assign = None
+        self.on_revoke = None
 
-    def subscribe(self, topics):
+    def subscribe(self, topics, on_assign=None, on_revoke=None):
         self._topics = list(topics)
+        self.on_assign = on_assign
+        self.on_revoke = on_revoke
+        self.subscribe_calls.append({"topics": list(topics), "on_assign": on_assign, "on_revoke": on_revoke})
+        # Simulate immediate assignment for tests
+        if on_assign:
+            t = topics[0]
+            on_assign([TopicPartition(t, 0), TopicPartition(t, 1)])
 
     def assignment(self):
         # Two partitions for the subscribed topic, mirroring tests' setup.
@@ -175,6 +193,16 @@ class FakeConsumer:
         # `offset >= seek_off` test yields nothing for that partition.
         off = math.inf if tp.offset == OFFSET_END else tp.offset
         self._seek_offsets[(tp.topic, tp.partition)] = off
+        self.seek_calls.append(tp)
+        # Reset cursor to the earliest message that meets all seek offsets
+        # (for retry scenarios and multi-partition seeks).
+        if tp.offset != OFFSET_END and tp.offset >= 0:
+            # Find the earliest message that meets ALL current seek offsets
+            for i, m in enumerate(self._messages):
+                seek_off = self._seek_offsets.get((m.topic(), m.partition()), 0)
+                if m.offset() >= seek_off:
+                    self._cursor = i
+                    break
 
     def seek_to_beginning(self, *tps):
         for tp in tps:
@@ -184,13 +212,32 @@ class FakeConsumer:
         if self.poll_error:
             return _ErrMsg()
         # Find next canned message at/after the seek offset for its partition.
+        # After a seek, the cursor might be at a message that doesn't meet the seek
+        # offset (for other partitions), so we need to skip those.
         while self._cursor < len(self._messages):
             m = self._messages[self._cursor]
-            self._cursor += 1
             seek_off = self._seek_offsets.get((m.topic(), m.partition()), 0)
             if m.offset() >= seek_off:
+                self._cursor += 1  # Only advance cursor if we return this message
                 return m
+            self._cursor += 1  # Skip messages that don't meet seek offset
         return None
+
+    def store_offset(self, msg):
+        """Record store_offset calls (used in consume_loop commit path)."""
+        self.store_offset_calls.append(msg)
+
+    def commit(self, offsets=None):
+        """Record commit calls (used in consume_loop commit path)."""
+        self.commit_calls.append(offsets)
+
+    def list_topics(self, topic=None, timeout=0):
+        """Record list_topics calls (used in probe)."""
+        self.list_topics_calls.append({"topic": topic, "timeout": timeout})
+        if self.list_topics_result is not None:
+            return self.list_topics_result
+        # Return a fake successful result by default
+        return type("obj", (object,), {"topics": [topic]})()
 
     def close(self):
         self.closed = True
@@ -595,3 +642,405 @@ def test_consume_window_predicate_filters_and_early_stops():
     )
 
     assert [m["key"] for m in result] == ["b"]  # stopped after the first match
+
+
+# ---------------------------------------------------------------------------
+# consume_loop
+# ---------------------------------------------------------------------------
+
+
+def test_consume_loop_commits_all_messages():
+    """consume_loop with COMMIT for all messages → commit called for each."""
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(topic, 0, 0, "k1", b'{"i":1}', now_ms),
+        FakeCMsg(topic, 0, 1, "k2", b'{"i":2}', now_ms + 100),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+    stop_event = threading.Event()
+    handle_calls = []
+
+    def handle(msg, *, attempt, final):
+        handle_calls.append((msg["key"], attempt, final))
+        return ReactionResult.COMMIT
+
+    client.consume_loop(
+        topic,
+        group_id="test-group",
+        stop_event=stop_event,
+        handle=handle,
+        poll_timeout=0.1,
+        max_retries=3,
+    )
+
+    # Both messages were handled (attempt=1, final=False for both)
+    assert len(handle_calls) == 2
+    assert handle_calls[0] == ("k1", 1, False)
+    assert handle_calls[1] == ("k2", 1, False)
+    # Both messages were committed
+    assert len(consumer.commit_calls) == 2
+    assert len(consumer.store_offset_calls) == 2
+    assert consumer.closed is True
+
+
+def test_consume_loop_retries_then_commits():
+    """handle returns RETRY for attempts 1 and 2 on first message, then COMMIT at attempt 3.
+    Second message is handled normally (no retries)."""
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(topic, 0, 0, "k1", b'{"i":1}', now_ms),
+        FakeCMsg(topic, 0, 1, "k2", b'{"i":2}', now_ms + 100),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+    stop_event = threading.Event()
+    handle_calls = []
+
+    def handle(msg, *, attempt, final):
+        key = msg["key"]
+        handle_calls.append((key, attempt, final))
+        # Only retry the first message (k1), second message (k2) commits immediately
+        if key == "k1" and attempt < 3:
+            return ReactionResult.RETRY
+        return ReactionResult.COMMIT
+
+    client.consume_loop(
+        topic,
+        group_id="test-group",
+        stop_event=stop_event,
+        handle=handle,
+        poll_timeout=0.1,
+        max_retries=3,
+    )
+
+    # First message: attempts 1, 2 (RETRY), 3 (COMMIT/final=True)
+    # Second message: handled once (attempt=1, final=False)
+    assert len(handle_calls) == 4
+    assert handle_calls[0] == ("k1", 1, False)
+    assert handle_calls[1] == ("k1", 2, False)
+    assert handle_calls[2] == ("k1", 3, True)  # final attempt
+    assert handle_calls[3] == ("k2", 1, False)
+    # Two seeks (retry back to k1 twice)
+    assert len(consumer.seek_calls) == 2
+    # Two commits (one per message)
+    assert len(consumer.commit_calls) == 2
+    assert consumer.closed is True
+
+
+def test_consume_loop_retry_on_final_treated_as_commit():
+    """handle returns RETRY on final attempt → forced COMMIT (defensive)."""
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(topic, 0, 0, "k1", b'{"i":1}', now_ms),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+    stop_event = threading.Event()
+    handle_calls = []
+
+    def handle(msg, *, attempt, final):
+        handle_calls.append((msg["key"], attempt, final))
+        return ReactionResult.RETRY  # Even on final!
+
+    client.consume_loop(
+        topic,
+        group_id="test-group",
+        stop_event=stop_event,
+        handle=handle,
+        poll_timeout=0.1,
+        max_retries=2,  # Only 2 attempts total
+    )
+
+    # Attempt 1 (RETRY, final=False), attempt 2 (RETRY treated as COMMIT, final=True)
+    assert len(handle_calls) == 2
+    assert handle_calls[0] == ("k1", 1, False)
+    assert handle_calls[1] == ("k1", 2, True)
+    # Message was committed despite RETRY on final
+    assert len(consumer.commit_calls) == 1
+    assert consumer.closed is True
+
+
+def test_consume_loop_stop_exits_immediately():
+    """handle returns STOP → loop exits, consumer closed."""
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(topic, 0, 0, "k1", b'{"i":1}', now_ms),
+        FakeCMsg(topic, 0, 1, "k2", b'{"i":2}', now_ms + 100),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+    stop_event = threading.Event()
+    handle_calls = []
+
+    def handle(msg, *, attempt, final):
+        handle_calls.append((msg["key"], attempt, final))
+        return ReactionResult.STOP
+
+    client.consume_loop(
+        topic,
+        group_id="test-group",
+        stop_event=stop_event,
+        handle=handle,
+        poll_timeout=0.1,
+        max_retries=3,
+    )
+
+    # Only first message was handled
+    assert len(handle_calls) == 1
+    assert handle_calls[0] == ("k1", 1, False)
+    # No commits (STOP exits before commit)
+    assert len(consumer.commit_calls) == 0
+    assert consumer.closed is True
+
+
+def test_consume_loop_stop_event_exits_without_handling():
+    """stop_event set before first poll → loop exits without calling handle."""
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(topic, 0, 0, "k1", b'{"i":1}', now_ms),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+    stop_event = threading.Event()
+    stop_event.set()  # Set before loop starts
+    handle_calls = []
+
+    def handle(msg, *, attempt, final):
+        handle_calls.append((msg["key"], attempt, final))
+        return ReactionResult.COMMIT
+
+    client.consume_loop(
+        topic,
+        group_id="test-group",
+        stop_event=stop_event,
+        handle=handle,
+        poll_timeout=0.1,
+        max_retries=3,
+    )
+
+    # Handle was never called
+    assert len(handle_calls) == 0
+    # No commits
+    assert len(consumer.commit_calls) == 0
+    assert consumer.closed is True
+
+
+def test_consume_loop_uses_group_id_parameter():
+    """consume_loop uses the group_id parameter, not self._group_id."""
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(topic, 0, 0, "k1", b'{"i":1}', now_ms),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    # Create client with default group_id
+    client = KafkaClient(["host:9092"], group_id="default-group", consumer_factory=factory)
+    stop_event = threading.Event()
+
+    def handle(msg, *, attempt, final):
+        return ReactionResult.COMMIT
+
+    client.consume_loop(
+        topic,
+        group_id="override-group",  # Should use this, not "default-group"
+        stop_event=stop_event,
+        handle=handle,
+        poll_timeout=0.1,
+        max_retries=3,
+    )
+
+    # Consumer was built with the override group_id
+    assert consumer.conf["group.id"] == "override-group"
+
+
+def test_consume_loop_registers_rebalance_callbacks():
+    """on_assign and on_revoke are registered with subscribe."""
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(topic, 0, 0, "k1", b'{"i":1}', now_ms),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+    stop_event = threading.Event()
+
+    assign_calls = []
+    revoke_calls = []
+
+    def on_assign(tps):
+        assign_calls.append(tps)
+
+    def on_revoke(tps):
+        revoke_calls.append(tps)
+
+    def handle(msg, *, attempt, final):
+        return ReactionResult.STOP
+
+    client.consume_loop(
+        topic,
+        group_id="test-group",
+        stop_event=stop_event,
+        handle=handle,
+        poll_timeout=0.1,
+        max_retries=3,
+        on_assign=on_assign,
+        on_revoke=on_revoke,
+    )
+
+    # Callbacks were registered and on_assign was called (simulated immediate assignment)
+    assert len(consumer.subscribe_calls) == 1
+    assert consumer.subscribe_calls[0]["on_assign"] is on_assign
+    assert consumer.subscribe_calls[0]["on_revoke"] is on_revoke
+    assert len(assign_calls) == 1  # Called immediately by FakeConsumer
+
+
+# ---------------------------------------------------------------------------
+# probe
+# ---------------------------------------------------------------------------
+
+
+def test_probe_returns_on_success():
+    """probe with successful list_topics → returns None, consumer closed."""
+    topic = "orders"
+    consumer = FakeConsumer({})
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+
+    result = client.probe(topic, group_id="test-group", timeout=1.0)
+
+    # probe returns None on success
+    assert result is None
+    # list_topics was called
+    assert len(consumer.list_topics_calls) == 1
+    assert consumer.list_topics_calls[0]["topic"] == topic
+    assert consumer.list_topics_calls[0]["timeout"] == 1.0
+    # Consumer was closed
+    assert consumer.closed is True
+
+
+def test_probe_raises_connection_failure_on_error():
+    """probe with list_topics raising → ConnectionFailure raised, consumer closed."""
+    topic = "orders"
+
+    class BrokenConsumer(FakeConsumer):
+        def list_topics(self, topic=None, timeout=0):
+            raise Exception("broker unreachable")
+
+    consumer = BrokenConsumer({})
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+
+    with pytest.raises(ConnectionFailure, match="broker unreachable"):
+        client.probe(topic, group_id="test-group", timeout=1.0)
+
+    # Consumer was still closed
+    assert consumer.closed is True
+
+
+def test_probe_raises_config_error_on_missing_kafka_extra():
+    """probe with _import_kafka raising ConfigError → propagates."""
+    topic = "orders"
+
+    client = KafkaClient(["host:9092"])
+
+    # Patch _import_kafka to raise ConfigError
+    import agctl.clients.kafka_client as kc_module
+    original_import = kc_module._import_kafka
+
+    def mock_import():
+        raise ConfigError("missing kafka extra")
+
+    kc_module._import_kafka = mock_import
+
+    try:
+        with pytest.raises(ConfigError, match="missing kafka extra"):
+            client.probe(topic, group_id="test-group", timeout=1.0)
+    finally:
+        kc_module._import_kafka = original_import
+
+
+def test_probe_uses_group_id_parameter():
+    """probe uses the group_id parameter, not self._group_id."""
+    topic = "orders"
+    consumer = FakeConsumer({})
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    # Create client with default group_id
+    client = KafkaClient(["host:9092"], group_id="default-group", consumer_factory=factory)
+
+    client.probe(topic, group_id="override-group", timeout=1.0)
+
+    # Consumer was built with the override group_id
+    assert consumer.conf["group.id"] == "override-group"
+
+
+def test_probe_error_message_includes_brokers():
+    """ConnectionFailure from probe includes broker list."""
+    topic = "orders"
+
+    class BrokenConsumer(FakeConsumer):
+        def list_topics(self, topic=None, timeout=0):
+            raise Exception("timeout")
+
+    consumer = BrokenConsumer({})
+
+    def factory(conf):
+        consumer.conf = conf
+        return consumer
+
+    client = KafkaClient(["broker1:9092", "broker2:9092"], consumer_factory=factory)
+
+    with pytest.raises(ConnectionFailure, match="broker1:9092.*broker2:9092"):
+        client.probe(topic, group_id="test-group", timeout=1.0)
