@@ -94,6 +94,62 @@ def validate_config(cfg: Config) -> tuple[list[dict], list[dict]]:
                 }
             )
 
+    # --- mock server validation -----------------------------------------------
+
+    # Check 1: mocks.kafka requires kafka.brokers
+    if (
+        cfg.mocks is not None
+        and cfg.mocks.kafka is not None
+        and cfg.mocks.kafka.reactors
+        and not cfg.kafka.brokers
+    ):
+        errors.append(
+            {
+                "path": "mocks.kafka",
+                "message": "kafka mocks require top-level kafka.brokers",
+            }
+        )
+
+    # Check 2: Missing description warnings for stubs and reactors
+    if cfg.mocks is not None:
+        if cfg.mocks.http is not None:
+            for name, stub in cfg.mocks.http.stubs.items():
+                if _missing_description(stub.description):
+                    warnings.append(
+                        {
+                            "path": f"mocks.http.stubs.{name}",
+                            "message": "missing description (discovery degrades without it)",
+                        }
+                    )
+
+        if cfg.mocks.kafka is not None:
+            for name, reactor in cfg.mocks.kafka.reactors.items():
+                if _missing_description(reactor.description):
+                    warnings.append(
+                        {
+                            "path": f"mocks.kafka.reactors.{name}",
+                            "message": "missing description (discovery degrades without it)",
+                        }
+                    )
+
+    # Check 3: Path-template shadowing warning for HTTP stubs
+    if cfg.mocks is not None and cfg.mocks.http is not None:
+        stubs = list(cfg.mocks.http.stubs.items())
+        for i, (later_name, later_stub) in enumerate(stubs):
+            later_segments = later_stub.path.strip("/").split("/")
+            for earlier_name, earlier_stub in stubs[:i]:
+                earlier_segments = earlier_stub.path.strip("/").split("/")
+                # Check if the earlier stub has a parameter at a position where the later stub has a literal
+                for pos, (earlier_seg, later_seg) in enumerate(zip(earlier_segments, later_segments)):
+                    if earlier_seg.startswith("{") and earlier_seg.endswith("}") and not later_seg.startswith("{"):
+                        warnings.append(
+                            {
+                                "path": f"mocks.http.stubs.{later_name}",
+                                "message": f"Path template '{later_name}' is shadowed by '{earlier_name}' — literal segment '{later_seg}' at position {pos} would never match because '{earlier_name}' has parameter {{{earlier_seg}}} at that position (first match wins)",
+                            }
+                        )
+                        break  # Only warn once per later stub
+
     return errors, warnings
 
 

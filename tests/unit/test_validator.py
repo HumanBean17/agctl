@@ -6,9 +6,17 @@ from agctl.config.models import (
     DatabaseConfig,
     DatabaseTemplate,
     Defaults,
+    HttpMatch,
+    HttpMockConfig,
+    HttpResponse,
+    HttpStub,
     HttpTemplate,
     KafkaConfig,
+    KafkaMockConfig,
     KafkaPattern,
+    KafkaReaction,
+    KafkaReactor,
+    MocksConfig,
     ServiceConfig,
 )
 from agctl.config.validator import validate_config
@@ -262,3 +270,172 @@ def test_read_mode_template_with_read_only_connection_no_error():
         and ("writable" in e["message"] or "write target" in e["message"])
         for e in errors
     )
+
+
+# --- mock server validation ---------------------------------------------------
+
+
+def test_mock_kafka_requires_kafka_brokers_error():
+    """mocks.kafka.reactors non-empty but no kafka.brokers → error."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            kafka=KafkaMockConfig(
+                reactors={
+                    "r": KafkaReactor(
+                        topic="test-topic",
+                        reaction=KafkaReaction(
+                            topic="test-topic", value='{"status": "ok"}'
+                        ),
+                    )
+                }
+            )
+        ),
+        kafka=KafkaConfig(brokers=[]),  # Empty brokers list
+    )
+    errors, warnings = validate_config(cfg)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.kafka"
+    assert errors[0]["message"] == "kafka mocks require top-level kafka.brokers"
+
+
+def test_mock_kafka_with_brokers_no_error():
+    """mocks.kafka.reactors with kafka.brokers present → no error."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            kafka=KafkaMockConfig(
+                reactors={
+                    "r": KafkaReactor(
+                        topic="test-topic",
+                        reaction=KafkaReaction(
+                            topic="test-topic", value='{"status": "ok"}'
+                        ),
+                    )
+                }
+            )
+        ),
+        kafka=KafkaConfig(brokers=["localhost:9092"]),
+    )
+    errors, warnings = validate_config(cfg)
+    # Should not have the kafka.brokers error
+    assert not any(e["path"] == "mocks.kafka" for e in errors)
+
+
+def test_mock_http_stub_missing_description_warns():
+    """HTTP stub without description → warning."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            http=HttpMockConfig(
+                stubs={
+                    "get-order": HttpStub(
+                        method="GET",
+                        path="/orders/{order_id}",
+                        response=HttpResponse(body={"id": 1}),
+                    )
+                }
+            )
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+    assert len(warnings) == 1
+    assert warnings[0]["path"] == "mocks.http.stubs.get-order"
+    assert warnings[0]["message"] == "missing description (discovery degrades without it)"
+
+
+def test_mock_kafka_reactor_missing_description_warns():
+    """Kafka reactor without description → warning."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            kafka=KafkaMockConfig(
+                reactors={
+                    "r": KafkaReactor(
+                        topic="test-topic",
+                        reaction=KafkaReaction(
+                            topic="test-topic", value='{"status": "ok"}'
+                        ),
+                    )
+                }
+            )
+        ),
+        kafka=KafkaConfig(brokers=["localhost:9092"]),
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+    assert len(warnings) == 1
+    assert warnings[0]["path"] == "mocks.kafka.reactors.r"
+    assert warnings[0]["message"] == "missing description (discovery degrades without it)"
+
+
+def test_mock_path_shadowing_warning():
+    """Stub /orders/{order_id} shadows /orders/bulk → warning."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            http=HttpMockConfig(
+                stubs={
+                    "order-by-id": HttpStub(
+                        method="GET",
+                        path="/orders/{order_id}",
+                        response=HttpResponse(body={"id": 1}),
+                    ),
+                    "bulk-orders": HttpStub(
+                        method="GET",
+                        path="/orders/bulk",
+                        response=HttpResponse(body={"orders": []}),
+                    ),
+                }
+            )
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+    shadowing_warnings = [w for w in warnings if "shadow" in w["message"].lower()]
+    assert len(shadowing_warnings) == 1
+    assert shadowing_warnings[0]["path"] == "mocks.http.stubs.bulk-orders"
+    assert "order-by-id" in shadowing_warnings[0]["message"]
+    assert "bulk-orders" in shadowing_warnings[0]["message"]
+
+
+def test_mock_no_shadowing_different_paths():
+    """Stubs /a/{x} and /b/{y} → no shadowing warning."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            http=HttpMockConfig(
+                stubs={
+                    "a-stub": HttpStub(
+                        method="GET", path="/a/{x}", response=HttpResponse(body={})
+                    ),
+                    "b-stub": HttpStub(
+                        method="GET", path="/b/{y}", response=HttpResponse(body={})
+                    ),
+                }
+            )
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    shadowing_warnings = [w for w in warnings if "shadow" in w["message"].lower()]
+    assert len(shadowing_warnings) == 0
+
+
+def test_mock_no_shadowing_literal_first():
+    """Stub /orders/bulk before /orders/{order_id} → no warning (literal first wins)."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            http=HttpMockConfig(
+                stubs={
+                    "bulk-orders": HttpStub(
+                        method="GET",
+                        path="/orders/bulk",
+                        response=HttpResponse(body={"orders": []}),
+                    ),
+                    "order-by-id": HttpStub(
+                        method="GET",
+                        path="/orders/{order_id}",
+                        response=HttpResponse(body={"id": 1}),
+                    ),
+                }
+            )
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    shadowing_warnings = [w for w in warnings if "shadow" in w["message"].lower()]
+    assert len(shadowing_warnings) == 0
