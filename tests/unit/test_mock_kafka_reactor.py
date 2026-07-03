@@ -546,32 +546,6 @@ def test_reactor_run_calls_consume_loop_with_resolved_group(sample_config, stop_
     assert call["group_id"] == "test-group"  # resolved_group()
     assert call["max_retries"] == 3
 
-
-def test_reactor_run_id_default_fallback(stop_event):
-    """When run_id is None, reactor defaults to str(os.getpid())."""
-    import os
-
-    config = KafkaReactor(
-        topic="commands",
-        consumer_group=None,  # omitted → generated
-        reaction=KafkaReaction(topic="events", value={}),
-    )
-    client = FakeKafkaClient(messages=[])
-    reactor = Reactor(
-        name="my-reactor",
-        config=config,
-        client=client,
-        emit_event=lambda _: None,
-        stop_event=stop_event,
-        fail_fast=False,
-        run_id=None,  # Test fallback
-    )
-
-    # Should use os.getpid() as fallback
-    expected_group = f"agctl-mock-my-reactor-{os.getpid()}"
-    assert reactor.resolved_group() == expected_group
-
-
 def test_reactor_no_match_config_processes_all(emit_event, stop_event):
     """When match is None, all messages are processed."""
     config = KafkaReactor(

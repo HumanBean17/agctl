@@ -7,12 +7,14 @@ failures are retried by the client; final failures emit kafka.error once
 before committing (non-fatal) or stopping (fail_fast).
 """
 
-import os
-from typing import Any
+import threading
+import time
+from typing import Callable
 
 from ..assertions import jq_bool
+from ..clients.kafka_client import KafkaClient, ReactionResult
+from ..config.models import KafkaReactor as KafkaReactorConfig
 from ..resolution import fill_placeholders
-from ..clients.kafka_client import ReactionResult
 
 
 class KafkaReactor:
@@ -33,13 +35,13 @@ class KafkaReactor:
     def __init__(
         self,
         name: str,
-        config,
-        client,
+        config: KafkaReactorConfig,
+        client: KafkaClient,
         *,
-        emit_event,
-        stop_event,
+        emit_event: Callable[[dict], None],
+        stop_event: threading.Event,
         fail_fast: bool,
-        run_id: str | None = None,
+        run_id: str,
     ):
         """Initialize the reactor.
 
@@ -50,7 +52,7 @@ class KafkaReactor:
             emit_event: Callable[[dict], None] — emit event WITHOUT timestamp.
             stop_event: threading.Event — set to stop the reactor.
             fail_fast: If True, final reaction failure → STOP (engine-wide).
-            run_id: Engine-provided run identifier (default: str(os.getpid())).
+            run_id: Engine-provided run identifier.
         """
         self._name = name
         self._config = config
@@ -58,7 +60,7 @@ class KafkaReactor:
         self._emit_event = emit_event
         self._stop_event = stop_event
         self._fail_fast = fail_fast
-        self._run_id = run_id if run_id is not None else str(os.getpid())
+        self._run_id = run_id
 
     def resolved_group(self) -> str:
         """Return the consumer group ID for this reactor.
@@ -149,8 +151,6 @@ class KafkaReactor:
                 )
 
             # Produce the reaction message
-            import time
-
             start = time.perf_counter()
             self._client.produce(
                 self._config.reaction.topic,
