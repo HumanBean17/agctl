@@ -153,6 +153,7 @@ def _db_query_core(
         param_tuple=param,
         connection_name=connection,
     )
+    _check_template_mode(cfg, template, forbidden="write")
     rows = _execute(cfg, sql_text, params, conn_name)
     return {"rows": rows, "row_count": len(rows), "connection": conn_name}
 
@@ -228,6 +229,7 @@ def _db_assert_core(
         param_tuple=param,
         connection_name=connection,
     )
+    _check_template_mode(cfg, template, forbidden="write")
 
     # Validate assertion mode + required flags BEFORE hitting the database, so a
     # bad invocation fails fast with the right error category (ConfigError, exit 2)

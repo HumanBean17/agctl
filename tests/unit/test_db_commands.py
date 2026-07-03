@@ -779,3 +779,89 @@ def test_db_execute_bare_write_flag_needs_template_or_sql(install_fake):
     assert payload["error"]["type"] == "ConfigError"
     # Fail-fast: execute_write was never called
     assert fake.executed_write == []
+
+
+# --------------------------------------------------------------------------- #
+# Task 7: Read-side mode checks (db query / db assert refuse write-mode templates)
+# --------------------------------------------------------------------------- #
+
+
+def test_db_query_rejects_write_mode_template(install_fake):
+    """db query with write-mode template (seed-order) should raise ConfigError (exit 2)."""
+    fake = install_fake([{"id": "o1", "status": "PENDING"}])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "query",
+            "--template", "seed-order",
+            "--param", "orderId=o1",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert "mode 'write'" in payload["error"]["message"].lower()
+    # Fail-fast: execute was never called
+    assert fake.executed == []
+
+
+def test_db_assert_rejects_write_mode_template(install_fake):
+    """db assert with write-mode template (seed-order) should raise ConfigError (exit 2)."""
+    fake = install_fake([{"id": "o1", "status": "PENDING"}])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "assert",
+            "--template", "seed-order",
+            "--param", "orderId=o1",
+            "--expect-rows", "1",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert "mode 'write'" in payload["error"]["message"].lower()
+    # Fail-fast: execute was never called
+    assert fake.executed == []
+
+
+def test_db_query_read_mode_template_still_works(install_fake):
+    """Regression guard: db query with read-mode template (find-order) should still work."""
+    fake = install_fake([{"id": "o1", "status": "PENDING"}])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "query",
+            "--template", "find-order",
+            "--param", "orderId=o1",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    assert payload["result"]["row_count"] == 1
+    # The query should have executed
+    assert len(fake.executed) == 1
+
+
+def test_db_query_freeform_sql_still_works(install_fake):
+    """Regression guard: db query with free-form SQL should still work."""
+    fake = install_fake([{"x": 1}])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "query",
+            "--sql", "SELECT 1",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    # The query should have executed
+    assert len(fake.executed) == 1
