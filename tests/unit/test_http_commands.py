@@ -255,3 +255,317 @@ def test_http_request_unknown_service(mock_transport, captured):
     assert result.exit_code == 2
     assert payload["ok"] is False
     assert payload["error"]["type"] == "ConfigError"
+
+
+# --------------------------------------------------------------------------- #
+# response assertion flags (--status / --contains / --match / --jq-path / --equals)
+# Task 9: validate BEFORE request, evaluate AFTER, AssertionFailure on miss.
+# --------------------------------------------------------------------------- #
+
+
+def _transport_returning(status_code, body):
+    """Build a fresh MockTransport that returns a fixed (status, body) response."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json=body)
+
+    return httpx.MockTransport(handler)
+
+
+def test_http_call_zero_assertion_flags_is_regression(mock_transport, captured):
+    """(a) Zero assertion flags on a 200 -> ok:true, exit 0, full result dict."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "call",
+            "get-order",
+            "--param",
+            "order_id=o9",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    assert payload["command"] == "http.call"
+    result_dict = payload["result"]
+    # Full §4.2 result schema present.
+    assert result_dict["status_code"] == 200
+    assert set(result_dict) >= {
+        "status_code",
+        "response_time_ms",
+        "headers",
+        "body",
+        "url",
+        "method",
+    }
+
+
+def test_http_request_zero_assertion_flags_is_regression(mock_transport, captured):
+    """(a) Zero assertion flags on http request -> ok:true, exit 0, full result."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "request",
+            "--service",
+            "order-service",
+            "--method",
+            "GET",
+            "--path",
+            "/x",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    assert payload["command"] == "http.request"
+    assert payload["result"]["status_code"] == 200
+
+
+def test_http_request_status_assertion_pass(mock_transport, captured):
+    """(b) --status 201 on a 201 response -> ok:true, exit 0."""
+    http_commands.set_default_transport(_transport_returning(201, {"id": "x"}))
+    try:
+        result = _run(
+            [
+                "--config",
+                str(FIXTURE),
+                "http",
+                "request",
+                "--service",
+                "order-service",
+                "--method",
+                "POST",
+                "--path",
+                "/x",
+                "--status",
+                "201",
+            ]
+        )
+        payload = json.loads(result.output)
+
+        assert result.exit_code == 0
+        assert payload["ok"] is True
+        assert payload["result"]["status_code"] == 201
+    finally:
+        http_commands.set_default_transport(None)
+
+
+def test_http_request_status_assertion_fail(mock_transport, captured):
+    """(c) --status 200 on a 201 -> ok:false, AssertionError, pinned detail, exit 1."""
+    http_commands.set_default_transport(_transport_returning(201, {"id": "x"}))
+    try:
+        result = _run(
+            [
+                "--config",
+                str(FIXTURE),
+                "http",
+                "request",
+                "--service",
+                "order-service",
+                "--method",
+                "POST",
+                "--path",
+                "/x",
+                "--status",
+                "200",
+            ]
+        )
+        payload = json.loads(result.output)
+
+        assert result.exit_code == 1
+        assert payload["ok"] is False
+        assert payload["result"] is None
+        assert payload["error"]["type"] == "AssertionError"
+        assert payload["error"]["detail"]["failures"] == [
+            {"mode": "status", "expected": 200, "actual": 201}
+        ]
+        assert payload["error"]["detail"]["response"]["status_code"] == 201
+    finally:
+        http_commands.set_default_transport(None)
+
+
+def test_http_call_status_assertion_fail(mock_transport, captured):
+    """(c) http call wiring: --status 200 on a 201 -> AssertionError, exit 1."""
+    http_commands.set_default_transport(_transport_returning(201, {"id": "x"}))
+    try:
+        result = _run(
+            [
+                "--config",
+                str(FIXTURE),
+                "http",
+                "call",
+                "create-order",
+                "--param",
+                "customer_id=c1",
+                "--param",
+                "sku=s1",
+                "--status",
+                "200",
+            ]
+        )
+        payload = json.loads(result.output)
+
+        assert result.exit_code == 1
+        assert payload["ok"] is False
+        assert payload["error"]["type"] == "AssertionError"
+        assert payload["error"]["detail"]["failures"] == [
+            {"mode": "status", "expected": 200, "actual": 201}
+        ]
+    finally:
+        http_commands.set_default_transport(None)
+
+
+def test_http_request_match_assertion_pass(mock_transport, captured):
+    """(d) --match '.status=="PENDING"' on {"status":"PENDING"} -> ok:true."""
+    http_commands.set_default_transport(
+        _transport_returning(200, {"status": "PENDING"})
+    )
+    try:
+        result = _run(
+            [
+                "--config",
+                str(FIXTURE),
+                "http",
+                "request",
+                "--service",
+                "order-service",
+                "--method",
+                "GET",
+                "--path",
+                "/x",
+                "--match",
+                '.status=="PENDING"',
+            ]
+        )
+        payload = json.loads(result.output)
+
+        assert result.exit_code == 0
+        assert payload["ok"] is True
+    finally:
+        http_commands.set_default_transport(None)
+
+
+def test_http_request_match_assertion_fail(mock_transport, captured):
+    """(d) --match '.status=="PENDING"' on {"status":"PAID"} -> ok:false, exit 1."""
+    http_commands.set_default_transport(_transport_returning(200, {"status": "PAID"}))
+    try:
+        result = _run(
+            [
+                "--config",
+                str(FIXTURE),
+                "http",
+                "request",
+                "--service",
+                "order-service",
+                "--method",
+                "GET",
+                "--path",
+                "/x",
+                "--match",
+                '.status=="PENDING"',
+            ]
+        )
+        payload = json.loads(result.output)
+
+        assert result.exit_code == 1
+        assert payload["ok"] is False
+        assert payload["error"]["type"] == "AssertionError"
+        assert payload["error"]["detail"]["failures"] == [
+            {"mode": "match", "expr": '.status=="PENDING"', "result": False}
+        ]
+    finally:
+        http_commands.set_default_transport(None)
+
+
+def test_http_call_jq_path_without_equals_is_config_error_and_skips_transport(
+    mock_transport, captured
+):
+    """(e) http call: --jq-path without --equals -> ConfigError exit 2 AND the
+    mock transport was NOT called (validate raised pre-request)."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "call",
+            "get-order",
+            "--param",
+            "order_id=o9",
+            "--jq-path",
+            ".status",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    # Load-bearing: validate raised BEFORE client.request -> transport untouched.
+    assert len(captured["requests"]) == 0
+
+
+def test_http_request_jq_path_without_equals_is_config_error_and_skips_transport(
+    mock_transport, captured
+):
+    """(e) http request: --jq-path without --equals -> ConfigError exit 2 AND the
+    mock transport was NOT called (validate raised pre-request)."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "request",
+            "--service",
+            "order-service",
+            "--method",
+            "GET",
+            "--path",
+            "/x",
+            "--jq-path",
+            ".status",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert len(captured["requests"]) == 0
+
+
+def test_http_request_match_with_jq_missing_is_config_error(
+    mock_transport, captured, monkeypatch
+):
+    """(f) --match with jq missing (sys.modules['jq']=None) -> ConfigError exit 2."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "jq", None)  # block the lazy `import jq`
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "request",
+            "--service",
+            "order-service",
+            "--method",
+            "GET",
+            "--path",
+            "/x",
+            "--match",
+            '.status=="PENDING"',
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert "agctl[jq]" in payload["error"]["message"]

@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 import click
 
+from ..assertions import evaluate_http_assertions, validate_http_assertion_args
 from ..command import envelope, load_config_or_raise
 from ..errors import AgctlError, ConfigError, TemplateNotFound
 from ..output import emit
@@ -84,6 +85,11 @@ def _http_call_core(
     body: str | None,
     header: tuple[str, ...],
     timeout: float | None,
+    status: int | None = None,
+    contains: str | None = None,
+    match: str | None = None,
+    jq_path: str | None = None,
+    equals: str | None = None,
 ) -> dict:
     cfg = load_config_or_raise(config_path)
 
@@ -124,8 +130,29 @@ def _http_call_core(
         timeout, service.timeout_seconds, cfg.defaults.timeout_seconds
     )
 
+    # Pre-request gate: fail pairing/bad-JSON misuse BEFORE the request is sent
+    # so no wasted side-effect (load-bearing for the validate/evaluate split).
+    validate_http_assertion_args(
+        status=status,
+        contains=contains,
+        match=match,
+        jq_path=jq_path,
+        equals=equals,
+    )
+
     client = new_client(service.base_url, effective_timeout)
-    return client.request(tpl.method, path, headers=resolved_headers, body=resolved_body)
+    result = client.request(
+        tpl.method, path, headers=resolved_headers, body=resolved_body
+    )
+    evaluate_http_assertions(
+        result,
+        status=status,
+        contains=contains,
+        match=match,
+        jq_path=jq_path,
+        equals=equals,
+    )
+    return result
 
 
 @click.command("call")
@@ -134,6 +161,31 @@ def _http_call_core(
 @click.option("--body", "body", default=None, help="JSON body (merged over template)")
 @click.option("--header", "header", multiple=True, help="k=v header override")
 @click.option("--timeout", "timeout", type=float, default=None)
+@click.option("--status", "status", type=int, default=None, help="Expected HTTP status code")
+@click.option(
+    "--contains",
+    "contains",
+    default=None,
+    help="JSON needle that must be present in the response body (subset match)",
+)
+@click.option(
+    "--match",
+    "match",
+    default=None,
+    help="jq predicate that must evaluate truthy against the response body",
+)
+@click.option(
+    "--jq-path",
+    "jq_path",
+    default=None,
+    help="jq path expression (used with --equals) to extract a value from the body",
+)
+@click.option(
+    "--equals",
+    "equals",
+    default=None,
+    help="Expected value for --jq-path (type-aware comparison; paired with --jq-path)",
+)
 @click.pass_context
 def http_call(
     ctx: click.Context,
@@ -142,10 +194,27 @@ def http_call(
     body: str | None,
     header: tuple[str, ...],
     timeout: float | None,
+    status: int | None,
+    contains: str | None,
+    match: str | None,
+    jq_path: str | None,
+    equals: str | None,
 ) -> None:
     """Resolve and send a named HTTP template."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
-    _http_call_envelope(config_path, template_name, param, body, header, timeout)
+    _http_call_envelope(
+        config_path,
+        template_name,
+        param,
+        body,
+        header,
+        timeout,
+        status,
+        contains,
+        match,
+        jq_path,
+        equals,
+    )
 
 
 _http_call_envelope = envelope("http.call")(_http_call_core)
@@ -164,6 +233,11 @@ def _http_request_core(
     body: str | None,
     header: tuple[str, ...],
     timeout: float | None,
+    status: int | None = None,
+    contains: str | None = None,
+    match: str | None = None,
+    jq_path: str | None = None,
+    equals: str | None = None,
 ) -> dict:
     cfg = load_config_or_raise(config_path)
 
@@ -180,10 +254,29 @@ def _http_request_core(
         timeout, service_cfg.timeout_seconds, cfg.defaults.timeout_seconds
     )
 
+    # Pre-request gate: fail pairing/bad-JSON misuse BEFORE the request is sent
+    # so no wasted side-effect (load-bearing for the validate/evaluate split).
+    validate_http_assertion_args(
+        status=status,
+        contains=contains,
+        match=match,
+        jq_path=jq_path,
+        equals=equals,
+    )
+
     client = new_client(service_cfg.base_url, effective_timeout)
-    return client.request(
+    result = client.request(
         method, path, headers=resolved_headers or None, body=resolved_body
     )
+    evaluate_http_assertions(
+        result,
+        status=status,
+        contains=contains,
+        match=match,
+        jq_path=jq_path,
+        equals=equals,
+    )
+    return result
 
 
 @click.command("request")
@@ -198,6 +291,31 @@ def _http_request_core(
 @click.option("--body", "body", default=None, help="JSON body")
 @click.option("--header", "header", multiple=True, help="k=v header")
 @click.option("--timeout", "timeout", type=float, default=None)
+@click.option("--status", "status", type=int, default=None, help="Expected HTTP status code")
+@click.option(
+    "--contains",
+    "contains",
+    default=None,
+    help="JSON needle that must be present in the response body (subset match)",
+)
+@click.option(
+    "--match",
+    "match",
+    default=None,
+    help="jq predicate that must evaluate truthy against the response body",
+)
+@click.option(
+    "--jq-path",
+    "jq_path",
+    default=None,
+    help="jq path expression (used with --equals) to extract a value from the body",
+)
+@click.option(
+    "--equals",
+    "equals",
+    default=None,
+    help="Expected value for --jq-path (type-aware comparison; paired with --jq-path)",
+)
 @click.pass_context
 def http_request(
     ctx: click.Context,
@@ -207,10 +325,28 @@ def http_request(
     body: str | None,
     header: tuple[str, ...],
     timeout: float | None,
+    status: int | None,
+    contains: str | None,
+    match: str | None,
+    jq_path: str | None,
+    equals: str | None,
 ) -> None:
     """Send a free-form HTTP request against a configured service."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
-    _http_request_envelope(config_path, service, method, path, body, header, timeout)
+    _http_request_envelope(
+        config_path,
+        service,
+        method,
+        path,
+        body,
+        header,
+        timeout,
+        status,
+        contains,
+        match,
+        jq_path,
+        equals,
+    )
 
 
 _http_request_envelope = envelope("http.request")(_http_request_core)
