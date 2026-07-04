@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agctl.config.models import HttpMatch, HttpMockConfig, HttpStub, HttpResponse, KafkaMockConfig, KafkaReaction, KafkaReactor, MocksConfig
+from agctl.config.models import CaptureSpec, HttpMatch, HttpMockConfig, HttpStub, HttpResponse, KafkaMockConfig, KafkaReaction, KafkaReactor, MocksConfig
 from agctl.errors import ConfigError, ConnectionFailure
 from agctl.mock.engine import MockEngine
 
@@ -1158,3 +1158,62 @@ def test_step0_body_only_stubs_do_not_import_jq(monkeypatch):
     engine._stop.set()
     engine.run()
     engine.shutdown()
+
+
+# =============================================================================
+# Step 0b: object-capture placement static check at startup — Task 5
+# (object captures must occupy a whole field; inline / string-only-slot use
+# is rejected fail-fast, mirroring the jq pre-compile above)
+# =============================================================================
+
+
+def test_step0_inline_object_capture_violation_raises_config_error():
+    """Step 0: an HTTP stub whose ``object``-typed capture ``{ctx}`` is used
+    inline within a larger ``response.body`` string makes ``start()`` raise
+    :class:`ConfigError` BEFORE the HTTP bind — no ``started`` line, no spurious
+    ``summary`` (Task 5's placement check, fail-fast at startup).
+
+    The object capture can only render correctly when it occupies a whole field
+    ('{ctx}' alone); inline use ('pre={ctx}') has no honest string form, so the
+    static check rejects it at startup rather than producing a broken response
+    at request time.
+    """
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            listen="127.0.0.1:0",
+            stubs={
+                "bad": HttpStub(
+                    method="POST",
+                    path="/echo",
+                    capture={"ctx": CaptureSpec(from_=".body.ctx", type="object")},
+                    response=HttpResponse(body={"msg": "pre={ctx}"}),
+                ),
+            },
+        ),
+    )
+
+    engine = MockEngine(
+        mocks=mocks,
+        run_http=True,
+        run_kafka=False,
+        http_listen="127.0.0.1:0",
+        kafka_client=None,
+        emit_fn=capture_emit,
+        run_id="test-run-step0-object-placement",
+    )
+
+    with pytest.raises(ConfigError):
+        engine.start()
+
+    # Step 0b raised before the HTTP bind / started emission.
+    started = [l for l in captured_lines if l.get("event") == "started"]
+    assert len(started) == 0
+    # No spurious summary — shutdown() must not emit one for a stream that never
+    # received a started line.
+    summary = [l for l in captured_lines if l.get("event") == "summary"]
+    assert len(summary) == 0
