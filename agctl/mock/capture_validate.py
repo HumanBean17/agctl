@@ -26,10 +26,12 @@ free of an assertions dependency when ``config_commands.py`` calls this.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ..config.models import MocksConfig
-from ..resolution import _PLACEHOLDER_RE
+
+_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 __all__ = ["collect_capture_placement_errors"]
 
