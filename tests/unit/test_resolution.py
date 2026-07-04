@@ -1,8 +1,17 @@
 """Tests for template resolution helpers (DESIGN D2, D5)."""
 
 import copy
+import json
 
-from agctl.resolution import convert_sql_params, deep_merge, fill_placeholders
+import pytest
+
+from agctl.resolution import (
+    CaptureValue,
+    convert_sql_params,
+    deep_merge,
+    fill_placeholders,
+    render_typed,
+)
 
 
 # --- fill_placeholders ---
@@ -52,6 +61,80 @@ def test_fill_does_not_mutate_input():
     src = {"path": "/{id}", "body": {"k": "{id}"}}
     snapshot = copy.deepcopy(src)
     fill_placeholders(src, {"id": "o9"})
+    assert src == snapshot
+
+
+def test_fill_placeholders_regression_sanity():
+    # Existing fill_placeholders semantics must remain byte-for-byte unchanged
+    # when render_typed is added alongside it.
+    assert fill_placeholders("hi {name}", {"name": "world"}) == "hi world"
+    assert fill_placeholders({"k": "{id}"}, {"id": "o9"}) == {"k": "o9"}
+
+
+# --- render_typed (typed CaptureValue renderer) ---
+
+
+def test_render_scalar_int_to_string():
+    assert render_typed("{op_id}", {"op_id": CaptureValue(42, "scalar")}) == "42"
+
+
+def test_render_scalar_multiple_fields_in_dict():
+    out = render_typed(
+        {"id": "{op_id}", "n": "{n}"},
+        {"op_id": CaptureValue(7, "scalar"), "n": CaptureValue(True, "scalar")},
+    )
+    assert out == {"id": "7", "n": "True"}
+
+
+def test_render_json_type_emits_json_dumps_string():
+    out = render_typed("{ctx}", {"ctx": CaptureValue({"a": 1}, "json")})
+    assert out == json.dumps({"a": 1})
+
+
+def test_render_object_whole_field_returns_live_object():
+    out = render_typed({"context": "{ctx}"}, {"ctx": CaptureValue({"a": 1}, "object")})
+    assert out == {"context": {"a": 1}}
+    # Real object, not a stringified form.
+    assert isinstance(out["context"], dict)
+
+
+def test_render_object_inline_raises_value_error():
+    with pytest.raises(ValueError):
+        render_typed(
+            {"context": "pre={ctx}"},
+            {"ctx": CaptureValue({"a": 1}, "object")},
+        )
+
+
+def test_render_list_with_scalar_and_json():
+    out = render_typed(
+        ["{a}", "{b}"],
+        {"a": CaptureValue("x", "scalar"), "b": CaptureValue([1, 2], "json")},
+    )
+    assert out == ["x", json.dumps([1, 2])]
+
+
+def test_render_none_scalar_becomes_empty_string():
+    assert render_typed("{op_id}", {"op_id": CaptureValue(None, "scalar")}) == ""
+
+
+def test_render_none_object_becomes_empty_string():
+    assert render_typed("{op_id}", {"op_id": CaptureValue(None, "object")}) == ""
+
+
+def test_render_none_json_becomes_empty_string():
+    # None→"" rule applies regardless of type.
+    assert render_typed("{op_id}", {"op_id": CaptureValue(None, "json")}) == ""
+
+
+def test_render_absent_name_left_as_literal():
+    assert render_typed("{missing}", {}) == "{missing}"
+
+
+def test_render_does_not_mutate_input():
+    src = {"path": "/{id}", "body": {"k": "{id}"}}
+    snapshot = copy.deepcopy(src)
+    render_typed(src, {"id": CaptureValue("o9", "scalar")})
     assert src == snapshot
 
 
