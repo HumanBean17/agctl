@@ -23,3 +23,6 @@ venv/
 
 # UV package manager
 uv.lock
+
+# agctl test-runbook results (ephemeral per-run reports)
+*.results.md
