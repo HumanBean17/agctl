@@ -10,7 +10,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
-from agctl.assertions import json_subset
+from agctl.assertions import jq_bool, json_subset
 from agctl.mock.routing import match_path
 from agctl.resolution import fill_placeholders
 
@@ -231,6 +231,13 @@ def make_handler(
                 if stub.match and stub.match.body is not None:
                     if not json_subset(stub.match.body, parsed_body):
                         continue  # Body filter failed
+
+                # Match jq predicate if present. jq_bool swallows compile/runtime
+                # errors to False (soft non-match per DESIGN §3.2): a non-JSON
+                # body (parsed_body is None) or a raising predicate -> continue.
+                if stub.match and stub.match.jq is not None:
+                    if not jq_bool(parsed_body, stub.match.jq):
+                        continue  # jq predicate failed
 
                 # Found a match
                 matched_stub = (stub_name, stub)

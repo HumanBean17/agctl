@@ -118,7 +118,7 @@ kafka:
 #   HTTP: agctl serves stubs; the SUT's HTTP client points at `listen`.
 #   Kafka: agctl joins as a consumer on the SUT's real broker and reacts.
 #   Supports ${ENV} interpolation at load, {placeholder} substitution at
-#   match/react time, and jq predicates for Kafka.
+#   match/react time, and jq predicates on stubs (match.jq) and reactors.
 # ---------------------------------------------------------------------------
 mocks:
   http:
@@ -129,7 +129,8 @@ mocks:
         method: POST
         path: "/api/v1/orders"
         match:
-          body: { "priority": "high" }
+          body: { "priority": "high" }    # optional: json_subset containment filter
+          # jq: '.amount > 1000'          # optional: jq predicate, AND-ed with body
         response:
           status: 201
           headers: { Content-Type: "application/json" }
@@ -321,6 +322,12 @@ agctl http call <template-name>
     [--body '{...}']        # override or extend the template body (merged, not replaced)
     [--header key=value]    # repeatable; merged with template headers; caller wins on conflict
     [--timeout <seconds>]
+    # Response assertions (≥1 flag => assertion mode; all active flags AND together):
+    [--status <code>]       # exact HTTP status code the response must return
+    [--contains '{...}']    # JSON needle that must be a subset of the response body
+    [--match <jq-expr>]     # jq predicate; true on ANY truthy output against the body
+    [--jq-path <jq>]        # jq path into the body (must be paired with --equals)
+    [--equals <value>]      # expected value for --jq-path (JSON-parsed when valid; strict compare)
 ```
 
 **Examples:**
@@ -355,6 +362,12 @@ agctl http request
     [--body '{...}']
     [--header key=value]    # repeatable
     [--timeout <seconds>]
+    # Response assertions (≥1 flag => assertion mode; all active flags AND together):
+    [--status <code>]       # exact HTTP status code the response must return
+    [--contains '{...}']    # JSON needle that must be a subset of the response body
+    [--match <jq-expr>]     # jq predicate; true on ANY truthy output against the body
+    [--jq-path <jq>]        # jq path into the body (must be paired with --equals)
+    [--equals <value>]      # expected value for --jq-path (JSON-parsed when valid; strict compare)
 ```
 
 **Example:**
@@ -365,6 +378,15 @@ agctl http request \
   --method GET \
   --path /api/v1/orders/ord-789
 ```
+
+**Response assertions (`http call` and `http request`):** Optional flags let you assert on the response in the same invocation, with the same exit-code discipline as `kafka assert` / `db assert`. Zero flags (the default) leaves behavior unchanged — a 4xx/5xx response is still `ok:true` (HTTP status is a result, not an assertion). Supplying ≥1 flag enters assertion mode; all active flags must pass (AND). A failed flag raises `AssertionError` (exit 1) with `error.detail = {response, failures}`, where `response` is the full HTTP result and `failures` lists every failing mode (no short-circuit).
+
+- `--status <code>` — exact HTTP status code the response must return.
+- `--contains '{...}'` — JSON subset match against the response body.
+- `--match <jq>` — jq predicate; true on ANY truthy output (`.items[].x > 100` means "≥1 item qualifies," not "all"). To assert "all," use the jq form `all(.items[]; .x > 100)`.
+- `--jq-path <jq>` + `--equals <v>` — extract a value via jq and compare strictly (type-aware: `0` ≠ `"0"`). The two flags must be used together; one without the other → `ConfigError` (exit 2).
+
+`--match` and `--jq-path` require the `jq` extra (`pip install 'agctl[jq]'`); a missing library surfaces as `ConfigError` (exit 2), not a crash.
 
 #### `agctl http ping`
 
@@ -809,7 +831,7 @@ agctl mock run --duration 30 --fail-fast
 
 #### `agctl config validate`
 
-Parse and validate `agctl.yaml`. Reports schema errors, unresolvable required env vars, dangling service/connection references in templates, and major-version mismatches. Exits 2 on any error.
+Parse and validate `agctl.yaml`. Reports schema errors, unresolvable required env vars, dangling service/connection references in templates, malformed jq expressions in `mocks` (stub `match.jq` / reactor `match`), and major-version mismatches. Exits 2 on any error.
 
 ```
 agctl config validate
@@ -1047,7 +1069,7 @@ Every invocation writes exactly one JSON object to stdout (the sole exception is
 
 | Type | Exit code | Applies when |
 |---|---|---|
-| `AssertionError` | 1 | An assertion was evaluated and failed — including `kafka assert` timing out (no matching message within the window) and `kafka consume --expect-count` receiving fewer than expected |
+| `AssertionError` | 1 | An assertion was evaluated and failed — including `kafka assert` timing out (no matching message within the window), `kafka consume --expect-count` receiving fewer than expected, and `http call`/`http request` response assertions (`--status`/`--contains`/`--match`/`--jq-path`/`--equals`) evaluating false |
 | `ConfigError` | 2 | Config missing/invalid, an unresolvable **required** env var, or a major-version mismatch |
 | `ConnectionError` | 2 | Could not reach a service, broker, or database |
 | `TimeoutError` | 1 | A non-assertion operation exceeded its time budget (e.g. a slow HTTP request or a hung DB query) |
@@ -1861,6 +1883,8 @@ These items are intentionally deferred. Do not implement them until the core des
 | **Secret backends** | Pull secrets from Vault or AWS Secrets Manager instead of environment variables. Would be implemented as a resolver plugin hooked into the config resolution pipeline (§5). |
 | **Parallel command execution** | `agctl run --parallel step1.sh step2.sh` for agents that want to fire multiple requests concurrently and assert on all results. |
 | **OpenTelemetry trace propagation** | Inject `traceparent` headers automatically when a trace context is available, enabling distributed traces that span `agctl` invocations. |
+| **HTTP response extraction (`--capture path=name`)** | Agents still hand-roll shell `jq -r` to pull a field for the next command. Response *assertion* (`--status`/`--contains`/`--match`/`--jq-path`/`--equals`) covers the verify-on-response case; a built-in capture/extraction flag is deferred to keep v1 focused on fail-loudly. |
+| **`--match-all` flag (HTTP / Kafka)** | The "every item" case (e.g. all order items satisfy a predicate). Today covered by a jq idiom (`all(.items[]; .predicate)`); a dedicated sibling flag is deferred. |
 | **Mock: cross-transport reactions** | HTTP trigger → Kafka produce; Kafka trigger → HTTP callback. The trigger→reaction model admits this later without a rewrite. |
 | **Mock: stateful / scenario mocks** | Sequences, "Nth call → Y", reactor behavior change after N messages. |
 | **Mock: managed daemon** | `mock start/stop/status` with pidfile + control socket, behind `--detach`. |

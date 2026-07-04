@@ -555,3 +555,246 @@ class TestContentTypeDefault:
             assert response.headers["content-type"] == "application/custom+json"
         finally:
             server.shutdown()
+
+
+class TestJqPredicate:
+    """Test match.jq predicate evaluation in stub matching."""
+
+    def test_jq_predicate_match(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """(a) POST amount:1500 against stub match.jq='.amount > 1000' -> 201 + hit."""
+        stubs = {
+            "big-payment": HttpStub(
+                method="POST",
+                path="/payments",
+                match=HttpMatch(jq=".amount > 1000"),
+                response=HttpResponse(status=201, body={"status": "OK"}),
+            )
+        }
+
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/payments",
+                    json={"amount": 1500},
+                )
+
+            assert response.status_code == 201
+
+            assert len(event_sink) == 1
+            event = event_sink[0]
+            assert event["event"] == "http.hit"
+            assert event["stub"] == "big-payment"
+            assert event["method"] == "POST"
+            assert event["path"] == "/payments"
+            assert event["status"] == 201
+        finally:
+            server.shutdown()
+
+    def test_jq_predicate_false_falls_through(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """(b) POST amount:500 against stub match.jq='.amount > 1000' -> 404 + unmatched."""
+        stubs = {
+            "big-payment": HttpStub(
+                method="POST",
+                path="/payments",
+                match=HttpMatch(jq=".amount > 1000"),
+                response=HttpResponse(status=201),
+            )
+        }
+
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/payments",
+                    json={"amount": 500},
+                )
+
+            assert response.status_code == 404
+            assert response.json() == {"mock_error": "no matching stub"}
+
+            assert len(event_sink) == 1
+            event = event_sink[0]
+            assert event["event"] == "http.unmatched"
+            assert event["status"] == 404
+        finally:
+            server.shutdown()
+
+    def test_two_stubs_distinguished_by_jq(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """(c) Two stubs same method+path, distinguished by jq.
+
+        high-value (amount>1000) -> 201/APPROVED (first stub).
+        low-value (else)         -> 202/QUEUED   (second stub, no jq).
+        POST 1500 hits first; POST 500 falls through to second.
+        """
+        stubs = {
+            "high-value": HttpStub(
+                method="POST",
+                path="/payments",
+                match=HttpMatch(jq=".amount > 1000"),
+                response=HttpResponse(status=201, body={"decision": "APPROVED"}),
+            ),
+            "low-value": HttpStub(
+                method="POST",
+                path="/payments",
+                response=HttpResponse(status=202, body={"decision": "QUEUED"}),
+            ),
+        }
+
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+
+        try:
+            with httpx.Client() as client:
+                r1 = client.post(
+                    f"http://127.0.0.1:{port}/payments",
+                    json={"amount": 1500},
+                )
+                r2 = client.post(
+                    f"http://127.0.0.1:{port}/payments",
+                    json={"amount": 500},
+                )
+
+            assert r1.status_code == 201
+            assert r1.json() == {"decision": "APPROVED"}
+
+            assert r2.status_code == 202
+            assert r2.json() == {"decision": "QUEUED"}
+
+            hit_events = [e for e in event_sink if e["event"] == "http.hit"]
+            assert len(hit_events) == 2
+            assert hit_events[0]["stub"] == "high-value"
+            assert hit_events[1]["stub"] == "low-value"
+        finally:
+            server.shutdown()
+
+    def test_body_and_jq_both_required(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """(d) Stub with match.body AND match.jq requires BOTH to pass (AND).
+
+        A request matching only the body filter (priority=high, amount=500)
+        falls through to 404; a request matching both (priority=high,
+        amount=1500) hits.
+        """
+        stubs = {
+            "priority-big": HttpStub(
+                method="POST",
+                path="/orders",
+                match=HttpMatch(body={"priority": "high"}, jq=".amount > 1000"),
+                response=HttpResponse(status=201, body={"ok": True}),
+            )
+        }
+
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+
+        try:
+            with httpx.Client() as client:
+                # Body matches but jq fails -> 404.
+                r_only_body = client.post(
+                    f"http://127.0.0.1:{port}/orders",
+                    json={"priority": "high", "amount": 500},
+                )
+                # Both pass -> 201.
+                r_both = client.post(
+                    f"http://127.0.0.1:{port}/orders",
+                    json={"priority": "high", "amount": 1500},
+                )
+
+            assert r_only_body.status_code == 404
+            assert r_both.status_code == 201
+            assert r_both.json() == {"ok": True}
+
+            hit_events = [e for e in event_sink if e["event"] == "http.hit"]
+            unmatched_events = [
+                e for e in event_sink if e["event"] == "http.unmatched"
+            ]
+            assert len(hit_events) == 1
+            assert len(unmatched_events) == 1
+        finally:
+            server.shutdown()
+
+    def test_jq_predicate_raises_is_soft_nonmatch(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """(e) match.jq='.x[0]' on a string body -> 404 + unmatched (no 500).
+
+        ``.x[0]`` on ``{"x": "str"}`` unambiguously raises a jq type error
+        ("Cannot index string with number"); jq_bool swallows it to False, so
+        the stub is a soft non-match and the request falls through cleanly.
+        """
+        stubs = {
+            "deep": HttpStub(
+                method="POST",
+                path="/items",
+                match=HttpMatch(jq=".x[0]"),
+                response=HttpResponse(status=200, body={"hit": True}),
+            )
+        }
+
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/items",
+                    json={"x": "str"},  # .x[0] on a string -> jq type error (raises)
+                )
+
+            assert response.status_code == 404
+            assert response.json() == {"mock_error": "no matching stub"}
+
+            assert len(event_sink) == 1
+            assert event_sink[0]["event"] == "http.unmatched"
+            assert event_sink[0]["status"] == 404
+        finally:
+            server.shutdown()
+
+    def test_jq_predicate_non_json_body_is_nonmatch(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """(f) match.jq on a non-JSON body -> 404 + unmatched.
+
+        parsed_body is None for plain text; jq_bool(None, expr) -> False ->
+        soft non-match -> fall through.
+        """
+        stubs = {
+            "big-payment": HttpStub(
+                method="POST",
+                path="/payments",
+                match=HttpMatch(jq=".amount > 1000"),
+                response=HttpResponse(status=201),
+            )
+        }
+
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/payments",
+                    content="plain text body",
+                    headers={"Content-Type": "text/plain"},
+                )
+
+            assert response.status_code == 404
+            assert response.json() == {"mock_error": "no matching stub"}
+
+            assert len(event_sink) == 1
+            assert event_sink[0]["event"] == "http.unmatched"
+            assert event_sink[0]["status"] == 404
+        finally:
+            server.shutdown()

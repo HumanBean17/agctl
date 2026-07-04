@@ -439,3 +439,139 @@ def test_mock_no_shadowing_literal_first():
     errors, warnings = validate_config(cfg)
     shadowing_warnings = [w for w in warnings if "shadow" in w["message"].lower()]
     assert len(shadowing_warnings) == 0
+
+
+# --- Check 4: jq-shadowing warning (method-gated) ---------------------------
+
+
+def _jq_shadowing_warnings(warnings: list[dict]) -> list[dict]:
+    """Filter to Check 4 jq-shadowing warnings (distinguished from Check 3)."""
+    return [w for w in warnings if "match.jq" in w["message"]]
+
+
+def test_jq_shadowing_two_stubs_same_method_path_both_jq_warns():
+    """(a) Two POST stubs same path, BOTH with match.jq → one warning on later stub."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            http=HttpMockConfig(
+                stubs={
+                    "post1": HttpStub(
+                        method="POST",
+                        path="/orders",
+                        match=HttpMatch(jq=".status == 1"),
+                        response=HttpResponse(body={}),
+                    ),
+                    "post2": HttpStub(
+                        method="POST",
+                        path="/orders",
+                        match=HttpMatch(jq=".status == 2"),
+                        response=HttpResponse(body={}),
+                    ),
+                }
+            )
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    jq_warnings = _jq_shadowing_warnings(warnings)
+    assert len(jq_warnings) == 1
+    assert jq_warnings[0]["path"] == "mocks.http.stubs.post2"
+    assert "post2" in jq_warnings[0]["message"]
+    assert "post1" in jq_warnings[0]["message"]
+
+
+def test_jq_shadowing_different_methods_no_warning():
+    """(b) Same path, different methods (POST vs DELETE), both jq → no warning."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            http=HttpMockConfig(
+                stubs={
+                    "post1": HttpStub(
+                        method="POST",
+                        path="/orders",
+                        match=HttpMatch(jq=".status == 1"),
+                        response=HttpResponse(body={}),
+                    ),
+                    "del1": HttpStub(
+                        method="DELETE",
+                        path="/orders",
+                        match=HttpMatch(jq=".status == 2"),
+                        response=HttpResponse(body={}),
+                    ),
+                }
+            )
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    assert _jq_shadowing_warnings(warnings) == []
+
+
+def test_jq_shadowing_jq_vs_body_no_warning():
+    """(c) Same method+path, one match.jq + one match.body (no jq) → no warning."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            http=HttpMockConfig(
+                stubs={
+                    "jq1": HttpStub(
+                        method="POST",
+                        path="/orders",
+                        match=HttpMatch(jq=".status == 1"),
+                        response=HttpResponse(body={}),
+                    ),
+                    "body1": HttpStub(
+                        method="POST",
+                        path="/orders",
+                        match=HttpMatch(body={"x": 1}),
+                        response=HttpResponse(body={}),
+                    ),
+                }
+            )
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    assert _jq_shadowing_warnings(warnings) == []
+
+
+def test_jq_shadowing_different_paths_no_warning():
+    """(d) Same method, different paths, both jq → no warning."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            http=HttpMockConfig(
+                stubs={
+                    "jq1": HttpStub(
+                        method="POST",
+                        path="/orders",
+                        match=HttpMatch(jq=".status == 1"),
+                        response=HttpResponse(body={}),
+                    ),
+                    "jq2": HttpStub(
+                        method="POST",
+                        path="/users",
+                        match=HttpMatch(jq=".status == 2"),
+                        response=HttpResponse(body={}),
+                    ),
+                }
+            )
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    assert _jq_shadowing_warnings(warnings) == []
+
+
+def test_jq_shadowing_single_stub_no_warning():
+    """(e) A single stub with match.jq → no warning."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            http=HttpMockConfig(
+                stubs={
+                    "only1": HttpStub(
+                        method="POST",
+                        path="/orders",
+                        match=HttpMatch(jq=".status == 1"),
+                        response=HttpResponse(body={}),
+                    ),
+                }
+            )
+        )
+    )
+    errors, warnings = validate_config(cfg)
+    assert _jq_shadowing_warnings(warnings) == []

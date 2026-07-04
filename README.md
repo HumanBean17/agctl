@@ -63,9 +63,10 @@ than a crash:
 
 ```bash
 pip install -e ".[http]"            # http call / request / ping / check ready
+pip install -e ".[jq]"             # jq flags: http --match/--jq-path, mock match.jq
 pip install -e ".[kafka]"           # kafka produce / consume / assert
 pip install -e ".[db]"              # db query / assert
-pip install -e ".[http,kafka,db]"   # everything (typical)
+pip install -e ".[http,kafka,db]"   # everything (typical — bundles jq)
 ```
 
 Verify the install — both binary names work:

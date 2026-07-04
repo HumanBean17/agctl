@@ -1,0 +1,70 @@
+"""Walk a :class:`MocksConfig` and pre-validate every jq match expression.
+
+Two helpers consumed by the mock engine (Task 5, ``MockEngine.start()`` Step 0
+— raises on the first error) and by ``config validate`` (Task 10 — collects
+ALL errors for a single report):
+
+- :func:`iter_mock_jq_expressions` — generator yielding ``(path_label, expr)``
+  for every HTTP stub with a non-None ``match.jq`` and every Kafka reactor with
+  a non-None ``match``. Stubs are yielded first (in dict order), then reactors.
+- :func:`collect_jq_compile_errors` — drives :func:`compile_jq` over every
+  expression the walker emits, catching :class:`ConfigError` so a single pass
+  surfaces every authoring typo (rather than stopping at the first).
+
+Dependency direction is intentionally one-way: ``mock`` may depend on
+``config.models`` (read-only traversal) and ``assertions`` (the compile guard),
+but neither of those depends on ``mock``.
+"""
+
+from collections.abc import Iterator
+
+from ..assertions import compile_jq
+from ..config.models import MocksConfig
+from ..errors import ConfigError
+
+
+def iter_mock_jq_expressions(
+    mocks: MocksConfig | None,
+) -> Iterator[tuple[str, str]]:
+    """Yield ``(path_label, expr)`` for every jq match expression in ``mocks``.
+
+    Iterates HTTP stubs first (in dict order), then Kafka reactors (in dict
+    order), yielding only non-None expressions. A stub contributes an entry
+    only when it has a :class:`HttpMatch` whose ``jq`` is not None; a reactor
+    contributes an entry only when its ``match`` is not None.
+
+    ``mocks is None`` (or its ``http``/``kafka`` subsections are None) yields
+    nothing — the caller may pass a Config with mocks disabled without
+    guarding.
+    """
+    if mocks is None:
+        return
+
+    if mocks.http is not None:
+        for name, stub in mocks.http.stubs.items():
+            if stub.match is not None and stub.match.jq is not None:
+                yield f"mocks.http.stubs.{name}.match.jq", stub.match.jq
+
+    if mocks.kafka is not None:
+        for name, reactor in mocks.kafka.reactors.items():
+            if reactor.match is not None:
+                yield f"mocks.kafka.reactors.{name}.match", reactor.match
+
+
+def collect_jq_compile_errors(mocks: MocksConfig | None) -> list[dict]:
+    """Compile every jq expression in ``mocks``; collect ALL errors.
+
+    Calls :func:`compile_jq` (compile-only — no value applied) on each
+    ``(label, expr)`` from :func:`iter_mock_jq_expressions`. On
+    :class:`ConfigError` appends ``{"path": label, "message": err.message}``
+    and continues — never raises, so ``config validate`` can report every
+    typo in a single run. Returns ``[]`` when ``mocks`` is None or every
+    expression compiles cleanly.
+    """
+    errors: list[dict] = []
+    for label, expr in iter_mock_jq_expressions(mocks):
+        try:
+            compile_jq(expr, label=label)
+        except ConfigError as exc:
+            errors.append({"path": label, "message": exc.message})
+    return errors

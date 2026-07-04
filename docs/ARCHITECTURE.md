@@ -123,7 +123,8 @@ agctl/
 │   ├── routing.py              # path-template matching (pure functions)
 │   ├── http_server.py          # stdlib ThreadingHTTPServer + handler
 │   ├── kafka_reactor.py        # Kafka consumer loop + jq match + reaction
-│   └── engine.py               # MockEngine lifecycle (start/run/shutdown)
+│   ├── jq_precompile.py        # walks mocks → (label, expr) pairs; compile-only validate
+│   └── engine.py               # MockEngine lifecycle (start/run/shutdown; Step 0 pre-compiles jq)
 ├── data/
 │   └── sample-config.yaml      # packaged starter config (read via importlib.resources)
 └── clients/
@@ -264,10 +265,22 @@ catching what Pydantic cannot:
 - HTTP template → unknown `service` → **error**.
 - DB template → unknown `connection` → **error**.
 - `defaults.database_connection` → unknown connection → **error**.
-- Any template/pattern missing `description` → **warning** (discovery degrades).
+- Any template/pattern/stub/reactor missing `description` → **warning**
+  (discovery degrades).
+- `mocks.kafka` with reactors but no top-level `kafka.brokers` → **error**.
+- Path-template shadowing: a `{name}` segment ahead of a literal at the same
+  position (`/orders/{id}` before `/orders/bulk`) → **warning** (first-match-wins;
+  the literal stub silently never fires). Method-agnostic — known limitation.
+- **jq-shadowing**: two stubs sharing method + path, both with `match.jq` →
+  **warning** (first-match-wins; a wrong predicate can fire the wrong branch
+  silently — the wrong-branch false-green surface). Method-gated so a
+  `GET /api/{id}` vs `DELETE /api/users` pair does not false-warn.
 
 `validate_config` is the reference for "valid config" and is also folded into
-`agctl config validate` (plus plugin validation, §10).
+`agctl config validate` (plus plugin validation, §10, and mock jq compile checks
+via `collect_jq_compile_errors` in `mock/jq_precompile.py`, invoked from the
+command layer — not `validator.py` — so `config/*` stays free of an `assertions`
+dependency).
 
 ---
 
@@ -339,7 +352,15 @@ unresolved required `${VAR}` (one error listing all), version mismatch, invalid
 `security.protocol` (Pydantic), an undelivered Kafka message within flush
 timeout (`ConnectionFailure`, never a silent `null` success), zero or >1
 assertion mode on `db`/`kafka assert` (`ConfigError` before any network call),
-and a match-miss in `kafka assert` / `db assert` (`AssertionFailure`, exit 1).
+`--jq-path`/`--equals` pairing misuse or non-JSON `--contains` on `http call`/
+`http request` (`ConfigError` before the request is sent, via
+`validate_http_assertion_args` — gating pre-request so a bad invocation never
+triggers a wasted side-effect),
+a malformed `match.jq`/reactor `match` in `mock run` (`ConfigError` at engine
+startup before probe/bind — `MockEngine.start()` Step 0 walks mocks via
+`iter_mock_jq_expressions` and `compile_jq`s each expression; a body-only
+config imports nothing), and a match-miss in `kafka assert` / `db assert` /
+`http call` / `http request` (`AssertionFailure`, exit 1).
 
 **`db execute` write-safety failures** — the command rejects writes at multiple
 gates, each surfacing as `ConfigError` (exit 2): missing `--write` flag, omitted
@@ -380,10 +401,14 @@ Exception mapping: `ConnectError`/`ConnectTimeout` → `ConnectionFailure`;
 `ReadTimeout`/other `TimeoutException` → `OperationTimeout`; other `HTTPError`
 → `ConnectionFailure`.
 
-> A 4xx/5xx response is **not** an error. `http call`/`http request` return
-> `ok:true` with the status in `result` — HTTP status is a result, not an
-> assertion. (Contrast `check ready`, which treats 2xx as "ready" but still
-> returns `ok:true` for the command itself.)
+> A 4xx/5xx response is **not** an error by default. `http call`/`http request`
+> return `ok:true` with the status in `result` — HTTP status is a result, not an
+> assertion. The response-assertion flags (`--status`/`--contains`/`--match`/`--jq-path`/`--equals`)
+> flip this: ≥1 flag enters assertion mode, `evaluate_http_assertions` runs
+> after the request, and a failing mode raises `AssertionFailure` (exit 1) with
+> `error.detail = {response, failures}`. Zero flags leaves the default
+> "result, not assertion" path byte-for-byte unchanged. (Contrast `check ready`,
+> which treats 2xx as "ready" but still returns `ok:true` for the command itself.)
 
 ### KafkaClient (`clients/kafka_client.py`)
 
@@ -473,12 +498,21 @@ leaves the transaction ambiguous.
 
 ## 9. Assertion Engine
 
-Primitives in `assertions.py`, composed by the command layer. Four families:
+Primitives in `assertions.py`, composed by the command layer. Five families:
 
 - **`jq_bool` / `jq_value`** — jq predicate / path evaluation. `jq` is
   lazy-imported; a *missing library* → `ConfigError` (exit 2), while a jq
   *expression* error → silently treated as no-match/`None` (partial matching
   must never crash on a weird message).
+- **`compile_jq(expr, *, label)`** — compile-only guard, distinct from
+  `jq_bool`/`jq_value`: it does **not** feed input or swallow errors. A
+  malformed expression raises `ConfigError` (exit 2) with `label` context, so
+  an authoring typo is caught loudly at startup / `config validate` rather than
+  silently mis-matching every request (the load-bearing loud-on-typo guard).
+  Drives both transports' pre-compile (HTTP `match.jq` and Kafka reactor
+  `match`) via `mock/jq_precompile.py::iter_mock_jq_expressions` and
+  `collect_jq_compile_errors` — covering both `MockEngine.start()` Step 0 and
+  `config validate`.
 - **`json_subset(needle, haystack)`** — recursive subset match for `--contains`:
   dicts key-by-key; lists order-independently (each needle element subset of
   *some* haystack element); scalars `==`.
@@ -500,6 +534,13 @@ Primitives in `assertions.py`, composed by the command layer. Four families:
   active modes must pass.
 - **`kafka consume --match`** — a `jq_bool` predicate, with short-circuit on
   `--expect-count`.
+- **`http call` / `http request`** — `evaluate_http_assertions` composes
+  `jq_bool` (`--match`), `json_subset` (`--contains`), and `jq_value` +
+  `parse_equals` + `type_aware_equal` (`--jq-path` + `--equals`) against the
+  response; `validate_http_assertion_args` gates `--jq-path`/`--equals` pairing
+  and `--contains` JSON shape pre-request (`ConfigError` exit 2, before the
+  request is sent). `coerce_db_value` is intentionally not reused — HTTP
+  response bodies are already JSON-native.
 
 ### Custom assertion modes (`assertion_registry.py`)
 
@@ -569,15 +610,19 @@ extras, so a user installs only what they need and the package imports fast:
 |---|---|---|
 | core (always) | `click`, `pyyaml`, `pydantic` | CLI, config loading, schema |
 | `http` | `httpx` | `http *`, `check ready` |
+| `jq` | `jq` | HTTP response assertions (`--match`/`--jq-path` on `http call`/`request`), mock HTTP `match.jq` (and mock startup pre-compile of stub `match.jq` / reactor `match`) |
 | `kafka` | `confluent-kafka`, `jq` | `kafka *` |
 | `db` | `psycopg[binary]`, `jq` | `db *` |
 | `dev` | `pytest` | unit tests |
 | `integration` | `testcontainers`, `agctl[db,kafka,http]`, `pytest` | live integration tests |
 
-`jq` lives under `kafka`/`db` because it is only needed for `--match`/`--path`
-and `db assert --expect-value`. At runtime the lazy-import convention (§8) keeps
-the error category correct: a missing library → `ConfigError` (exit 2), not an
-opaque `ModuleNotFoundError`.
+`jq` is bundled under `kafka`/`db` (which always needed it) **and** exposed as a
+dedicated `jq` extra for HTTP-only users (response assertions) and HTTP-only-mock
+users (`match.jq`) — `pip install 'agctl[jq]'`. A mock with no `match.jq` and no
+reactor `match` imports nothing, preserving the zero-dep HTTP-only mock. At
+runtime the lazy-import convention (§8) keeps the error category correct: a
+missing library → `ConfigError` (exit 2) pointing at `agctl[jq]`, not an opaque
+`ModuleNotFoundError`.
 
 **Build & entry points:** hatchling backend, wheel target `agctl`; console
 scripts `agctl`/`agt` → `agctl.cli:cli`; entry-point groups `agctl.db_drivers`
