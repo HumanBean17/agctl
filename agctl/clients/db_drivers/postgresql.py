@@ -7,11 +7,51 @@ connection may be injected via ``connectable`` for testing.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ...assertions import coerce_db_value
 from ...errors import ConfigError, ConnectionFailure
 from ...resolution import convert_sql_params
+
+
+# Secret-style keys redacted wholesale before a config copy enters any error
+# detail (substring match, case-insensitive). Deliberately broad: a key like
+# `key_password` or `api_token` is caught along with `password`.
+_SECRET_KEY_PATTERN = re.compile(r"password|secret|token|key", re.IGNORECASE)
+
+# Matches a Postgres URL's ``user:pass@`` (or ``user@``) userinfo prefix so it
+# can be replaced with a sentinel — e.g. ``postgres://u:p4ss@h:5432/db`` ->
+# ``postgres://***@h:5432/db``. URLs without userinfo (no ``@`` before the first
+# ``/``) are left untouched. ``postgres(ql)://`` scheme only.
+_URL_USERINFO_PATTERN = re.compile(r"^(postgres(?:ql)?://)[^@/]+@")
+
+_REDACTED_SENTINEL = "***"
+
+
+def _redact_config(config: dict) -> dict:
+    """Return a copy of ``config`` safe to embed in an error ``detail``.
+
+    The original ``config`` is NOT mutated (the caller still needs the real
+    values for the actual connection attempt). Applied transformations:
+
+    - Any key whose name contains ``password``/``secret``/``token``/``key``
+      (case-insensitive) -> ``"***"``.
+    - A ``url`` string with leading ``user:pass@`` userinfo -> the userinfo is
+      replaced by ``"***"`` (scheme + host kept). URLs without userinfo, or
+      non-string ``url`` values, pass through unchanged.
+    """
+    redacted: dict = {}
+    for key, value in config.items():
+        if _SECRET_KEY_PATTERN.search(key):
+            redacted[key] = _REDACTED_SENTINEL
+        elif key == "url" and isinstance(value, str):
+            redacted[key] = _URL_USERINFO_PATTERN.sub(
+                lambda m: f"{m.group(1)}{_REDACTED_SENTINEL}@", value
+            )
+        else:
+            redacted[key] = value
+    return redacted
 
 
 class PostgreSQLDriver:
@@ -67,7 +107,7 @@ class PostgreSQLDriver:
         except psycopg.Error as exc:
             raise ConnectionFailure(
                 message=str(exc),
-                detail={"driver": "postgresql", "config": dict(config)},
+                detail={"driver": "postgresql", "config": _redact_config(config)},
             ) from exc
 
     def execute(self, sql: str, params: dict) -> list[dict[str, Any]]:
