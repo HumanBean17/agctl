@@ -1210,7 +1210,7 @@ Every invocation writes exactly one JSON object to stdout (the sole exception is
   "columns": [
     { "name": "id", "data_type": "integer", "nullable": false, "default": null, "generated": null, "enum_values": null, "comment": null }
   ],
-  "primary_key": { "name": "orders_pkey", "columns": ["id"] },
+  "primary_key": ["id"],
   "foreign_keys": [
     { "name": "orders_customer_fkey", "columns": ["customer_id"], "references_schema": "public", "references_table": "customers", "references_columns": ["id"] }
   ],

@@ -139,7 +139,7 @@ no `--sql`, no `--param`; it ignores `writable`/`mode`. Any configured connectio
 2. **Drill into one** — `agctl db schema --table T [--schema S] [--connection C]`
    (tag `db.schema.table`). Returns `{connection, schema, table, kind, comment,
    columns:[{name, data_type, nullable, default, generated, enum_values,
-   comment}], primary_key, foreign_keys:[{name, columns, references_schema,
+   comment}], primary_key:[col], foreign_keys:[{name, columns, references_schema,
    references_table, references_columns}], unique_constraints:[{name, columns}],
    hint}`. `--table` accepts views. Match is **exact-case** on the stored name.
 
