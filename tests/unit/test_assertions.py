@@ -516,6 +516,29 @@ def test_evaluate_missing_jq_with_match_raises_config_error_mentioning_agctl_jq(
     assert "agctl[jq]" in exc_info.value.message
 
 
+def test_evaluate_missing_jq_with_jq_path_raises_config_error_mentioning_agctl_jq(
+    monkeypatch,
+):
+    """e9: missing jq library + --jq-path -> ConfigError whose message names agctl[jq]
+    (symmetric to e8 for the --jq-path branch)."""
+    import sys
+    from agctl import assertions
+    from agctl.errors import ConfigError
+
+    monkeypatch.setitem(sys.modules, "jq", None)  # block the lazy import
+
+    with pytest.raises(ConfigError) as exc_info:
+        assertions.evaluate_http_assertions(
+            RESULT,
+            status=None,
+            contains=None,
+            match=None,
+            jq_path=".status",
+            equals="PENDING",
+        )
+    assert "agctl[jq]" in exc_info.value.message
+
+
 def test_evaluate_non_json_body_contains_fails_matched_false():
     """e9a: non-JSON body (a string) + --contains -> json_subset is False on a
     scalar haystack, so failure with matched:False."""
