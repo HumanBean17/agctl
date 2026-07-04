@@ -56,17 +56,24 @@ reactor fires — they are **not** capture sources. `${ENV}` still resolves at c
    significant** (`/orders` ≠ `/orders/`); the query string is stripped before matching.
 4. **match.body** *(optional)* — a JSON subset the request body must contain for this stub
    to fire (reuses `json_subset`). Omit = match on method+path alone.
-5. **response** — `status` (100–599), `headers` (optional; `Content-Type` defaults to
+5. **match.jq** *(optional)* — a jq boolean predicate over the parsed request body
+   (e.g. `.amount > 1000`), AND-ed with `match.body` when both are present. `body` is
+   declarative subset containment; `jq` is a predicate (`.amount > 1000`,
+   `has("priority") and .priority != "low"`, regex/membership) — same split as `kafka
+   assert --contains` vs `--match`. Needs `pip install 'agctl[jq]'`.
+6. **response** — `status` (100–599), `headers` (optional; `Content-Type` defaults to
    `application/json` for a dict/list body, `text/plain` otherwise), `body` (any). Render
    `{name}` against the capture context.
-6. **delay_ms** *(optional)* — simulated latency; capped at 64 concurrent requests (overflow
+7. **delay_ms** *(optional)* — simulated latency; capped at 64 concurrent requests (overflow
    → `429`).
-7. **name** — kebab-case from the route (`POST /api/v1/orders` → `create-order`).
-8. **description** — one line (effectively required per contract #4).
+8. **name** — kebab-case from the route (`POST /api/v1/orders` → `create-order`).
+9. **description** — one line (effectively required per contract #4).
 
 **First-match-wins.** Stubs are matched in YAML mapping order; put a literal segment ahead
 of a `{name}` segment at the same position (`/orders/bulk` before `/orders/{order_id}`) or
-the param stub silently shadows the literal one (config validate warns on this).
+the param stub silently shadows the literal one (config validate warns on this). Two stubs
+sharing **method + path** and distinguished **only by `match.jq`** earn a separate
+jq-shadowing warning (see Gotchas).
 
 ## Extraction — Kafka reactor (`mocks.kafka.reactors.<name>`)
 
@@ -106,6 +113,36 @@ reaction `key` from the message key so a duplicate produce is a no-op for an ide
 downstream consumer, or embed a stable idempotency id in `value`. The offset commits **only
 on success**; a failing reaction is retried (bounded), then surfaced as `kafka.error`
 (visible in the stream, never silently dropped).
+
+## jq match semantics — compile loud, evaluate soft (load-bearing)
+
+Both `match.jq` (HTTP stub) and `match` (Kafka reactor) use the jq engine, but the engine
+treats **authoring typos** and **data-variance errors** differently. Conflating them is the
+#1 jq-match trap:
+
+- **Compile-time error (a typo)** — caught **loudly**. `agctl config validate` AND
+  `mock run` startup pre-compile every expression (via `compile_jq`); a malformed `match.jq`
+  or reactor `match` → `ConfigError` (exit 2) before any request/message is served. This
+  extends to the *existing* Kafka reactor `match` — a config that previously started and ran
+  silently inert now fails loud.
+- **Runtime eval error (data-dependent)** — treated as a **soft non-match**. If the
+  predicate raises against a particular body/value (e.g. `.amount > 1000` against a body
+  missing `amount`), `jq_bool` swallows it to `false` — the stub/reactor falls through, the
+  request goes to the next stub (or `404` + `http.unmatched`), the message is skipped. This
+  is deliberate: partial matching must never crash the server.
+- **Missing `jq` extra** → `ConfigError` (exit 2) at startup / `config validate`, pointing
+  at `pip install 'agctl[jq]'`. A stub/reactor with no jq expression imports nothing — the
+  HTTP-only zero-dep mock stays zero-dep.
+
+**Wrong-branch false-green (the branching-mock trap).** When two stubs share method+path
+and are distinguished **only by `match.jq`** (the high-value vs low-value use case), a
+subtly-wrong predicate routes the request to the *other* branch's stub — which returns 2xx
+and emits `http.hit`, **not** `http.unmatched`. The §3.5 log-grep protocol does not catch
+this, and the compile guard catches only syntax errors, not logic errors. `config validate`
+emits a jq-shadowing warning for this shape. **Mitigation**: pair branching stubs with a
+response assertion that distinguishes branches — e.g.
+`agctl http call create-order --jq-path '.status' --equals '"APPROVED"'` — so a wrong-branch
+fire fails loudly (exit 1). See the `agctl` skill for the assertion flags.
 
 ## Stack snippets
 
@@ -158,6 +195,11 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
   may reject the reaction.
 - **Pinned `consumer_group` reused across runs/devs** — partition split or resume-past-
   messages → silently missing/old reactions. Mitigated by the unique-per-run default.
+- **Wrong-branch match (predicate logic error)** — two stubs sharing method+path and
+  distinguished only by `match.jq`: a subtly-wrong predicate silently fires the wrong branch
+  (returns 2xx + `http.hit`, **not** `http.unmatched`). The compile guard catches only
+  syntax errors; mitigate by pairing with a response assertion (see "jq match semantics"
+  above).
 
 ## Gotchas
 
@@ -171,3 +213,8 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
 - Mocks are **not** surfaced by `agctl discover` (no `mocks` category) — navigate the
   `mocks:` section directly. Verify with `agctl config validate` and a `mock run --duration`
   smoke (see the `agctl` skill).
+- A jq **typo** in `match.jq` / reactor `match` fails loud at startup (exit 2); a jq
+  **eval error** against a particular request/message is a soft non-match (falls through).
+  Two different guards for two different error classes — see "jq match semantics" above.
+- `match.jq` / reactor `match` need `pip install 'agctl[jq]'` (bundled in `agctl[kafka]`
+  and `agctl[db]`). A stub with no `match.jq` and a reactor with no `match` import nothing.

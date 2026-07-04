@@ -265,7 +265,16 @@ catching what Pydantic cannot:
 - HTTP template → unknown `service` → **error**.
 - DB template → unknown `connection` → **error**.
 - `defaults.database_connection` → unknown connection → **error**.
-- Any template/pattern missing `description` → **warning** (discovery degrades).
+- Any template/pattern/stub/reactor missing `description` → **warning**
+  (discovery degrades).
+- `mocks.kafka` with reactors but no top-level `kafka.brokers` → **error**.
+- Path-template shadowing: a `{name}` segment ahead of a literal at the same
+  position (`/orders/{id}` before `/orders/bulk`) → **warning** (first-match-wins;
+  the literal stub silently never fires). Method-agnostic — known limitation.
+- **jq-shadowing**: two stubs sharing method + path, both with `match.jq` →
+  **warning** (first-match-wins; a wrong predicate can fire the wrong branch
+  silently — the wrong-branch false-green surface). Method-gated so a
+  `GET /api/{id}` vs `DELETE /api/users` pair does not false-warn.
 
 `validate_config` is the reference for "valid config" and is also folded into
 `agctl config validate` (plus plugin validation, §10, and mock jq compile checks
@@ -449,12 +458,21 @@ leaves the transaction ambiguous.
 
 ## 9. Assertion Engine
 
-Primitives in `assertions.py`, composed by the command layer. Four families:
+Primitives in `assertions.py`, composed by the command layer. Five families:
 
 - **`jq_bool` / `jq_value`** — jq predicate / path evaluation. `jq` is
   lazy-imported; a *missing library* → `ConfigError` (exit 2), while a jq
   *expression* error → silently treated as no-match/`None` (partial matching
   must never crash on a weird message).
+- **`compile_jq(expr, *, label)`** — compile-only guard, distinct from
+  `jq_bool`/`jq_value`: it does **not** feed input or swallow errors. A
+  malformed expression raises `ConfigError` (exit 2) with `label` context, so
+  an authoring typo is caught loudly at startup / `config validate` rather than
+  silently mis-matching every request (the load-bearing loud-on-typo guard).
+  Drives both transports' pre-compile (HTTP `match.jq` and Kafka reactor
+  `match`) via `mock/jq_precompile.py::iter_mock_jq_expressions` and
+  `collect_jq_compile_errors` — covering both `MockEngine.start()` Step 0 and
+  `config validate`.
 - **`json_subset(needle, haystack)`** — recursive subset match for `--contains`:
   dicts key-by-key; lists order-independently (each needle element subset of
   *some* haystack element); scalars `==`.
@@ -550,15 +568,19 @@ extras, so a user installs only what they need and the package imports fast:
 |---|---|---|
 | core (always) | `click`, `pyyaml`, `pydantic` | CLI, config loading, schema |
 | `http` | `httpx` | `http *`, `check ready` |
+| `jq` | `jq` | HTTP response assertions (`--match`/`--jq-path` on `http call`/`request`), mock HTTP `match.jq` (and mock startup pre-compile of stub `match.jq` / reactor `match`) |
 | `kafka` | `confluent-kafka`, `jq` | `kafka *` |
 | `db` | `psycopg[binary]`, `jq` | `db *` |
 | `dev` | `pytest` | unit tests |
 | `integration` | `testcontainers`, `agctl[db,kafka,http]`, `pytest` | live integration tests |
 
-`jq` lives under `kafka`/`db` because it is only needed for `--match`/`--path`
-and `db assert --expect-value`. At runtime the lazy-import convention (§8) keeps
-the error category correct: a missing library → `ConfigError` (exit 2), not an
-opaque `ModuleNotFoundError`.
+`jq` is bundled under `kafka`/`db` (which always needed it) **and** exposed as a
+dedicated `jq` extra for HTTP-only users (response assertions) and HTTP-only-mock
+users (`match.jq`) — `pip install 'agctl[jq]'`. A mock with no `match.jq` and no
+reactor `match` imports nothing, preserving the zero-dep HTTP-only mock. At
+runtime the lazy-import convention (§8) keeps the error category correct: a
+missing library → `ConfigError` (exit 2) pointing at `agctl[jq]`, not an opaque
+`ModuleNotFoundError`.
 
 **Build & entry points:** hatchling backend, wheel target `agctl`; console
 scripts `agctl`/`agt` → `agctl.cli:cli`; entry-point groups `agctl.db_drivers`

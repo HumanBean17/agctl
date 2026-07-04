@@ -118,7 +118,7 @@ kafka:
 #   HTTP: agctl serves stubs; the SUT's HTTP client points at `listen`.
 #   Kafka: agctl joins as a consumer on the SUT's real broker and reacts.
 #   Supports ${ENV} interpolation at load, {placeholder} substitution at
-#   match/react time, and jq predicates for Kafka.
+#   match/react time, and jq predicates on stubs (match.jq) and reactors.
 # ---------------------------------------------------------------------------
 mocks:
   http:
@@ -129,7 +129,8 @@ mocks:
         method: POST
         path: "/api/v1/orders"
         match:
-          body: { "priority": "high" }
+          body: { "priority": "high" }    # optional: json_subset containment filter
+          # jq: '.amount > 1000'          # optional: jq predicate, AND-ed with body
         response:
           status: 201
           headers: { Content-Type: "application/json" }

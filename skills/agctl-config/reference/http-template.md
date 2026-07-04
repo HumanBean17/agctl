@@ -79,5 +79,8 @@ Under top-level `templates:`, as a new key. Idempotent: if the key exists, diff 
 - Body and path use **`{name}`** only. Never `${VAR}` (that's env) or `:` (that's SQL).
 - `service` must resolve to a real `services:` key — add one if missing (contract #2).
 - A 4xx/5xx response is `ok:true` at runtime; templates don't encode "expected status" — that's
-  the caller's assertion, not config.
+  the caller's assertion, not config. Callers assert via `--status` / `--contains '{…}'` /
+  `--match '<jq>'` / `--jq-path <jq> --equals <v>` on `http call` / `http request` (≥1 flag =>
+  assertion mode, all AND; see the `agctl` skill). `--match`/`--jq-path` need
+  `pip install 'agctl[jq]'`.
 - A body value that is itself a secret (rare) → `${ENV}`, not a literal.
