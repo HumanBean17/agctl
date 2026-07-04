@@ -136,6 +136,115 @@ class PostgreSQLDriver:
 
         return {"rows_affected": rows_affected, "returning": returning}
 
+    def describe_schema(self, table: str | None, schema: str | None) -> dict:
+        """Return the live schema of the connection (DESIGN §7, optional capability).
+
+        This is an optional driver capability (the ``DBDriver`` Protocol is
+        unchanged); introspection-capable drivers implement it and the command
+        layer probes for a callable ``describe_schema`` before use.
+
+        **Level 1** (``table is None``) lists the relations (tables and views)
+        visible in the connection, normalized to::
+
+            {"items": [ {"schema", "name", "kind", "column_count"} ... ]}
+
+        Relations are read from ``pg_class`` joined to ``pg_namespace`` (schema
+        name) with a non-dropped user-column count from ``pg_attribute``. The
+        v1 scope (spec D5/D6) is enforced here, at the normalization seam:
+
+        - ``relkind`` ordinary/partitioned table (``'r'``/``'p'``) -> ``"table"``,
+          view (``'v'``) -> ``"view"``; every other ``relkind`` (materialized
+          view ``'m'``, sequence ``'S'``, foreign table, index, TOAST) is
+          excluded.
+        - System schemas (name starting with ``pg_`` or equal to
+          ``information_schema``) are excluded.
+        - Partition *leaf* relations (``relispartition = true``) are excluded;
+          only partitioned parents and plain tables appear.
+        - Items are sorted by ``(schema, name)`` ascending for stable output.
+
+        When ``schema`` is provided it restricts the namespace and is sent as a
+        **bind parameter** (never interpolated). An unknown/empty ``schema``
+        yields ``{"items": []}`` (not an error).
+
+        ``psycopg`` is lazy-imported and any ``psycopg.Error`` during the catalog
+        read surfaces as :class:`ConnectionFailure`; no ``commit()`` is issued
+        (read-only catalog SELECTs). The ``table is not None`` (Level 2) branch
+        is implemented in Task 3.
+        """
+        import psycopg
+
+        if table is not None:
+            # Level 2 (per-table detail) is implemented in Task 3.
+            raise NotImplementedError(
+                "describe_schema Level 2 (table detail) is implemented in Task 3"
+            )
+
+        # Level 1: relations from pg_class + pg_namespace + a non-dropped
+        # user-column count from pg_attribute (attnum > 0 excludes system
+        # columns; NOT attisdropped excludes dropped ones).
+        base_query = (
+            "SELECT n.nspname AS schema_name, c.relname AS relation_name, "
+            "c.relkind AS relkind, c.relispartition AS relispartition, "
+            "(SELECT count(*) FROM pg_attribute a "
+            "WHERE a.attrelid = c.oid AND a.attnum > 0 "
+            "AND NOT a.attisdropped) AS column_count "
+            "FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace"
+        )
+        if schema is not None:
+            sql = base_query + " WHERE n.nspname = %(schema)s"
+            params = {"schema": schema}
+        else:
+            sql = base_query
+            params = {}
+
+        cur = self._conn.cursor()
+        try:
+            cur.execute(sql, params)
+            column_names = [desc.name for desc in (cur.description or [])]
+            rows = cur.fetchall()
+        except psycopg.Error as exc:
+            raise ConnectionFailure(message=str(exc)) from exc
+        finally:
+            cur.close()
+
+        records = [dict(zip(column_names, row)) for row in rows]
+
+        items = []
+        for rec in records:
+            relkind = rec.get("relkind")
+            if relkind in ("r", "p"):
+                kind = "table"
+            elif relkind == "v":
+                kind = "view"
+            else:
+                # Exclude matviews ('m'), sequences ('S'), foreign tables,
+                # indexes, TOAST, etc. from v1.
+                continue
+
+            schema_name = rec.get("schema_name")
+            if schema_name is None:
+                continue
+            if schema_name.startswith("pg_") or schema_name == "information_schema":
+                continue
+            if rec.get("relispartition"):
+                # Partition leaves: only parents appear.
+                continue
+            if schema is not None and schema_name != schema:
+                continue
+
+            items.append(
+                {
+                    "schema": schema_name,
+                    "name": rec.get("relation_name"),
+                    "kind": kind,
+                    "column_count": rec.get("column_count"),
+                }
+            )
+
+        items.sort(key=lambda it: (it["schema"], it["name"]))
+        return {"items": items}
+
     def close(self) -> None:
         """Close the connection iff the driver owns it."""
         if self._conn is not None and self._owned:

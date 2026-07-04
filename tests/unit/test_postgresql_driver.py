@@ -350,3 +350,220 @@ def test_execute_write_does_not_close_injected_connection():
     driver.execute_write("UPDATE orders SET status = 'shipped'", {})
 
     assert conn.closed is False
+
+
+# --- describe_schema() Level 1 test seams ---------------------------------
+
+
+class CatalogFakeCursor:
+    """Cursor that dispatches staged result sets by SQL substring.
+
+    ``execute(sql, params)`` inspects ``sql`` and stages the canned
+    ``(description, rows)`` registered for the first matching substring;
+    ``description`` / ``fetchall()`` return the currently staged values.
+
+    This double is reused and extended in Task 3 for the Level-2 catalog
+    SELECTs (column / constraint queries) -- stage any number of queries,
+    each keyed by a distinguishing SQL substring.
+    """
+
+    def __init__(self):
+        self._staged = []  # list of (sql_substring, description, rows)
+        self.description = None
+        self._rows = []
+        self.last_sql = None
+        self.last_params = None
+
+    def stage(self, sql_substring, description, rows):
+        self._staged.append((sql_substring, description, rows))
+
+    def execute(self, sql, params):
+        self.last_sql = sql
+        self.last_params = params
+        for substring, description, rows in self._staged:
+            if substring in sql:
+                self.description = description
+                self._rows = rows
+                return
+        # No staged match -> empty result set.
+        self.description = None
+        self._rows = []
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):  # pragma: no cover - trivial
+        pass
+
+
+class CatalogFakeConn:
+    """Minimal connection returning one shared :class:`CatalogFakeCursor`.
+
+    ``describe_schema`` issues read-only catalog SELECTs and never commits, so
+    this double intentionally has no ``commit`` / ``rollback`` -- only
+    ``cursor`` (always the same staged cursor) and ``close`` for ownership
+    regression checks.
+    """
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.closed = False
+
+    def cursor(self):
+        return self._cursor
+
+    def close(self):
+        self.closed = True
+
+
+# Level-1 canned pg_class rowset shape. Alias names are the implementer's
+# choice (the contract asserts on the normalized output, not the SQL); they
+# line up positionally with the driver's SELECT column order.
+_RELATION_DESC = [
+    _col("schema_name"),
+    _col("relation_name"),
+    _col("relkind"),
+    _col("relispartition"),
+    _col("column_count"),
+]
+
+
+def _relation(schema, name, relkind, relispartition, column_count):
+    """Build one canned pg_class row tuple in the Level-1 column order."""
+    return (schema, name, relkind, relispartition, column_count)
+
+
+def _catalog_conn_with_relations(*relations):
+    """Build a (CatalogFakeConn, CatalogFakeCursor) serving a Level-1 rowset.
+
+    The relation rowset is keyed on the ``pg_class`` SQL substring -- the
+    driver's Level-1 catalog SELECT always reads ``FROM pg_class``.
+    """
+    cur = CatalogFakeCursor()
+    cur.stage("pg_class", _RELATION_DESC, list(relations))
+    return CatalogFakeConn(cur), cur
+
+
+# --- describe_schema() Level 1 tests --------------------------------------
+
+
+def test_describe_schema_level1_mixed_tables_and_view():
+    """Scenario 1: two tables + one view, normalized and sorted by (schema, name)."""
+    conn, _ = _catalog_conn_with_relations(
+        _relation("public", "orders", "r", False, 6),
+        _relation("public", "order_items", "r", False, 4),
+        _relation("public", "order_view", "v", False, 3),
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.describe_schema(table=None, schema=None)
+
+    # Ascending string sort: '_' (0x5F) precedes lowercase letters, so
+    # "order_items" < "order_view" < "orders".
+    assert result == {
+        "items": [
+            {"schema": "public", "name": "order_items", "kind": "table", "column_count": 4},
+            {"schema": "public", "name": "order_view", "kind": "view", "column_count": 3},
+            {"schema": "public", "name": "orders", "kind": "table", "column_count": 6},
+        ]
+    }
+
+
+def test_describe_schema_level1_excludes_system_schemas():
+    """Scenario 2 (D6): pg_* and information_schema relations are excluded."""
+    conn, _ = _catalog_conn_with_relations(
+        _relation("public", "orders", "r", False, 6),
+        _relation("pg_catalog", "pg_class", "r", False, 12),
+        _relation("information_schema", "columns", "v", False, 9),
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.describe_schema(table=None, schema=None)
+
+    assert result == {
+        "items": [
+            {"schema": "public", "name": "orders", "kind": "table", "column_count": 6},
+        ]
+    }
+
+
+def test_describe_schema_level1_excludes_partition_leaves():
+    """Scenario 3 (D6): partition leaf (relispartition=true) excluded; parent kept."""
+    conn, _ = _catalog_conn_with_relations(
+        _relation("public", "orders", "p", False, 6),  # partitioned parent
+        _relation("public", "orders_p2026", "r", True, 6),  # partition leaf
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.describe_schema(table=None, schema=None)
+
+    assert result == {
+        "items": [
+            {"schema": "public", "name": "orders", "kind": "table", "column_count": 6},
+        ]
+    }
+
+
+def test_describe_schema_level1_excludes_matview_and_sequence():
+    """Scenario 4: relkind 'm' (matview) and 'S' (sequence) are excluded from v1."""
+    conn, _ = _catalog_conn_with_relations(
+        _relation("public", "orders", "r", False, 6),
+        _relation("public", "orders_summary", "m", False, 3),
+        _relation("public", "orders_id_seq", "S", False, 1),
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.describe_schema(table=None, schema=None)
+
+    assert result == {
+        "items": [
+            {"schema": "public", "name": "orders", "kind": "table", "column_count": 6},
+        ]
+    }
+
+
+def test_describe_schema_level1_schema_filter_passed_as_bind_param():
+    """Scenario 5: --schema restricts to one namespace and reaches SQL as a bind param."""
+    conn, cur = _catalog_conn_with_relations(
+        _relation("public", "orders", "r", False, 6),
+        _relation("analytics", "events", "r", False, 5),
+        _relation("analytics", "events_view", "v", False, 4),
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.describe_schema(table=None, schema="analytics")
+
+    assert result == {
+        "items": [
+            {"schema": "analytics", "name": "events", "kind": "table", "column_count": 5},
+            {"schema": "analytics", "name": "events_view", "kind": "view", "column_count": 4},
+        ]
+    }
+    # The schema value reaches the query as a bind parameter (never interpolated).
+    assert cur.last_params == {"schema": "analytics"}
+    assert "%(schema)s" in cur.last_sql
+    assert "analytics" not in cur.last_sql
+
+
+def test_describe_schema_level1_unknown_schema_returns_empty_not_error():
+    """Scenario 6: an empty/unknown --schema yields items == [], not an error."""
+    conn, _ = _catalog_conn_with_relations(
+        _relation("public", "orders", "r", False, 6),
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.describe_schema(table=None, schema="nope")
+
+    assert result == {"items": []}
+
+
+def test_describe_schema_level1_does_not_close_injected_connection():
+    """Scenario 7: an injected connectable is not closed after describe_schema."""
+    conn, _ = _catalog_conn_with_relations(
+        _relation("public", "orders", "r", False, 6),
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    driver.describe_schema(table=None, schema=None)
+
+    assert conn.closed is False
