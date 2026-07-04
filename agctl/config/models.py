@@ -15,7 +15,9 @@ def parse_listen(listen: str) -> tuple[str, int]:
         Tuple of (host, port) where host is the string without brackets and port is an int.
 
     Raises:
-        ValueError: If listen is empty, missing port, or port is not a valid integer.
+        ValueError: If listen is empty, missing port, port is not a valid
+            integer, port is out of range (0-65535), or an IPv6 address is not
+            bracketed.
     """
     if not listen:
         raise ValueError("listen address cannot be empty")
@@ -34,11 +36,25 @@ def parse_listen(listen: str) -> tuple[str, int]:
         if ":" not in listen:
             raise ValueError(f"missing port in listen address: {listen!r}")
         host, port_part = listen.rsplit(":", 1)
+        if ":" in host:
+            # An unbracketed host containing ':' is an IPv6 address — spec §7.2
+            # requires bracketing (e.g. [::1]:18080). rsplit would otherwise
+            # mis-split it ("::1:8080" → ("::1", 8080); "::1" → ("::", 1)).
+            raise ValueError(
+                f"IPv6 listen addresses must be bracketed, e.g. '[::1]:18080'; "
+                f"got {listen!r}"
+            )
 
     try:
         port = int(port_part)
     except ValueError:
         raise ValueError(f"port must be an integer, got {port_part!r}")
+
+    # 0 is allowed (ephemeral bind — the engine reports the OS-assigned port in
+    # the started line); reject out-of-range ports so a typo yields a clean
+    # ConfigError(2) at parse time rather than an opaque OS bind error.
+    if not (0 <= port <= 65535):
+        raise ValueError(f"port out of range 0-65535: {port}")
 
     return host, port
 

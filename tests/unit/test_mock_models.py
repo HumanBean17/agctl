@@ -106,6 +106,24 @@ def test_parse_listen_invalid():
         parse_listen("")
 
 
+def test_parse_listen_rejects_unbracketed_ipv6():
+    """Unbracketed IPv6 (host contains ':') → ValueError per spec §7.2 (must be bracketed)."""
+    with pytest.raises(ValueError, match="IPv6|bracket"):
+        parse_listen("::1:8080")
+    with pytest.raises(ValueError, match="IPv6|bracket"):
+        parse_listen("::1")
+
+
+def test_parse_listen_rejects_port_out_of_range():
+    """Out-of-range ports → ValueError; port 0 (ephemeral) is allowed."""
+    with pytest.raises(ValueError, match="range|0-65535"):
+        parse_listen("0.0.0.0:99999")
+    with pytest.raises(ValueError, match="range|0-65535"):
+        parse_listen("0.0.0.0:-1")
+    # Port 0 is valid (ephemeral bind — the engine reports the OS-assigned port).
+    assert parse_listen("0.0.0.0:0") == ("0.0.0.0", 0)
+
+
 def test_http_mock_config_listen_invalid():
     """HttpMockConfig(listen="0.0.0.0:notaport") -> ValidationError (the listen validator runs parse_listen)."""
     with pytest.raises(ValidationError):
