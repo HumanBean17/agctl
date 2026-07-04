@@ -268,7 +268,10 @@ catching what Pydantic cannot:
 - Any template/pattern missing `description` → **warning** (discovery degrades).
 
 `validate_config` is the reference for "valid config" and is also folded into
-`agctl config validate` (plus plugin validation, §10).
+`agctl config validate` (plus plugin validation, §10, and mock jq compile checks
+via `collect_jq_compile_errors` in `mock/jq_precompile.py`, invoked from the
+command layer — not `validator.py` — so `config/*` stays free of an `assertions`
+dependency).
 
 ---
 

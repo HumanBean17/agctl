@@ -806,7 +806,7 @@ agctl mock run --duration 30 --fail-fast
 
 #### `agctl config validate`
 
-Parse and validate `agctl.yaml`. Reports schema errors, unresolvable required env vars, dangling service/connection references in templates, and major-version mismatches. Exits 2 on any error.
+Parse and validate `agctl.yaml`. Reports schema errors, unresolvable required env vars, dangling service/connection references in templates, malformed jq expressions in `mocks` (stub `match.jq` / reactor `match`), and major-version mismatches. Exits 2 on any error.
 
 ```
 agctl config validate

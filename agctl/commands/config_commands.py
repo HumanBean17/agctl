@@ -27,6 +27,7 @@ import click
 
 from ..config import ConfigError, load_config
 from ..config.validator import validate_config
+from ..mock.jq_precompile import collect_jq_compile_errors
 from ..output import emit
 
 __all__ = ["config_init", "config_validate", "config_show", "set_plugins_provider"]
@@ -135,6 +136,10 @@ def config_validate(ctx: click.Context, config_path: str | None) -> None:
     errors, warnings = validate_config(cfg)
     # Let loaded plugins validate their own config sections (DESIGN §9.2).
     errors = errors + _plugin_validation_errors(_plugins_provider(), cfg.model_dump())
+    # Surface malformed match.jq / reactor match as validation errors (D5,
+    # Task 10). The collector lives in mock.jq_precompile (not validator.py)
+    # so config/* stays free of an assertions dependency.
+    errors = errors + collect_jq_compile_errors(cfg.mocks)
     if errors:
         summary = f"Configuration has {len(errors)} error(s)"
         emit(
