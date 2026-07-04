@@ -187,3 +187,24 @@ def test_end_to_end_via_load_config():
     assert cfg.mocks.kafka.reactors["order-created"].consumer_group == "mock-reactor"
     assert cfg.mocks.kafka.reactors["order-created"].reaction.topic == "orders.mock"
     assert cfg.mocks.kafka.reactors["order-created"].reaction.value == {"mock": True}
+
+
+def test_http_match_no_args():
+    """HttpMatch() with no args -> body is None, jq is None."""
+    match = HttpMatch()
+    assert match.body is None
+    assert match.jq is None
+
+
+def test_http_match_jq_only():
+    """HttpMatch(jq='.amount > 1000') -> body is None, jq == '.amount > 1000'."""
+    match = HttpMatch(jq=".amount > 1000")
+    assert match.body is None
+    assert match.jq == ".amount > 1000"
+
+
+def test_http_match_body_and_jq():
+    """HttpMatch(body={'priority': 'high'}, jq='.amount > 1000') -> both set (coexist)."""
+    match = HttpMatch(body={"priority": "high"}, jq=".amount > 1000")
+    assert match.body == {"priority": "high"}
+    assert match.jq == ".amount > 1000"

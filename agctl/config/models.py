@@ -160,9 +160,15 @@ class HttpResponse(BaseModel):
 
 
 class HttpMatch(BaseModel):
-    """HTTP request matching criteria for mock stubs."""
+    """HTTP request matching criteria for mock stubs.
+
+    Supports optional body subset matching (via `body`) and optional jq predicate
+    matching (via `jq`). Both fields can coexist; a stub matches if all provided
+    criteria pass.
+    """
 
     body: dict | None = None
+    jq: str | None = None
 
 
 class HttpStub(BaseModel):
