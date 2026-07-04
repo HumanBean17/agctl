@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agctl.config.models import HttpMockConfig, HttpStub, HttpResponse, KafkaMockConfig, KafkaReaction, KafkaReactor, MocksConfig
+from agctl.config.models import HttpMatch, HttpMockConfig, HttpStub, HttpResponse, KafkaMockConfig, KafkaReaction, KafkaReactor, MocksConfig
 from agctl.errors import ConfigError, ConnectionFailure
 from agctl.mock.engine import MockEngine
 
@@ -953,3 +953,208 @@ def test_run_id_defaults_to_pid():
 
         # Verify run_id was set to PID
         assert engine._run_id == "12345"
+
+
+# =============================================================================
+# Step 0: jq pre-compile at startup (loud on typos) — Task 5
+# (D5: loud-on-typo, D6: jq imported at startup not first request)
+# =============================================================================
+
+
+def test_step0_malformed_http_stub_match_jq_raises_config_error():
+    """Step 0: an HTTP stub whose ``match.jq`` is malformed (e.g. ``)(``) makes
+    ``start()`` raise :class:`ConfigError` BEFORE the HTTP bind, so no ``started``
+    line (and no spurious ``summary``) is emitted.
+
+    Realizes D5 (loud-on-typo): a jq authoring error is caught at startup rather
+    than silently mis-matching every request. The ConfigError propagates through
+    the existing outer try -> shutdown() -> re-raise -> mock_run's AgctlError
+    envelope (exit 2) before any event line.
+    """
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            listen="127.0.0.1:0",
+            stubs={
+                "bad": HttpStub(
+                    method="GET",
+                    path="/api/test",
+                    match=HttpMatch(jq=")("),  # malformed jq
+                    response=HttpResponse(status=200),
+                ),
+            },
+        )
+    )
+
+    engine = MockEngine(
+        mocks=mocks,
+        run_http=True,
+        run_kafka=False,
+        http_listen="127.0.0.1:0",
+        kafka_client=None,
+        emit_fn=capture_emit,
+        run_id="test-run-step0-bad-http",
+    )
+
+    with pytest.raises(ConfigError):
+        engine.start()
+
+    # No started line — Step 0 raised before the started emission.
+    started = [l for l in captured_lines if l.get("event") == "started"]
+    assert len(started) == 0
+    # No spurious summary — shutdown() must not emit one for a stream that never
+    # received a started line.
+    summary = [l for l in captured_lines if l.get("event") == "summary"]
+    assert len(summary) == 0
+
+
+def test_step0_malformed_kafka_reactor_match_raises_config_error():
+    """Step 0: a Kafka reactor whose ``match`` is malformed makes ``start()``
+    raise :class:`ConfigError` BEFORE the Kafka probe runs (proving Step 0
+    precedes Step 1). The probe is never reached.
+    """
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    fake_client = FakeKafkaClient()
+
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "r1": KafkaReactor(
+                    topic="orders",
+                    match=")(",  # malformed jq
+                    reaction=KafkaReaction(topic="out", value={}),
+                ),
+            },
+        )
+    )
+
+    engine = MockEngine(
+        mocks=mocks,
+        run_http=False,
+        run_kafka=True,
+        http_listen="127.0.0.1:0",
+        kafka_client=fake_client,
+        emit_fn=capture_emit,
+        run_id="test-run-step0-bad-kafka",
+    )
+
+    with pytest.raises(ConfigError):
+        engine.start()
+
+    # Step 0 raised before Step 1 (kafka probe), so the probe was never called.
+    assert fake_client.probe_called is False
+    started = [l for l in captured_lines if l.get("event") == "started"]
+    assert len(started) == 0
+
+
+def test_step0_missing_jq_library_raises_config_error(monkeypatch):
+    """Step 0: an HTTP stub with a VALID ``match.jq`` but jq library missing
+    (``sys.modules['jq'] = None`` blocks the lazy import) makes ``start()``
+    raise :class:`ConfigError``. The missing-extra surfaces at startup, not at
+    first request (D6).
+    """
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    # Block the lazy `import jq` inside _jq(). A valid expression is used so the
+    # only failure mode is the missing library.
+    monkeypatch.setitem(sys.modules, "jq", None)
+
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            listen="127.0.0.1:0",
+            stubs={
+                "ok": HttpStub(
+                    method="GET",
+                    path="/api/test",
+                    match=HttpMatch(jq=".status == 200"),  # valid expression
+                    response=HttpResponse(status=200),
+                ),
+            },
+        )
+    )
+
+    engine = MockEngine(
+        mocks=mocks,
+        run_http=True,
+        run_kafka=False,
+        http_listen="127.0.0.1:0",
+        kafka_client=None,
+        emit_fn=capture_emit,
+        run_id="test-run-step0-no-jq",
+    )
+
+    with pytest.raises(ConfigError):
+        engine.start()
+
+    started = [l for l in captured_lines if l.get("event") == "started"]
+    assert len(started) == 0
+
+
+def test_step0_body_only_stubs_do_not_import_jq(monkeypatch):
+    """Step 0: a body-only config (no ``match.jq``, no reactor ``match``) must
+    NOT import jq. With ``sys.modules['jq'] = None`` (any ``import jq`` raises
+    ModuleNotFoundError), ``start()`` must reach the started line without raising
+    — proving the walker never entered a jq-import path. Preserves zero-dep
+    HTTP-only runs.
+    """
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    # If Step 0 incorrectly called compile_jq, _jq()'s `import jq` would hit
+    # None in sys.modules -> ModuleNotFoundError -> ConfigError -> start()
+    # raises, failing this test.
+    monkeypatch.setitem(sys.modules, "jq", None)
+
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            listen="127.0.0.1:0",
+            stubs={
+                "body_only": HttpStub(
+                    method="POST",
+                    path="/api/webhook",
+                    match=HttpMatch(body={"event": "created"}),  # jq=None
+                    response=HttpResponse(status=200),
+                ),
+                "bare": HttpStub(
+                    method="GET",
+                    path="/health",
+                    match=None,  # no HttpMatch at all
+                    response=HttpResponse(status=200),
+                ),
+            },
+        ),
+    )
+
+    # Use the fake HTTP server so no real socket is bound.
+    with patch("agctl.mock.engine.MockHTTPServer", FakeHTTPServer):
+        engine = MockEngine(
+            mocks=mocks,
+            run_http=True,
+            run_kafka=False,
+            http_listen="127.0.0.1:0",
+            kafka_client=None,
+            emit_fn=capture_emit,
+            run_id="test-run-step0-body-only",
+        )
+        engine.start()  # must NOT raise
+
+    # Reached the started line — Step 0 was a no-op (walker yielded nothing).
+    started = [l for l in captured_lines if l.get("event") == "started"]
+    assert len(started) == 1
+
+    engine._stop.set()
+    engine.run()
+    engine.shutdown()

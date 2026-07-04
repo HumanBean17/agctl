@@ -20,9 +20,11 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from ..assertions import compile_jq
 from ..config.models import MocksConfig, parse_listen
 from ..errors import ConfigError
 from .http_server import MockHTTPServer
+from .jq_precompile import iter_mock_jq_expressions
 from .kafka_reactor import KafkaReactor as KafkaReactorClass
 
 
@@ -165,6 +167,17 @@ class MockEngine:
         On any exception, run shutdown() to release acquired resources.
         """
         try:
+            # Step 0: Pre-compile every jq match expression (loud on typos).
+            # Walks HTTP stubs' match.jq and Kafka reactors' match, compiling
+            # each BEFORE any probe/bind. A malformed expression or a missing jq
+            # library raises ConfigError here, propagated by the outer try ->
+            # shutdown() -> re-raise -> mock_run's AgctlError envelope (exit 2)
+            # before any event line. A body-only config (no jq expressions)
+            # makes this a no-op that imports nothing, preserving zero-dep
+            # HTTP-only runs (D5 loud-on-typo, D6 jq-imported-at-startup).
+            for label, expr in iter_mock_jq_expressions(self._mocks):
+                compile_jq(expr, label=label)
+
             # Step 1: Probe Kafka brokers (if run_kafka)
             if self._run_kafka:
                 if self._mocks is None or self._mocks.kafka is None:
