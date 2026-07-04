@@ -124,6 +124,7 @@ agctl/
 │   ├── http_server.py          # stdlib ThreadingHTTPServer + handler
 │   ├── kafka_reactor.py        # Kafka consumer loop + jq match + reaction
 │   ├── jq_precompile.py        # walks mocks → (label, expr) pairs; compile-only validate
+│   ├── capture_validate.py     # walks mocks → object-capture placement errors; pure Python (no jq)
 │   └── engine.py               # MockEngine lifecycle (start/run/shutdown; Step 0 pre-compiles jq)
 ├── data/
 │   └── sample-config.yaml      # packaged starter config (read via importlib.resources)
