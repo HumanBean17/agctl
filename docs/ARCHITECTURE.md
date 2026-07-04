@@ -123,7 +123,8 @@ agctl/
 │   ├── routing.py              # path-template matching (pure functions)
 │   ├── http_server.py          # stdlib ThreadingHTTPServer + handler
 │   ├── kafka_reactor.py        # Kafka consumer loop + jq match + reaction
-│   └── engine.py               # MockEngine lifecycle (start/run/shutdown)
+│   ├── jq_precompile.py        # walks mocks → (label, expr) pairs; compile-only validate
+│   └── engine.py               # MockEngine lifecycle (start/run/shutdown; Step 0 pre-compiles jq)
 ├── data/
 │   └── sample-config.yaml      # packaged starter config (read via importlib.resources)
 └── clients/
@@ -339,7 +340,11 @@ unresolved required `${VAR}` (one error listing all), version mismatch, invalid
 `security.protocol` (Pydantic), an undelivered Kafka message within flush
 timeout (`ConnectionFailure`, never a silent `null` success), zero or >1
 assertion mode on `db`/`kafka assert` (`ConfigError` before any network call),
-and a match-miss in `kafka assert` / `db assert` (`AssertionFailure`, exit 1).
+a malformed `match.jq`/reactor `match` in `mock run` (`ConfigError` at engine
+startup before probe/bind — `MockEngine.start()` Step 0 walks mocks via
+`iter_mock_jq_expressions` and `compile_jq`s each expression; a body-only
+config imports nothing), and a match-miss in `kafka assert` / `db assert`
+(`AssertionFailure`, exit 1).
 
 **`db execute` write-safety failures** — the command rejects writes at multiple
 gates, each surfacing as `ConfigError` (exit 2): missing `--write` flag, omitted
