@@ -36,14 +36,19 @@ class FakeDriver:
     Records the (rewritten) SQL + params it was called with — mirroring the real
     PostgreSQLDriver, which rewrites ``:name`` -> ``%(name)s`` inside execute()
     via convert_sql_params — so the recorded SQL reflects what a real driver
-    would dispatch.
+    would dispatch. Also records ``describe_schema`` calls (``self.described``)
+    and returns a canned ``schema_result`` dict, so ``db schema`` command tests
+    avoid a real DB.
     """
 
-    def __init__(self, rows=None, write_result=None):
+    def __init__(self, rows=None, write_result=None, schema_result=None):
         self.rows = rows if rows is not None else []
         self.write_result = write_result if write_result is not None else {"rows_affected": 1, "returning": [{"id": "o1", "status": "PENDING"}]}
+        # Default schema_result mirrors the Level-1 shape (empty items list).
+        self.schema_result = schema_result if schema_result is not None else {"items": []}
         self.executed = []
         self.executed_write = []
+        self.described = []
         self.connected = False
         self.closed = False
 
@@ -60,16 +65,41 @@ class FakeDriver:
         self.executed_write.append((rewrite, params))
         return self.write_result
 
+    def describe_schema(self, table, schema):
+        self.described.append({"table": table, "schema": schema})
+        return self.schema_result
+
     def close(self):
         self.closed = True
 
 
+class FakeDriverNoSchema(FakeDriver):
+    """Fake driver whose ``describe_schema`` attr is non-callable.
+
+    The pre-connect probe (:meth:`DbClient.supports_describe_schema`) inspects
+    ``callable(getattr(driver, "describe_schema", None))``; setting the
+    attribute to ``None`` makes the probe report False without opening a
+    connection, mirroring a read-only driver that never implemented
+    introspection.
+    """
+
+    describe_schema = None
+
+
 @pytest.fixture
 def install_fake(monkeypatch):
-    """Return a factory: install_fake(rows=..., write_result=...) wires a FakeDriver-backed client."""
+    """Factory: wire a FakeDriver-backed DbClient so command tests avoid a real DB.
 
-    def _install(rows=None, write_result=None):
-        fake = FakeDriver(rows=rows, write_result=write_result)
+    Accepts the canned ``schema_result`` for ``db schema`` happy-path tests,
+    and ``introspect=False`` to swap in :class:`FakeDriverNoSchema` for the
+    pre-connect probe refusal test.
+    """
+
+    def _install(rows=None, write_result=None, schema_result=None, introspect=True):
+        if introspect:
+            fake = FakeDriver(rows=rows, write_result=write_result, schema_result=schema_result)
+        else:
+            fake = FakeDriverNoSchema(rows=rows, write_result=write_result)
 
         def factory(connection_obj):
             return DbClient(connection_obj, driver=fake)
@@ -865,3 +895,304 @@ def test_db_query_freeform_sql_still_works(install_fake):
     assert payload["ok"] is True
     # The query should have executed
     assert len(fake.executed) == 1
+
+
+# --------------------------------------------------------------------------- #
+# db schema (Task 5: live, read-only schema discovery — two levels)
+# --------------------------------------------------------------------------- #
+
+# Verbatim hint strings from the spec — copy character-for-character.
+_SCHEMA_TABLES_HINT = (
+    "Run 'agctl db schema --table <name> [--schema <name>] "
+    "[--connection <name>]' for columns and keys"
+)
+_SCHEMA_TABLE_HINT = (
+    "Use these columns in 'agctl db query' / 'db assert --sql' "
+    "with :paramName bind params."
+)
+
+_LEVEL1_ITEMS = [
+    {"schema": "public", "name": "orders", "kind": "table", "column_count": 4},
+    {"schema": "public", "name": "order_items", "kind": "table", "column_count": 3},
+]
+
+
+def _level2_match(schema="public", table="orders"):
+    """Build a canned Level-2 match dict (one relation's full description)."""
+    return {
+        "schema": schema,
+        "table": table,
+        "kind": "table",
+        "comment": None,
+        "columns": [
+            {
+                "name": "id",
+                "data_type": "integer",
+                "nullable": False,
+                "default": None,
+                "generated": None,
+                "enum_values": None,
+                "comment": None,
+            },
+            {
+                "name": "status",
+                "data_type": "text",
+                "nullable": False,
+                "default": "'PENDING'",
+                "generated": None,
+                "enum_values": None,
+                "comment": None,
+            },
+        ],
+        "primary_key": ["id"],
+        "foreign_keys": [
+            {
+                "name": "order_items_order_id_fkey",
+                "columns": ["order_id"],
+                "references_schema": "public",
+                "references_table": "orders",
+                "references_columns": ["id"],
+            }
+        ],
+        "unique_constraints": [
+            {"name": "orders_status_key", "columns": ["status"]},
+        ],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Level 1 (list tables)
+# --------------------------------------------------------------------------- #
+
+
+def test_db_schema_level1_happy_path(install_fake):
+    """Level 1, no flags: resolves to default main-db, lists all items."""
+    fake = install_fake(schema_result={"items": _LEVEL1_ITEMS})
+    result = _run(["--config", str(FIXTURE), "db", "schema"])
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["command"] == "db.schema.tables"
+    assert payload["ok"] is True
+    assert payload["result"]["connection"] == "main-db"
+    assert payload["result"]["schema_filter"] is None
+    assert payload["result"]["count"] == len(_LEVEL1_ITEMS)
+    assert payload["result"]["items"] == _LEVEL1_ITEMS
+    assert payload["result"]["hint"] == _SCHEMA_TABLES_HINT
+    # FakeDriver received describe_schema(table=None, schema=None).
+    assert fake.described == [{"table": None, "schema": None}]
+
+
+def test_db_schema_level1_with_schema_filter(install_fake):
+    """Level 1 with --schema: schema_filter echoed; describe_schema gets schema."""
+    fake = install_fake(schema_result={"items": _LEVEL1_ITEMS})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "schema",
+            "--connection", "main-db",
+            "--schema", "public",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["command"] == "db.schema.tables"
+    assert payload["result"]["schema_filter"] == "public"
+    assert fake.described == [{"table": None, "schema": "public"}]
+
+
+def test_db_schema_level1_empty_items_is_not_error(install_fake):
+    """Level 1 with canned items == []: count 0, ok True (NOT an error)."""
+    install_fake(schema_result={"items": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "schema",
+            "--schema", "empty_ns",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    assert payload["result"]["count"] == 0
+    assert payload["result"]["items"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Level 2 (single table detail)
+# --------------------------------------------------------------------------- #
+
+
+def test_db_schema_level2_happy_path(install_fake):
+    """Level 2 happy path: single match flattened into top-level result."""
+    match = _level2_match()
+    fake = install_fake(schema_result={"items": [], "matches": [match]})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "schema",
+            "--connection", "main-db",
+            "--table", "orders",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["command"] == "db.schema.table"
+    assert payload["ok"] is True
+    res = payload["result"]
+    # Flattened single-match fields
+    assert res["schema"] == "public"
+    assert res["table"] == "orders"
+    assert res["kind"] == "table"
+    assert res["comment"] is None
+    assert res["columns"] == match["columns"]
+    assert res["primary_key"] == ["id"]
+    assert res["foreign_keys"] == match["foreign_keys"]
+    assert res["unique_constraints"] == match["unique_constraints"]
+    assert res["connection"] == "main-db"
+    assert res["hint"] == _SCHEMA_TABLE_HINT
+    # FakeDriver received describe_schema(table="orders", schema=None).
+    assert fake.described == [{"table": "orders", "schema": None}]
+
+
+def test_db_schema_level2_with_schema_filter(install_fake):
+    """Level 2 with --schema: describe_schema gets both table and schema."""
+    match = _level2_match()
+    fake = install_fake(schema_result={"items": [], "matches": [match]})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "schema",
+            "--connection", "main-db",
+            "--schema", "public",
+            "--table", "orders",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["command"] == "db.schema.table"
+    assert payload["result"]["table"] == "orders"
+    assert payload["result"]["schema"] == "public"
+    assert fake.described == [{"table": "orders", "schema": "public"}]
+
+
+# --------------------------------------------------------------------------- #
+# Pre-connect probe + error paths
+# --------------------------------------------------------------------------- #
+
+
+def test_db_schema_pre_connect_probe_refusal_never_connects(install_fake):
+    """Pre-connect probe refusal: unsupported driver -> exit 2 ConfigError,
+    and connect() was NEVER called (the load-bearing lifecycle guarantee)."""
+    fake = install_fake(introspect=False)
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "schema",
+            "--connection", "main-db",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert "does not support schema discovery" in payload["error"]["message"]
+    assert payload["error"]["detail"]["driver"] == "postgresql"
+    # The probe fires BEFORE connect(); the driver must not have been touched.
+    assert fake.connected is False
+
+
+def test_db_schema_level2_not_found(install_fake):
+    """Level 2 not-found: 0 matches -> ConfigError telling agent to list tables."""
+    install_fake(schema_result={"items": [], "matches": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "schema",
+            "--connection", "main-db",
+            "--table", "nope",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    # Message tells the agent the table was not found AND to list tables.
+    msg = payload["error"]["message"].lower()
+    assert "not found" in msg
+    assert "agctl db schema" in payload["error"]["message"]
+    assert payload["error"]["detail"] == {"table": "nope"}
+
+
+def test_db_schema_level2_ambiguity(install_fake):
+    """Level 2 ambiguity: >1 matches, no --schema -> ConfigError with candidates."""
+    matches = [_level2_match(schema="public"), _level2_match(schema="legacy")]
+    install_fake(schema_result={"items": [], "matches": matches})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "schema",
+            "--connection", "main-db",
+            "--table", "orders",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    msg = payload["error"]["message"].lower()
+    assert "ambig" in msg
+    assert "--schema" in payload["error"]["message"]
+    detail = payload["error"]["detail"]
+    assert detail["table"] == "orders"
+    assert {"schema": "public", "kind": "table"} in detail["candidates"]
+    assert {"schema": "legacy", "kind": "table"} in detail["candidates"]
+    assert len(detail["candidates"]) == 2
+
+
+def test_db_schema_no_default_no_connection_raises_config_error(install_fake, tmp_path):
+    """Connection resolution: no default and no --connection -> exit 2
+    ConfigError 'No database connection specified'."""
+    install_fake(schema_result={"items": []})
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "1"\n'
+        "database:\n"
+        "  connections:\n"
+        "    main-db:\n"
+        "      type: postgresql\n"
+        '      host: "h"\n'
+    )
+    result = _run(["--config", str(cfg), "db", "schema"], env=ENV)
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert payload["error"]["message"] == "No database connection specified"
+
+
+def test_db_schema_unknown_connection_raises_config_error(install_fake):
+    """Connection resolution: unknown --connection foo -> exit 2 ConfigError."""
+    install_fake(schema_result={"items": []})
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "db", "schema",
+            "--connection", "foo",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert payload["error"]["message"] == "Unknown database connection: foo"
+    assert payload["error"]["detail"] == {"connection": "foo"}
