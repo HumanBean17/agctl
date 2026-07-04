@@ -156,6 +156,50 @@ class FakeKafkaClientNonFatalError(FakeKafkaClient):
         stop_event.set()
 
 
+class FakeKafkaClientWinddownError(FakeKafkaClient):
+    """Reactor emits a NON-fatal kafka.error AFTER stop is set, simulating a
+    wind-down error landing during the engine's shutdown join window.
+
+    Sequence on the reactor thread: set stop_event first (run()'s loop wakes
+    immediately), sleep past run()'s wake window, THEN call handle(final=True)
+    whose failing produce makes the reactor emit a non-fatal kafka.error
+    (→ _kafka_errors += 1). With the post-join exit-code fix, run() joins this
+    thread first → captures the error → exit 1. Without the fix, run() reads the
+    counter before the error lands → exit 0 while the summary still shows
+    kafka_errors=1 (false green).
+    """
+
+    def __init__(self, winddown_delay=0.3):
+        super().__init__(consume_loop_returns_immediately=False)
+        self._winddown_delay = winddown_delay
+
+    def produce(self, topic, value, *, key=None, headers=None):
+        raise RuntimeError("produce failed (winddown)")
+
+    def consume_loop(self, topic, group_id, stop_event, handle, max_retries):
+        self.consume_loop_called = True
+        self._stop_signal = stop_event
+        # 1. Signal stop FIRST — run()'s loop wakes immediately (wait() returns
+        #    when the event is set), so the old pre-join read races ahead.
+        stop_event.set()
+        # 2. Delay so the old pre-join counter read misses the error below.
+        time.sleep(self._winddown_delay)
+        # 3. NOW emit the non-fatal kafka.error (failing produce → reactor
+        #    _handle except branch, final=True, fatal=False → _kafka_errors += 1).
+        handle(
+            {
+                "value": {"test": "data"},
+                "key": None,
+                "partition": 0,
+                "offset": 7,
+                "timestamp": 1234567890,
+                "headers": {},
+            },
+            attempt=1,
+            final=True,
+        )
+
+
 class FailingAndHealthyKafkaClient:
     """Fake KafkaClient for the reactor-thread-death contract (spec §11).
 
@@ -549,6 +593,61 @@ def test_non_fatal_kafka_error_returns_exit_1():
     errors = [l for l in captured_lines if l.get("event") == "kafka.error"]
     assert len(errors) == 1
     assert errors[0]["fatal"] is False
+
+
+def test_winddown_kafka_error_after_stop_yields_exit_1():
+    """Regression: a non-fatal kafka.error emitted during shutdown wind-down
+    (after stop is set, while a reactor is still finishing its handle) must
+    yield exit 1, not 0.
+
+    run() must join reactor threads before deciding the exit code, so the code
+    and the summary share one post-join snapshot (spec §11: any runtime error
+    → exit 1). On the old pre-join read this returns 0 while the summary shows
+    kafka_errors=1 — a false green. This test fails on that old path.
+    """
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    fake_client = FakeKafkaClientWinddownError(winddown_delay=0.3)
+
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "reactor1": KafkaReactor(
+                    topic="test-topic",
+                    reaction=KafkaReaction(topic="out-topic", value="{}"),
+                )
+            }
+        )
+    )
+
+    engine = MockEngine(
+        mocks=mocks,
+        run_http=False,
+        run_kafka=True,
+        http_listen="127.0.0.1:0",
+        kafka_client=fake_client,
+        emit_fn=capture_emit,
+        run_id="test-run-winddown",
+        fail_fast=False,
+    )
+
+    engine.start()
+    exit_code = engine.run()
+
+    # Exit code must be 1 (a runtime error occurred during wind-down), matching
+    # the summary's kafka_errors count — not 0.
+    assert exit_code == 1, f"expected exit 1 after wind-down kafka.error, got {exit_code}"
+
+    engine.shutdown()
+
+    errors = [l for l in captured_lines if l.get("event") == "kafka.error"]
+    assert len(errors) == 1
+    assert errors[0]["fatal"] is False
+    summary = [l for l in captured_lines if l.get("event") == "summary"][0]
+    assert summary["kafka_errors"] == 1
 
 
 def test_reactor_thread_death_emits_fatal_kafka_error_exit_1():

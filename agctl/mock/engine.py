@@ -323,11 +323,32 @@ class MockEngine:
                 # Wait for stop with a small timeout to check fail-fast condition
                 self._stop.wait(0.1)
 
+            # Signal stop so still-running reactors (e.g. under fail_fast, where
+            # a fatal error breaks the loop without setting _stop) begin winding
+            # down, then JOIN the reactor threads before deciding the exit code.
+            # A reactor finishing its final handle() after _stop was set can emit
+            # a non-fatal kafka.error during this window; reading the counters
+            # before joining would miss it and return 0 while the post-join
+            # summary snapshot shows kafka_errors > 0 — a false-green exit 0
+            # (spec §11). Joining first makes the exit code and the summary share
+            # one post-join snapshot. Joining an already-finished thread is a
+            # no-op, so shutdown()'s later join is harmless. The HTTP serve
+            # thread is NOT joined here (it blocks until shutdown() stops the
+            # server, so joining now would always hit the timeout); shutdown()
+            # joins it after stopping the server.
+            self._stop.set()
+            for t in self._reactor_threads:
+                t.join(timeout=2.0)
+
             # Determine exit code (DESIGN §11): exit 1 if ANY runtime error
             # occurred (any kafka.error, fatal or not) or a fatal/fail-fast
-            # stop was triggered; else 0. The fail_fast immediate-exit-on-fatal
-            # mid-run behavior is preserved by the loop break above.
-            if self._kafka_errors > 0 or self._runtime_error:
+            # stop was triggered; else 0. Read under _emit_lock to share the
+            # same snapshot discipline as _emit_summary_line (counters mutated
+            # under the lock).
+            with self._emit_lock:
+                kafka_errors = self._kafka_errors
+                runtime_error = self._runtime_error
+            if kafka_errors > 0 or runtime_error:
                 return 1
             return 0
 
