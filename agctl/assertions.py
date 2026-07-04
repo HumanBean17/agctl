@@ -57,6 +57,40 @@ def jq_value(value, expr: str):
     return outputs[0]
 
 
+def compile_jq(expr: str, *, label: str | None = None) -> None:
+    """Compile a jq expression WITHOUT evaluating it against any value.
+
+    Compile-only guard, distinct from ``jq_bool``/``jq_value``: those helpers wrap
+    compile+eval in ``except Exception: return False/None`` (correct for runtime
+    matching, where a partial match must never crash). ``compile_jq`` instead
+    surfaces a malformed expression loudly as a :class:`ConfigError` (exit 2), so
+    authoring typos are caught at startup / ``config validate`` rather than
+    silently mis-matching every request.
+
+    On a missing jq library, re-raises ``ConfigError`` pointing at the ``jq``
+    extra (the base ``_jq()`` message names only db/kafka and is rewritten here
+    for the HTTP/mock context). On any other compile-time exception (e.g.
+    ``ValueError`` from a truncated expression), raises ``ConfigError`` whose
+    message includes ``label``, the expression, and the underlying error.
+    """
+    context = f"[{label}] " if label else ""
+    try:
+        jq_lib = _jq()
+    except ConfigError as exc:
+        raise ConfigError(
+            f"{context}jq is required for jq assertions: pip install 'agctl[jq]'",
+            {"expr": expr, "label": label},
+        ) from exc
+    try:
+        jq_lib.compile(expr)
+    except Exception as exc:
+        raise ConfigError(
+            f"{context}invalid jq expression {expr!r}: {exc}",
+            {"expr": expr, "label": label},
+        ) from exc
+    return None
+
+
 def json_subset(needle, haystack) -> bool:
     """DESIGN --contains: True if every key/element in needle is present-and-equal
     in haystack, recursively for nested dict/list. Subset, not equality.

@@ -6,6 +6,7 @@ import pytest
 
 from agctl.assertions import (
     coerce_db_value,
+    compile_jq,
     jq_bool,
     jq_value,
     json_subset,
@@ -52,6 +53,57 @@ def test_jq_value_missing_path():
 
 def test_jq_value_bad_expr():
     assert jq_value({}, ")(") is None
+
+
+# --- compile_jq -------------------------------------------------------------
+def test_compile_jq_valid_returns_none():
+    # valid expression compiles without applying it; returns None
+    assert compile_jq(".a == 1") is None
+
+
+def test_compile_jq_syntax_error_raises_config_error():
+    # malformed expression -> ConfigError (loud), not silently swallowed
+    from agctl.errors import ConfigError
+
+    with pytest.raises(ConfigError):
+        compile_jq(")(")
+
+
+def test_compile_jq_truncated_expr_raises_config_error():
+    # truncated expression (the case jq_bool silently swallows) -> ConfigError
+    from agctl.errors import ConfigError
+
+    with pytest.raises(ConfigError):
+        compile_jq(".amount >")
+
+
+def test_compile_jq_message_includes_label():
+    # the raised ConfigError.message includes the label when one is passed
+    from agctl.errors import ConfigError
+
+    with pytest.raises(ConfigError) as exc_info:
+        compile_jq(".amount >", label="order.amount match")
+    assert "order.amount match" in exc_info.value.message
+
+
+def test_compile_jq_contrast_jq_bool_swallows():
+    # contrast: jq_bool wraps compile+eval in except Exception -> False,
+    # so the SAME bad expression that compile_jq raises on yields False here.
+    assert jq_bool({}, ")(") is False
+
+
+def test_compile_jq_missing_jq_message_names_agctl_jq_extra(monkeypatch):
+    # missing jq library -> ConfigError pointing at pip install 'agctl[jq]'
+    # (the base _jq() message names only db/kafka; compile_jq MUST replace it).
+    import sys
+    from agctl.errors import ConfigError
+
+    monkeypatch.setitem(sys.modules, "jq", None)  # block the lazy import
+    from agctl import assertions
+
+    with pytest.raises(ConfigError) as exc_info:
+        assertions.compile_jq(".a")
+    assert "agctl[jq]" in exc_info.value.message
 
 
 # --- jq lazy import (Fix A) ------------------------------------------------
