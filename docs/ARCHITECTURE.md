@@ -114,7 +114,7 @@ agctl/
 ├── commands/                   # one module per command group
 │   ├── http_commands.py        # http call / request / ping
 │   ├── kafka_commands.py       # kafka produce / consume / assert
-│   ├── db_commands.py          # db query / assert / execute
+│   ├── db_commands.py          # db query / assert / execute / schema
 │   ├── check_commands.py       # check ready
 │   ├── config_commands.py      # config validate / show / init
 │   ├── discover_commands.py    # discover summary / category / item / search
@@ -348,6 +348,15 @@ connection, or read-mode template. All fail before any database operation is
 attempted. Driver-level write errors (execute, rollback, commit failures) surface
 as `ConnectionFailure`.
 
+**`db schema` failures** — all three failure modes surface as `ConfigError`
+(exit 2): the selected driver lacks the optional `describe_schema` capability
+(raised pre-connect by the `supports_describe_schema()` probe, so no connection
+is opened), Level-2 not-found (0 matches), and Level-2 ambiguity (>1 match
+across schemas, with `error.detail.candidates=[{schema, kind}]` — disambiguate
+with `--schema`). The capability check fires pre-`SELECT`; the not-found and
+ambiguity checks fire post-`describe_schema`. DB/catalog errors during
+introspection surface as `ConnectionFailure`.
+
 ---
 
 ## 8. Transport / Client Layer
@@ -420,6 +429,29 @@ capability, not required by the `DBDriver` protocol. `DbClient.execute_write`
 probes the driver for a callable `execute_write` attribute and raises
 `ConfigError` if absent. `PostgreSQLDriver` implements this method; third-party
 drivers may omit it (read-only drivers remain valid).
+
+**Optional `describe_schema` capability** — live schema discovery is a second
+optional driver capability following the same probe pattern.
+`DbClient.supports_describe_schema()` is a **pre-connect, side-effect-free**
+probe (it inspects the driver for a callable `describe_schema` attribute without
+opening a connection); `agctl db schema` calls it to fail fast with
+`ConfigError` (exit 2) when the driver cannot introspect. `DbClient.describe_schema`
+delegates to the driver and returns its dict unchanged.
+`PostgreSQLDriver.describe_schema` reads `pg_catalog` (relations from `pg_class`/
+`pg_namespace`/`pg_attribute`; columns from `pg_attribute`/`pg_type`; defaults,
+enum values, comments, and constraints from `pg_attrdef`/`pg_enum`/
+`pg_description`/`pg_constraint`) and excludes schemas whose name starts with
+`pg_` or equals `information_schema`. Third-party drivers may omit it
+(non-introspection drivers remain valid for `db query`/`assert`/`execute`).
+
+**`db schema` lifecycle** — the Click `db_schema` command dispatches on
+`--table`: absent → `_db_schema_tables_core` (Level 1, command tag
+`db.schema.tables`); present → `_db_schema_table_core` (Level 2, command tag
+`db.schema.table`). Both `_core`s are wrapped by `@envelope` and share an
+`_probe_and_describe` helper that probes → `connect` → `describe_schema` →
+`close` in `try/finally`, so the close runs even on Level-2 not-found/ambiguity
+raises. Level 2 flattens the single driver match into the top-level result
+shape; `error.detail.candidates` carries the >1-match case.
 
 **Commit-after-materialize ordering** — `PostgreSQLDriver.execute_write`
 materializes `rows_affected` and `RETURNING` data *before* committing. The
@@ -498,10 +530,12 @@ and **skipped** — it never bricks the CLI, the registry, or driver discovery.
 
 - **DB drivers** — `DbClient` selects by `connection["type"]`; unknown →
   `ConfigError`. Built-in `postgresql` always wins over a registration gap.
-  The `DBDriver` protocol requires `connect`/`execute`/`close`; `execute_write`
-  is optional. Drivers that only support read operations omit `execute_write`
-  — `DbClient.execute_write` probes for the method and raises `ConfigError` if
-  absent. Register in another package's `pyproject.toml`:
+  The `DBDriver` protocol requires `connect`/`execute`/`close`; both
+  `execute_write` and `describe_schema` are optional capabilities (probed
+  without opening a connection). Built-in `postgresql` implements both;
+  third-party drivers may omit either — `DbClient.execute_write`/
+  `supports_describe_schema` probe for the method and raise `ConfigError`
+  if absent. Register in another package's `pyproject.toml`:
   ```toml
   [project.entry-points."agctl.db_drivers"]
   mysql = "agctl_mysql:MySQLDriver"
