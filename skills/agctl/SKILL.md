@@ -41,6 +41,7 @@ Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`.
 | What can I do here? | `agctl discover` |
 | Send a known request | `agctl http call <tpl> [--param k=v]…` |
 | Ad-hoc request | `agctl http request --service S --method M --path P` |
+| Assert an HTTP response | `agctl http call <tpl> --status N [--contains '{…}'] [--match '<jq>'] [--jq-path .x --equals v]` |
 | Verify an event was published | `agctl kafka assert --topic T <mode> --timeout N` |
 | See what was published | `agctl kafka consume --topic T [--match <jq>]` |
 | Publish a message | `agctl kafka produce --topic T --message '{…}'` |
@@ -60,7 +61,9 @@ Only `--config <path>` is global. `--timeout` is **not** global (see gotchas).
 
 ```
 agctl http call   <tpl> [--param k=v]… [--body '{…}'] [--header k=v]… [--timeout N]
+                    [--status N] [--contains '{…}'] [--match '<jq>'] [--jq-path <jq> --equals <v>]
 agctl http request --service S --method GET|POST|PUT|PATCH|DELETE --path P [--body '{…}'] [--header k=v]…
+                    [--status N] [--contains '{…}'] [--match '<jq>'] [--jq-path <jq> --equals <v>]
 agctl http ping   [<tpl> | --service S --path P] --interval N [--duration N | --until-stopped]   # streams NDJSON; background it
 
 agctl kafka assert [--topic T] <mode> [--param k=v]… [--path <jq>] --timeout N [--from-beginning]
@@ -80,6 +83,11 @@ agctl config validate | config show [--unmask]
 - `--body` on `http call` is **deep-merged** over the template body (adds/overrides).
 - `--header` merges with template headers; caller wins.
 - `db`/`kafka produce` have **no** `--timeout`. `kafka assert --timeout` is **required**.
+- **HTTP response assertions** (`http call`/`http request`): `--status` / `--contains '{…}'`
+  / `--match '<jq>'` / `--jq-path <jq> --equals <v>`. ≥1 flag => assertion mode (all AND;
+  fail => exit 1, `AssertionError`). `--jq-path` needs `--equals` (else exit 2). `--match`
+  is "any truthy output"; for "all items" use `all(.items[]; .pred)`. `--match`/`--jq-path`
+  need `pip install 'agctl[jq]'`.
 
 ## Gotchas (what `--help` won't tell you)
 
@@ -87,7 +95,11 @@ agctl config validate | config show [--unmask]
    `mock run` (one NDJSON event line as things happen, plus a final `summary`).
    Both are meant to run backgrounded with `&` and `kill`ed when done. Exits `0`
    (all ok) / `1` (any failed). Everything else emits exactly one object.
-2. **A 4xx/5xx HTTP response is `ok:true`.** Status is a *result*, not an error.
+2. **A 4xx/5xx HTTP response is `ok:true` — unless you assert.** Status is a
+   *result*, not an error. Add `--status` / `--contains` / `--match` / `--jq-path` /
+   `--equals` to `http call` / `http request` to flip a wrong response into
+   `AssertionError` (exit 1); zero assertion flags leaves the default
+   "result, not assertion" path unchanged.
 3. **Three placeholder syntaxes — don't mix them:**
    - `${VAR}` — env var, resolved at **config load** (`${VAR}` required → exit 2 if
      unset; `${VAR:-default}` optional; `${VAR:-}` optional/empty).
@@ -238,6 +250,12 @@ grep -E 'http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error' mock.
 # Send → assert the downstream Kafka event (reliable by default)
 agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001
 agctl kafka assert --topic orders.created --contains '{"customer_id":"cust-42"}' --timeout 10
+
+# Assert the HTTP response itself in one call (no shell jq; exit 1 if it fails)
+agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001 \
+  --status 201 --match '.order_id != null' --contains '{"status": "PENDING"}'
+# Type-aware value equality via jq path (0 ≠ "0"; pairing needs both flags)
+agctl http call get-order --param order_id=ord-789 --jq-path '.status' --equals '"CONFIRMED"'
 
 # E2E: thread an ID through HTTP → Kafka → DB
 OID=$(agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001 | jq -r '.result.body.order_id')

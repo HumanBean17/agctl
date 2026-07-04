@@ -340,11 +340,15 @@ unresolved required `${VAR}` (one error listing all), version mismatch, invalid
 `security.protocol` (Pydantic), an undelivered Kafka message within flush
 timeout (`ConnectionFailure`, never a silent `null` success), zero or >1
 assertion mode on `db`/`kafka assert` (`ConfigError` before any network call),
+`--jq-path`/`--equals` pairing misuse or non-JSON `--contains` on `http call`/
+`http request` (`ConfigError` before the request is sent, via
+`validate_http_assertion_args` — gating pre-request so a bad invocation never
+triggers a wasted side-effect),
 a malformed `match.jq`/reactor `match` in `mock run` (`ConfigError` at engine
 startup before probe/bind — `MockEngine.start()` Step 0 walks mocks via
 `iter_mock_jq_expressions` and `compile_jq`s each expression; a body-only
-config imports nothing), and a match-miss in `kafka assert` / `db assert`
-(`AssertionFailure`, exit 1).
+config imports nothing), and a match-miss in `kafka assert` / `db assert` /
+`http call` / `http request` (`AssertionFailure`, exit 1).
 
 **`db execute` write-safety failures** — the command rejects writes at multiple
 gates, each surfacing as `ConfigError` (exit 2): missing `--write` flag, omitted
@@ -376,10 +380,14 @@ Exception mapping: `ConnectError`/`ConnectTimeout` → `ConnectionFailure`;
 `ReadTimeout`/other `TimeoutException` → `OperationTimeout`; other `HTTPError`
 → `ConnectionFailure`.
 
-> A 4xx/5xx response is **not** an error. `http call`/`http request` return
-> `ok:true` with the status in `result` — HTTP status is a result, not an
-> assertion. (Contrast `check ready`, which treats 2xx as "ready" but still
-> returns `ok:true` for the command itself.)
+> A 4xx/5xx response is **not** an error by default. `http call`/`http request`
+> return `ok:true` with the status in `result` — HTTP status is a result, not an
+> assertion. The response-assertion flags (`--status`/`--contains`/`--match`/`--jq-path`/`--equals`)
+> flip this: ≥1 flag enters assertion mode, `evaluate_http_assertions` runs
+> after the request, and a failing mode raises `AssertionFailure` (exit 1) with
+> `error.detail = {response, failures}`. Zero flags leaves the default
+> "result, not assertion" path byte-for-byte unchanged. (Contrast `check ready`,
+> which treats 2xx as "ready" but still returns `ok:true` for the command itself.)
 
 ### KafkaClient (`clients/kafka_client.py`)
 
@@ -465,6 +473,13 @@ Primitives in `assertions.py`, composed by the command layer. Four families:
   active modes must pass.
 - **`kafka consume --match`** — a `jq_bool` predicate, with short-circuit on
   `--expect-count`.
+- **`http call` / `http request`** — `evaluate_http_assertions` composes
+  `jq_bool` (`--match`), `json_subset` (`--contains`), and `jq_value` +
+  `parse_equals` + `type_aware_equal` (`--jq-path` + `--equals`) against the
+  response; `validate_http_assertion_args` gates `--jq-path`/`--equals` pairing
+  and `--contains` JSON shape pre-request (`ConfigError` exit 2, before the
+  request is sent). `coerce_db_value` is intentionally not reused — HTTP
+  response bodies are already JSON-native.
 
 ### Custom assertion modes (`assertion_registry.py`)
 
