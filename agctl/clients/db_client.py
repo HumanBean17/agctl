@@ -107,5 +107,35 @@ class DbClient:
             )
         return self._driver.execute_write(sql, params)
 
+    def supports_describe_schema(self) -> bool:
+        """Return True if the driver offers a callable ``describe_schema``.
+
+        This is a **pre-connect**, side-effect-free probe: it does not call
+        ``describe_schema`` and does not require a connection. Callers
+        (``agctl db schema``) use it to fail fast when the selected driver
+        cannot introspect, without opening a connection.
+
+        Returns:
+            True if the driver has a callable ``describe_schema`` attribute.
+        """
+        return callable(getattr(self._driver, "describe_schema", None))
+
+    def describe_schema(self, table: str | None, schema: str | None) -> dict:
+        """Delegate to the driver's optional ``describe_schema`` capability.
+
+        Probes :meth:`supports_describe_schema`; raises ConfigError if the
+        driver lacks this optional capability. Otherwise delegates to the
+        driver and returns its dict unchanged.
+
+        Returns:
+            The dict returned by the driver's ``describe_schema`` method.
+        """
+        if not self.supports_describe_schema():
+            raise ConfigError(
+                f"connection's driver ({self._conn_dict['type']}) does not support schema discovery",
+                {"driver": self._conn_dict["type"]},
+            )
+        return self._driver.describe_schema(table, schema)
+
     def close(self) -> None:
         self._driver.close()

@@ -690,6 +690,22 @@ agctl db execute \
 
 **Idempotency:** `db execute` does NOT enforce idempotency. If you need repeatable writes (e.g., for flaky-test resilience), encode idempotency in the SQL using `ON CONFLICT` (PostgreSQL) or `ON DUPLICATE KEY UPDATE` (MySQL). Consider using `RETURNING` clauses to return inserted/updated rows for verification.
 
+#### `agctl db schema`
+
+Discover live database schema — read-only and ungated. No `--write`, no `--template`, no `--sql`, no `--param`; ignores `writable`/`mode` entirely, so any configured connection (read-only or writable) is eligible. Two levels, picked by `--table`:
+
+```
+agctl db schema
+    [--connection <name>]       # overrides defaults.database_connection
+    [--schema <name>]           # schema filter (valid at both levels)
+    [--table <name>]            # relation to drill into; omit for the relations list
+```
+
+- **Level 1 (no `--table`)** — list relations (tables and views) the agent can drill into.
+- **Level 2 (`--table <name>`)** — return the single matching relation's columns, primary key, foreign keys, and unique constraints. `--table` accepts views. Match is **exact-case** on the stored name; `--schema` disambiguates when the same name exists in multiple schemas.
+
+**Capability gate:** schema discovery requires the driver to implement the optional `describe_schema` capability (see §9.1). A driver without it is valid for `db query`/`assert`/`execute` but ineligible for `db schema`; the command fails fast with `ConfigError` (exit 2) **without opening a connection**.
+
 ---
 
 ### 3.4 `agctl check` — Service Health
@@ -1174,6 +1190,46 @@ Every invocation writes exactly one JSON object to stdout (the sole exception is
 ```
 
 `rows_affected` is an integer count or `null` (for statements like DDL that don't report a row count). `returning` is a list of dict rows when the SQL includes a `RETURNING` clause, otherwise an empty array `[]`.
+
+#### `db.schema.tables`
+
+```json
+{
+  "connection": "main-db",
+  "schema_filter": null,
+  "count": 2,
+  "items": [
+    { "schema": "public", "name": "orders",   "kind": "table", "column_count": 4 },
+    { "schema": "public", "name": "order_view", "kind": "view",  "column_count": 3 }
+  ],
+  "hint": "Run 'agctl db schema --table <name> [--schema <name>] [--connection <name>]' for columns and keys"
+}
+```
+
+#### `db.schema.table`
+
+```json
+{
+  "connection": "main-db",
+  "schema": "public",
+  "table": "orders",
+  "kind": "table",
+  "comment": null,
+  "columns": [
+    { "name": "id", "data_type": "integer", "nullable": false, "default": null, "generated": null, "enum_values": null, "comment": null }
+  ],
+  "primary_key": ["id"],
+  "foreign_keys": [
+    { "name": "orders_customer_fkey", "columns": ["customer_id"], "references_schema": "public", "references_table": "customers", "references_columns": ["id"] }
+  ],
+  "unique_constraints": [
+    { "name": "orders_external_id_key", "columns": ["external_id"] }
+  ],
+  "hint": "Use these columns in 'agctl db query' / 'db assert --sql' with :paramName bind params."
+}
+```
+
+The `db` group is now **mixed**: the `schema.*` tags carry a `hint` string (like `discover`) to chain the agent's next call, while `db.query`/`db.assert`/`db.execute` do not.
 
 #### `check.ready`
 
@@ -1737,6 +1793,11 @@ class DBDriver(Protocol):
     def execute(self, sql: str, params: dict) -> list[dict[str, Any]]: ...
     def close(self) -> None: ...
 ```
+
+The Protocol requires only `connect`/`execute`/`close`. Two capabilities are **optional** and follow the same probe pattern (their presence is detected without opening a connection):
+
+- **`execute_write(sql, params) -> {rows_affected, returning}`** — enables `agctl db execute`. Absent → the driver is read-only and `db execute` raises `ConfigError` (exit 2) before any database operation.
+- **`describe_schema(table, schema) -> {items, matches}`** — enables `agctl db schema` (§3.3). Absent → the driver is valid but ineligible for `db schema`; `DbClient.supports_describe_schema()` is a pre-connect, side-effect-free probe, so the command fails fast with `ConfigError` (exit 2) **without opening a connection**.
 
 To add a MySQL driver in a separate package:
 

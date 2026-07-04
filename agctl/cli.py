@@ -20,7 +20,7 @@ from .commands.config_commands import (
     config_validate,
     set_plugins_provider,
 )
-from .commands.db_commands import db_assert, db_execute, db_query
+from .commands.db_commands import db_assert, db_execute, db_query, db_schema
 from .commands.discover_commands import discover
 from .commands.http_commands import http_call, http_ping, http_request
 from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
@@ -141,6 +141,7 @@ http_group.add_command(http_ping)
 db_group.add_command(db_query)
 db_group.add_command(db_assert)
 db_group.add_command(db_execute)
+db_group.add_command(db_schema)
 
 
 # Register subcommands on the kafka group.

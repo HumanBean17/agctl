@@ -186,6 +186,398 @@ class PostgreSQLDriver:
 
         return {"rows_affected": rows_affected, "returning": returning}
 
+    def describe_schema(self, table: str | None, schema: str | None) -> dict:
+        """Return the live schema of the connection (DESIGN §7, optional capability).
+
+        This is an optional driver capability (the ``DBDriver`` Protocol is
+        unchanged); introspection-capable drivers implement it and the command
+        layer probes for a callable ``describe_schema`` before use.
+
+        **Level 1** (``table is None``) lists the relations (tables and views)
+        visible in the connection, normalized to::
+
+            {"items": [ {"schema", "name", "kind", "column_count"} ... ]}
+
+        Relations are read from ``pg_class`` joined to ``pg_namespace`` (schema
+        name) with a non-dropped user-column count from ``pg_attribute``. The
+        v1 scope (spec D5/D6) is enforced here, at the normalization seam:
+
+        - ``relkind`` ordinary/partitioned table (``'r'``/``'p'``) -> ``"table"``,
+          view (``'v'``) -> ``"view"``; every other ``relkind`` (materialized
+          view ``'m'``, sequence ``'S'``, foreign table, index, TOAST) is
+          excluded.
+        - System schemas (name starting with ``pg_`` or equal to
+          ``information_schema``) are excluded.
+        - Partition *leaf* relations (``relispartition = true``) are excluded;
+          only partitioned parents and plain tables appear.
+        - Items are sorted by ``(schema, name)`` ascending for stable output.
+
+        When ``schema`` is provided it restricts the namespace and is sent as a
+        **bind parameter** (never interpolated). An unknown/empty ``schema``
+        yields ``{"items": []}`` (not an error).
+
+        ``psycopg`` is lazy-imported and any ``psycopg.Error`` during the catalog
+        read surfaces as :class:`ConnectionFailure`; no ``commit()`` is issued
+        (read-only catalog SELECTs).
+
+        **Level 2** (``table is not None``) returns one ``matches`` entry per
+        relation named ``table`` (exact stored case; views accepted), restricted
+        to ``schema`` when given. The driver does NOT disambiguate: when
+        ``schema`` is unset and the name exists in multiple schemas, every match
+        is returned (the command layer raises on ambiguity). Each entry carries
+        columns (``name``, ``data_type`` verbatim from ``format_type``,
+        ``nullable`` inverted from ``attnotnull``, ``default`` from
+        ``pg_get_expr`` -- redacted to ``null`` when ``generated`` is non-null,
+        ``generated`` from ``attidentity``/``attgenerated``, ``enum_values``
+        from ``pg_enum`` for enum-typed columns, per-column ``comment``),
+        ``primary_key``, ``foreign_keys`` (with positional ``conkey``/
+        ``confkey`` pairing preserved, self-references handled), and
+        ``unique_constraints`` (``contype == 'u'`` only). Catalog cells are
+        emitted verbatim (``coerce_db_value`` is deliberately not applied).
+        ``items`` is kept (empty) so the return shape is uniform across both
+        branches.
+        """
+        import psycopg
+
+        if table is not None:
+            # Level 2: one relation's columns + keys. Find every relation named
+            # ``table`` (restricted to ``schema`` when given; views accepted),
+            # then read each relation's columns, defaults, enum values,
+            # comments, and constraints from pg_catalog. The driver does NOT
+            # disambiguate: when ``schema`` is unset and the name exists in
+            # multiple schemas, every match is returned (the command layer
+            # raises on ambiguity). ``items`` is kept (empty) so the return
+            # shape is uniform across both branches.
+            cur = self._conn.cursor()
+            try:
+                rel_sql = (
+                    "SELECT c.oid AS oid, n.nspname AS schema_name, "
+                    "c.relname AS relation_name, c.relkind AS relkind, "
+                    "c.relispartition AS relispartition "
+                    "FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE c.relname = %(table)s"
+                )
+                rel_params: dict[str, Any] = {"table": table}
+                if schema is not None:
+                    rel_sql += " AND n.nspname = %(schema)s"
+                    rel_params["schema"] = schema
+                cur.execute(rel_sql, rel_params)
+                rel_desc = [d.name for d in (cur.description or [])]
+                rel_rows = cur.fetchall()
+
+                matches = []
+                for row in rel_rows:
+                    rec = dict(zip(rel_desc, row))
+                    relkind = rec.get("relkind")
+                    if relkind in ("r", "p"):
+                        kind = "table"
+                    elif relkind == "v":
+                        kind = "view"
+                    else:
+                        # Same v1 scope as Level 1 (matviews/sequences/etc.).
+                        continue
+                    schema_name = rec.get("schema_name")
+                    if schema_name is None:
+                        continue
+                    if schema_name.startswith("pg_") or schema_name == "information_schema":
+                        continue
+                    if rec.get("relispartition"):
+                        continue
+                    if schema is not None and schema_name != schema:
+                        continue
+                    matches.append(
+                        self._describe_one_relation(
+                            cur,
+                            oid=rec.get("oid"),
+                            schema_name=schema_name,
+                            table_name=rec.get("relation_name"),
+                            kind=kind,
+                        )
+                    )
+            except psycopg.Error as exc:
+                raise ConnectionFailure(message=str(exc)) from exc
+            finally:
+                cur.close()
+
+            return {"items": [], "matches": matches}
+
+        # Level 1: relations from pg_class + pg_namespace + a non-dropped
+        # user-column count from pg_attribute (attnum > 0 excludes system
+        # columns; NOT attisdropped excludes dropped ones).
+        base_query = (
+            "SELECT n.nspname AS schema_name, c.relname AS relation_name, "
+            "c.relkind AS relkind, c.relispartition AS relispartition, "
+            "(SELECT count(*) FROM pg_attribute a "
+            "WHERE a.attrelid = c.oid AND a.attnum > 0 "
+            "AND NOT a.attisdropped) AS column_count "
+            "FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace"
+        )
+        if schema is not None:
+            sql = base_query + " WHERE n.nspname = %(schema)s"
+            params = {"schema": schema}
+        else:
+            sql = base_query
+            params = {}
+
+        cur = self._conn.cursor()
+        try:
+            cur.execute(sql, params)
+            column_names = [desc.name for desc in (cur.description or [])]
+            rows = cur.fetchall()
+        except psycopg.Error as exc:
+            raise ConnectionFailure(message=str(exc)) from exc
+        finally:
+            cur.close()
+
+        records = [dict(zip(column_names, row)) for row in rows]
+
+        items = []
+        for rec in records:
+            relkind = rec.get("relkind")
+            if relkind in ("r", "p"):
+                kind = "table"
+            elif relkind == "v":
+                kind = "view"
+            else:
+                # Exclude matviews ('m'), sequences ('S'), foreign tables,
+                # indexes, TOAST, etc. from v1.
+                continue
+
+            schema_name = rec.get("schema_name")
+            if schema_name is None:
+                continue
+            if schema_name.startswith("pg_") or schema_name == "information_schema":
+                continue
+            if rec.get("relispartition"):
+                # Partition leaves: only parents appear.
+                continue
+            if schema is not None and schema_name != schema:
+                continue
+
+            items.append(
+                {
+                    "schema": schema_name,
+                    "name": rec.get("relation_name"),
+                    "kind": kind,
+                    "column_count": rec.get("column_count"),
+                }
+            )
+
+        items.sort(key=lambda it: (it["schema"], it["name"]))
+        return {"items": items}
+
+    def _describe_one_relation(
+        self, cur, *, oid, schema_name, table_name, kind
+    ) -> dict:
+        """Build the normalized Level-2 dict for one relation.
+
+        Issues the per-relation catalog SELECTs (columns, defaults, enum
+        values, comments, constraints) on the shared ``cur``. Any
+        ``psycopg.Error`` propagates to :meth:`describe_schema`'s mapping to
+        :class:`ConnectionFailure`. Catalog cells are emitted verbatim
+        (``coerce_db_value`` is deliberately not applied).
+        """
+        # Columns (pg_attribute + pg_type for data_type/typtype). attnum > 0
+        # excludes system columns; NOT attisdropped excludes dropped ones.
+        cur.execute(
+            "SELECT a.attnum AS attnum, a.attname AS attname, "
+            "format_type(a.atttypid, a.atttypmod) AS data_type, "
+            "a.attnotnull AS attnotnull, a.attidentity AS attidentity, "
+            "a.attgenerated AS attgenerated, t.typtype AS typtype, "
+            "a.atttypid AS atttypid "
+            "FROM pg_attribute a "
+            "JOIN pg_type t ON t.oid = a.atttypid "
+            "WHERE a.attrelid = %(oid)s AND a.attnum > 0 "
+            "AND NOT a.attisdropped "
+            "ORDER BY a.attnum",
+            {"oid": oid},
+        )
+        col_desc = [d.name for d in (cur.description or [])]
+        attnum_to_name: dict[int, str] = {}
+        raw_columns = []
+        for row in cur.fetchall():
+            crec = dict(zip(col_desc, row))
+            attnum_to_name[crec.get("attnum")] = crec.get("attname")
+            raw_columns.append(crec)
+
+        # Defaults (pg_attrdef rendered through pg_get_expr -> already text).
+        cur.execute(
+            "SELECT adnum AS adnum, "
+            "pg_get_expr(adbin, adrelid) AS default_expr "
+            "FROM pg_attrdef WHERE adrelid = %(oid)s",
+            {"oid": oid},
+        )
+        def_desc = [d.name for d in (cur.description or [])]
+        defaults: dict[int, str] = {}
+        for row in cur.fetchall():
+            drec = dict(zip(def_desc, row))
+            defaults[drec.get("adnum")] = drec.get("default_expr")
+
+        # Enum values (pg_enum) — one batched query for all enum types on this
+        # relation, in declared (enumsortorder) order, grouped by type oid.
+        enum_values_by_typid: dict[int, list[str]] = {}
+        enum_typids = sorted(
+            {c.get("atttypid") for c in raw_columns if c.get("typtype") == "e"}
+        )
+        if enum_typids:
+            cur.execute(
+                "SELECT enumtypid AS enum_typid, enumlabel AS enum_label "
+                "FROM pg_enum WHERE enumtypid = ANY(%(typids)s) "
+                "ORDER BY enumtypid, enumsortorder",
+                {"typids": enum_typids},
+            )
+            enum_desc = [d.name for d in (cur.description or [])]
+            for row in cur.fetchall():
+                erec = dict(zip(enum_desc, row))
+                enum_values_by_typid.setdefault(
+                    erec.get("enum_typid"), []
+                ).append(erec.get("enum_label"))
+
+        # Comments (pg_description): objsubid 0 -> table, >0 -> column attnum.
+        cur.execute(
+            "SELECT objsubid AS objsubid, description AS description "
+            "FROM pg_description WHERE objoid = %(oid)s",
+            {"oid": oid},
+        )
+        com_desc = [d.name for d in (cur.description or [])]
+        column_comments: dict[int, str] = {}
+        table_comment = None
+        for row in cur.fetchall():
+            corec = dict(zip(com_desc, row))
+            subid = corec.get("objsubid")
+            if subid == 0:
+                table_comment = corec.get("description")
+            elif subid:
+                column_comments[subid] = corec.get("description")
+
+        # Normalize columns (data_type verbatim, nullable inverted, generated
+        # mapped, default redacted when generated is non-null, enum_values
+        # only for enum types, column comment or None).
+        columns = []
+        for crec in raw_columns:
+            attnum = crec.get("attnum")
+            attidentity = crec.get("attidentity") or ""
+            attgenerated = crec.get("attgenerated") or ""
+            if attidentity == "a":
+                generated = "always_identity"
+            elif attidentity == "d":
+                generated = "by_default_identity"
+            elif attgenerated == "s":
+                generated = "stored"
+            else:
+                generated = None
+            # Redaction rule (load-bearing): identity/stored-generated columns
+            # have no literal default the agent may supply, regardless of what
+            # pg_attrdef returned.
+            default = None if generated is not None else defaults.get(attnum)
+            if crec.get("typtype") == "e":
+                enum_values = list(enum_values_by_typid.get(crec.get("atttypid"), []))
+            else:
+                enum_values = None
+            columns.append(
+                {
+                    "name": crec.get("attname"),
+                    "data_type": crec.get("data_type"),
+                    "nullable": not crec.get("attnotnull"),
+                    "default": default,
+                    "generated": generated,
+                    "enum_values": enum_values,
+                    "comment": column_comments.get(attnum),
+                }
+            )
+
+        # Constraints (pg_constraint): PK/FK/unique. conkey/confkey are
+        # attnum arrays resolved to names via the maps above/below; array
+        # order is the constraint's column order and the FK pairing, preserved.
+        cur.execute(
+            "SELECT con.conname AS conname, con.contype AS contype, "
+            "con.conkey AS conkey, con.confkey AS confkey, "
+            "rn.nspname AS ref_schema, rf.relname AS ref_table, "
+            "con.confrelid AS ref_oid "
+            "FROM pg_constraint con "
+            "LEFT JOIN pg_class rf ON rf.oid = con.confrelid "
+            "LEFT JOIN pg_namespace rn ON rn.oid = rf.relnamespace "
+            "WHERE con.conrelid = %(oid)s "
+            "AND con.contype IN ('p', 'f', 'u')",
+            {"oid": oid},
+        )
+        con_desc = [d.name for d in (cur.description or [])]
+        primary_key: list[str] = []
+        foreign_keys: list[dict] = []
+        unique_constraints: list[dict] = []
+        # Cache of referenced-relation attnum->name maps; pre-seeded with this
+        # relation so self-referencing FKs (confrelid == own oid) reuse the
+        # local map without an extra round trip.
+        ref_attnum_cache: dict[Any, dict[int, str]] = {oid: dict(attnum_to_name)}
+        for row in cur.fetchall():
+            crec = dict(zip(con_desc, row))
+            contype = crec.get("contype")
+            conkey = crec.get("conkey") or []
+            conname = crec.get("conname")
+            if contype == "p":
+                primary_key = [
+                    attnum_to_name[k]
+                    for k in conkey
+                    if attnum_to_name.get(k) is not None
+                ]
+            elif contype == "u":
+                cols = [
+                    attnum_to_name[k]
+                    for k in conkey
+                    if attnum_to_name.get(k) is not None
+                ]
+                unique_constraints.append({"name": conname, "columns": cols})
+            elif contype == "f":
+                local_cols = [
+                    attnum_to_name[k]
+                    for k in conkey
+                    if attnum_to_name.get(k) is not None
+                ]
+                ref_oid = crec.get("ref_oid")
+                confkey = crec.get("confkey") or []
+                if ref_oid not in ref_attnum_cache:
+                    cur.execute(
+                        "SELECT a.attnum AS ref_attnum, a.attname AS ref_attname "
+                        "FROM pg_attribute a "
+                        "WHERE a.attrelid = %(ref_oid)s AND a.attnum > 0 "
+                        "AND NOT a.attisdropped",
+                        {"ref_oid": ref_oid},
+                    )
+                    ref_desc = [d.name for d in (cur.description or [])]
+                    ref_map: dict[int, str] = {}
+                    for rrow in cur.fetchall():
+                        rrec = dict(zip(ref_desc, rrow))
+                        ref_map[rrec.get("ref_attnum")] = rrec.get("ref_attname")
+                    ref_attnum_cache[ref_oid] = ref_map
+                ref_map = ref_attnum_cache[ref_oid]
+                ref_cols = [
+                    ref_map[k]
+                    for k in confkey
+                    if ref_map.get(k) is not None
+                ]
+                foreign_keys.append(
+                    {
+                        "name": conname,
+                        "columns": local_cols,
+                        "references_schema": crec.get("ref_schema"),
+                        "references_table": crec.get("ref_table"),
+                        "references_columns": ref_cols,
+                    }
+                )
+
+        return {
+            "schema": schema_name,
+            "table": table_name,
+            "kind": kind,
+            "columns": columns,
+            "primary_key": primary_key,
+            "foreign_keys": foreign_keys,
+            "unique_constraints": unique_constraints,
+            "comment": table_comment,
+        }
+
     def close(self) -> None:
         """Close the connection iff the driver owns it."""
         if self._conn is not None and self._owned:

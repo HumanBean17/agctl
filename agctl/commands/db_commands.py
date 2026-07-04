@@ -20,7 +20,14 @@ from ..command import envelope, load_config_or_raise
 from ..errors import AssertionFailure, ConfigError, TemplateNotFound
 from ..params import parse_params
 
-__all__ = ["db_query", "db_assert", "db_execute", "new_db_client", "resolve_db_request"]
+__all__ = [
+    "db_query",
+    "db_assert",
+    "db_execute",
+    "db_schema",
+    "new_db_client",
+    "resolve_db_request",
+]
 
 
 def new_db_client(connection_obj: Any):
@@ -33,6 +40,35 @@ def new_db_client(connection_obj: Any):
     from ..clients.db_client import DbClient
 
     return DbClient(connection_obj)
+
+
+def resolve_connection_name(
+    cfg,
+    *,
+    connection_name: str | None,
+    template_connection: str | None = None,
+) -> str:
+    """Resolve the database connection name to use for a query/assert/execute.
+
+    Precedence: explicit ``connection_name`` > ``template_connection`` >
+    ``cfg.defaults.database_connection``. Raises :class:`ConfigError` if none
+    of the three is set, or if the resolved name is absent from
+    ``cfg.database.connections``.
+    """
+    resolved_name = connection_name
+    if resolved_name is None:
+        resolved_name = template_connection
+    if resolved_name is None:
+        resolved_name = cfg.defaults.database_connection
+    if resolved_name is None:
+        raise ConfigError("No database connection specified", {})
+
+    if resolved_name not in cfg.database.connections:
+        raise ConfigError(
+            f"Unknown database connection: {resolved_name}",
+            {"connection": resolved_name},
+        )
+    return resolved_name
 
 
 def resolve_db_request(
@@ -82,19 +118,11 @@ def resolve_db_request(
     params = parse_params(param_tuple)
 
     # Connection resolution: explicit arg > template connection > default.
-    resolved_name = connection_name
-    if resolved_name is None:
-        resolved_name = template_connection
-    if resolved_name is None:
-        resolved_name = cfg.defaults.database_connection
-    if resolved_name is None:
-        raise ConfigError("No database connection specified", {})
-
-    if resolved_name not in cfg.database.connections:
-        raise ConfigError(
-            f"Unknown database connection: {resolved_name}",
-            {"connection": resolved_name},
-        )
+    resolved_name = resolve_connection_name(
+        cfg,
+        connection_name=connection_name,
+        template_connection=template_connection,
+    )
 
     return sql_text, params, resolved_name
 
@@ -432,3 +460,152 @@ def db_execute(
 
 
 _db_execute_envelope = envelope("db.execute")(_db_execute_core)
+
+
+# --------------------------------------------------------------------------- #
+# db schema (Task 5: live, read-only schema discovery — two levels)
+#
+# ``db schema`` is read-only and ungated: no --write / --template / --sql /
+# --param. It ignores ``writable`` / ``mode`` entirely. Level 1 (no --table)
+# lists relations; Level 2 (--table <name>) returns one relation's columns and
+# keys, disambiguating on the driver's ``matches`` list.
+# --------------------------------------------------------------------------- #
+
+
+# Verbatim hint strings from the spec (DESIGN §7 / spec D5–D7) — copied
+# character-for-character. The agent reads these to chain its next call.
+_SCHEMA_TABLES_HINT = (
+    "Run 'agctl db schema --table <name> [--schema <name>] "
+    "[--connection <name>]' for columns and keys"
+)
+_SCHEMA_TABLE_HINT = (
+    "Use these columns in 'agctl db query' / 'db assert --sql' "
+    "with :paramName bind params."
+)
+
+
+def _probe_and_describe(conn_obj, *, table, schema):
+    """Build a client, probe schema-discovery support BEFORE connecting, then
+    connect → describe_schema → close (try/finally).
+
+    Returns the driver's raw result dict. Raises :class:`ConfigError` (exit 2)
+    when the driver lacks ``describe_schema`` — and this happens BEFORE
+    ``connect()``, so a non-introspection driver fails fast without opening a
+    connection (the load-bearing lifecycle guarantee tested by Task 5).
+
+    The close runs in ``finally`` even on the Level-2 not-found / ambiguity
+    error paths, since those raise after ``describe_schema`` returned.
+    """
+    client = new_db_client(conn_obj)
+    # Pre-connect probe: side-effect-free, never opens a connection.
+    if not client.supports_describe_schema():
+        driver_type = getattr(conn_obj, "type", None)
+        raise ConfigError(
+            f"connection's driver ({driver_type}) does not support schema discovery",
+            {"driver": driver_type},
+        )
+    try:
+        client.connect()
+        return client.describe_schema(table=table, schema=schema)
+    finally:
+        client.close()
+
+
+def _db_schema_tables_core(
+    config_path: str | None,
+    connection: str | None,
+    schema: str | None,
+) -> dict:
+    """Level 1: list relations (tables/views) visible in the connection."""
+    cfg = load_config_or_raise(config_path)
+    # Schema has no template, so resolve inline with no template_connection.
+    conn_name = resolve_connection_name(cfg, connection_name=connection)
+    raw = _probe_and_describe(
+        cfg.database.connections[conn_name], table=None, schema=schema
+    )
+    items = raw.get("items", [])
+    return {
+        "connection": conn_name,
+        "schema_filter": schema,
+        "count": len(items),
+        "items": items,
+        "hint": _SCHEMA_TABLES_HINT,
+    }
+
+
+def _db_schema_table_core(
+    config_path: str | None,
+    connection: str | None,
+    schema: str | None,
+    table: str,
+) -> dict:
+    """Level 2: return one relation's columns + keys, disambiguating matches."""
+    cfg = load_config_or_raise(config_path)
+    conn_name = resolve_connection_name(cfg, connection_name=connection)
+    raw = _probe_and_describe(
+        cfg.database.connections[conn_name], table=table, schema=schema
+    )
+    matches = raw.get("matches", [])
+
+    if len(matches) == 0:
+        raise ConfigError(
+            f"Table '{table}' not found in connection '{conn_name}'; "
+            "run 'agctl db schema' to list available tables",
+            {"table": table},
+        )
+    if len(matches) > 1:
+        candidates = [
+            {"schema": m.get("schema"), "kind": m.get("kind")} for m in matches
+        ]
+        raise ConfigError(
+            f"Table name '{table}' is ambiguous across schemas; "
+            "pass --schema to disambiguate",
+            {"table": table, "candidates": candidates},
+        )
+
+    # Single match: flatten it into the top-level result.
+    match = matches[0]
+    return {
+        "connection": conn_name,
+        "schema": match.get("schema"),
+        "table": match.get("table"),
+        "kind": match.get("kind"),
+        "comment": match.get("comment"),
+        "columns": match.get("columns"),
+        "primary_key": match.get("primary_key"),
+        "foreign_keys": match.get("foreign_keys"),
+        "unique_constraints": match.get("unique_constraints"),
+        "hint": _SCHEMA_TABLE_HINT,
+    }
+
+
+@click.command("schema")
+@click.option(
+    "--connection", "connection", default=None, help="Connection name override"
+)
+@click.option(
+    "--schema", "schema", default=None, help="Schema filter (valid at both levels)"
+)
+@click.option(
+    "--table",
+    "table",
+    default=None,
+    help="Relation name for Level 2 detail (columns + keys); omit for Level 1 list",
+)
+@click.pass_context
+def db_schema(
+    ctx: click.Context,
+    connection: str | None,
+    schema: str | None,
+    table: str | None,
+) -> None:
+    """Discover live DB schema: list relations, then columns/keys for one."""
+    config_path = ctx.obj.get("config_path") if ctx.obj else None
+    if table is None:
+        _db_schema_tables_envelope(config_path, connection, schema)
+    else:
+        _db_schema_table_envelope(config_path, connection, schema, table)
+
+
+_db_schema_tables_envelope = envelope("db.schema.tables")(_db_schema_tables_core)
+_db_schema_table_envelope = envelope("db.schema.table")(_db_schema_table_core)

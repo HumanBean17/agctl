@@ -48,6 +48,7 @@ Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`.
 | Assert a DB row count | `agctl db assert (--template\|--sql) --expect-rows N` |
 | Assert a DB field value | `agctl db assert (…) --expect-value --path .x --equals v` |
 | Inspect raw DB state | `agctl db query (--template\|--sql)` |
+| Discover live DB schema | `agctl db schema [--connection C] [--schema S] [--table T]` |
 | Impersonate a dependency (HTTP stub / Kafka reaction) | `agctl mock run` |
 | Are services up? | `agctl check ready --all` |
 | Validate / debug config | `agctl config validate` / `config show` |
@@ -70,6 +71,7 @@ agctl kafka produce --topic T --message '{…}' [--key K] [--header k=v]…
 agctl db query    (--template T | --sql "…") [--param k=v]… [--connection C]
 agctl db assert   (--template T | --sql "…") (--expect-rows N | --expect-value --path <jq> --equals V)
 agctl db execute  (--template T | --sql "…") [--param k=v]… [--connection C] --write
+agctl db schema   [--connection C] [--schema S] [--table T]                # read-only; NO --write/--template/--sql/--param
 
 agctl mock run    [--only http|kafka] [--http-listen H:P] [--fail-fast] [--duration N | --until-stopped]   # streams NDJSON; background it
 
@@ -115,6 +117,48 @@ agctl config validate | config show [--unmask]
 9. **`db execute` requires two gates** — a `writable: true` connection AND the
    `--write` flag. It also requires an explicit target (`--template` or
    `--connection`), refusing to write to the default connection implicitly.
+10. **`db schema` reads `pg_catalog`, which is cluster-wide and NOT
+    privilege-filtered.** On a shared cluster it can list relations this
+    connection cannot actually `SELECT` from — discovering a name is not a
+    grant. Treat the listing as "visible," not "accessible"; let the
+    subsequent `SELECT` fail loudly if privileges are missing.
+
+## Discover live schema before authoring SQL
+
+`agctl db schema` is **read-only and ungated** — no `--write`, no `--template`,
+no `--sql`, no `--param`; it ignores `writable`/`mode`. Any configured connection
+(read-only or writable) is eligible. Use it before authoring `db execute` /
+`db query` SQL: `pg_catalog` is the source of truth, not your memory of the schema.
+
+**Two levels (progressive):**
+
+1. **List relations** — `agctl db schema [--connection C] [--schema S]`
+   (tag `db.schema.tables`). Returns `{connection, schema_filter, count,
+   items:[{schema, name, kind, column_count}], hint}`. `kind` is `"table"` or
+   `"view"`. Call this first to find the exact relation name.
+2. **Drill into one** — `agctl db schema --table T [--schema S] [--connection C]`
+   (tag `db.schema.table`). Returns `{connection, schema, table, kind, comment,
+   columns:[{name, data_type, nullable, default, generated, enum_values,
+   comment}], primary_key:[col], foreign_keys:[{name, columns, references_schema,
+   references_table, references_columns}], unique_constraints:[{name, columns}],
+   hint}`. `--table` accepts views. Match is **exact-case** on the stored name.
+
+**Fail-loud `--table` matching:** 0 matches → `ConfigError` (exit 2) telling you
+to run Level 1; >1 match across schemas → `ConfigError` with
+`error.detail.candidates=[{schema, kind}]` → disambiguate with `--schema`.
+
+**Authoring rules the schema tells you (load-bearing):**
+
+1. **Quote mixed-case / reserved identifiers.** PostgreSQL folds unquoted
+   identifiers to lowercase. If a column or table name contains uppercase or
+   non-`[a-z0-9_]` characters, or matches a Postgres reserved word, you MUST
+   double-quote it in your SQL: `"OrderItems"`, `"user"`. The `name` field is
+   the exact stored case — copy it verbatim, quoting as needed.
+2. **Omit generated columns from INSERT.** A column with
+   `generated == "always_identity"` or `generated == "stored"` MUST be omitted
+   from `INSERT` (and `"stored"` from `UPDATE` too). `generated ==
+   "by_default_identity"` and `serial` columns (default `nextval(...)`,
+   `generated == null`) may be supplied or omitted.
 
 ## `db execute` — write operations
 
