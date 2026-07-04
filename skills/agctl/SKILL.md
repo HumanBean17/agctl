@@ -48,6 +48,7 @@ Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`.
 | Assert a DB row count | `agctl db assert (--template\|--sql) --expect-rows N` |
 | Assert a DB field value | `agctl db assert (…) --expect-value --path .x --equals v` |
 | Inspect raw DB state | `agctl db query (--template\|--sql)` |
+| Impersonate a dependency (HTTP stub / Kafka reaction) | `agctl mock run` |
 | Are services up? | `agctl check ready --all` |
 | Validate / debug config | `agctl config validate` / `config show` |
 
@@ -70,6 +71,8 @@ agctl db query    (--template T | --sql "…") [--param k=v]… [--connection C]
 agctl db assert   (--template T | --sql "…") (--expect-rows N | --expect-value --path <jq> --equals V)
 agctl db execute  (--template T | --sql "…") [--param k=v]… [--connection C] --write
 
+agctl mock run    [--only http|kafka] [--http-listen H:P] [--fail-fast] [--duration N | --until-stopped]   # streams NDJSON; background it
+
 agctl check ready [--service S | --all]
 agctl config validate | config show [--unmask]
 ```
@@ -80,8 +83,9 @@ agctl config validate | config show [--unmask]
 
 ## Gotchas (what `--help` won't tell you)
 
-1. **`http ping` is the only streaming command** — one JSON object **per ping**
-   (NDJSON), meant to run backgrounded with `&`; `kill` it when done. Exits `0`
+1. **Two streaming commands** — `http ping` (one JSON object **per ping**) and
+   `mock run` (one NDJSON event line as things happen, plus a final `summary`).
+   Both are meant to run backgrounded with `&` and `kill`ed when done. Exits `0`
    (all ok) / `1` (any failed). Everything else emits exactly one object.
 2. **A 4xx/5xx HTTP response is `ok:true`.** Status is a *result*, not an error.
 3. **Three placeholder syntaxes — don't mix them:**
@@ -176,6 +180,57 @@ agctl db execute \
 writes (e.g., for flaky-test resilience), encode idempotency in the SQL using
 `ON CONFLICT` (PostgreSQL) or `ON DUPLICATE KEY UPDATE` (MySQL). The template
 author's job — see `agctl-config/reference/db-write-template.md`.
+
+## `agctl mock run` — impersonate a dependency
+
+`agctl mock run` stands in for the system's **external** dependencies so a local test is
+self-contained — an HTTP API the SUT calls, or the downstream Kafka consumer the SUT
+expects to react to its events. It is **SUT-facing**: the real application's HTTP client
+points at the mock's `listen`, and Kafka reactors join the SUT's *real* broker as consumers
+(it is not a broker itself). Stubs/reactors are authored in the `mocks:` config section —
+see the `agctl-config` skill (`reference/mocks.md`).
+
+```
+agctl mock run [--only http|kafka] [--http-listen H:P] [--fail-fast] [--duration N | --until-stopped]
+```
+
+- `--only http` runs just the HTTP server (no `kafka` extra / `kafka.brokers` needed);
+  `--only kafka` just the reactors.
+- `--http-listen` is a **literal** `host:port` (CLI args are not `${}`-interpolated); it
+  overrides `mocks.http.listen`.
+- `--duration N` (foreground, stops after N s) and `--until-stopped` (run until SIGTERM/SIGINT; default behavior if --duration is omitted) are mutually
+  exclusive. `--fail-fast` exits `1` on the **first** runtime error instead of continuing.
+
+It streams one NDJSON event per line: `started`, `http.hit`, `http.unmatched`,
+`http.body_parse_skipped`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, and a final
+`summary`. A clean run exits `0`; a clean run in which any `kafka.error` occurred exits `1`.
+Startup failures (bad `mocks:`, port in use, broker unreachable) emit **one** structured
+envelope then exit `2`.
+
+### Background lifecycle — load-bearing
+
+The failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`,
+`kafka.error`) live **only** on stdout, and the exit-1 escalation arrives only on a clean
+`SIGTERM`. The plain `&` / `kill` pattern loses both and silently produces a **false
+green**. Always follow this protocol:
+
+1. **Redirect stdout to a log:** `agctl mock run > mock.log 2>&1 &` (and capture the PID).
+2. **Poll** `mock.log` for the `started` line **before** running the SUT — don't sleep a
+   fixed delay.
+3. **Stop with `SIGTERM` and `wait`** — never `SIGKILL` (it skips the shutdown handler, the
+   `summary` line, and the exit code).
+4. **Grep the log for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` /
+   `kafka.error` regardless of the test result** — any hit is a failure, even if the
+   assertions passed. `--fail-fast` is the synchronous alternative for `--duration` runs.
+
+```bash
+nohup agctl mock run > mock.log 2>&1 &
+MOCK_PID=$!
+until grep -q '"event":"started"' mock.log; do sleep 0.1; done    # poll, don't guess
+# … run the SUT / assertions, pointing the SUT at the mock's listen address …
+kill -TERM "$MOCK_PID"; wait "$MOCK_PID"                            # SIGTERM + wait, never SIGKILL
+grep -E 'http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error' mock.log && exit 1
+```
 
 ## Recipes
 
