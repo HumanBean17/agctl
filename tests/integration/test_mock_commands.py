@@ -415,6 +415,156 @@ class TestMockRunHTTP:
             proc.wait(timeout=5)
             pytest.skip(f"Chunked POST request failed: {e}")
 
+    def test_http_mock_run_match_jq_branching(self, tmp_path):
+        """Two same-method+path stubs distinguished by ``match.jq`` route by amount.
+
+        Models the DESIGN §3.2 branching case: a single POST endpoint whose
+        response is decided by a jq predicate over the request body.
+
+        Stubs (both POST /api/v1/payments):
+          - ``high-value-payment`` (``.amount > 1000``)  -> 201 / {"status":"APPROVED"}
+          - ``low-value-payment``  (``.amount <= 1000``) -> 202 / {"status":"QUEUED"}
+
+        Asserts:
+        - POST {amount:1500} -> 201, body.status == "APPROVED"
+        - POST {amount:500}  -> 202, body.status == "QUEUED"
+        - Two ``http.hit`` NDJSON events naming the correct stubs (verifies the
+          match.jq router selected the right branch, not just the response body)
+        - Each ``http.hit`` records the matching stub's response status
+        - ``summary`` line reports ``http_hits == 2``
+        - Exit code 0
+
+        ALWAYS RUN (no Docker, no ``require_*`` fixture) — exercises the real
+        MockHTTPServer subprocess end-to-end.
+        """
+        if not HTTPX_AVAILABLE:
+            pytest.skip("httpx not installed; skipping HTTP mock integration test")
+
+        config_content = _build_config({
+            "http": {
+                "listen": "127.0.0.1:0",
+                "stubs": {
+                    "high-value-payment": {
+                        "description": "High-value payment (amount > 1000) -> approved",
+                        "method": "POST",
+                        "path": "/api/v1/payments",
+                        "match": {"jq": ".amount > 1000"},
+                        "response": {
+                            "status": 201,
+                            "headers": {"Content-Type": "application/json"},
+                            "body": {"status": "APPROVED"},
+                        },
+                    },
+                    "low-value-payment": {
+                        "description": "Low-value payment (amount <= 1000) -> queued",
+                        "method": "POST",
+                        "path": "/api/v1/payments",
+                        "match": {"jq": ".amount <= 1000"},
+                        "response": {
+                            "status": 202,
+                            "headers": {"Content-Type": "application/json"},
+                            "body": {"status": "QUEUED"},
+                        },
+                    },
+                },
+            }
+        })
+
+        config_file = tmp_path / "agctl.yaml"
+        config_file.write_text(config_content)
+
+        proc = subprocess.Popen(
+            ["python3", "-m", "agctl.cli", "--config", str(config_file),
+             "mock", "run", "--duration", "3"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Wait for the started event and capture the OS-assigned listen address.
+        base_url = None
+        while True:
+            if proc.poll() is not None:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                time.sleep(0.1)
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("event") == "started":
+                http_info = event.get("http") or {}
+                listen = http_info.get("listen", "")
+                if listen:
+                    port = listen.split(":")[-1]
+                    base_url = f"http://127.0.0.1:{port}"
+                    break
+
+        if not base_url:
+            proc.terminate()
+            proc.wait(timeout=5)
+            pytest.skip("HTTP server did not start properly")
+
+        # Drive the two branches. emit_event flushes each http.hit line before
+        # the handler returns, so by the time proc.wait() returns the events are
+        # already in the stdout pipe.
+        resp_high = httpx.post(
+            f"{base_url}/api/v1/payments", json={"amount": 1500}, timeout=5.0
+        )
+        resp_low = httpx.post(
+            f"{base_url}/api/v1/payments", json={"amount": 500}, timeout=5.0
+        )
+
+        # Let the duration timer shut the server down, then drain stdout.
+        proc.wait(timeout=6)
+        remaining = proc.stdout.read()
+
+        # HTTP-level assertions: the match.jq router picked the right branch.
+        assert resp_high.status_code == 201, f"high-value: {resp_high.text}"
+        assert resp_high.json()["status"] == "APPROVED"
+        assert resp_low.status_code == 202, f"low-value: {resp_low.text}"
+        assert resp_low.json()["status"] == "QUEUED"
+
+        assert proc.returncode == 0, f"stderr: {proc.stderr.read()}"
+
+        # Parse the NDJSON stream (started line already consumed above).
+        events = []
+        for raw in remaining.split("\n"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                events.append(json.loads(raw))
+            except json.JSONDecodeError:
+                pass
+
+        hit_events = [e for e in events if e.get("event") == "http.hit"]
+        assert len(hit_events) == 2, (
+            f"expected 2 http.hit events, got {len(hit_events)}; events={events}"
+        )
+
+        # The two hits must name the correct stubs (proves match.jq routing, not
+        # just that some 201/202 came back).
+        hit_by_stub = {e["stub"]: e for e in hit_events}
+        assert set(hit_by_stub) == {"high-value-payment", "low-value-payment"}, (
+            set(hit_by_stub)
+        )
+        assert hit_by_stub["high-value-payment"]["status"] == 201
+        assert hit_by_stub["low-value-payment"]["status"] == 202
+        # Both hits are on the shared POST /api/v1/payments path.
+        assert all(h["method"] == "POST" for h in hit_events)
+        assert all(h["path"] == "/api/v1/payments" for h in hit_events)
+
+        summary_events = [e for e in events if e.get("event") == "summary"]
+        assert len(summary_events) == 1
+        assert summary_events[0]["http_hits"] == 2
+        assert summary_events[0]["http_unmatched"] == 0
+
 
 class TestMockRunKafka:
     """Kafka mock integration tests (SELF-SKIPPING without AGCTL_TEST_LIVE=1)."""
