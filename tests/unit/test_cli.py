@@ -209,3 +209,14 @@ def test_sample_matches_readme_block():
     fence_end = text.index("```", fence_start)
     readme_block = text[fence_start:fence_end]
     assert readme_block.strip() == _load_sample().strip()
+
+
+def test_mock_run_help_exits_zero():
+    """mock run --help exits 0 and lists the flags."""
+    result = CliRunner().invoke(cli, ["mock", "run", "--help"])
+    assert result.exit_code == 0
+    assert "--only" in result.output
+    assert "--fail-fast" in result.output
+    assert "--http-listen" in result.output
+    assert "--duration" in result.output
+    assert "--until-stopped" in result.output

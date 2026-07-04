@@ -117,7 +117,13 @@ agctl/
 │   ├── db_commands.py          # db query / assert / execute
 │   ├── check_commands.py       # check ready
 │   ├── config_commands.py      # config validate / show / init
-│   └── discover_commands.py    # discover summary / category / item / search
+│   ├── discover_commands.py    # discover summary / category / item / search
+│   └── mock_commands.py        # mock run (HTTP mock + Kafka reactors)
+├── mock/                       # mock server implementation (HTTP + Kafka)
+│   ├── routing.py              # path-template matching (pure functions)
+│   ├── http_server.py          # stdlib ThreadingHTTPServer + handler
+│   ├── kafka_reactor.py        # Kafka consumer loop + jq match + reaction
+│   └── engine.py               # MockEngine lifecycle (start/run/shutdown)
 ├── data/
 │   └── sample-config.yaml      # packaged starter config (read via importlib.resources)
 └── clients/
@@ -129,6 +135,8 @@ agctl/
 ```
 
 > DESIGN §7's structure sketch predates several modules; §14 lists the deltas.
+
+> **Module location note (mock):** The Pydantic models for `mocks` (`MocksConfig`, `HttpMockConfig`, `KafkaMockConfig`, etc.) live in `config/models.py` alongside every other section model — *not* in `agctl/mock/`. This preserves config's dependency isolation (`config/* → {errors}` only) and keeps the one-place convention. The `mock/` subpackage holds only runtime engine/server/reactor code.
 
 **Dependency direction (inward-only, no cycles):** `cli → commands → {config,
 clients, resolution, assertions, params, errors, command, output}`; `clients →
@@ -186,6 +194,7 @@ hand-reimplement the same try/except → emit + exit shape so the contract holds
 
 - **`http ping`** streams NDJSON (§6). Startup errors get a structured envelope
   *before* any ping line; bad `--body` JSON → `InternalError`.
+- **`mock run`** streams NDJSON (the second streaming exception, §6). Startup errors emit one structured envelope *before* any event line; the command installs `SIGTERM`/`SIGINT` handlers that emit a final `summary` line and exit `0` (clean) or `1` (runtime errors occurred).
 - **`discover`** has four `_core`s, each wrapped in its *own* envelope with a
   distinct tag (`discover.summary`/`.category`/`.item`/`.search`); the Click
   command selects one from the flags. Argument errors emit under `discover.summary` (exit 2).
@@ -241,7 +250,7 @@ deep-merged with highest precedence. Two refinements beyond the spec:
 - `database.connections.*.writable` — write safety gate must be set explicitly in config
 - `database.templates.*.mode` — read/write mode is a template authoring intent, not runtime config
 
-**Version guard** — major only, currently `"1"`; mismatch → `ConfigError`.
+**Version guard** — major only, currently `"1"`; mismatch → `ConfigError`. The `mocks` section is additive under major `1` — no version bump.
 
 **Typed validation** (`Config.model_validate`, `models.py`) — Pydantic v2 tree
 (`Config` → `ServiceConfig`, `KafkaConfig`/`KafkaSSL`, `DatabaseConfig`/…,
@@ -289,6 +298,14 @@ results as they happen, so it violates "one object per invocation":
   final `{summary:true, total_pings, failed_pings, duration_ms}` and exits `0`
   (all ok) or `1` (any failed).
 - Startup errors emit a single structured envelope **before** any ping line.
+
+**The second streaming exception — `mock run`.** Like `http ping`, the mock server must stream events as they happen:
+
+- Not wrapped by `@envelope`.
+- Emits one JSON object **per event** (`started`, `http.hit`, `http.unmatched`, `http.body_parse_skipped`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, `summary`) directly as they occur.
+- All emission goes through a single-writer path (`threading.Lock` in `MockEngine.emit_event` or a dedicated writer thread) — concurrent HTTP handler threads and Kafka reactor threads emit safely without interleaved lines.
+- Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary, http_hits, http_unmatched, http_body_parse_skipped, kafka_reactions, kafka_skipped, kafka_errors, duration_ms}` and exits `0` (clean, no runtime errors) or `1` (runtime errors occurred, or `--fail-fast` triggered).
+- Startup errors emit a single structured envelope **before** any event line.
 
 **stdout vs stderr** — all machine-readable output on stdout; stderr carries
 only diagnostics an agent must never parse (plugin-load failures, entry-point
@@ -379,6 +396,8 @@ command layer (`_kafka_ssl_conf`).
   older than the window, the result is `-1`; the client seeks such partitions to
   `OFFSET_END`, else `auto.offset.reset=earliest` would re-read every stale
   message and violate the window.
+- **`consume_loop`** — committed consume loop for mock reactors. The reactor owns its consumer lifecycle (D13); each message invokes a `handle(message, attempt, final)` callback and returns a `ReactionResult` (`COMMIT` → store_offset + commit; `RETRY` → re-handle the same in-memory message; `STOP` → exit loop). Supports `max_retries` (must be >= 1), `stop_event`, and optional rebalance callbacks (`on_assign`/`on_revoke`). The consumer is closed in `finally` after the loop exits.
+- **`probe`** — one-shot broker connectivity check. Builds a consumer, calls `list_topics(topic, timeout)`, and closes the consumer. Raises `ConnectionFailure` on any Kafka/broker error (the engine calls this at startup before binding HTTP to satisfy the spec §11 "broker unreachable at startup → exit 2" guarantee).
 - **Test seams** — `producer_factory`/`consumer_factory` inject fakes sharing
   the real Producer/Consumer contract.
 
@@ -544,6 +563,11 @@ purpose:
   `PostgreSQLDriver(connectable=)` — inject a fake driver or connection.
 - `ping_loop(...)` takes injectable `sleep_fn`, `monotonic`, `emit_line`,
   `stop_event`.
+- `mock_commands.new_mock_engine` — inject a fake `MockEngine`.
+- `KafkaClient.consume_loop` / `probe` — `consumer_factory` injects fakes.
+- `MockEngine` — `emit_fn` injects a fake writer; `run_id` is configurable.
+- `mock/routing.py` — pure functions, tested directly.
+- `sys.setswitchinterval` single-writer test technique — forces thread switching to verify NDJSON emission doesn't interleave (tests the `threading.Lock` in `MockEngine.emit_event`).
 - `cli._entry_points` and `assertion_registry._entry_points` are
   monkeypatchable.
 
@@ -563,7 +587,25 @@ is absent; they `pytest.skip()`. The machinery (`tests/integration/conftest.py`)
      mock, wiring addresses into the same env vars. Flag unset → nothing starts
      and every integration test skips, so a plain `pytest` run stays fast.
 
+**Integration tests** are **self-skipping** — they never fail because a service
+is absent; they `pytest.skip()`. The machinery (`tests/integration/conftest.py`):
+
+- Per-service fixtures `require_http_service`/`require_postgres`/`require_kafka`
+  probe reachability and skip if absent, else yield the handle.
+- Two ways to supply a live service:
+  1. **Manual/CI** — point at a running service via `AGCTL_TEST_*` env vars
+     (`AGCTL_TEST_HTTP_URL`, `AGCTL_TEST_PG_DSN`, `AGCTL_TEST_KAFKA_BROKER`).
+  2. **Local Docker, opt-in** — `AGCTL_TEST_LIVE=1` spins throwaway
+     **testcontainers** (Postgres 16, Kafka+KRaft) plus a local threaded HTTP
+     mock, wiring addresses into the same env vars. Flag unset → nothing starts
+     and every integration test skips, so a plain `pytest` run stays fast.
+
 Run: `pytest tests/unit`; live: `AGCTL_TEST_LIVE=1 pytest tests/integration`.
+
+**New mock-specific integration tests:**
+
+- `tests/integration/test_mock_commands.py` — tests `mock run` end-to-end with real HTTP server and Kafka reactors (self-skips under `AGCTL_TEST_LIVE=1`).
+- `FakeKafkaClient` / `consumer_factory` seams for unit tests (avoid real broker).
 
 ---
 
@@ -606,6 +648,7 @@ divergence is introduced.
 
 | Area | Resolution |
 |---|---|
+| **Mocking non-goal reversed** | DESIGN §1 stated "No built-in mock server." The `agctl mock` command (HTTP stub server + Kafka reactors) reverses this non-goal — local testing is now self-contained. DESIGN §1 and §3.5 document the new command. ||
 | Dependencies | DESIGN §7 updated to the optional-extras model (`http`/`kafka`/`db`/…). |
 | Project structure | DESIGN §7 tree updated to the real layout (incl. `config/models.py`, top-level `command.py`/`errors.py`/…, `clients/db_drivers/`). |
 | One-emit enforcement | DESIGN §8 documents the `@envelope` mechanism. |
@@ -630,3 +673,14 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
   (deferred).
 - **No MCP wrapper, no OpenTelemetry propagation, no parallel runner, no secret
   backends** — deferred per DESIGN §10.
+
+**Mock server MVP limitations** (see DESIGN §10 "Known-wrong-result / Not Covered" for the full list with failure-mode analysis):
+
+- **Stateful flows** (OAuth/token exchange, create-then-GET, idempotency-key replay, pagination) — static engine returns same canned response → false green.
+- **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** — cannot intercept HTTPS → integration untested → false green.
+- **Cross-transport sagas** (Kafka trigger → HTTP callback) — no causal linkage → false green.
+- **Header-borne correlation IDs** — reactor cannot capture from headers → cannot produce correlatable reply → false green.
+- **Non-JSON Kafka values** (Avro/Protobuf/schema-registry) — emitted as `kafka.skipped` → false green.
+- **JSON-type pass-through** — captured values are stringified → strict downstream may reject → false failure.
+- **Containerized SUT topology** — operator must target `host.docker.internal` / host LAN IP and avoid SUT that swallows connection errors → false green.
+- **Shared broker + pinned `consumer_group` reused across runs/devs** — partition split or resume-past-messages → silently missing/old reactions → false green (mitigated by unique-per-run default).
