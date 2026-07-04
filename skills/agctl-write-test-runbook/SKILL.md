@@ -20,7 +20,7 @@ testing request) plus the repo's `agctl.yaml`, and produce a well-formed
 
 Accept either input and scale planning depth to it:
 
-- **One-line testing request** → produce a **Steps-only** runbook (no Fixtures/Cleanup sections). Keep it to the assertions that answer the request.
+- **One-line testing request** → produce a **Steps-only** runbook (omit the Fixtures and Cleanup sections entirely). Keep it to the assertions that answer the request.
 - **Spec link / design doc** → produce the full structure: Goal + Preconditions + Fixtures + Steps + Cleanup.
 
 Record the source in the runbook's `**Source:**` line.
@@ -53,20 +53,29 @@ Sequence the steps. For each step decide:
   `agctl db assert --template <name>`, `agctl kafka assert --pattern <name>`).
   Use free-form (`http request`, `db --sql`) only when no template exists.
 - **Capture** *(optional)* — `VAR=<envelope-path>` when a later step needs a
-  value from this step's result (e.g. `ORDER_ID=result.body.order_id`).
+  value from this step's result (e.g. `ORDER_ID=result.body.order_id`). Captured
+  values are stringified (a numeric id `42` becomes `"42"`).
 - **Expected** — `<envelope-path>: <literal>` pairs (ANDed; compared type-aware,
   like `--equals`), or `exit 0` for an assertion step.
 
-Identify the fixtures (seed data, mocks, heartbeat) and the cleanup that
-reverses them. Background commands (`mock run`, `http ping`) go under Fixtures,
-never as Steps — they stream NDJSON, not a single envelope.
+Identify the fixtures and the cleanup that reverses them:
+
+- **Seed data** when the test needs specific DB state (`agctl db execute --write`).
+- **Mocks** when a downstream dependency should not be hit for real (`agctl mock run`).
+- **Heartbeat** when the SUT enforces a session timeout a long run would trip (`agctl http ping`).
+
+If none apply, omit the Fixtures section entirely. Background commands
+(`mock run`, `http ping`) go under Fixtures, never as Steps — they stream NDJSON,
+not a single envelope.
 
 ### 4. Emit
 
-Instantiate `reference/runbook-template.md`, prune the fixture sections you
-don't need, and fill in goal, source, preconditions, steps, and cleanup. Write
-the file as `runbook.md` (committable — it is a test plan; the `*.results.md`
-report produced at execution is gitignored).
+Instantiate `reference/runbook-template.md`, prune the fixture subsections you
+don't need, and fill in goal, source, preconditions, steps, and cleanup. For a
+**Steps-only** runbook (one-line request), omit the Fixtures and Cleanup
+sections entirely. Write the file as `runbook.md` wherever you prefer (a
+`runbooks/` directory at the repo root is common). It is committable — a test
+plan; the `*.results.md` report produced at execution is gitignored.
 
 ## Reference
 

@@ -2,8 +2,7 @@
 
 > The mock server is a **background, SUT-facing** process: the real app's HTTP
 > client points at the mock's listen address, and Kafka reactors join the SUT's
-> real broker. It streams NDJSON events to stdout. Source: DESIGN §3.5, mock
-> spec §10.1.
+> real broker. It streams NDJSON events to stdout. Source: DESIGN §3.5.
 
 A mock is a **fixture**, not a Step. It emits NDJSON (one event per line), not a
 single result envelope, so it has no per-step exit code or `ok`. Start it in
@@ -20,9 +19,16 @@ Redirect stdout to a log file and capture the PID.
 
 ## Startup gate
 
-Poll mock.log for the `started` line before running any Step. Do not sleep a
-fixed delay — poll mock.log until the `started` event appears (the mock binds
-HTTP and probes the broker before emitting it).
+Poll mock.log for the `started` line before running any Step. The mock emits a
+`started` event once it has bound HTTP and probed the broker:
+
+```bash
+grep -Eq '"event":\s*"started"' mock.log
+```
+
+Do not sleep a fixed delay — poll mock.log until the line appears. If it does
+not appear within ~30 s, fail the run: the mock failed to start (inspect
+`mock.log`).
 
 ## Stop
 

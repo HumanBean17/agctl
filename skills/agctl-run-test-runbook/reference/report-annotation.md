@@ -35,6 +35,9 @@ agent logs.
   Curated excerpts are *additional* — never a substitute. An agent can still
   fabricate these; the point is that a reviewer can re-run any **Run** command
   and compare (see "For reviewers" below).
+- **What to excerpt.** Include the few fields that matter for the assertion:
+  HTTP `status_code` plus a key body field, the matched Kafka message, or the DB
+  row asserted on. Omit headers and timing boilerplate.
 - **PASS / FAIL / SKIPPED.** PASS and FAIL show the spine + Actual + Expected
   (with ✓ / ✗). **SKIPPED** steps echo **Expected** for context but show **no**
   Run / Exit / Actual, and are marked *not exercised* — they were blocked by an
@@ -71,7 +74,7 @@ falsifiable, not prevented.
 - **Run:** `agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001`
 - **Exit:** 0 · **ok:** true
 - **Actual:** status_code 201, body.order_id=ord-xyz   (captured ORDER_ID=ord-xyz)
-- **Expected:** ok:true, result.status_code:201 ✓
+- **Expected:** ok: true, result.status_code: 201 ✓
 
 ### 2. assert ORDER_CREATED — FAIL
 - **Run:** `agctl kafka assert --pattern order-created --param orderId=ord-xyz --timeout 10`

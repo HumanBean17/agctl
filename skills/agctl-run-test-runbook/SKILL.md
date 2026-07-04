@@ -11,7 +11,10 @@ its **exit code**, and the raw **ok** / **error.type** from the envelope — an
 auditable spine, not a prose "all passed."
 
 This skill is self-contained: you do **not** need `agctl-write-test-runbook`
-installed to run a runbook.
+installed to run a runbook. It assumes you can already drive `agctl` primitives
+(the operational `agctl` skill): each `agctl` command emits one JSON envelope on
+stdout — `{ok, command, result, error, duration_ms}` (DESIGN §4) — and exits
+`0` success, `1` assertion failure, `2` tool/config/env error.
 
 ## Runbook anatomy (what you parse)
 
@@ -43,10 +46,15 @@ On any violation: stop with a validation error. Do not execute — no partial ru
 
 ### 2. Setup
 
-- Run **Preconditions**: `agctl check ready --all` (and any env checks).
-- Start **Fixtures**, capturing PIDs:
+- Start any **Fixtures that provide a service the runbook checks** *first* —
+  e.g. a mock that the Preconditions `check ready` will hit. (Otherwise
+  `check ready` sees that service as down.)
+- Run **Preconditions**: `agctl check ready --all` (and any env checks). If it
+  exits non-zero, treat the run as **FAIL** (a service isn't up) and go straight
+  to Teardown.
+- Start the remaining **Fixtures**, capturing PIDs:
   - Seed data: `agctl db execute --template … --write`.
-  - Mock: `agctl mock run > mock.log 2>&1 &`, then **poll `mock.log` for `started`** before continuing.
+  - Mock: `agctl mock run > mock.log 2>&1 &`, then poll `mock.log` for `started` (see `fixtures-mock.md`).
   - Heartbeat: `agctl http ping … --until-stopped &`.
 
 Record each in the report's `## Setup` block.
@@ -57,7 +65,7 @@ For each step, in order:
 
 - Substitute `$VAR` from prior Captures into the Command.
 - Run the verbatim command.
-- From the JSON envelope, capture the exit code, `ok`, `error.type` (if any), and a curated excerpt (e.g. `result.status_code`, a DB row, the matched Kafka message).
+- From the JSON envelope `agctl` emits on stdout, capture the exit code, `ok`, `error.type` (if any), and a curated excerpt (e.g. `result.status_code`, a DB row, the matched Kafka message).
 
 ### 4. Annotate
 

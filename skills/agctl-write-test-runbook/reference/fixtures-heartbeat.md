@@ -2,7 +2,8 @@
 
 > Some systems expire the session unless an endpoint is hit periodically. A
 > heartbeat keeps the session alive across a long multi-step run. Source:
-> DESIGN §3.1, AGENTS.md pattern 5.
+> DESIGN §3.1 (`http ping`); the keepalive pattern is AGENTS.md Pattern 5
+> (DESIGN §6).
 
 Like the mock, `http ping` is a **background fixture**, not a Step. It streams
 one JSON object per ping (plus a final summary on `SIGTERM`/`SIGINT`), not a
