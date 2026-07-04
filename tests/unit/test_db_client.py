@@ -47,6 +47,28 @@ class FakeDriverWithNonCallableExecuteWrite(FakeDriver):
         self.execute_write = "not a method"
 
 
+class FakeDriverWithDescribeSchema(FakeDriver):
+    """Fake driver that supports schema discovery."""
+
+    SCHEMA = {
+        "tables": [
+            {"name": "users", "schema": "public", "columns": [{"name": "id"}]}
+        ]
+    }
+
+    def describe_schema(self, table, schema):
+        return self.SCHEMA
+
+
+class FakeDriverWithNonCallableDescribeSchema(FakeDriver):
+    """Fake driver with non-callable describe_schema attribute."""
+
+    def __init__(self):
+        super().__init__()
+        # Set describe_schema to a non-callable value
+        self.describe_schema = "not a method"
+
+
 class FakeDriverSubclass(FakeDriver):
     """Distinct class so tests can assert which driver was selected."""
 
@@ -169,3 +191,52 @@ class TestExecuteWrite:
             client.execute_write("INSERT INTO t (x) VALUES (1)", {"x": 1})
         assert "does not support writes" in exc_info.value.message
         assert exc_info.value.detail.get("driver") == "postgresql"
+
+
+class TestDescribeSchema:
+    """Tests for DbClient.supports_describe_schema + describe_schema probe."""
+
+    def test_driver_with_describe_schema_reports_support_and_delegates(self):
+        """Driver WITH callable describe_schema: probe True, delegation returns dict unchanged."""
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=FakeDriverWithDescribeSchema(),
+        )
+        assert client.supports_describe_schema() is True
+        result = client.describe_schema(None, None)
+        assert result == FakeDriverWithDescribeSchema.SCHEMA
+
+    def test_driver_without_describe_schema_reports_no_support_and_raises(self):
+        """Driver WITHOUT describe_schema: probe False, raises ConfigError with driver type."""
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=FakeDriverReadOnly(),
+        )
+        assert client.supports_describe_schema() is False
+        with pytest.raises(ConfigError) as exc_info:
+            client.describe_schema(None, None)
+        assert "does not support schema discovery" in exc_info.value.message
+        assert exc_info.value.detail.get("driver") == "postgresql"
+
+    def test_driver_with_non_callable_describe_schema_raises_config_error(self):
+        """Driver with non-callable describe_schema attribute: probe False, raises ConfigError."""
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=FakeDriverWithNonCallableDescribeSchema(),
+        )
+        assert client.supports_describe_schema() is False
+        with pytest.raises(ConfigError) as exc_info:
+            client.describe_schema(None, None)
+        assert "does not support schema discovery" in exc_info.value.message
+        assert exc_info.value.detail.get("driver") == "postgresql"
+
+    def test_supports_describe_schema_does_not_open_connection(self):
+        """Pre-connect probe must be side-effect-free: no connection opened."""
+        fake = FakeDriverWithDescribeSchema()
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=fake,
+        )
+        # Probe before any connect(); the driver must not have been connected.
+        assert client.supports_describe_schema() is True
+        assert fake.connected_with is None
