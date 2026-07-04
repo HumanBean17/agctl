@@ -276,6 +276,63 @@ def test_connect_with_url_raises_connection_failure_on_psycopg_error(monkeypatch
         driver.connect({"url": "postgresql://x"})
 
 
+def test_connect_failure_redacts_secrets_from_detail(monkeypatch):
+    """Security: a connection failure must NOT leak `password` or url-embedded
+    credentials into the ConnectionFailure detail (which @envelope writes to
+    stdout). See hardening fix for ConnectionFailure detail in connect()."""
+    import json
+
+    import psycopg
+    import psycopg.errors
+
+    def _boom(*args, **kwargs):
+        raise psycopg.errors.OperationalError("auth fail")
+
+    monkeypatch.setattr(psycopg, "connect", _boom)
+
+    config = {
+        "type": "postgresql",
+        "host": "db.example.com",
+        "port": 5432,
+        "dbname": "orders",
+        "user": "appuser",
+        "password": "s3cret",
+        "url": "postgres://u:p4ss@host:5432/db",
+    }
+    driver = PostgreSQLDriver()
+    with pytest.raises(ConnectionFailure) as exc_info:
+        driver.connect(config)
+
+    detail = exc_info.value.detail
+    assert detail["driver"] == "postgresql"
+
+    redacted_config = detail["config"]
+
+    # 1. `password` replaced by a fixed sentinel (not the raw value).
+    assert redacted_config["password"] == "***"
+
+    # 2. Strongest guarantee: the raw secrets appear NOWHERE in the serialized
+    #    detail (covers url-embedded creds and any other secret-style key).
+    serialized = json.dumps(detail)
+    assert "s3cret" not in serialized
+    assert "p4ss" not in serialized
+
+    # 3. URL still present but scrubbed of `user:pass@` userinfo.
+    assert "p4ss" not in redacted_config["url"]
+    assert "u:p4ss@" not in redacted_config["url"]
+    # Host portion of the URL survives.
+    assert "host:5432" in redacted_config["url"]
+
+    # 4. Non-secret keys preserved unchanged.
+    for key in ("type", "host", "port", "dbname", "user"):
+        assert redacted_config[key] == config[key]
+
+    # 5. Redaction is applied to a COPY; the caller's config is untouched
+    #    (so the actual connect() kwargs / retry logic still see real values).
+    assert config["password"] == "s3cret"
+    assert config["url"] == "postgres://u:p4ss@host:5432/db"
+
+
 def test_protocol_is_satisfied_by_postgresql_driver():
     # runtime_checkable structural check: PostgreSQLDriver has all 3 methods.
     driver = PostgreSQLDriver()
