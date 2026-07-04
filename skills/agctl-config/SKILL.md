@@ -22,10 +22,12 @@ commands. Don't conflate them: `agctl` drives the CLI; `agctl-config` writes its
 | `kafka` | producer / emitter / event class | `kafka.patterns:` |
 | `db` | SQL query / repo method | `database.templates:` (+ a `database.connections:` entry if new) |
 | `db` (write) | INSERT/UPDATE/DELETE / mutating repo method | `database.templates:` with `mode: write` (requires `writable: true` connection) |
+| `mock` | downstream HTTP API contract / Kafka consumer+event to impersonate | `mocks:` (HTTP stubs under `mocks.http.stubs:`, Kafka reactors under `mocks.kafka.reactors:`) |
 | `init` | the whole repo | a full `agctl.yaml` + `.env.example` |
 
 Then read the matching `reference/<mode>.md` in this skill's directory for extraction
-steps and stack snippets. For write templates, see `reference/db-write-template.md`.
+steps and stack snippets. For write templates, see `reference/db-write-template.md`; for
+mock stubs/reactors, see `reference/mocks.md`.
 
 ## Step 0 — locate the config (never guess)
 
@@ -53,6 +55,12 @@ pins it byte-identical to the README).
 `${VAR:-}` empty if unset. Never put `${}` in keys; never use `{name}` call-time params in SQL,
 and never use `:name` SQL bind syntax in an HTTP path/body (a literal `:` inside a value is fine);
 `::` casts like `::jsonb` are safe in SQL.
+
+**Mocks are the exception to `{name}` = call-time param.** In a `mocks:` block there is no
+caller passing `--param` — the SUT's own request/message *is* the input. So `{name}` in a
+mock means **capture-from-trigger**: a stub `path` `/orders/{order_id}` captures that
+segment, and `{name}` in a `response.body` / Kafka `reaction.value` is filled from the
+captured context (never `--param`). See `reference/mocks.md` — the #1 mock-authoring trap.
 
 **2. Cross-references must resolve** (else `config validate` exits 2). Before you finish:
 
@@ -89,6 +97,12 @@ agctl config validate                                                       # ok
 agctl discover --category <http-templates|kafka-patterns|db-templates> --name <new-key>   # must list expected params
 ```
 
+**Mocks have no `discover` category** — `agctl discover` does not surface `mocks:` (only
+`services` / `http-templates` / `kafka-patterns` / `db-templates`). For a `mock` edit,
+verify with `agctl config validate` and a smoke run (`agctl mock run --duration 5`,
+checking the `started` line and that no `http.unmatched` / `kafka.error` appears) — see the
+`agctl` skill.
+
 If `agctl` isn't installed, run the **structural checklist** below instead and tell the user
 live validation was skipped. **Never** declare done on config that doesn't validate.
 
@@ -101,6 +115,10 @@ live validation was skipped. **Never** declare done on config that doesn't valid
 - [ ] `defaults.database_connection` (if set) ∈ `database.connections`.
 - [ ] `kafka.ssl.security_protocol` (if set) ∈ {PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT}.
 - [ ] Every `templates` / `database.templates` / `kafka.patterns` entry has a non-empty `description`.
+- [ ] If `mocks.kafka.reactors` is set, `kafka.brokers` is non-empty (required at `mock run` startup).
+- [ ] `mocks.http.listen` (if set) parses as `host:port` (IPv6 hosts bracketed, e.g. `[::1]:18080`).
+- [ ] Every `mocks.http.stubs` / `mocks.kafka.reactors` entry has a non-empty `description`.
+- [ ] Every `mocks.kafka.reactors.*.reaction.headers` value (if set) is a string.
 
 ## Worked example (HTTP, Spring)
 
