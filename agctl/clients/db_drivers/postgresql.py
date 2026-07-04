@@ -31,10 +31,14 @@ class PostgreSQLDriver:
     def connect(self, config: dict) -> None:
         """Open a psycopg connection from ``config`` unless one was injected.
 
-        Config keys: ``host``, ``port``, ``dbname``, ``user``, ``password``
-        (any subset is forwarded; psycopg applies its own defaults). A
-        ``psycopg`` import failure raises :class:`ConfigError` pointing at the
-        ``db`` extra; a connection failure raises :class:`ConnectionFailure`.
+        Config keys: ``url`` (optional connection URI, e.g.
+        ``postgresql://user:pass@host:port/dbname``) and/or the discrete
+        ``host``, ``port``, ``dbname``, ``user``, ``password`` fields. When
+        ``url`` is set it is passed to psycopg as the conninfo string; any
+        discrete fields present are forwarded as kwargs and **override** the
+        URI params (merge semantics — psycopg lets kwargs win). A ``psycopg``
+        import failure raises :class:`ConfigError` pointing at the ``db`` extra;
+        a connection failure raises :class:`ConnectionFailure`.
         """
         if self._conn is not None:
             # Injected connection: nothing to do.
@@ -52,8 +56,14 @@ class PostgreSQLDriver:
             if key in config and config[key] is not None:
                 kwargs[key] = config[key]
 
+        # conninfo (positional) when a url is given; discrete fields override.
+        # A missing or empty url (e.g. "${DB_URL:-}" resolving to "") falls back
+        # to discrete fields — see DatabaseConnection.url.
+        url = config.get("url")
+        args = (url,) if url else ()
+
         try:
-            self._conn = psycopg.connect(**kwargs)
+            self._conn = psycopg.connect(*args, **kwargs)
         except psycopg.Error as exc:
             raise ConnectionFailure(
                 message=str(exc),

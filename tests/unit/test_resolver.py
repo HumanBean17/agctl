@@ -58,6 +58,16 @@ def test_override_matches_hyphenated_nested_connection_key():
     assert "main_db" not in out["database"]["connections"]
 
 
+def test_override_sets_url_on_connection():
+    """AGCTL_DATABASE__CONNECTIONS__<NAME>__URL is not denylisted and deep-merges
+    (the documented env-override path for connection URLs)."""
+    src = {"database": {"connections": {"main-db": {"host": "h"}}}}
+    out = apply_env_overrides(
+        src, {"AGCTL_DATABASE__CONNECTIONS__MAIN_DB__URL": "postgresql://u:p@h/d"}
+    )
+    assert out["database"]["connections"]["main-db"]["url"] == "postgresql://u:p@h/d"
+
+
 def test_override_matches_case_insensitively():
     src = {"Defaults": {"TimeoutSeconds": 5}}
     out = apply_env_overrides(src, {"AGCTL_DEFAULTS__TIMEOUTSECONDS": "9"})

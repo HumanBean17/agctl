@@ -195,6 +195,14 @@ database:
       user: "${ANALYTICS_DB_USER}"
       password: "${ANALYTICS_DB_PASSWORD}"
 
+    # Connection via URL (optional, supports ${ENV} interpolation).
+    # When `url` is set, discrete fields (host/port/dbname/user/password) may
+    # still be provided — they override the corresponding URI params.
+    url-db:
+      type: postgresql
+      url: "${DATABASE_URL}"                 # e.g. "postgresql://user:pass@host:port/dbname"
+      port: 5432                              # overrides the port from DATABASE_URL (if present)
+
   # templates — named SQL queries. `connection` is optional (falls back to
   # defaults.database_connection). `sql` uses :paramName named params (JDBC-style).
   # `mode` is optional; defaults to "read". Set `mode: write` for templates used

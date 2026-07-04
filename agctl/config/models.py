@@ -121,6 +121,13 @@ class KafkaConfig(BaseModel):
 
 class DatabaseConnection(BaseModel):
     type: str
+    # Optional connection URI (e.g. "postgresql://user:pass@host:port/dbname").
+    # When set, the driver passes it to psycopg as the conninfo string and still
+    # forwards any discrete host/port/dbname/user/password fields — discrete
+    # fields override URI params (DESIGN §3.3). Supports ${ENV} interpolation.
+    # An empty/missing url falls back to discrete fields, so "${DB_URL:-}" lets
+    # you default to discrete fields when the env var is unset.
+    url: str | None = None
     host: str | None = None
     port: int | None = None
     dbname: str | None = None

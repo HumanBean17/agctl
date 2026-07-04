@@ -71,6 +71,16 @@ class TestDbClientDirectInjection:
         assert forwarded["host"] == "h"
         assert forwarded["port"] == 5432
 
+    def test_connect_forwards_url_field_to_driver(self):
+        """url flows through the forwarded config dict so the driver sees it."""
+        fake = FakeDriver()
+        client = DbClient(
+            DatabaseConnection(type="postgresql", url="postgresql://u:p@h/d"),
+            driver=fake,
+        )
+        client.connect()
+        assert fake.connected_with["url"] == "postgresql://u:p@h/d"
+
     def test_close_sets_driver_closed(self):
         fake = FakeDriver()
         client = DbClient(

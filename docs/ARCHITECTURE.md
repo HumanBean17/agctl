@@ -415,6 +415,14 @@ does **not** own the connection and `close()` is a no-op. `execute` rewrites
 `:name`→`%(name)s` (protecting `::` casts), runs read-only (no commit), and runs
 each cell through `coerce_db_value` (§9).
 
+**Connection mechanism** — `connect()` accepts an optional `url` field (a
+PostgreSQL connection URI, e.g. `postgresql://user:pass@host:port/dbname`). When
+`url` is present, it is passed to `psycopg.connect()` as the positional conninfo
+string; any discrete fields (`host`/`port`/`dbname`/`user`/`password`) are
+forwarded as kwargs and **override** the corresponding URI parameters (psycopg's
+merge semantics — kwargs win). When `url` is absent, the driver behaves as before,
+using only discrete fields.
+
 **Optional `execute_write` capability** — write support is an optional driver
 capability, not required by the `DBDriver` protocol. `DbClient.execute_write`
 probes the driver for a callable `execute_write` attribute and raises

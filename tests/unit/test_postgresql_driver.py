@@ -185,6 +185,97 @@ def test_connect_raises_connection_failure_on_operational_error(monkeypatch):
         driver.connect({"host": "x"})
 
 
+# --- connect() with `url` -------------------------------------------------
+
+
+class _RecordingPsycopg:
+    """Stand-in for psycopg: records connect() args/kwargs, returns a sentinel."""
+
+    def __init__(self):
+        self.calls = []
+
+        class Error(Exception):
+            pass
+
+        self.Error = Error
+
+    def connect(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return object()
+
+
+def test_connect_with_url_passes_it_as_positional_conninfo(monkeypatch):
+    """A `url` is forwarded as the positional conninfo string to psycopg."""
+    import psycopg
+
+    fake = _RecordingPsycopg()
+    monkeypatch.setattr(psycopg, "connect", fake.connect)
+
+    url = "postgresql://u:p@h:5432/d"
+    driver = PostgreSQLDriver()
+    driver.connect({"url": url})
+
+    assert len(fake.calls) == 1
+    args, kwargs = fake.calls[0]
+    assert args == (url,)
+    # No discrete fields given -> no kwargs beyond what the config held.
+    assert kwargs == {}
+
+
+def test_connect_with_url_and_discrete_fields_forwards_both(monkeypatch):
+    """Merge semantics: url is conninfo AND discrete fields are forwarded as
+    kwargs so they override URI params (psycopg lets kwargs win)."""
+    import psycopg
+
+    fake = _RecordingPsycopg()
+    monkeypatch.setattr(psycopg, "connect", fake.connect)
+
+    driver = PostgreSQLDriver()
+    driver.connect(
+        {
+            "url": "postgresql://u:p@h:5432/d",
+            "host": "override-host",
+            "port": 6543,
+            "dbname": "other",
+        }
+    )
+
+    assert len(fake.calls) == 1
+    args, kwargs = fake.calls[0]
+    assert args == ("postgresql://u:p@h:5432/d",)
+    assert kwargs == {"host": "override-host", "port": 6543, "dbname": "other"}
+
+
+def test_connect_without_url_keeps_kwargs_only_path(monkeypatch):
+    """Regression: no `url` -> psycopg.connect(**kwargs), no positional arg."""
+    import psycopg
+
+    fake = _RecordingPsycopg()
+    monkeypatch.setattr(psycopg, "connect", fake.connect)
+
+    driver = PostgreSQLDriver()
+    driver.connect({"host": "h", "port": 5432})
+
+    assert len(fake.calls) == 1
+    args, kwargs = fake.calls[0]
+    assert args == ()
+    assert kwargs == {"host": "h", "port": 5432}
+
+
+def test_connect_with_url_raises_connection_failure_on_psycopg_error(monkeypatch):
+    """The psycopg.Error -> ConnectionFailure path also covers the url branch."""
+    import psycopg
+
+    def _boom(*args, **kwargs):
+        raise psycopg.Error("bad uri")
+
+    monkeypatch.setattr(psycopg, "connect", _boom)
+
+    driver = PostgreSQLDriver()
+    with pytest.raises(ConnectionFailure):
+        driver.connect({"url": "postgresql://x"})
+
+
 def test_protocol_is_satisfied_by_postgresql_driver():
     # runtime_checkable structural check: PostgreSQLDriver has all 3 methods.
     driver = PostgreSQLDriver()
