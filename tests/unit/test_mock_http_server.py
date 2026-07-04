@@ -728,16 +728,17 @@ class TestJqPredicate:
     def test_jq_predicate_raises_is_soft_nonmatch(
         self, emit_event: callable, event_sink: list[dict[str, Any]]
     ) -> None:
-        """(e) match.jq='.a.b.c' on a body without .a -> 404 + unmatched (no 500).
+        """(e) match.jq='.x[0]' on a string body -> 404 + unmatched (no 500).
 
-        jq_bool swallows the predicate's runtime error to False, so the stub
-        is a soft non-match and the request falls through cleanly.
+        ``.x[0]`` on ``{"x": "str"}`` unambiguously raises a jq type error
+        ("Cannot index string with number"); jq_bool swallows it to False, so
+        the stub is a soft non-match and the request falls through cleanly.
         """
         stubs = {
             "deep": HttpStub(
                 method="POST",
                 path="/items",
-                match=HttpMatch(jq=".a.b.c"),
+                match=HttpMatch(jq=".x[0]"),
                 response=HttpResponse(status=200, body={"hit": True}),
             )
         }
@@ -749,7 +750,7 @@ class TestJqPredicate:
             with httpx.Client() as client:
                 response = client.post(
                     f"http://127.0.0.1:{port}/items",
-                    json={"x": 1},  # no .a -> .a.b.c raises
+                    json={"x": "str"},  # .x[0] on a string -> jq type error (raises)
                 )
 
             assert response.status_code == 404

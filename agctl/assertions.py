@@ -27,6 +27,21 @@ def _jq():
     return jq
 
 
+def _missing_jq_config_error(kind: str, detail: dict) -> ConfigError:
+    """Build a :class:`ConfigError` pointing at the ``jq`` extra for the given
+    assertion ``kind`` (e.g. ``"match"``, ``"jq-path"``).
+
+    The base :func:`_jq` install hint names only db/kafka; HTTP/mock callers
+    must point at ``pip install 'agctl[jq]'`` instead (DESIGN D7). Call sites
+    raise the result ``from None`` so the stale db/kafka hint doesn't linger
+    in the exception chain.
+    """
+    return ConfigError(
+        f"jq is required for {kind} assertions: pip install 'agctl[jq]'",
+        detail,
+    )
+
+
 def jq_bool(value, expr: str) -> bool:
     """Evaluate a jq predicate against value; True only if the result is truthy.
 
@@ -76,11 +91,11 @@ def compile_jq(expr: str, *, label: str | None = None) -> None:
     context = f"[{label}] " if label else ""
     try:
         jq_lib = _jq()
-    except ConfigError as exc:
+    except ConfigError:
         raise ConfigError(
             f"{context}jq is required for jq assertions: pip install 'agctl[jq]'",
             {"expr": expr, "label": label},
-        ) from exc
+        ) from None
     try:
         jq_lib.compile(expr)
     except Exception as exc:
@@ -255,11 +270,8 @@ def evaluate_http_assertions(
     if match is not None:
         try:
             ok = jq_bool(result["body"], match)
-        except ConfigError as exc:
-            raise ConfigError(
-                "jq is required for match assertions: pip install 'agctl[jq]'",
-                {"expr": match},
-            ) from exc
+        except ConfigError:
+            raise _missing_jq_config_error("match", {"expr": match}) from None
         if not ok:
             failures.append({"mode": "match", "expr": match, "result": False})
 
@@ -267,11 +279,8 @@ def evaluate_http_assertions(
         expected = parse_equals(equals)
         try:
             actual = jq_value(result["body"], jq_path)
-        except ConfigError as exc:
-            raise ConfigError(
-                "jq is required for jq-path assertions: pip install 'agctl[jq]'",
-                {"path": jq_path},
-            ) from exc
+        except ConfigError:
+            raise _missing_jq_config_error("jq-path", {"path": jq_path}) from None
         if not type_aware_equal(actual, expected):
             failures.append(
                 {

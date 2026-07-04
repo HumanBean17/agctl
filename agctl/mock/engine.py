@@ -159,6 +159,8 @@ class MockEngine:
         """Start the engine: probe Kafka, bind HTTP, emit started line.
 
         Probe-then-bind ordering (DESIGN §9):
+        0. Pre-compile every jq match expression (raises ConfigError on a
+           malformed expression, before probe/bind).
         1. If run_kafka, build reactors and call prepare() (probes brokers).
            On any failure, close already-prepared reactors and re-raise.
         2. If run_http, bind MockHTTPServer (raises ConfigError if port in use).

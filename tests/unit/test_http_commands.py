@@ -483,6 +483,68 @@ def test_http_request_match_assertion_fail(mock_transport, captured):
         http_commands.set_default_transport(None)
 
 
+def test_http_request_contains_assertion_pass(mock_transport, captured):
+    """(d') --contains '{"status":"PENDING"}' on a superset body -> ok:true."""
+    http_commands.set_default_transport(
+        _transport_returning(200, {"status": "PENDING", "id": "x"})
+    )
+    try:
+        result = _run(
+            [
+                "--config",
+                str(FIXTURE),
+                "http",
+                "request",
+                "--service",
+                "order-service",
+                "--method",
+                "GET",
+                "--path",
+                "/x",
+                "--contains",
+                '{"status":"PENDING"}',
+            ]
+        )
+        payload = json.loads(result.output)
+
+        assert result.exit_code == 0
+        assert payload["ok"] is True
+    finally:
+        http_commands.set_default_transport(None)
+
+
+def test_http_request_contains_assertion_fail(mock_transport, captured):
+    """(d') --contains '{"status":"PENDING"}' on {"status":"PAID"} -> ok:false, exit 1."""
+    http_commands.set_default_transport(_transport_returning(200, {"status": "PAID"}))
+    try:
+        result = _run(
+            [
+                "--config",
+                str(FIXTURE),
+                "http",
+                "request",
+                "--service",
+                "order-service",
+                "--method",
+                "GET",
+                "--path",
+                "/x",
+                "--contains",
+                '{"status":"PENDING"}',
+            ]
+        )
+        payload = json.loads(result.output)
+
+        assert result.exit_code == 1
+        assert payload["ok"] is False
+        assert payload["error"]["type"] == "AssertionError"
+        assert payload["error"]["detail"]["failures"] == [
+            {"mode": "contains", "needle": {"status": "PENDING"}, "matched": False}
+        ]
+    finally:
+        http_commands.set_default_transport(None)
+
+
 def test_http_call_jq_path_without_equals_is_config_error_and_skips_transport(
     mock_transport, captured
 ):
