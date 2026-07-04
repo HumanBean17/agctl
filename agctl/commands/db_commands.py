@@ -35,6 +35,35 @@ def new_db_client(connection_obj: Any):
     return DbClient(connection_obj)
 
 
+def resolve_connection_name(
+    cfg,
+    *,
+    connection_name: str | None,
+    template_connection: str | None = None,
+) -> str:
+    """Resolve the database connection name to use for a query/assert/execute.
+
+    Precedence: explicit ``connection_name`` > ``template_connection`` >
+    ``cfg.defaults.database_connection``. Raises :class:`ConfigError` if none
+    of the three is set, or if the resolved name is absent from
+    ``cfg.database.connections``.
+    """
+    resolved_name = connection_name
+    if resolved_name is None:
+        resolved_name = template_connection
+    if resolved_name is None:
+        resolved_name = cfg.defaults.database_connection
+    if resolved_name is None:
+        raise ConfigError("No database connection specified", {})
+
+    if resolved_name not in cfg.database.connections:
+        raise ConfigError(
+            f"Unknown database connection: {resolved_name}",
+            {"connection": resolved_name},
+        )
+    return resolved_name
+
+
 def resolve_db_request(
     cfg,
     *,
@@ -82,19 +111,11 @@ def resolve_db_request(
     params = parse_params(param_tuple)
 
     # Connection resolution: explicit arg > template connection > default.
-    resolved_name = connection_name
-    if resolved_name is None:
-        resolved_name = template_connection
-    if resolved_name is None:
-        resolved_name = cfg.defaults.database_connection
-    if resolved_name is None:
-        raise ConfigError("No database connection specified", {})
-
-    if resolved_name not in cfg.database.connections:
-        raise ConfigError(
-            f"Unknown database connection: {resolved_name}",
-            {"connection": resolved_name},
-        )
+    resolved_name = resolve_connection_name(
+        cfg,
+        connection_name=connection_name,
+        template_connection=template_connection,
+    )
 
     return sql_text, params, resolved_name
 
