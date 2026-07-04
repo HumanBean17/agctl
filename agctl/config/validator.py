@@ -150,6 +150,32 @@ def validate_config(cfg: Config) -> tuple[list[dict], list[dict]]:
                         )
                         break  # Only warn once per later stub
 
+    # Check 4: jq-shadowing warning for HTTP stubs (method-gated, spec §10).
+    # Two stubs sharing the same method (case-insensitive) AND the same path
+    # template AND both carrying a non-None ``match.jq`` are "distinguished
+    # only by jq" — a wrong predicate can silently fire the wrong branch
+    # (first match wins). Unlike Check 3 this is method-gated so that
+    # ``GET /api/{id}`` vs ``DELETE /api/users`` does not false-warn.
+    if cfg.mocks is not None and cfg.mocks.http is not None:
+        stubs = list(cfg.mocks.http.stubs.items())
+        for i, (later_name, later_stub) in enumerate(stubs):
+            for earlier_name, earlier_stub in stubs[:i]:
+                if (
+                    earlier_stub.method.upper() == later_stub.method.upper()
+                    and earlier_stub.path == later_stub.path
+                    and earlier_stub.match is not None
+                    and earlier_stub.match.jq is not None
+                    and later_stub.match is not None
+                    and later_stub.match.jq is not None
+                ):
+                    warnings.append(
+                        {
+                            "path": f"mocks.http.stubs.{later_name}",
+                            "message": f"Stub '{later_name}' is shadowed by '{earlier_name}' — same method+path and both use match.jq (first match wins; a wrong predicate can fire the wrong branch silently).",
+                        }
+                    )
+                    break  # Only warn once per later stub
+
     return errors, warnings
 
 
