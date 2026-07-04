@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from agctl.config.models import (
     Config,
+    CaptureSpec,
     HttpMatch,
     HttpMockConfig,
     HttpResponse,
@@ -208,3 +209,73 @@ def test_http_match_body_and_jq():
     match = HttpMatch(body={"priority": "high"}, jq=".amount > 1000")
     assert match.body == {"priority": "high"}
     assert match.jq == ".amount > 1000"
+
+
+# --- CaptureSpec (Task 1: envelope-rooted capture:) ---
+
+
+def test_capture_spec_alias_default_type():
+    """CaptureSpec.model_validate({"from": ".body.variables.id"}) -> from_ == path, type == 'scalar' (default)."""
+    spec = CaptureSpec.model_validate({"from": ".body.variables.id"})
+    assert spec.from_ == ".body.variables.id"
+    assert spec.type == "scalar"
+
+
+def test_capture_spec_alias_object_type():
+    """CaptureSpec.model_validate({"from": ".value.context", "type": "object"}) -> type == 'object'."""
+    spec = CaptureSpec.model_validate({"from": ".value.context", "type": "object"})
+    assert spec.from_ == ".value.context"
+    assert spec.type == "object"
+
+
+def test_capture_spec_populate_by_name():
+    """CaptureSpec(**{"from": ".x"}) works via populate_by_name (alias == 'from')."""
+    spec = CaptureSpec(**{"from": ".x"})
+    assert spec.from_ == ".x"
+
+
+def test_capture_spec_field_name_construction():
+    """CaptureSpec(from_=".x") works via populate_by_name (field name 'from_')."""
+    spec = CaptureSpec(from_=".x")
+    assert spec.from_ == ".x"
+
+
+def test_capture_spec_invalid_type_rejected():
+    """CaptureSpec.model_validate({"from": ".x", "type": "bogus"}) -> ValidationError."""
+    with pytest.raises(ValidationError):
+        CaptureSpec.model_validate({"from": ".x", "type": "bogus"})
+
+
+def test_http_stub_capture_defaults_none():
+    """HttpStub without capture -> .capture is None."""
+    stub = HttpStub(method="POST", path="/x", response=HttpResponse())
+    assert stub.capture is None
+
+
+def test_http_stub_with_capture():
+    """HttpStub(capture={"op_id": CaptureSpec(...)}) -> .capture["op_id"].from_ == path."""
+    stub = HttpStub(
+        method="POST",
+        path="/x",
+        response=HttpResponse(),
+        capture={"op_id": CaptureSpec.model_validate({"from": ".body.variables.id"})},
+    )
+    assert stub.capture is not None
+    assert stub.capture["op_id"].from_ == ".body.variables.id"
+
+
+def test_kafka_reactor_capture_defaults_none():
+    """KafkaReactor without capture -> .capture is None."""
+    reactor = KafkaReactor(topic="t", reaction=KafkaReaction(topic="r", value={}))
+    assert reactor.capture is None
+
+
+def test_kafka_reactor_with_capture():
+    """KafkaReactor(capture={...}) parses analogously to HttpStub."""
+    reactor = KafkaReactor(
+        topic="t",
+        reaction=KafkaReaction(topic="r", value={}),
+        capture={"op_id": CaptureSpec.model_validate({"from": ".value.id"})},
+    )
+    assert reactor.capture is not None
+    assert reactor.capture["op_id"].from_ == ".value.id"
