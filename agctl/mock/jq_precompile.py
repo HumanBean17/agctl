@@ -26,12 +26,20 @@ from ..errors import ConfigError
 def iter_mock_jq_expressions(
     mocks: MocksConfig | None,
 ) -> Iterator[tuple[str, str]]:
-    """Yield ``(path_label, expr)`` for every jq match expression in ``mocks``.
+    """Yield ``(path_label, expr)`` for every jq expression in ``mocks``.
 
     Iterates HTTP stubs first (in dict order), then Kafka reactors (in dict
-    order), yielding only non-None expressions. A stub contributes an entry
-    only when it has a :class:`HttpMatch` whose ``jq`` is not None; a reactor
-    contributes an entry only when its ``match`` is not None.
+    order). For each stub, yields its ``match.jq`` (when not None) and then,
+    when the stub carries a non-None ``capture``, one ``capture.{cap}.from``
+    entry per capture (in dict order) — the capture ``from`` is itself a jq
+    expression that must compile. Reactors mirror this: ``match`` first, then
+    each ``capture.{cap}.from``. A stub/reactor with ``capture=None`` (or no
+    match) contributes no capture labels.
+
+    Walking the capture ``from`` here means :func:`collect_jq_compile_errors`
+    (used by ``config validate``) and the engine's Step 0 pre-compile (used by
+    ``mock run``) both surface a malformed ``from`` at the capture label,
+    automatically — no caller changes needed.
 
     ``mocks is None`` (or its ``http``/``kafka`` subsections are None) yields
     nothing — the caller may pass a Config with mocks disabled without
@@ -44,11 +52,20 @@ def iter_mock_jq_expressions(
         for name, stub in mocks.http.stubs.items():
             if stub.match is not None and stub.match.jq is not None:
                 yield f"mocks.http.stubs.{name}.match.jq", stub.match.jq
+            if stub.capture is not None:
+                for cap, spec in stub.capture.items():
+                    yield f"mocks.http.stubs.{name}.capture.{cap}.from", spec.from_
 
     if mocks.kafka is not None:
         for name, reactor in mocks.kafka.reactors.items():
             if reactor.match is not None:
                 yield f"mocks.kafka.reactors.{name}.match", reactor.match
+            if reactor.capture is not None:
+                for cap, spec in reactor.capture.items():
+                    yield (
+                        f"mocks.kafka.reactors.{name}.capture.{cap}.from",
+                        spec.from_,
+                    )
 
 
 def collect_jq_compile_errors(mocks: MocksConfig | None) -> list[dict]:

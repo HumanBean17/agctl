@@ -8,6 +8,7 @@ typos in one pass rather than stopping at the first.
 """
 
 from agctl.config.models import (
+    CaptureSpec,
     HttpMatch,
     HttpMockConfig,
     HttpResponse,
@@ -282,3 +283,218 @@ def test_iter_stable_order_multiple_stubs_and_reactors():
         ("mocks.kafka.reactors.r1.match", ".x"),
         ("mocks.kafka.reactors.r2.match", ".y"),
     ]
+
+
+# --- (g) capture.*.from yielded after match.jq / match (Task 4) -------------
+def test_iter_yields_capture_from_for_stub_and_reactor():
+    """A stub/reactor with a non-None ``capture`` contributes, AFTER its
+    match.jq/match label, one ``capture.{cap}.from`` (label, expr) pair per
+    capture entry — in dict insertion order, with the exact path label and the
+    spec's ``from_`` expression verbatim."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "create-order": HttpStub(
+                    method="POST",
+                    path="/orders",
+                    match=HttpMatch(jq=".amount > 100"),
+                    capture={"order_id": CaptureSpec(from_=".body.variables.id")},
+                    response=HttpResponse(status=201),
+                ),
+            },
+        ),
+        kafka=KafkaMockConfig(
+            reactors={
+                "order-created": KafkaReactor(
+                    topic="orders.created",
+                    match='.eventType == "ORDER_CREATED"',
+                    capture={"event_key": CaptureSpec(from_=".key")},
+                    reaction=KafkaReaction(topic="orders.mock", value={"ok": True}),
+                ),
+            },
+        ),
+    )
+    pairs = list(iter_mock_jq_expressions(mocks))
+    # match.jq/match still yielded first (regression), then capture.*.from.
+    assert pairs == [
+        ("mocks.http.stubs.create-order.match.jq", ".amount > 100"),
+        ("mocks.http.stubs.create-order.capture.order_id.from", ".body.variables.id"),
+        ("mocks.kafka.reactors.order-created.match", '.eventType == "ORDER_CREATED"'),
+        ("mocks.kafka.reactors.order-created.capture.event_key.from", ".key"),
+    ]
+
+
+def test_iter_capture_order_within_stub_preserves_dict_order():
+    """Multiple captures on one stub yield in dict insertion order, immediately
+    after the stub's match.jq label (and before the next stub/reactor)."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "stub-a": HttpStub(
+                    method="POST",
+                    path="/a",
+                    match=HttpMatch(jq=".a"),
+                    capture={
+                        "first": CaptureSpec(from_=".body.a"),
+                        "second": CaptureSpec(from_=".body.b"),
+                    },
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+        kafka=None,
+    )
+    pairs = list(iter_mock_jq_expressions(mocks))
+    assert pairs == [
+        ("mocks.http.stubs.stub-a.match.jq", ".a"),
+        ("mocks.http.stubs.stub-a.capture.first.from", ".body.a"),
+        ("mocks.http.stubs.stub-a.capture.second.from", ".body.b"),
+    ]
+
+
+def test_iter_skips_capture_labels_when_capture_is_none():
+    """Stubs/reactors whose ``capture`` is None contribute NO capture labels,
+    even when sibling stubs/reactors in the SAME config do carry a capture.
+    Also covers a stub that has a capture but no match (jq=None): the capture
+    labels are still yielded (capture is independent of match)."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "with-cap": HttpStub(
+                    method="POST",
+                    path="/a",
+                    match=HttpMatch(jq=".a"),
+                    capture={"id": CaptureSpec(from_=".body.id")},
+                    response=HttpResponse(),
+                ),
+                "no-cap": HttpStub(
+                    method="POST",
+                    path="/b",
+                    match=HttpMatch(jq=".b"),
+                    capture=None,  # explicitly None -> no capture labels
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+        kafka=KafkaMockConfig(
+            reactors={
+                "with-cap-r": KafkaReactor(
+                    topic="t",
+                    match=".x",
+                    capture={"k": CaptureSpec(from_=".key")},
+                    reaction=KafkaReaction(topic="o", value=1),
+                ),
+                "no-cap-r": KafkaReactor(
+                    topic="t",
+                    match=".y",
+                    capture=None,
+                    reaction=KafkaReaction(topic="o", value=1),
+                ),
+            },
+        ),
+    )
+    pairs = list(iter_mock_jq_expressions(mocks))
+    # Only with-cap / with-cap-r contribute capture labels; no-cap* do not.
+    capture_labels = [label for label, _ in pairs if ".capture." in label]
+    assert capture_labels == [
+        "mocks.http.stubs.with-cap.capture.id.from",
+        "mocks.kafka.reactors.with-cap-r.capture.k.from",
+    ]
+    # Pre-existing match.jq / match labels still present for all four entries.
+    match_labels = [label for label, _ in pairs if ".capture." not in label]
+    assert match_labels == [
+        "mocks.http.stubs.with-cap.match.jq",
+        "mocks.http.stubs.no-cap.match.jq",
+        "mocks.kafka.reactors.with-cap-r.match",
+        "mocks.kafka.reactors.no-cap-r.match",
+    ]
+
+
+def test_iter_capture_yielded_even_when_match_is_none():
+    """A stub with ``match=None`` but a non-None ``capture`` still yields its
+    capture.*.from labels — capture is independent of match. (A reactor's
+    ``match`` and ``capture`` are likewise independent.)"""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "body-only-cap": HttpStub(
+                    method="POST",
+                    path="/a",
+                    match=None,
+                    capture={"id": CaptureSpec(from_=".body.id")},
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+        kafka=None,
+    )
+    assert list(iter_mock_jq_expressions(mocks)) == [
+        ("mocks.http.stubs.body-only-cap.capture.id.from", ".body.id"),
+    ]
+
+
+# --- (h) collect surfaces capture.from errors under the capture label -------
+def test_collect_malformed_capture_from_surfaces_under_capture_label():
+    """collect_jq_compile_errors on a config whose capture ``from`` is malformed
+    (e.g. '.body[') returns one error whose ``path`` is the capture label, NOT
+    a match.jq/match label. Both HTTP and Kafka capture paths are exercised."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "bad-cap": HttpStub(
+                    method="POST",
+                    path="/orders",
+                    match=HttpMatch(jq=".amount > 0"),
+                    capture={"order_id": CaptureSpec(from_=".body[")},
+                    response=HttpResponse(status=201),
+                ),
+            },
+        ),
+        kafka=KafkaMockConfig(
+            reactors={
+                "bad-cap-r": KafkaReactor(
+                    topic="t",
+                    match=".x",
+                    capture={"k": CaptureSpec(from_=".key[")},
+                    reaction=KafkaReaction(topic="o", value=1),
+                ),
+            },
+        ),
+    )
+    errors = collect_jq_compile_errors(mocks)
+    paths = [e["path"] for e in errors]
+    assert "mocks.http.stubs.bad-cap.capture.order_id.from" in paths
+    assert "mocks.kafka.reactors.bad-cap-r.capture.k.from" in paths
+    # Each error carries both keys and a non-empty message naming the bad expr.
+    for err in errors:
+        assert set(err.keys()) == {"path", "message"}
+        assert "invalid jq expression" in err["message"]
+
+
+def test_collect_valid_capture_froms_return_empty():
+    """A config whose every match.jq/match AND capture ``from`` compiles cleanly
+    -> [] (capture froms are validated by the same collect pass)."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "ok": HttpStub(
+                    method="POST",
+                    path="/orders",
+                    match=HttpMatch(jq=".amount > 1000"),
+                    capture={"id": CaptureSpec(from_=".body.variables.id")},
+                    response=HttpResponse(status=201),
+                ),
+            },
+        ),
+        kafka=KafkaMockConfig(
+            reactors={
+                "ok-r": KafkaReactor(
+                    topic="orders.created",
+                    match='.eventType == "ORDER_CREATED"',
+                    capture={"k": CaptureSpec(from_=".key")},
+                    reaction=KafkaReaction(topic="out", value={"ok": True}),
+                ),
+            },
+        ),
+    )
+    assert collect_jq_compile_errors(mocks) == []
