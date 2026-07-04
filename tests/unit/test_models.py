@@ -101,6 +101,19 @@ def test_database_connection_roundtrip():
     assert dumped["writable"] is True
 
 
+def test_database_connection_url_defaults_none():
+    """DatabaseConnection.url is optional and defaults to None."""
+    conn = DatabaseConnection(type="postgresql", host="h")
+    assert conn.url is None
+
+
+def test_database_connection_url_roundtrips():
+    """DatabaseConnection.url round-trips through model_dump()."""
+    url = "postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}/${DB_NAME}"
+    conn = DatabaseConnection(type="postgresql", url=url)
+    assert conn.model_dump()["url"] == url
+
+
 def test_database_template_roundtrip():
     """DatabaseTemplate.mode round-trips through model_dump()."""
     tmpl = DatabaseTemplate(sql="x", mode="write")

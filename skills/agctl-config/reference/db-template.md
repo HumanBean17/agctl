@@ -13,7 +13,7 @@ non-negotiable contract (placeholder syntaxes, cross-refs, naming, verify-after)
 
 1. **sql** — the query, with bind params normalized to **`:name`** (JDBC-style).
 2. **connection** — match to an existing `database.connections:` key, or omit it to fall back to
-   `defaults.database_connection`; if neither fits, create a connection (ask for type/host/dbname;
+   `defaults.database_connection`; if neither fits, create a connection (ask for type/url/host/dbname;
    `${ENV}` for secrets).
 3. **description** — one line.
 4. **name** — kebab-case from the query (`SELECT … FROM orders WHERE id = :orderId` → `find-order`).
@@ -48,7 +48,7 @@ column/meaning (`:orderId`, `:status`).
 ## What to clarify
 
 - Which connection to bind to (if several exist, or none).
-- type / host / dbname + env-var names if you must create a connection.
+- type / url / host / dbname + env-var names if you must create a connection.
 - Meaningful param names when the source used positional placeholders.
 
 ## Where it writes
