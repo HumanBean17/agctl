@@ -187,3 +187,170 @@ def test_db_execute_then_query_visible(require_postgres):
     assert envelope["ok"] is True
     assert envelope["result"]["row_count"] == 1
     assert envelope["result"]["rows"] == [{"id": test_id, "status": "PENDING"}]
+
+
+def _exec_ddl(sql: str) -> None:
+    """Run one DDL statement via ``db execute --connection main-db-writable --write``.
+
+    Each statement is its own invocation so a failure is unambiguous. DDL commits.
+    """
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            FIXTURE,
+            "db",
+            "execute",
+            "--connection",
+            "main-db-writable",
+            "--sql",
+            sql,
+            "--write",
+        ],
+        env=_env(),
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_db_schema_live_introspection(require_postgres):
+    """Build a rich schema via DDL, then assert ``db schema`` (both levels)
+    returns the real introspected shape from a live Postgres 16.
+
+    Uses a dedicated throwaway schema (``agctl_schema_test``) so Level-1
+    assertions are deterministic and isolated from other tests' objects
+    (``agctl_seed``, etc.). ``require_postgres`` skips the whole test when
+    Postgres is unreachable.
+    """
+    import json
+
+    # --- Setup: throwaway schema + objects (one DDL statement per invocation) ---
+    _exec_ddl("DROP SCHEMA IF EXISTS agctl_schema_test CASCADE")
+    _exec_ddl("CREATE SCHEMA agctl_schema_test")
+    _exec_ddl(
+        "CREATE TYPE agctl_schema_test.order_state "
+        "AS ENUM ('PENDING','PAID','CANCELLED')"
+    )
+    _exec_ddl(
+        "CREATE TABLE agctl_schema_test.customers "
+        "(id uuid PRIMARY KEY, email text NOT NULL, created_at timestamptz)"
+    )
+    _exec_ddl(
+        "CREATE TABLE agctl_schema_test.orders ("
+        "id uuid PRIMARY KEY, "
+        "customer_id uuid NOT NULL REFERENCES agctl_schema_test.customers(id), "
+        "status agctl_schema_test.order_state NOT NULL DEFAULT 'PENDING', "
+        "payload jsonb, "
+        "audit_id integer GENERATED ALWAYS AS IDENTITY, "
+        "row_total integer GENERATED ALWAYS AS (0) STORED, "
+        "UNIQUE (status, customer_id)"
+        ")"
+    )
+    _exec_ddl(
+        "CREATE VIEW agctl_schema_test.order_view "
+        "AS SELECT id, status FROM agctl_schema_test.orders"
+    )
+    _exec_ddl(
+        "COMMENT ON COLUMN agctl_schema_test.orders.status IS 'lifecycle state'"
+    )
+    _exec_ddl("COMMENT ON TABLE agctl_schema_test.orders IS 'Customer orders'")
+
+    # --- Level 1: list relations in the throwaway schema ---
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            FIXTURE,
+            "db",
+            "schema",
+            "--connection",
+            "main-db-writable",
+            "--schema",
+            "agctl_schema_test",
+        ],
+        env=_env(),
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["command"] == "db.schema.tables"
+    res = envelope["result"]
+    assert res["schema_filter"] == "agctl_schema_test"
+    assert res["count"] == 3
+
+    # Exactly three relations: customers (table), orders (table), order_view (view).
+    # Enum TYPE is not a relation and must not appear. Assert the set is exactly
+    # those three; membership-style to tolerate ordering variation.
+    expected = {
+        ("agctl_schema_test", "customers", "table"),
+        ("agctl_schema_test", "orders", "table"),
+        ("agctl_schema_test", "order_view", "view"),
+    }
+    actual = {
+        (it["schema"], it["name"], it["kind"]) for it in res["items"]
+    }
+    assert actual == expected
+
+    # --- Level 2: introspect the orders table ---
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            FIXTURE,
+            "db",
+            "schema",
+            "--connection",
+            "main-db-writable",
+            "--schema",
+            "agctl_schema_test",
+            "--table",
+            "orders",
+        ],
+        env=_env(),
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["command"] == "db.schema.table"
+    res = envelope["result"]
+    assert res["table"] == "orders"
+    assert res["kind"] == "table"
+    assert res["comment"] == "Customer orders"
+
+    # Primary key.
+    assert res["primary_key"] == ["id"]
+
+    # Foreign keys: one entry, customer_id -> customers(id).
+    fks = res["foreign_keys"]
+    assert len(fks) == 1
+    fk = fks[0]
+    assert fk["columns"] == ["customer_id"]
+    assert fk["references_schema"] == "agctl_schema_test"
+    assert fk["references_table"] == "customers"
+    assert fk["references_columns"] == ["id"]
+
+    # Unique constraints: one entry with the two columns in declared order.
+    uqs = res["unique_constraints"]
+    assert len(uqs) == 1
+    assert uqs[0]["columns"] == ["status", "customer_id"]
+
+    # Column-level richness. Index columns by name so ordering is non-load-bearing.
+    cols = {c["name"]: c for c in res["columns"]}
+
+    status = cols["status"]
+    assert status["data_type"].endswith("order_state")
+    assert status["enum_values"] == ["PENDING", "PAID", "CANCELLED"]
+    assert status["nullable"] is False
+    assert status["default"] is not None and "'PENDING'" in status["default"]
+    assert status["comment"] == "lifecycle state"
+
+    audit_id = cols["audit_id"]
+    assert audit_id["generated"] == "always_identity"
+    assert audit_id["default"] is None
+
+    row_total = cols["row_total"]
+    assert row_total["generated"] == "stored"
+    assert row_total["default"] is None
+
+    payload = cols["payload"]
+    assert payload["data_type"] == "jsonb"
+    assert payload["enum_values"] is None
