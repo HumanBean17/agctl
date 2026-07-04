@@ -153,6 +153,7 @@ class FakeConsumer:
         self.store_offset_calls = []
         self.commit_calls = []
         self.seek_calls = []
+        self.poll_calls = 0
         self.list_topics_calls = []
         self.list_topics_result = None
         self.on_assign = None
@@ -209,6 +210,7 @@ class FakeConsumer:
             self._seek_offsets[(tp.topic, tp.partition)] = 0
 
     def poll(self, timeout):
+        self.poll_calls += 1
         if self.poll_error:
             return _ErrMsg()
         # Find next canned message at/after the seek offset for its partition.
@@ -290,6 +292,24 @@ def test_produce_value_can_be_list():
     client.produce("t", [1, 2, 3])
 
     assert fake.calls[0]["value"] == b"[1, 2, 3]"
+
+
+def test_produce_rejects_non_serializable_value():
+    """produce() JSON-encodes the value (json.dumps at encode time); a
+    non-serializable value (e.g. object()) raises TypeError before any broker
+    interaction. This is the produce-time failure the model-level test
+    (test_kafka_reaction_object_value) defers to "later" — a reaction value that
+    survives model validation must still fail loudly at produce time rather than
+    silently coerce.
+    """
+    fake = FakeProducer({})
+    client = KafkaClient("host:9092", producer_factory=lambda c: fake)
+
+    with pytest.raises(TypeError):
+        client.produce("t", object())
+
+    # The producer was never handed the message (encoding failed first).
+    assert fake.calls == []
 
 
 def test_produce_delivery_error_raises_connection_failure():
@@ -740,8 +760,14 @@ def test_consume_loop_retries_then_commits():
     assert handle_calls[1] == ("k1", 2, False)
     assert handle_calls[2] == ("k1", 3, True)  # final attempt
     assert handle_calls[3] == ("k2", 1, False)
-    # Two seeks (retry back to k1 twice)
-    assert len(consumer.seek_calls) == 2
+    # No seeks: retries re-handle the same in-memory message (the seek+re-poll
+    # path was removed — it returned a different-partition message on
+    # multi-partition topics and reset the attempt counter; see
+    # test_consume_loop_retry_rehandles_same_message_in_memory).
+    assert len(consumer.seek_calls) == 0
+    # k1 polled once and re-handled in-memory (not re-polled between attempts);
+    # k2 polled once.
+    assert consumer.poll_calls == 2
     # Two commits (one per message)
     assert len(consumer.commit_calls) == 2
     assert consumer.closed is True
@@ -788,6 +814,121 @@ def test_consume_loop_retry_on_final_treated_as_commit():
     assert len(consumer.commit_calls) == 1
     assert len(consumer.store_offset_calls) == 1  # Fix 4: assert store_offset was called
     assert consumer.closed is True
+
+
+class _InterleavingConsumer:
+    """Models real multi-partition delivery after a seek: the first poll returns
+    the poison message (partition 0); the next returns a message from partition
+    1, then None. This mirrors confluent_kafka's behavior when a seek invalidates
+    one partition's buffer — a buffered message from another partition is
+    delivered first. The old seek+re-poll retry path ran later attempts against
+    this other message and reset the attempt counter, silently spinning on the
+    poison message (no kafka.error, fail-loudly violated).
+    """
+
+    def __init__(self, poison, other):
+        self._poison = poison
+        self._other = other
+        self._stage = 0  # 0 → poison, 1 → other, 2+ → None
+        self.subscribe_calls = []
+        self.store_offset_calls = []
+        self.commit_calls = []
+        self.seek_calls = []
+        self.poll_calls = 0
+        self.closed = False
+
+    def subscribe(self, topics, on_assign=None, on_revoke=None):
+        self.subscribe_calls.append(list(topics))
+
+    def seek(self, tp):
+        self.seek_calls.append(tp)
+
+    def poll(self, timeout):
+        self.poll_calls += 1
+        if self._stage == 0:
+            self._stage = 1
+            return self._poison
+        if self._stage == 1:
+            self._stage = 2
+            return self._other
+        return None
+
+    def store_offset(self, msg):
+        self.store_offset_calls.append(msg)
+
+    def commit(self, offsets=None):
+        self.commit_calls.append(offsets)
+
+    def close(self):
+        self.closed = True
+
+
+def test_consume_loop_retry_rehandles_same_message_in_memory():
+    """Regression: a poison message (always RETRY) on a multi-partition topic
+    must be re-handled in-memory through the final-attempt forced COMMIT, even
+    when the broker would deliver a different-partition message on the next poll.
+
+    The old seek+re-poll path polled a different message after the seek, handled
+    IT (committing it), and re-delivered the poison with the attempt counter
+    reset — never reaching final, never emitting kafka.error, spinning forever.
+    This test fails on that old path (the poison only ever sees attempt 1) and
+    passes once retries re-handle the same in-memory message.
+    """
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    poison = FakeCMsg(topic, 0, 0, "poison", b'{"i":1}', now_ms)
+    other = FakeCMsg(topic, 1, 0, "other", b'{"i":2}', now_ms + 100)
+    consumer = _InterleavingConsumer(poison, other)
+
+    client = KafkaClient(["host:9092"], consumer_factory=lambda conf: consumer)
+    stop_event = threading.Event()
+    handle_calls = []
+
+    def handle(msg, *, attempt, final):
+        key = msg["key"]
+        handle_calls.append((key, attempt, final))
+        if key == "poison":
+            return ReactionResult.RETRY  # always fails → poison message
+        # The other message succeeds and ends the run.
+        stop_event.set()
+        return ReactionResult.COMMIT
+
+    client.consume_loop(
+        topic,
+        group_id="test-group",
+        stop_event=stop_event,
+        handle=handle,
+        poll_timeout=0.1,
+        max_retries=3,
+    )
+
+    # The poison message is re-handled in-memory through all 3 attempts, reaching
+    # final (forced COMMIT) — proving retries do NOT advance past it.
+    poison_attempts = [(a, final) for (k, a, final) in handle_calls if k == "poison"]
+    assert len(poison_attempts) == 3, f"poison must reach final attempt, got: {poison_attempts}"
+    assert poison_attempts == [(1, False), (2, False), (3, True)]
+    # No seek at all (the seek+re-poll path is gone).
+    assert consumer.seek_calls == []
+    # The other message is handled AFTER the poison is fully retried.
+    assert handle_calls[-1] == ("other", 1, False)
+    # Both messages committed (poison via forced final-COMMIT, other normally).
+    assert len(consumer.commit_calls) == 2
+    assert consumer.closed is True
+
+
+def test_consume_loop_max_retries_below_one_rejected():
+    """max_retries < 1 is rejected (would poll forever without handling/committing)."""
+    consumer = FakeConsumer({}, messages=[])
+    client = KafkaClient(["host:9092"], consumer_factory=lambda conf: consumer)
+    stop_event = threading.Event()
+    with pytest.raises(ValueError, match="max_retries"):
+        client.consume_loop(
+            "t",
+            group_id="g",
+            stop_event=stop_event,
+            handle=lambda msg, *, attempt, final: ReactionResult.COMMIT,
+            max_retries=0,
+        )
 
 
 def test_consume_loop_stop_exits_immediately():

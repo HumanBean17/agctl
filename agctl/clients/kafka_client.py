@@ -326,9 +326,10 @@ class KafkaClient:
         :class:`ReactionResult`:
 
         - ``COMMIT``: message processed → ``store_offset(msg)`` + ``commit()``.
-        - ``RETRY``: transient failure → seek back and re-poll (only when
-          ``final`` is False). ``RETRY`` on ``final`` is treated as ``COMMIT``
-          (defensive, avoids deadlock).
+        - ``RETRY``: transient failure → re-handle the same in-memory message
+          (only when ``final`` is False). ``RETRY`` on ``final`` is treated as
+          ``COMMIT`` (defensive poison-message guard). No seek/re-poll: see the
+          retry-loop rationale in the loop body.
         - ``STOP``: exit loop immediately (reactor is done/dying).
 
         The consumer is built with the given ``group_id`` (each reactor has its
@@ -345,6 +346,9 @@ class KafkaClient:
             on_assign: Optional rebalance callback for partition assignment.
             on_revoke: Optional rebalance callback for partition revocation.
         """
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
+
         Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
 
         consumer = self._build_consumer(group_id=group_id)
@@ -360,10 +364,26 @@ class KafkaClient:
                     # Skip individual poll errors
                     continue
 
-                # Retry loop: keep retrying the same message until COMMIT/STOP/max_retries
+                # Retry loop: re-handle the SAME in-memory message until
+                # COMMIT/STOP/max_retries. We deliberately do NOT seek+re-poll:
+                # on a multi-partition topic a post-seek poll() can return a
+                # message from a *different* partition (the seek invalidated this
+                # partition's buffer, so a buffered message from another
+                # partition is delivered first). That would run later attempts
+                # against the wrong message and reset the attempt counter when
+                # the original is re-delivered — silently spinning on a poison
+                # message forever, defeating the final-attempt forced-COMMIT
+                # guard and emitting no kafka.error (violating the fail-loudly
+                # contract, DESIGN §11). The handler only needs the normalized
+                # dict, so re-handling in-memory is correct and simpler; the
+                # commit offset advances only on store_offset+commit, so
+                # crash-recovery positioning is unaffected.
+                normalized = self._normalize_message(msg)
                 for attempt in range(1, max_retries + 1):
+                    if stop_event.is_set():
+                        return
+
                     final = attempt >= max_retries
-                    normalized = self._normalize_message(msg)
                     result = handle(normalized, attempt=attempt, final=final)
 
                     if result == ReactionResult.STOP:
@@ -379,24 +399,8 @@ class KafkaClient:
                             raise ConnectionFailure(message=str(exc)) from exc
                         break  # Move to next message
 
-                    # RETRY (not final): seek back to retry same message
-                    tp = TopicPartition(
-                        topic, msg.partition(), msg.offset()
-                    )
-                    try:
-                        consumer.seek(tp)
-                    except KafkaException as exc:
-                        raise ConnectionFailure(message=str(exc)) from exc
-
-                    # Check stop_event before re-poll (Fix 3)
-                    if stop_event.is_set():
-                        return
-
-                    # Re-poll the same message for next retry attempt
-                    msg = consumer.poll(poll_timeout)
-                    if msg is None or msg.error():
-                        # If re-poll fails, break to avoid infinite loop
-                        break
+                    # RETRY (not final): re-handle the same in-memory message
+                    # (loop continues to the next attempt — no seek, no re-poll).
         finally:
             try:
                 consumer.close()

@@ -396,7 +396,7 @@ command layer (`_kafka_ssl_conf`).
   older than the window, the result is `-1`; the client seeks such partitions to
   `OFFSET_END`, else `auto.offset.reset=earliest` would re-read every stale
   message and violate the window.
-- **`consume_loop`** — committed consume loop for mock reactors. The reactor owns its consumer lifecycle (D13); each message invokes a `handle(message, attempt, final)` callback and returns a `ReactionResult` (`COMMIT` → store_offset + commit; `RETRY` → seek back and retry; `STOP` → exit loop). Supports `max_retries`, `stop_event`, and optional rebalance callbacks (`on_assign`/`on_revoke`). The consumer is closed in `finally` after the loop exits.
+- **`consume_loop`** — committed consume loop for mock reactors. The reactor owns its consumer lifecycle (D13); each message invokes a `handle(message, attempt, final)` callback and returns a `ReactionResult` (`COMMIT` → store_offset + commit; `RETRY` → re-handle the same in-memory message; `STOP` → exit loop). Supports `max_retries` (must be >= 1), `stop_event`, and optional rebalance callbacks (`on_assign`/`on_revoke`). The consumer is closed in `finally` after the loop exits.
 - **`probe`** — one-shot broker connectivity check. Builds a consumer, calls `list_topics(topic, timeout)`, and closes the consumer. Raises `ConnectionFailure` on any Kafka/broker error (the engine calls this at startup before binding HTTP to satisfy the spec §11 "broker unreachable at startup → exit 2" guarantee).
 - **Test seams** — `producer_factory`/`consumer_factory` inject fakes sharing
   the real Producer/Consumer contract.
