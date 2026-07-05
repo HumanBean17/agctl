@@ -477,7 +477,13 @@ def test_http_request_match_assertion_fail(mock_transport, captured):
         assert payload["ok"] is False
         assert payload["error"]["type"] == "AssertionError"
         assert payload["error"]["detail"]["failures"] == [
-            {"mode": "match", "expr": '.body.status=="PENDING"', "result": False}
+            {
+                "mode": "match",
+                "expr": '.body.status=="PENDING"',
+                "result": False,
+                "root": "response envelope",
+                "body": {"status": "PAID"},
+            }
         ]
     finally:
         http_commands.set_default_transport(None)
@@ -569,7 +575,13 @@ def test_http_request_contains_assertion_fail(mock_transport, captured):
         assert payload["ok"] is False
         assert payload["error"]["type"] == "AssertionError"
         assert payload["error"]["detail"]["failures"] == [
-            {"mode": "contains", "needle": {"status": "PENDING"}, "matched": False}
+            {
+                "mode": "contains",
+                "needle": {"status": "PENDING"},
+                "matched": False,
+                "root": "response body",
+                "body": {"status": "PAID"},
+            }
         ]
     finally:
         http_commands.set_default_transport(None)
@@ -661,3 +673,210 @@ def test_http_request_match_with_jq_missing_is_config_error(
     assert payload["ok"] is False
     assert payload["error"]["type"] == "ConfigError"
     assert "agctl[jq]" in payload["error"]["message"]
+
+
+def test_http_match_help_states_response_envelope_root():
+    """Regression (battle-test incident): the agent trusted --help's old
+    'response body' wording and wrote body-rooted .data.operator. The --match
+    help MUST now name the response envelope so the root is unambiguous."""
+    for cmd in (http_commands.http_call, http_commands.http_request):
+        match_opt = next(p for p in cmd.params if p.name == "match")
+        assert "response envelope" in match_opt.help
+        assert "response body" not in match_opt.help
+
+
+# --------------------------------------------------------------------------- #
+# http request --url mode (free-form URL, no configured service required)
+# --------------------------------------------------------------------------- #
+
+
+def test_http_request_url_mode_hits_full_url(mock_transport, captured):
+    """--url sends to the full URL; result.url reflects it; no service needed."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "request",
+            "--url",
+            "https://example.invalid:8443/api/v1/orders/ord-1",
+            "--method",
+            "GET",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 0
+    assert payload["command"] == "http.request"
+    assert payload["ok"] is True
+    sent_url = str(captured["requests"][0].url)
+    assert sent_url == "https://example.invalid:8443/api/v1/orders/ord-1"
+    assert payload["result"]["url"] == sent_url
+    assert payload["result"]["method"] == "GET"
+
+
+def test_http_request_url_method_defaults_get(mock_transport, captured):
+    """--url with no --method defaults to GET (parity with http ping free-form)."""
+    result = _run(
+        ["--config", str(FIXTURE), "http", "request", "--url", "https://host/health"]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 0
+    assert payload["result"]["method"] == "GET"
+    assert captured["requests"][0].method == "GET"
+
+
+def test_http_request_url_preserves_query_string(mock_transport, captured):
+    """--url query string is forwarded intact."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "request",
+            "--url",
+            "https://host/api?x=1&y=2",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 0
+    assert str(captured["requests"][0].url) == "https://host/api?x=1&y=2"
+
+
+def test_http_request_url_malformed_no_scheme(mock_transport, captured):
+    """A schemeless --url -> ConfigError exit 2; no request is sent."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "request",
+            "--url",
+            "host/path",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+    assert len(captured["requests"]) == 0
+
+
+def test_http_request_url_rejects_non_http_scheme(mock_transport, captured):
+    """A non-http(s) scheme (e.g. ftp://) -> ConfigError at resolve time, not a
+    confusing httpx-layer error later. No request is sent."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "request",
+            "--url",
+            "ftp://host/file",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+    assert len(captured["requests"]) == 0
+
+
+def test_http_request_url_mutually_exclusive_with_service(mock_transport, captured):
+    """--url + --service -> ConfigError exit 2; no request is sent."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "request",
+            "--url",
+            "https://host/x",
+            "--service",
+            "order-service",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+    assert len(captured["requests"]) == 0
+
+
+def test_http_request_url_mutually_exclusive_with_path(mock_transport, captured):
+    """--url + --path -> ConfigError exit 2."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "request",
+            "--url",
+            "https://host/x",
+            "--path",
+            "/y",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+
+
+def test_http_request_neither_url_nor_service(mock_transport, captured):
+    """No --url and no --service -> ConfigError (exactly one mode is required)."""
+    result = _run(
+        ["--config", str(FIXTURE), "http", "request", "--method", "GET"]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+
+
+def test_http_request_service_mode_method_defaults_get(mock_transport, captured):
+    """Service mode also picks up the --method GET default (behavior change)."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "request",
+            "--service",
+            "order-service",
+            "--path",
+            "/x",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 0
+    assert payload["result"]["method"] == "GET"
+
+
+def test_http_request_url_mode_status_assertion(mock_transport, captured):
+    """Response assertion flags pass through unchanged in URL mode."""
+    http_commands.set_default_transport(_transport_returning(201, {"id": "x"}))
+    try:
+        result = _run(
+            [
+                "--config",
+                str(FIXTURE),
+                "http",
+                "request",
+                "--url",
+                "https://host/x",
+                "--method",
+                "POST",
+                "--status",
+                "201",
+            ]
+        )
+        payload = json.loads(result.output)
+
+        assert result.exit_code == 0
+        assert payload["result"]["status_code"] == 201
+    finally:
+        http_commands.set_default_transport(None)

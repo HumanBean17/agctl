@@ -133,3 +133,48 @@ templates:
 defaults:
   timeout_seconds: 10
   database_connection: main-db
+
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      charge-ok:
+        description: "Successful charge for a payment"
+        method: POST
+        path: /v1/charge
+        match:
+          body:
+            amount_cents: 1000
+        response:
+          status: 200
+          headers:
+            Content-Type: application/json
+          body:
+            status: ok
+      healthz:
+        description: "Health check endpoint"
+        method: GET
+        path: /healthz
+        response:
+          status: 200
+          body:
+            status: ok
+  kafka:
+    reactors:
+      order-confirmation:
+        description: "Confirm an order when ORDER_CREATED is seen"
+        topic: orders.created
+        consumer_group: mock-order-reactor
+        match: '.value.eventType == "ORDER_CREATED"'
+        reaction:
+          topic: orders.confirmed
+          value:
+            event: ORDER_CONFIRMED
+      payment-audit:
+        description: "Audit log on PAYMENT_FAILED"
+        topic: payments.events
+        consumer_group: mock-payment-audit
+        reaction:
+          topic: audit.events
+          value:
+            kind: payment_failed

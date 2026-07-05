@@ -91,6 +91,15 @@ def test_render_json_type_emits_json_dumps_string():
     assert out == json.dumps({"a": 1})
 
 
+def test_render_json_type_preserves_non_ascii():
+    # A json-typed capture must not \u-escape non-ASCII: the produced string is
+    # embedded verbatim in the envelope, so escapes would survive even after
+    # the emit-level ensure_ascii=False fix.
+    out = render_typed("{ctx}", {"ctx": CaptureValue({"name": "Иван"}, "json")})
+    assert out == '{"name": "Иван"}'
+    assert "\\u" not in out
+
+
 def test_render_object_whole_field_returns_live_object():
     out = render_typed({"context": "{ctx}"}, {"ctx": CaptureValue({"a": 1}, "object")})
     assert out == {"context": {"a": 1}}

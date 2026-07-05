@@ -35,15 +35,17 @@ agctl discover --category http-templates
 agctl discover --category kafka-patterns
 agctl discover --category db-templates
 agctl discover --category services
+agctl discover --category mock-http-stubs
+agctl discover --category mock-kafka-reactors
 ```
 
 Then `agctl discover --category <X> --name <Y>` for any template you intend to
 use, to read its params and example before invoking it.
 
-**`discover` has no `mocks` category** (DESIGN §3.7 lists only `services`,
-`http-templates`, `kafka-patterns`, `db-templates`). To ground a mock fixture,
-read the `mocks:` section of `agctl.yaml` directly — the same way the
-`agctl-config` skill reads config. Do not invent stubs.
+**Mocks have their own categories** — `mock-http-stubs` and `mock-kafka-reactors`.
+To ground a mock fixture, run `agctl discover --category mock-http-stubs` /
+`mock-kafka-reactors` (and `--name <Y>` for full detail) — the same way you ground
+templates. Do not invent stubs.
 
 ### 3. Design
 

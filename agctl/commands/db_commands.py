@@ -284,6 +284,10 @@ def _db_assert_core(
                     "actual": actual,
                     "sql": sql_text,
                     "connection": conn_name,
+                    # Sample of the actual rows so the agent can see what the
+                    # query returned without a follow-up `db query` (capped to
+                    # the first 5; `actual` holds the true count).
+                    "rows": rows[:5],
                 },
             )
         return {
@@ -299,7 +303,7 @@ def _db_assert_core(
     if not rows:
         raise AssertionFailure(
             "Expected a row but query returned none",
-            {"sql": sql_text, "connection": conn_name},
+            {"sql": sql_text, "connection": conn_name, "rows": []},
         )
     first_row = rows[0]
     actual = coerce_db_value(jq_value(first_row, path))
@@ -312,6 +316,10 @@ def _db_assert_core(
                 "expected": expected,
                 "actual": actual,
                 "connection": conn_name,
+                # --path is rooted at the FIRST ROW; echo it so the agent can see
+                # the surrounding fields (issue #5) instead of re-running db query.
+                "root": "first row",
+                "row": first_row,
             },
         )
     return {
@@ -337,7 +345,7 @@ def _db_assert_core(
     default=False,
     help="Assert a cell value via --path/--equals",
 )
-@click.option("--path", "path", default=None, help="jq path to the cell (expect-value)")
+@click.option("--path", "path", default=None, help="jq path into the FIRST ROW (expect-value), e.g. .status")
 @click.option("--equals", "equals", default=None, help="Expected value (expect-value)")
 @click.option(
     "--assertion",

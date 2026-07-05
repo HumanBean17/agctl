@@ -21,6 +21,12 @@ invocation prints **one JSON object** on stdout and exits deterministically:
 Read `ok` first; on `false` read `error.type`. Parse **stdout only** — stderr is
 diagnostics. For any command's exact flags run `agctl <cmd> --help`.
 
+**Pin the version you target.** `--match`/`--jq-path` roots and failure shapes
+moved in agctl ≥1.0 (dialect v2). A stale global install (e.g. `0.1.0`, where
+`--match` was body-rooted) silently contradicts this skill. After upgrading the
+project's agctl, reinstall in every environment that runs it
+(`pip install -U 'agctl[jq]'`) so `--help` and behavior match the docs.
+
 ## Orient first: `agctl discover`
 
 `discover` is a map, not a dump — it tells you what's configured. Don't guess
@@ -32,7 +38,7 @@ agctl discover --category http-templates              # names + one-line descrip
 agctl discover --category http-templates --name NAME  # params + a copy-paste example
 agctl discover --search payment                       # cross-category keyword search
 ```
-Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`.
+Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`, `mock-http-stubs`, `mock-kafka-reactors`.
 
 ## Which command for which intent
 
@@ -40,7 +46,7 @@ Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`.
 |---|---|
 | What can I do here? | `agctl discover` |
 | Send a known request | `agctl http call <tpl> [--param k=v]…` |
-| Ad-hoc request | `agctl http request --service S --method M --path P` |
+| Ad-hoc request | `agctl http request --service S --path P` or `--url <full-url>` |
 | Assert an HTTP response | `agctl http call <tpl> --status N [--contains '{…}'] [--match '<jq>'] [--jq-path .x --equals v]` |
 | Verify an event was published | `agctl kafka assert --topic T <mode> --timeout N` |
 | See what was published | `agctl kafka consume --topic T [--match <jq>]` |
@@ -64,9 +70,9 @@ Only `--config <path>` is global. `--timeout` is **not** global (see gotchas).
 ```
 agctl http call   <tpl> [--param k=v]… [--body '{…}'] [--header k=v]… [--timeout N]
                     [--status N] [--contains '{…}'] [--match '<jq>'] [--jq-path <jq> --equals <v>]
-agctl http request --service S --method GET|POST|PUT|PATCH|DELETE --path P [--body '{…}'] [--header k=v]…
+agctl http request (--service S --path P | --url <full-url>) [--method GET|POST|PUT|PATCH|DELETE] [--body '{…}'] [--header k=v]…
                     [--status N] [--contains '{…}'] [--match '<jq>'] [--jq-path <jq> --equals <v>]
-agctl http ping   [<tpl> | --service S --path P] --interval N [--duration N | --until-stopped]   # streams NDJSON; background it
+agctl http ping   [<tpl> | --service S --path P | --url <full-url>] --interval N [--duration N | --until-stopped]   # streams NDJSON; background it
 
 agctl kafka assert [--topic T] <mode> [--param k=v]… [--path <jq>] --timeout N [--from-beginning]
 agctl kafka consume --topic T [--timeout N] [--match '<jq>'] [--expect-count N] [--from-beginning]
@@ -157,24 +163,33 @@ agctl config migrate [--config <path>] [--dry-run]
     connection cannot actually `SELECT` from — discovering a name is not a
     grant. Treat the listing as "visible," not "accessible"; let the
     subsequent `SELECT` fail loudly if privileges are missing.
-12. **`mock stop` uses the strict failure rule.** Unlike `mock run`'s own exit
+12. **Assertion failures now self-document their root + payload.**
+    When `--match`/`--jq-path`/`--contains`/`--path`/`--equals` assertions fail,
+    read `error.detail.failures[].root` (HTTP) or `error.detail.root` (DB) or
+    `error.detail.modes[].root` (Kafka) to see what the expression was evaluated
+    against: `"response envelope"` vs `"response body"` (HTTP), `"message envelope"`
+    vs `"message value"` (Kafka), `"first row"` (DB `--path`). The payload snapshot
+    (`"body"` / `"row"` / `"rows"` / `"modes"`) shows the actual data so you can
+    correct a mis-rooted jq path (e.g. `.data.operator` → `.body.data.operator`)
+    without dropping the flag and re-running raw.
+13. **`mock stop` uses the strict failure rule.** Unlike `mock run`'s own exit
     rule (exit 1 only when `kafka_errors > 0`), `mock stop` treats **any** of
     `http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, or
     `kafka.error` as fatal and exits 1. `capture.missing` is non-fatal but
     surfaced in the failure list. The verdict travels in `error.detail` on a
     fatal stop (exit 1) and in `result` on a clean stop (exit 0).
-13. **`mock stop`'s `--all` selector returns an array of verdicts.** With
+14. **`mock stop`'s `--all` selector returns an array of verdicts.** With
     `--all`, `stop` iterates every running mock in `--state-dir` and returns
     `result.stopped` as an array (one entry per mock). If any mock had a
     fatal failure, exit 1 carries the array in `error.detail.stopped`. With a
     single selector (`--listen`/`--pid`/no-arg), `stopped` is a boolean, not
     an array.
-14. **`mock start` is the readiness gate.** The command blocks until the
+15. **`mock start` is the readiness gate.** The command blocks until the
     daemon's `started` line appears in the log (or a startup error/timeout),
     then returns. No separate polling step is needed — the old four-step
     protocol (redirect → poll → SIGTERM → grep) is now `mock start` → `mock
     stop`.
-15. **Daemon state under `.agctl/` is the only on-disk state.** Managed
+16. **Daemon state under `.agctl/` is the only on-disk state.** Managed
     daemons write a pidfile (`mock-<port>.pid`) and log (`mock-<port>.log`)
     under `<state-dir>/` (default `./.agctl/`). This is the sole exception to
     `agctl`'s stateless-invocation principle, scoped to the daemon lifecycle.
@@ -392,6 +407,9 @@ agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001 
   --status 201 --match '.body.order_id != null' --contains '{"status": "PENDING"}'
 # Type-aware value equality via jq path (0 ≠ "0"; pairing needs both flags)
 agctl http call get-order --param order_id=ord-789 --jq-path '.status' --equals '"CONFIRMED"'
+
+# Ad-hoc request to a URL not in config (no service registration needed)
+agctl http request --url https://abc123.ngrok.io/api/v1/orders/ord-789
 
 # E2E: thread an ID through HTTP → Kafka → DB
 OID=$(agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001 | jq -r '.result.body.order_id')
