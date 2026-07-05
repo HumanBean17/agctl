@@ -9,6 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from agctl.cli import cli
+from agctl.mock.daemon import is_alive
 
 # Test fixture config (minimal, version 2.0)
 MINIMAL_CONFIG = """version: "2.0"
@@ -52,6 +53,20 @@ def sleeper_pids():
             os.kill(pid, 15)  # SIGTERM
         except (ProcessLookupError, OSError):
             pass  # Already dead
+        # Poll for liveness with a short grace period
+        if is_alive(pid):
+            import time
+            for _ in range(10):  # Up to ~1s total
+                time.sleep(0.1)
+                if not is_alive(pid):
+                    break
+            # If still alive, escalate to SIGKILL
+            if is_alive(pid):
+                try:
+                    os.kill(pid, 9)  # SIGKILL
+                except (ProcessLookupError, OSError):
+                    pass  # Died between poll and kill
+        # Best-effort reap
         try:
             os.waitpid(pid, os.WNOHANG)
         except (ChildProcessError, OSError):

@@ -109,22 +109,21 @@ def test_mock_daemon_round_trip(tmp_path: Path, with_failure: bool) -> None:
         ],
     )
 
-    # Parse the envelope from start's stdout
-    start_envelope = json.loads(result.output)
-    assert result.exit_code == 0, f"start failed: {result.output}"
-    assert start_envelope["ok"] is True
-    assert start_envelope["result"]["pid"] is not None
-    assert isinstance(start_envelope["result"]["pid"], int)
-    assert start_envelope["result"]["listen"] == f"127.0.0.1:{port}"
-    assert start_envelope["result"]["stubs"] == 1
-
-    pid = start_envelope["result"]["pid"]
-
-    # Assert pidfile exists
-    pidfile = state_dir / f"mock-{port}.pid"
-    assert pidfile.exists(), "pidfile should exist after start"
-
     try:
+        # Parse the envelope from start's stdout
+        start_envelope = json.loads(result.output)
+        assert result.exit_code == 0, f"start failed: {result.output}"
+        assert start_envelope["ok"] is True
+        assert start_envelope["result"]["pid"] is not None
+        assert isinstance(start_envelope["result"]["pid"], int)
+        assert start_envelope["result"]["listen"] == f"127.0.0.1:{port}"
+        assert start_envelope["result"]["stubs"] == 1
+
+        pid = start_envelope["result"]["pid"]
+
+        # Assert pidfile exists
+        pidfile = state_dir / f"mock-{port}.pid"
+        assert pidfile.exists(), "pidfile should exist after start"
         # Step 3: Hit the /ping endpoint (both variants)
         ping_url = f"http://127.0.0.1:{port}/ping"
         with request.urlopen(ping_url, timeout=5) as response:
@@ -136,9 +135,9 @@ def test_mock_daemon_round_trip(tmp_path: Path, with_failure: bool) -> None:
         if with_failure:
             unmatched_url = f"http://127.0.0.1:{port}/no-such-path"
             try:
-                with request.urlopen(unmatched_url, timeout=5) as response:
-                    # If we get here, it's a 404 (expected)
-                    assert response.status == 404, f"expected 404, got {response.status}"
+                request.urlopen(unmatched_url, timeout=5)
+                # If we get here, something is wrong - 404 should raise
+                assert False, "expected HTTPError for 404 response"
             except urllib_error.HTTPError as e:
                 # 404 is expected - this generates the http.unmatched event
                 assert e.code == 404, f"expected 404, got {e.code}"
