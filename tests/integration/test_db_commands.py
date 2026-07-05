@@ -354,3 +354,91 @@ def test_db_schema_live_introspection(require_postgres):
     payload = cols["payload"]
     assert payload["data_type"] == "jsonb"
     assert payload["enum_values"] is None
+
+
+def test_db_schema_standalone_unique_index_surfaces(require_postgres):
+    """A standalone ``CREATE UNIQUE INDEX`` (no ``pg_constraint`` backing) must
+    appear in ``unique_constraints``, a ``pg_constraint``-backed ``UNIQUE`` must
+    NOT be double-counted, and a plain non-unique index must NOT leak in.
+
+    This verifies the SQL-level ``NOT EXISTS`` / ``NOT indisprimary`` /
+    ``indpred IS NULL`` predicates in the ``pg_index`` discovery query — the
+    FakeCursor unit tests cannot evaluate SQL, so the filtering is only
+    meaningfully provable here against a real Postgres. ``require_postgres``
+    skips when Postgres is unreachable.
+    """
+    import json
+
+    # Throwaway schema so this is isolated from other tests' objects.
+    _exec_ddl("DROP SCHEMA IF EXISTS agctl_uniq_test CASCADE")
+    _exec_ddl("CREATE SCHEMA agctl_uniq_test")
+    _exec_ddl(
+        "CREATE TABLE agctl_uniq_test.t ("
+        "id integer PRIMARY KEY, "
+        "email text NOT NULL, "
+        "external_ref text, "
+        "code text, "
+        "tag text, "
+        "UNIQUE (email)"  # pg_constraint-backed unique (contype='u')
+        ")"
+    )
+    # Standalone unique index: NO pg_constraint entry -> only the pg_index
+    # query surfaces it. This is the case the fix adds support for.
+    _exec_ddl(
+        "CREATE UNIQUE INDEX t_external_ref_uidx "
+        "ON agctl_uniq_test.t (external_ref)"
+    )
+    # Expression unique index: indkey placeholder is 0, so it has no column
+    # list to map. Must be SKIPPED (not surfaced as a misleading empty-cols
+    # entry). The driver filters this at the row-mapping layer.
+    _exec_ddl(
+        "CREATE UNIQUE INDEX t_code_lower_uidx "
+        "ON agctl_uniq_test.t (lower(code))"
+    )
+    # Partial unique index: excluded by the ``indpred IS NULL`` predicate.
+    _exec_ddl(
+        "CREATE UNIQUE INDEX t_tag_partial_uidx "
+        "ON agctl_uniq_test.t (tag) WHERE tag IS NOT NULL"
+    )
+    # Plain (non-unique) index: must NOT appear in unique_constraints.
+    _exec_ddl("CREATE INDEX t_id_nonunique ON agctl_uniq_test.t (id)")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            FIXTURE,
+            "db",
+            "schema",
+            "--connection",
+            "main-db-writable",
+            "--schema",
+            "agctl_uniq_test",
+            "--table",
+            "t",
+        ],
+        env=_env(),
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    uqs = envelope["result"]["unique_constraints"]
+
+    pairs = {(u["name"], tuple(u["columns"])) for u in uqs}
+    # pg_constraint-backed UNIQUE(email) captured EXACTLY ONCE (not double-counted
+    # by the pg_index query whose NOT EXISTS excludes constraint-backed indexes).
+    assert sum(1 for u in uqs if tuple(u["columns"]) == ("email",)) == 1
+    # Standalone unique index surfaced by the pg_index query.
+    assert ("t_external_ref_uidx", ("external_ref",)) in pairs
+    # Primary key not duplicated into unique_constraints.
+    assert all("id" != tuple(u["columns"]) for u in uqs)
+    # Plain non-unique index must not leak in.
+    assert all(u["name"] != "t_id_nonunique" for u in uqs)
+    # Expression unique index (indkey=0) skipped — no misleading empty-cols entry.
+    assert all(u["name"] != "t_code_lower_uidx" for u in uqs)
+    assert all(u["columns"] != [] for u in uqs)
+    # Partial unique index excluded by the indpred IS NULL predicate.
+    assert all(u["name"] != "t_tag_partial_uidx" for u in uqs)
+    # No duplicate entries overall.
+    assert len(uqs) == len({u["name"] for u in uqs})
+

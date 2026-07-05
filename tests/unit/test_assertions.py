@@ -108,6 +108,50 @@ def test_compile_jq_missing_jq_message_names_agctl_jq_extra(monkeypatch):
     assert "agctl[jq]" in exc_info.value.message
 
 
+# --- compile_jq: hyphenated-key hint --------------------------------------
+# jq parses `.headers.x-request-id` as subtraction (`.headers.x - request - id`)
+# -> baffling "request/0 is not defined" compile error. compile_jq appends a
+# targeted bracket-notation hint when the failing expression looks like a
+# dotted path with a hyphenated final segment.
+def test_compile_jq_hyphenated_header_key_hint_appended():
+    from agctl.errors import ConfigError
+
+    with pytest.raises(ConfigError) as exc_info:
+        compile_jq(".headers.x-request-id")
+    assert "bracket notation" in exc_info.value.message
+    # detail dict still carries expr/label
+    assert exc_info.value.detail["expr"] == ".headers.x-request-id"
+
+
+def test_compile_jq_hyphenated_body_field_hint_appended():
+    from agctl.errors import ConfigError
+
+    with pytest.raises(ConfigError) as exc_info:
+        compile_jq(".body.event-id", label="evt")
+    assert "bracket notation" in exc_info.value.message
+    assert exc_info.value.detail["label"] == "evt"
+
+
+def test_compile_jq_bracket_notation_compiles_no_hint():
+    # correct bracket-notation form compiles fine -> no raise, no hint.
+    assert compile_jq('.headers["x-request-id"]') is None
+
+
+def test_compile_jq_broken_expr_without_hyphen_has_no_hint():
+    from agctl.errors import ConfigError
+
+    with pytest.raises(ConfigError) as exc_info:
+        compile_jq(".foo bar")
+    assert "bracket notation" not in exc_info.value.message
+
+
+def test_compile_jq_event_type_field_compiles_due_to_type_builtin():
+    # `.body.event-type` parses as `.body.event - type` where `type` IS a jq
+    # builtin -> compiles fine, so no raise and no hint. (Hyphenated-key
+    # hinting is gated on a compile failure; this case does not fail.)
+    assert compile_jq(".body.event-type") is None
+
+
 # --- jq lazy import (Fix A) ------------------------------------------------
 def test_jq_missing_raises_config_error(monkeypatch):
     """When the optional `jq` library is unavailable, jq_bool/jq_value surface a
@@ -257,6 +301,45 @@ def test_tae_bool_int_numeric_equality():
 
 def test_tae_one_vs_string_one():
     assert type_aware_equal(1, "1") is False
+
+
+# --- type_aware_equal: ISO 8601 timestamp normalization -------------------
+# DESIGN §3.3 tells users to write --equals "2026-06-29T14:22:00Z", but
+# coerce_db_value emits ".isoformat()" -> "...+00:00". Both are valid ISO 8601
+# for the same UTC instant; the comparison layer must treat them as equal.
+def test_tae_timestamp_z_vs_utc_offset_equal():
+    assert type_aware_equal("2026-06-29T14:22:00Z", "2026-06-29T14:22:00+00:00") is True
+
+
+def test_tae_timestamp_z_vs_different_offset_not_equal():
+    assert type_aware_equal("2026-06-29T14:22:00Z", "2026-06-29T14:22:00+05:00") is False
+
+
+def test_tae_timestamp_naive_treated_as_utc_equal_z():
+    assert type_aware_equal("2026-06-29T14:22:00", "2026-06-29T14:22:00Z") is True
+
+
+def test_tae_timestamp_z_vs_utc_offset_end_to_end_via_coerce_db_value():
+    # Regression-of-record: the exact pair from DESIGN §3.3 vs coerce_db_value.
+    aware = datetime.datetime(2026, 6, 29, 14, 22, 0, tzinfo=datetime.timezone.utc)
+    assert type_aware_equal(parse_equals("2026-06-29T14:22:00Z"), coerce_db_value(aware)) is True
+
+
+def test_tae_non_timestamp_with_T_falls_back_to_string_equality():
+    # Contains "T" but is not a valid datetime -> plain string compare.
+    assert type_aware_equal("xTy", "xTy") is True
+    assert type_aware_equal("xTy", "xTz") is False
+
+
+def test_tae_date_only_string_unaffected():
+    # No "T" -> never parsed as a datetime, plain string compare.
+    assert type_aware_equal("2026-06-29", "2026-06-29") is True
+
+
+def test_tae_lists_and_dicts_compare_elementwise():
+    assert type_aware_equal([1, 2], [1, 2]) is True
+    assert type_aware_equal([1, 2], [1, 3]) is False
+    assert type_aware_equal({"a": 1}, {"a": 1}) is True
 
 
 # --- validate_http_assertion_args -----------------------------------------

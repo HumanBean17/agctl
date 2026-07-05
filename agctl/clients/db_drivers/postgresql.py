@@ -567,6 +567,60 @@ class PostgreSQLDriver:
                     }
                 )
 
+        # Standalone unique indexes (CREATE UNIQUE INDEX ...): these have NO
+        # pg_constraint entry, so the constraint query above misses them.
+        # Query pg_index for unique, non-primary, non-partial indexes that do
+        # NOT back a pg_constraint (the NOT EXISTS excludes indexes already
+        # captured above, preventing double-counting), and append each to
+        # unique_constraints in the same {"name", "columns"} shape so the
+        # constraints-then-indexes ordering is preserved. indkey is an
+        # int2vector that psycopg may return as a string ("1 2") or a list
+        # ([1, 2]); normalize defensively and map attnums to names via the
+        # attnum_to_name map built above (skip any not found, mirroring the
+        # PK/FK mapping).
+        cur.execute(
+            "SELECT c.relname AS indexname, i.indkey AS indkey "
+            "FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE i.indrelid = %(oid)s "
+            "AND i.indisunique "
+            "AND NOT i.indisprimary "
+            "AND i.indpred IS NULL "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM pg_constraint con "
+            "WHERE con.conindid = i.indexrelid) "
+            "ORDER BY c.relname",
+            {"oid": oid},
+        )
+        idx_desc = [d.name for d in (cur.description or [])]
+        for row in cur.fetchall():
+            irec = dict(zip(idx_desc, row))
+            raw_indkey = irec.get("indkey") or []
+            if isinstance(raw_indkey, str):
+                attnums = [int(part) for part in raw_indkey.split()]
+            else:
+                attnums = [int(k) for k in raw_indkey]
+            # pg_index.indkey uses 0 as the placeholder for expression columns
+            # (the actual expression lives in pg_index.indexprs). An expression
+            # unique index (e.g. CREATE UNIQUE INDEX ... ON t (lower(email)))
+            # therefore has no column list to map; skip it rather than emit a
+            # misleading {"columns": []} entry. The column-oriented contract of
+            # unique_constraints can't honestly represent an expression.
+            if 0 in attnums:
+                continue
+            cols = [
+                attnum_to_name[k]
+                for k in attnums
+                if attnum_to_name.get(k) is not None
+            ]
+            # Defensive: if nothing mappable survived, skip rather than emit
+            # an empty-columns entry.
+            if not cols:
+                continue
+            unique_constraints.append(
+                {"name": irec.get("indexname"), "columns": cols}
+            )
+
         return {
             "schema": schema_name,
             "table": table_name,
