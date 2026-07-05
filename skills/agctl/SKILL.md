@@ -56,7 +56,7 @@ Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`, `moc
 | Assert a DB field value | `agctl db assert (…) --expect-value --path .x --equals v` |
 | Inspect raw DB state | `agctl db query (--template\|--sql)` |
 | Discover live DB schema | `agctl db schema [--connection C] [--schema S] [--table T]` |
-| Impersonate a dependency (HTTP stub / Kafka reaction) | `agctl mock run` |
+| Impersonate a dependency (HTTP stub / Kafka reaction) | `agctl mock run` / `mock start` / `mock stop` / `mock status` |
 | Are services up? | `agctl check ready --all` |
 | Validate / debug config | `agctl config validate` / `config show` |
 | Migrate v1 config to dialect `"2"` | `agctl config migrate [--dry-run]` |
@@ -84,6 +84,9 @@ agctl db execute  (--template T | --sql "…") [--param k=v]… [--connection C]
 agctl db schema   [--connection C] [--schema S] [--table T]                # read-only; NO --write/--template/--sql/--param
 
 agctl mock run    [--only http|kafka] [--http-listen H:P] [--fail-fast] [--duration N | --until-stopped]   # streams NDJSON; background it
+agctl mock start  [--only http|kafka] [--http-listen H:P] [--fail-fast] [--duration N] [--state-dir <path>]
+agctl mock stop   [--listen H:P | --pid <pid> | --all] [--timeout N] [--state-dir <path>]
+agctl mock status [--listen H:P] [--state-dir <path>]
 
 agctl check ready [--service S | --all]
 agctl config validate | config show [--unmask]
@@ -104,7 +107,9 @@ agctl config migrate [--config <path>] [--dry-run]
 1. **Two streaming commands** — `http ping` (one JSON object **per ping**) and
    `mock run` (one NDJSON event line as things happen, plus a final `summary`).
    Both are meant to run backgrounded with `&` and `kill`ed when done. Exits `0`
-   (all ok) / `1` (any failed). Everything else emits exactly one object.
+   (all ok) / `1` (any failed). The managed daemon commands (`mock start`/
+   `stop`/`status`) are NOT streaming — each emits exactly one JSON object
+   like all other non-streaming commands. Everything else emits exactly one object.
 2. **A 4xx/5xx HTTP response is `ok:true` — unless you assert.** Status is a
    *result*, not an error. Add `--status` / `--contains` / `--match` / `--jq-path` /
    `--equals` to `http call` / `http request` to flip a wrong response into
@@ -167,6 +172,28 @@ agctl config migrate [--config <path>] [--dry-run]
     (`"body"` / `"row"` / `"rows"` / `"modes"`) shows the actual data so you can
     correct a mis-rooted jq path (e.g. `.data.operator` → `.body.data.operator`)
     without dropping the flag and re-running raw.
+13. **`mock stop` uses the strict failure rule.** Unlike `mock run`'s own exit
+    rule (exit 1 only when `kafka_errors > 0`), `mock stop` treats **any** of
+    `http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, or
+    `kafka.error` as fatal and exits 1. `capture.missing` is non-fatal but
+    surfaced in the failure list. The verdict travels in `error.detail` on a
+    fatal stop (exit 1) and in `result` on a clean stop (exit 0).
+14. **`mock stop`'s `--all` selector returns an array of verdicts.** With
+    `--all`, `stop` iterates every running mock in `--state-dir` and returns
+    `result.stopped` as an array (one entry per mock). If any mock had a
+    fatal failure, exit 1 carries the array in `error.detail.stopped`. With a
+    single selector (`--listen`/`--pid`/no-arg), `stopped` is a boolean, not
+    an array.
+15. **`mock start` is the readiness gate.** The command blocks until the
+    daemon's `started` line appears in the log (or a startup error/timeout),
+    then returns. No separate polling step is needed — the old four-step
+    protocol (redirect → poll → SIGTERM → grep) is now `mock start` → `mock
+    stop`.
+16. **Daemon state under `.agctl/` is the only on-disk state.** Managed
+    daemons write a pidfile (`mock-<port>.pid`) and log (`mock-<port>.log`)
+    under `<state-dir>/` (default `./.agctl/`). This is the sole exception to
+    `agctl`'s stateless-invocation principle, scoped to the daemon lifecycle.
+    Clean up with `rm -rf .agctl`.
 
 ## Discover live schema before authoring SQL
 
@@ -279,6 +306,10 @@ points at the mock's `listen`, and Kafka reactors join the SUT's *real* broker a
 (it is not a broker itself). Stubs/reactors are authored in the `mocks:` config section —
 see the `agctl-config` skill (`reference/mocks.md`).
 
+**Two modes:** foreground streaming (`mock run`) and managed daemon (`mock start`/`stop`/`status`).
+
+### Foreground streaming mode (`mock run`)
+
 ```
 agctl mock run [--only http|kafka] [--http-listen H:P] [--fail-fast] [--duration N | --until-stopped]
 ```
@@ -296,12 +327,49 @@ and a final `summary`. A clean run exits `0`; a clean run in which any `kafka.er
 exits `1`. Startup failures (bad `mocks:`, port in use, broker unreachable) emit **one**
 structured envelope then exit `2`.
 
-### Background lifecycle — load-bearing
+### Managed daemon mode (`mock start` / `mock stop` / `mock status`)
+
+The managed daemon commands automate the lifecycle: `mock start` spawns the daemon as a
+detached subprocess (redirecting stdout to a log file under `<state-dir>/`), waits for the
+`started` line, and returns. `mock stop` signals the daemon, waits for shutdown, parses the
+log, and returns the verdict — surfacing any fatal failures (exit 1, verdict in
+`error.detail`). `mock status` provides live read-only introspection.
+
+```
+agctl mock start  [--only http|kafka] [--http-listen H:P] [--fail-fast] [--duration N] [--state-dir <path>]
+agctl mock stop   [--listen H:P | --pid <pid> | --all] [--timeout N] [--state-dir <path>]
+agctl mock status [--listen H:P] [--state-dir <path>]
+```
+
+**Simplified lifecycle:** The managed commands collapse the four-step `mock run` protocol
+into two commands:
+
+```bash
+# Start the daemon (blocks until ready)
+agctl mock start
+
+# ... run the SUT / assertions ...
+
+# Stop the daemon and get the verdict (fatal failures → exit 1)
+agctl mock stop
+```
+
+The old protocol (redirect log → poll `started` → SIGTERM+wait → grep log) is now handled
+by `start`/`stop` internally.
+
+**`mock stop` failure surfacing:** Unlike `mock run`'s own exit rule (exit 1 only when
+`kafka_errors > 0`), `mock stop` uses the **strict** rule — any of `http.unmatched`,
+`http.body_parse_skipped`, `kafka.skipped`, or `kafka.error` is fatal and triggers exit 1.
+`capture.missing` is included in the failure list but is non-fatal. On a fatal stop, the
+verdict travels in `error.detail`; on a clean stop, it travels in `result`.
+
+### Background lifecycle — load-bearing (when using `mock run` directly)
 
 The failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`,
 `kafka.error`, `capture.missing`) live **only** on stdout, and the exit-1 escalation arrives
 only on a clean `SIGTERM`. The plain `&` / `kill` pattern loses both and silently produces a
-**false green**. Always follow this protocol:
+**false green**. When using `mock run` directly (not the managed daemon), always follow this
+protocol:
 
 1. **Redirect stdout to a log:** `agctl mock run > mock.log 2>&1 &` (and capture the PID).
 2. **Poll** `mock.log` for the `started` line **before** running the SUT — don't sleep a
@@ -323,6 +391,9 @@ until grep -q '"event":"started"' mock.log; do sleep 0.1; done    # poll, don't 
 kill -TERM "$MOCK_PID"; wait "$MOCK_PID"                            # SIGTERM + wait, never SIGKILL
 grep -E 'http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error|capture.missing' mock.log && exit 1
 ```
+
+**Prefer `mock start`/`stop` for new tests.** The managed daemon mode handles the
+four-step protocol for you and provides cleaner failure surfacing.
 
 ## Recipes
 

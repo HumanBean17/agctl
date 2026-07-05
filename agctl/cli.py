@@ -26,7 +26,7 @@ from .commands.db_commands import db_assert, db_execute, db_query, db_schema
 from .commands.discover_commands import discover
 from .commands.http_commands import http_call, http_ping, http_request
 from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
-from .commands.mock_commands import mock_run
+from .commands.mock_commands import mock_run, mock_start, mock_stop, mock_status
 
 #: Entry-point group for third-party protocol plugins (DESIGN §9.2).
 PLUGIN_ENTRY_POINT_GROUP = "agctl.plugins"
@@ -178,6 +178,9 @@ check_group.add_command(check_ready)
 
 # Register subcommands on the mock group.
 mock_group.add_command(mock_run)
+mock_group.add_command(mock_start)
+mock_group.add_command(mock_stop)
+mock_group.add_command(mock_status)
 
 
 # Register the top-level `discover` command directly on the root group.
