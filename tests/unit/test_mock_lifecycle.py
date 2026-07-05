@@ -762,3 +762,146 @@ time.sleep(30)
 
         # Verify pidfile was removed
         assert not pidfile_path.exists()
+
+
+# ----------------------------------------------------------------------------
+# Task 6: `mock status` tests (3 scenarios)
+# ----------------------------------------------------------------------------
+
+
+def test_mock_status_running():
+    """Scenario 1: status running - live mock with started + http.hit + http.unmatched in log."""
+    import tempfile
+    from datetime import datetime, timezone
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Use os.getpid() since status never kills (cleaner test)
+        my_pid = os.getpid()
+
+        # Pre-write log with started + http.hit + http.unmatched
+        log_path = tmp_path / "mock-18080.log"
+        started_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        log_path.write_text(f'{{"event":"started","http":{{"listen":"127.0.0.1:18080","stubs":1}},"kafka":null}}\n')
+        with open(log_path, 'a') as f:
+            f.write('{"event":"http.hit","method":"GET","path":"/test","ts":"2024-01-01T00:00:00Z"}\n')
+            f.write('{"event":"http.unmatched","method":"POST","path":"/not-found","ts":"2024-01-01T00:00:00Z"}\n')
+
+        # Write pidfile
+        pidfile_path = tmp_path / "mock-18080.pid"
+        pidfile_path.write_text(json.dumps({
+            "pid": my_pid,
+            "listen": "127.0.0.1:18080",
+            "port": 18080,
+            "log_path": str(log_path),
+            "config_path": None,
+            "started_at": started_at,
+            "run_id": "test-run"
+        }))
+
+        # Invoke status (no selector - exactly one running)
+        result, payload = _run(["mock", "status", "--state-dir", str(tmp_path)])
+
+        # Assert exit_code == 0, envelope ok:true, running:true
+        assert result.exit_code == 0, f"stdout: {result.output}"
+        assert payload is not None
+        assert payload["ok"] is True
+        assert payload["command"] == "mock.status"
+        assert payload["result"]["running"] is True
+        assert payload["result"]["pid"] == my_pid
+        assert payload["result"]["listen"] == "127.0.0.1:18080"
+        assert isinstance(payload["result"]["uptime_ms"], int) and payload["result"]["uptime_ms"] >= 0
+        assert payload["result"]["summary_so_far"]["http_hits"] == 1
+        assert payload["result"]["summary_so_far"]["http_unmatched"] == 1
+        assert len(payload["result"]["failures_so_far"]) == 1
+        assert payload["result"]["failures_so_far"][0]["event"] == "http.unmatched"
+
+        # Assert process still alive and pidfile still exists (status never kills)
+        import errno
+        try:
+            os.kill(my_pid, 0)
+        except OSError as e:
+            if e.errno == errno.ESRCH:
+                assert False, "Process should still be alive"
+        assert pidfile_path.exists()
+
+
+def test_mock_status_not_running():
+    """Scenario 2: status not-running - empty state dir, return running:false."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Empty state dir (no pidfiles)
+        result, payload = _run(["mock", "status", "--state-dir", str(tmp_path)])
+
+        # Assert exit_code == 0, running:false
+        assert result.exit_code == 0, f"stdout: {result.output}"
+        assert payload is not None
+        assert payload["ok"] is True
+        assert payload["result"]["running"] is False
+
+
+def test_mock_status_listen_selects():
+    """Scenario 3: status --listen selects - two running, selector picks one."""
+    import tempfile
+    from datetime import datetime, timezone
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Use os.getpid() for both (status never kills)
+        my_pid = os.getpid()
+
+        # Pre-write two pidfiles with logs
+        started_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        # First mock
+        log_path1 = tmp_path / "mock-18080.log"
+        log_path1.write_text(f'{{"event":"started","http":{{"listen":"127.0.0.1:18080","stubs":1}},"kafka":null}}\n')
+        with open(log_path1, 'a') as f:
+            f.write('{"event":"http.hit","method":"GET","path":"/test","ts":"2024-01-01T00:00:00Z"}\n')
+
+        pidfile1 = tmp_path / "mock-18080.pid"
+        pidfile1.write_text(json.dumps({
+            "pid": my_pid,
+            "listen": "127.0.0.1:18080",
+            "port": 18080,
+            "log_path": str(log_path1),
+            "config_path": None,
+            "started_at": started_at,
+            "run_id": "test-run-1"
+        }))
+
+        # Second mock
+        log_path2 = tmp_path / "mock-18081.log"
+        log_path2.write_text(f'{{"event":"started","http":{{"listen":"127.0.0.1:18081","stubs":1}},"kafka":null}}\n')
+        with open(log_path2, 'a') as f:
+            f.write('{"event":"http.hit","method":"GET","path":"/test","ts":"2024-01-01T00:00:00Z"}\n')
+
+        pidfile2 = tmp_path / "mock-18081.pid"
+        pidfile2.write_text(json.dumps({
+            "pid": my_pid,
+            "listen": "127.0.0.1:18081",
+            "port": 18081,
+            "log_path": str(log_path2),
+            "config_path": None,
+            "started_at": started_at,
+            "run_id": "test-run-2"
+        }))
+
+        # Invoke status with --listen selector
+        result, payload = _run(["mock", "status", "--listen", "127.0.0.1:18080", "--state-dir", str(tmp_path)])
+
+        # Assert exit_code == 0, listen matches selector
+        assert result.exit_code == 0, f"stdout: {result.output}"
+        assert payload is not None
+        assert payload["ok"] is True
+        assert payload["result"]["running"] is True
+        assert payload["result"]["listen"] == "127.0.0.1:18080"
+
+        # Both pidfiles still exist (status never removes)
+        assert pidfile1.exists()
+        assert pidfile2.exists()

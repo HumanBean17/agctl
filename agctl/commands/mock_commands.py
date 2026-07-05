@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from ..config.models import KafkaConfig
     from ..clients.kafka_client import KafkaClient
 
-__all__ = ["mock_run", "new_mock_engine", "mock_start", "mock_stop"]
+__all__ = ["mock_run", "new_mock_engine", "mock_start", "mock_stop", "mock_status"]
 
 # Import from kafka_commands to avoid duplication (no circular import)
 from .kafka_commands import new_kafka_client
@@ -41,6 +41,7 @@ from ..mock.daemon import (
     pidfile_path,
     read_pidfile,
     remove_pidfile,
+    resolve_target,
     write_pidfile,
 )
 
@@ -608,3 +609,82 @@ def mock_stop(
 
 
 _mock_stop_envelope = envelope("mock.stop")(_mock_stop_core)
+
+
+# ----------------------------------------------------------------------------
+# Task 6: mock status command
+# ----------------------------------------------------------------------------
+
+
+def _mock_status_core(
+    listen: str | None,
+    state_dir: str,
+) -> dict:
+    """Core logic for `mock status` (Task 6).
+
+    Returns live snapshot of a running mock by resolving via pidfile and
+    parsing the NDJSON log. Never signals the daemon and never removes the
+    pidfile.
+
+    Returns:
+        Dict with keys: running (bool), pid, listen, uptime_ms, summary_so_far,
+        failures_so_far. When not running: {"running": False}.
+
+    Raises:
+        ConfigError: If multiple mocks running and no selector, or if
+            specified --listen doesn't match any running mock.
+    """
+    state_path = Path(state_dir)
+
+    # Step 1: Resolve targets (no --all flag for status)
+    targets = resolve_target(state_path, listen, None, all_=False)
+
+    # Step 2: Handle not-running case
+    if not targets:
+        return {"running": False}
+
+    # Step 3: Get the single target
+    target = targets[0]
+
+    # Step 4: Parse the log
+    parsed = parse_log(Path(target.log_path))
+
+    # Step 5: Compute uptime_ms from started_at (ISO-8601 Z)
+    uptime_ms = None
+    try:
+        # Parse ISO-8601 with Z suffix (UTC)
+        started_at_str = target.started_at
+        if started_at_str.endswith("Z"):
+            started_at_str = started_at_str.replace("Z", "+00:00")
+        started_at = datetime.fromisoformat(started_at_str)
+        now_utc = datetime.now(timezone.utc)
+        uptime_ms = int((now_utc - started_at).total_seconds() * 1000)
+    except (ValueError, TypeError):
+        # If parsing fails, leave uptime_ms as None
+        uptime_ms = None
+
+    # Step 6: Return live snapshot
+    return {
+        "running": True,
+        "pid": target.pid,
+        "listen": target.listen,
+        "uptime_ms": uptime_ms,
+        "summary_so_far": parsed.summary_so_far,
+        "failures_so_far": parsed.failures,
+    }
+
+
+@click.command("status")
+@click.option("--listen", "listen", type=str, default=None, help="Listen address (e.g., 127.0.0.1:18080)")
+@click.option("--state-dir", "state_dir", default="./.agctl", help="Directory for mock state (pidfiles, logs)")
+@click.pass_context
+def mock_status(
+    ctx: click.Context,
+    listen: str | None,
+    state_dir: str,
+) -> None:
+    """Show live status of a running mock daemon (no signal)."""
+    _mock_status_envelope(listen, state_dir)
+
+
+_mock_status_envelope = envelope("mock.status")(_mock_status_core)
