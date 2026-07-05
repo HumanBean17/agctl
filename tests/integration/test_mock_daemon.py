@@ -16,6 +16,7 @@ subsequent test runs.
 from __future__ import annotations
 
 import json
+import os
 import socket
 from pathlib import Path
 from urllib import error as urllib_error
@@ -193,7 +194,6 @@ def test_mock_daemon_round_trip(tmp_path: Path, with_failure: bool) -> None:
     assert not pidfile.exists(), "pidfile should be removed after stop"
 
     # Step 8: Assert daemon process is gone
-    import os
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)  # Should raise ProcessLookupError
 

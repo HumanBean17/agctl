@@ -38,6 +38,26 @@ mocks:
 """
 
 
+# Pytest fixture to track and cleanup sleeper subprocesses
+@pytest.fixture
+def sleeper_pids():
+    """Track sleeper subprocess PIDs and ensure cleanup on test exit."""
+    pids = []
+
+    yield pids  # Test code can append to this list
+
+    # Cleanup: terminate all tracked sleepers
+    for pid in pids:
+        try:
+            os.kill(pid, 15)  # SIGTERM
+        except (ProcessLookupError, OSError):
+            pass  # Already dead
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass  # Not our child or already reaped
+
+
 def _run(args, env=None):
     """Helper to run CLI.
 
@@ -317,7 +337,7 @@ import subprocess
 import signal
 
 
-def test_mock_stop_clean():
+def test_mock_stop_clean(sleeper_pids):
     """Scenario 1: stop clean - daemon exits cleanly, summary parsed, no fatal failures."""
     import tempfile
 
@@ -344,6 +364,7 @@ while time.time() < end_time and not should_exit:
     time.sleep(0.001)
 """
         sleeper = subprocess.Popen([sys.executable, "-c", sleeper_code])
+        sleeper_pids.append(sleeper.pid)
 
         # Pre-write the log with started + clean summary
         log_path = tmp_path / "mock-18080.log"
@@ -384,7 +405,7 @@ while time.time() < end_time and not should_exit:
         assert not pidfile_path.exists()
 
 
-def test_mock_stop_with_fatal_failures():
+def test_mock_stop_with_fatal_failures(sleeper_pids):
     """Scenario 2: stop with fatal failures - log has http.unmatched + kafka.error, exit 1."""
     import tempfile
 
@@ -411,6 +432,7 @@ while time.time() < end_time and not should_exit:
     time.sleep(0.001)
 """
         sleeper = subprocess.Popen([sys.executable, "-c", sleeper_code])
+        sleeper_pids.append(sleeper.pid)
 
         # Pre-write the log with started + summary + fatal failures
         log_path = tmp_path / "mock-18080.log"
@@ -451,7 +473,7 @@ while time.time() < end_time and not should_exit:
         assert sleeper.poll() is not None
 
 
-def test_mock_stop_capture_missing_non_fatal():
+def test_mock_stop_capture_missing_non_fatal(sleeper_pids):
     """Scenario 3: stop with capture.missing - non-fatal, exit 0, failure in list for visibility."""
     import tempfile
 
@@ -478,6 +500,7 @@ while time.time() < end_time and not should_exit:
     time.sleep(0.001)
 """
         sleeper = subprocess.Popen([sys.executable, "-c", sleeper_code])
+        sleeper_pids.append(sleeper.pid)
 
         # Pre-write the log with started + summary + capture.missing (non-fatal)
         log_path = tmp_path / "mock-18080.log"
@@ -533,7 +556,7 @@ def test_mock_stop_not_running():
         assert payload["result"]["stopped"] is False
 
 
-def test_mock_stop_ambiguous():
+def test_mock_stop_ambiguous(sleeper_pids):
     """Scenario 5: stop ambiguous - two running mocks, no selector, ConfigError."""
     import tempfile
 
@@ -561,6 +584,7 @@ while time.time() < end_time and not should_exit:
 """
         sleeper1 = subprocess.Popen([sys.executable, "-c", sleeper_code])
         sleeper2 = subprocess.Popen([sys.executable, "-c", sleeper_code])
+        sleeper_pids.extend([sleeper1.pid, sleeper2.pid])
 
         # Write two pidfiles with clean logs
         log_path1 = tmp_path / "mock-18080.log"
@@ -613,7 +637,7 @@ while time.time() < end_time and not should_exit:
         sleeper2.wait(timeout=2)
 
 
-def test_mock_stop_all():
+def test_mock_stop_all(sleeper_pids):
     """Scenario 6: stop --all - two running mocks, both stopped, list of 2 entries."""
     import tempfile
 
@@ -641,6 +665,7 @@ while time.time() < end_time and not should_exit:
 """
         sleeper1 = subprocess.Popen([sys.executable, "-c", sleeper_code])
         sleeper2 = subprocess.Popen([sys.executable, "-c", sleeper_code])
+        sleeper_pids.extend([sleeper1.pid, sleeper2.pid])
 
         # Write two pidfiles with clean logs
         log_path1 = tmp_path / "mock-18080.log"
@@ -698,7 +723,7 @@ while time.time() < end_time and not should_exit:
         assert not pidfile2.exists()
 
 
-def test_mock_stop_sigkill_fallback():
+def test_mock_stop_sigkill_fallback(sleeper_pids):
     """Scenario 7: stop SIGKILL fallback - daemon ignores SIGTERM, timeout → SIGKILL, warning set."""
     import tempfile
 
@@ -722,6 +747,7 @@ sys.stdout.flush()
 time.sleep(30)
 """
         sleeper = subprocess.Popen([sys.executable, "-c", sleeper_code], stdout=subprocess.PIPE)
+        sleeper_pids.append(sleeper.pid)
 
         # Wait for sleeper to be ready
         line = sleeper.stdout.readline()

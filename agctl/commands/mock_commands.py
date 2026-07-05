@@ -35,6 +35,7 @@ from .kafka_commands import new_kafka_client
 
 # Import daemon lifecycle helpers (Task 2: pidfile, liveness; Task 3: log parser)
 from ..mock.daemon import (
+    FATAL_FAILURE_EVENTS,
     is_alive,
     log_path,
     parse_log,
@@ -47,6 +48,66 @@ from ..mock.daemon import (
 
 # Readiness poll timeout (Task 4)
 _START_BUDGET_SECONDS: float = 30.0
+
+# Termination grace period for mock start cleanup (short - daemon won't emit useful summary yet)
+_START_CLEANUP_GRACE_SECONDS: float = 2.0
+
+
+def _terminate(pid: int, timeout: float) -> str:
+    """Terminate a process with SIGTERM, wait for exit, SIGKILL if timeout.
+
+    Args:
+        pid: Process ID to terminate.
+        timeout: Seconds to wait for graceful exit after SIGTERM before SIGKILL.
+
+    Returns:
+        The signal that was used: "SIGTERM" if process exited on SIGTERM,
+        "SIGKILL" if timeout elapsed and SIGKILL was sent.
+
+    This is the shared discipline for both mock start cleanup (short grace) and
+    mock stop (user-configurable timeout). A daemon hung in a blocking C call
+    (e.g., Kafka broker TCP connect) will ignore SIGTERM; SIGKILL ensures cleanup.
+    """
+    # Step 1: Send SIGTERM (best-effort)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return "SIGTERM"  # Already dead or doesn't exist
+
+    # Step 2: Wait for process to exit or timeout
+    start = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - start
+
+        # Try to reap zombie child first (non-blocking)
+        # This is critical in unit test context where the sleeper is our child:
+        # if it exits on SIGTERM but we don't reap it, is_alive() still returns True
+        # because the zombie process entry exists. Reaping turns is_alive() to False.
+        try:
+            reaped_pid, status = os.waitpid(pid, os.WNOHANG)
+            if reaped_pid == pid:
+                # Child has exited and been reaped
+                return "SIGTERM"
+        except (ChildProcessError, OSError):
+            # Not our child or doesn't exist - check with is_alive
+            pass
+
+        # Check if process is gone using is_alive (for non-child processes)
+        if not is_alive(pid):
+            return "SIGTERM"  # Exited gracefully
+
+        # Timeout - send SIGKILL
+        if elapsed >= timeout:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass  # Already dead
+            # Brief wait after SIGKILL to ensure process is reaped by the system
+            time.sleep(0.1)
+            return "SIGKILL"
+
+        # Sleep briefly before next poll
+        time.sleep(0.05)
 
 
 # Test seam: tests monkeypatch this to return a fake MockEngine
@@ -145,6 +206,9 @@ def spawn_daemon(argv: list[str], log_path: str, env: dict | None = None) -> int
         env=env,  # Inherit parent env if None
     )
 
+    # Close the parent's copy of the log file handle (the child holds its own dup)
+    log_handle.close()
+
     return proc.pid
 
 
@@ -209,11 +273,18 @@ def _mock_start_core(
     if existing is not None:
         existing_pid = existing.get("pid")
         if existing_pid is not None and is_alive(existing_pid):
-            raise ConfigError(
-                f"mock already running on {http_listen} (pid {existing_pid}); "
-                "run 'agctl mock stop' first or use a different --http-listen",
-                {"pid": existing_pid, "listen": http_listen},
-            )
+            if run_http:
+                raise ConfigError(
+                    f"mock already running on {http_listen} (pid {existing_pid}); "
+                    "run 'agctl mock stop' first or use a different --http-listen",
+                    {"pid": existing_pid, "listen": http_listen},
+                )
+            else:
+                raise ConfigError(
+                    f"mock already running (kafka-only, pid {existing_pid}); "
+                    "run 'agctl mock stop' first",
+                    {"pid": existing_pid},
+                )
 
     # Step 6: Build daemon argv
     daemon_argv = ["mock", "run"]
@@ -265,11 +336,8 @@ def _mock_start_core(
                 started = parsed.started
                 break
             elif parsed.startup_error is not None:
-                # Cleanup: kill daemon and remove pidfile
-                try:
-                    os.kill(child_pid, signal.SIGTERM)
-                except (ProcessLookupError, OSError):
-                    pass  # Already dead
+                # Cleanup: terminate daemon and remove pidfile
+                _terminate(child_pid, _START_CLEANUP_GRACE_SECONDS)
                 remove_pidfile(pid)
 
                 # Extract error details from the startup_error envelope
@@ -284,10 +352,7 @@ def _mock_start_core(
 
     except Exception:
         # Cleanup on any error
-        try:
-            os.kill(child_pid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass  # Already dead
+        _terminate(child_pid, _START_CLEANUP_GRACE_SECONDS)
         remove_pidfile(pid)
         raise
 
@@ -464,16 +529,6 @@ def mock_run(
 # Task 5: mock stop command
 # ----------------------------------------------------------------------------
 
-# Import daemon lifecycle helpers (Task 2: pidfile, liveness; Task 3: log parser)
-from ..mock.daemon import (
-    FATAL_FAILURE_EVENTS,
-    is_alive,
-    parse_log,
-    read_pidfile,
-    remove_pidfile,
-    resolve_target,
-)
-
 
 def _mock_stop_core(
     listen: str | None,
@@ -513,40 +568,28 @@ def _mock_stop_core(
         sig = "SIGTERM"
         warning = None
 
-        # Step 3a: Send SIGTERM (best-effort)
+        # Step 3a: Check if process is alive before attempting termination
+        was_alive_before = is_alive(target.pid)
+
+        # Step 3b: Try to reap zombie child if this is our child process (unit test context)
+        # This dual behavior is intentional: in unit tests, the sleeper is the test process's child,
+        # so we reap it here. In production, the daemon is not our child, so this raises ChildProcessError
+        # and we fall through to _terminate which handles non-child processes.
         try:
-            os.kill(target.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass  # Already dead is fine
+            pid, status = os.waitpid(target.pid, os.WNOHANG)
+            if pid == target.pid:
+                # Child has exited and been reaped
+                was_alive_before = False
+        except (ChildProcessError, OSError):
+            # Not our child process - continue to _terminate below
+            pass
 
-        # Step 3b: Wait loop (poll is_alive until False or timeout)
-        start = time.monotonic()
-        while True:
-            elapsed = time.monotonic() - start
-
-            # Try to reap zombie child first (non-blocking)
-            try:
-                pid, status = os.waitpid(target.pid, os.WNOHANG)
-                if pid == target.pid:
-                    # Child has exited and been reaped
-                    break
-            except (ChildProcessError, OSError):
-                # Not our child or doesn't exist - check with is_alive
-                if not is_alive(target.pid):
-                    break
-
-            # Check timeout BEFORE sleeping
-            if elapsed >= timeout:
-                # Step 3c: Timeout - send SIGKILL
-                try:
-                    os.kill(target.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass  # Already dead
-                sig = "SIGKILL"
+        # Step 3c: Terminate the process (sends SIGTERM, waits, sends SIGKILL if timeout)
+        if was_alive_before:
+            sig = _terminate(target.pid, timeout)
+            if sig == "SIGKILL":
                 timeout_str = str(int(timeout)) if timeout == int(timeout) else str(timeout)
                 warning = f"process did not exit on SIGTERM within {timeout_str}s; sent SIGKILL; summary may be incomplete"
-                break
-            time.sleep(0.05)
 
         # Step 3d: Parse log
         parsed = parse_log(Path(target.log_path))

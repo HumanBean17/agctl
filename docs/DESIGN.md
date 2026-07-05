@@ -978,6 +978,8 @@ When fatal failures are detected, `stop` raises `AssertionFailure` (exit 1) and 
 
 **`--all` shape:** with `--all`, `stop` iterates every running mock in `--state-dir`, collecting one verdict per mock. On success the verdicts are returned in `result.stopped` as an **array**; if **any** stopped mock had a fatal failure, `stop` raises `AssertionFailure` (exit 1) and the array is carried in `error.detail.stopped`.
 
+**SIGKILL behavior:** when a mock daemon does not exit on SIGTERM within the `--timeout` budget, `stop` sends SIGKILL. In this case, the verdict includes a `warning` field (string) explaining the timeout, and the `summary` field may be absent or incomplete (the daemon was killed before it could emit the final `summary` line).
+
 #### `agctl mock status` — managed daemon (status)
 
 Query whether a mock daemon is running and, if so, report live statistics by reading the log file. This command never signals the daemon and never removes the pidfile — it is read-only introspection.
