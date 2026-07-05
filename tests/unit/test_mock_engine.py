@@ -1217,3 +1217,15 @@ def test_step0_inline_object_capture_violation_raises_config_error():
     # received a started line.
     summary = [l for l in captured_lines if l.get("event") == "summary"]
     assert len(summary) == 0
+
+
+def test_default_emit_renders_non_ascii_utf8(capsys):
+    # NDJSON event lines stream straight to stdout (bypassing emit), so they
+    # need their own ensure_ascii=False to render readable UTF-8.
+    from agctl.mock.engine import _default_emit
+
+    _default_emit({"event": "http.request", "body": {"name": "Иван"}})
+    out = capsys.readouterr().out
+    assert "Иван" in out
+    assert "\\u" not in out
+    assert json.loads(out)["body"] == {"name": "Иван"}

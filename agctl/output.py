@@ -20,6 +20,9 @@ def emit(
         "error": error,
         "duration_ms": duration_ms,
     }
-    sys.stdout.write(json.dumps(payload, default=str))
+    # ensure_ascii=False: non-ASCII (e.g. Cyrillic) must render as readable
+    # UTF-8 in stdout, not as \uXXXX escapes. Valid JSON per RFC 8259, and
+    # downstream JSON consumers decode both forms identically.
+    sys.stdout.write(json.dumps(payload, default=str, ensure_ascii=False))
     sys.stdout.write("\n")
     sys.stdout.flush()

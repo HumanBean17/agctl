@@ -35,7 +35,7 @@ def _default_emit(line: dict) -> None:
     This is the stdout write pattern from http_commands._emit_stdout_line.
     The lock lives in MockEngine.emit_event, not here.
     """
-    sys.stdout.write(json.dumps(line))
+    sys.stdout.write(json.dumps(line, ensure_ascii=False))
     sys.stdout.write("\n")
     sys.stdout.flush()
 

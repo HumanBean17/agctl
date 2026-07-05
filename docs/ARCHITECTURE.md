@@ -295,8 +295,11 @@ Every command writes one JSON object to stdout via `output.emit()`:
 ```
 
 `emit()` is the **only** permitted stdout write path — `json.dumps(...,
-default=str)` + newline + flush (`default=str` stringifies non-JSON-native
-values rather than crashing).
+default=str, ensure_ascii=False)` + newline + flush (`default=str` stringifies
+non-JSON-native values rather than crashing; `ensure_ascii=False` emits UTF-8
+characters directly rather than `\uXXXX` escapes). stdout/stderr are forced to UTF-8
+at CLI bootstrap via `sys.stdout.reconfigure(encoding="utf-8")` so raw UTF-8
+emission doesn't raise `UnicodeEncodeError` on non-UTF-8 terminals.
 
 **The `@envelope` guarantee.** Because every `_core` is wrapped, *every* code
 path — success, `AgctlError`, builtin `AssertionError`, unexpected `Exception` —

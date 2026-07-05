@@ -82,7 +82,7 @@ def render_typed(value: Any, captures: dict[str, CaptureValue]) -> Any:
     carries a ``type`` controlling how its value is rendered:
 
     - ``scalar`` -> ``str(capture.value)``.
-    - ``json`` -> ``json.dumps(capture.value)``.
+    - ``json`` -> ``json.dumps(capture.value, ensure_ascii=False)``.
     - ``object`` -> the live ``capture.value``, but ONLY when the containing
       field string is exactly ``"{name}"`` (whole-field). Used inline (e.g.
       ``"pre={name}"``) -> ``ValueError``. Valid configs never reach this —
@@ -120,7 +120,7 @@ def _render_typed_str(s: str, captures: dict[str, CaptureValue]) -> Any:
         if capture.type == "scalar":
             return str(capture.value)
         if capture.type == "json":
-            return json.dumps(capture.value)
+            return json.dumps(capture.value, ensure_ascii=False)
         raise ValueError(f"unknown capture type for {name!r}: {capture.type!r}")
 
     def _sub(match: re.Match[str]) -> str:
@@ -133,7 +133,7 @@ def _render_typed_str(s: str, captures: dict[str, CaptureValue]) -> Any:
         if capture.type == "scalar":
             return str(capture.value)
         if capture.type == "json":
-            return json.dumps(capture.value)
+            return json.dumps(capture.value, ensure_ascii=False)
         if capture.type == "object":
             raise ValueError(
                 f"capture {name!r} of type 'object' must occupy the whole "

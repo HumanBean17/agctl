@@ -518,3 +518,13 @@ def test_http_ping_duration_and_until_stopped_emits_config_error(monkeypatch):
     data = json.loads(result.output)
     assert data["ok"] is False
     assert data["error"]["type"] == "ConfigError"
+
+
+def test_emit_stdout_line_renders_non_ascii_utf8(capsys):
+    # NDJSON ping/summary lines stream straight to stdout (bypassing emit),
+    # so they need their own ensure_ascii=False to render readable UTF-8.
+    http_commands._emit_stdout_line({"url": "https://пример.рф", "status": 200})
+    out = capsys.readouterr().out
+    assert "пример" in out
+    assert "\\u" not in out
+    assert json.loads(out)["url"] == "https://пример.рф"
