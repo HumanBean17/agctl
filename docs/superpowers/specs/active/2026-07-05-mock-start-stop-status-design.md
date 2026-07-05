@@ -112,6 +112,14 @@ list is always present in `failures[]` so the caller sees the whole picture.
 `capture.missing` stays **non-fatal** (per DESIGN — included in `failures[]` for
 visibility, does not drive exit 1).
 
+**Verdict placement (implementation note):** `stop` stays `@envelope`-wrapped. A clean
+stop returns the verdict in `result`; a stop that surfaces fatal failures **raises
+`AssertionFailure`** (exit 1), so the verdict (`stopped`/`signal`/`summary`/`failures`)
+is carried in `error.detail` — consistent with how `http call` / `kafka assert` already
+report assertion failures (DESIGN §4.1, ARCHITECTURE §8). This refines the illustrative
+`result`-placement in the §6.2 preview to the idiomatic `error.detail` placement, so the
+spec's "all three commands are `@envelope`-wrapped" claim (§3) holds without hand-rolling.
+
 **D4 — Pidfile + log under `.agctl/` in cwd, keyed by port.**
 The agent is working in a repo; state colocated with the work is discoverable and
 trivial to clean (`rm -rf .agctl`). It avoids `~/.cache` cross-repo collisions. Port
@@ -188,41 +196,52 @@ agctl mock stop
 Selector resolution: no-arg works when exactly one mock is running in `--state-dir`;
 otherwise `--listen`, `--pid`, or `--all` is required (else `ConfigError` exit 2).
 
-**`--all` result shape:** with `--all`, `result.stopped` is an **array** of per-mock
-stop results (each shaped like the single-mock `result` above, minus the outer wrapper),
-and the envelope's `ok` is `false` if **any** stopped mock had a fatal failure (exit 1).
-With a single selector (`--listen`/`--pid`/no-arg), `result.stopped` stays the single
-boolean shown in the example above.
+**`--all` shape:** with `--all`, `stop` iterates every running mock in `--state-dir`,
+collecting one verdict per mock. On success the verdicts are returned in
+`result.stopped` as an **array**; if **any** stopped mock had a fatal failure, `stop`
+raises `AssertionFailure` (exit 1) and the array is carried in `error.detail.stopped`
+(each entry is the single-mock verdict shape below). With a single selector
+(`--listen`/`--pid`/no-arg), `stopped` is the single boolean shown below, not an array.
 
-**Result shape (`mock.stop`) — example with failures:**
+**Result shape (`mock.stop`):** the verdict fields `stopped` / `pid` / `signal` /
+`summary` / `failures` always appear together — in `result` on a clean stop, in
+`error.detail` when fatal failures are surfaced (raised as `AssertionFailure`, exit 1).
+
+Example — failures found (`ok:false`, exit 1):
 
 ```json
 {
   "ok": false,
   "command": "mock.stop",
-  "result": {
-    "stopped": true,
-    "pid": 12345,
-    "signal": "SIGTERM",
-    "summary": {
-      "http_hits": 7,
-      "http_unmatched": 2,
-      "http_body_parse_skipped": 0,
-      "kafka_reactions": 3,
-      "kafka_skipped": 0,
-      "kafka_errors": 1,
-      "duration_ms": 45213
-    },
-    "failures": [
-      {"event": "http.unmatched", "method": "GET", "path": "/x", "timestamp": "..."},
-      {"event": "kafka.error", "reactor": "order-command-handler", "error": "...", "timestamp": "..."}
-    ]
+  "result": null,
+  "error": {
+    "type": "AssertionError",
+    "message": "mock run had 2 fatal failure event(s)",
+    "detail": {
+      "stopped": true,
+      "pid": 12345,
+      "signal": "SIGTERM",
+      "summary": {
+        "http_hits": 7,
+        "http_unmatched": 2,
+        "http_body_parse_skipped": 0,
+        "kafka_reactions": 3,
+        "kafka_skipped": 0,
+        "kafka_errors": 1,
+        "duration_ms": 45213
+      },
+      "failures": [
+        {"event": "http.unmatched", "method": "GET", "path": "/x", "timestamp": "..."},
+        {"event": "kafka.error", "reactor": "order-command-handler", "error": "...", "timestamp": "..."}
+      ]
+    }
   },
   "duration_ms": 8
 }
 ```
 
-A clean stop (no failure events) returns `ok:true` and an empty `failures: []`, exit 0.
+A clean stop (no fatal failure events) returns `ok:true` with the same fields under
+`result` (`stopped:true`, `signal`, `summary`, `failures: []`), exit 0.
 
 ### 6.3 `agctl mock status`
 
@@ -317,9 +336,10 @@ non-daemon command. This carve-out is bounded to `.agctl/` and recorded in §14.
    `SIGKILL` skips the shutdown path that emits `summary`).
 4. Parse the log: take the **last** `summary` line; collect every event line whose
    `event` is in the failure set (§8.4) into `failures[]`, preserving order.
-5. Apply the strict exit rule (D3): `ok:false` / exit 1 iff `failures[]` contains any
-   **fatal** failure event (i.e. anything other than `capture.missing`); else
-   `ok:true` / exit 0.
+5. Apply the strict exit rule (D3): if `failures[]` contains any **fatal** failure event
+   (i.e. anything other than `capture.missing`), raise `AssertionFailure` carrying the
+   verdict in `detail` (`@envelope` → `ok:false`, exit 1); else return the verdict as
+   `result` (`ok:true`, exit 0).
 
 ### 8.3 `status` → live snapshot
 
