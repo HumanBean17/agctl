@@ -258,17 +258,17 @@ agctl mock run [--only http|kafka] [--http-listen H:P] [--fail-fast] [--duration
   exclusive. `--fail-fast` exits `1` on the **first** runtime error instead of continuing.
 
 It streams one NDJSON event per line: `started`, `http.hit`, `http.unmatched`,
-`http.body_parse_skipped`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, and a final
-`summary`. A clean run exits `0`; a clean run in which any `kafka.error` occurred exits `1`.
-Startup failures (bad `mocks:`, port in use, broker unreachable) emit **one** structured
-envelope then exit `2`.
+`http.body_parse_skipped`, `capture.missing`, `kafka.reacted`, `kafka.skipped`, `kafka.error`,
+and a final `summary`. A clean run exits `0`; a clean run in which any `kafka.error` occurred
+exits `1`. Startup failures (bad `mocks:`, port in use, broker unreachable) emit **one**
+structured envelope then exit `2`.
 
 ### Background lifecycle — load-bearing
 
 The failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`,
-`kafka.error`) live **only** on stdout, and the exit-1 escalation arrives only on a clean
-`SIGTERM`. The plain `&` / `kill` pattern loses both and silently produces a **false
-green**. Always follow this protocol:
+`kafka.error`, `capture.missing`) live **only** on stdout, and the exit-1 escalation arrives
+only on a clean `SIGTERM`. The plain `&` / `kill` pattern loses both and silently produces a
+**false green**. Always follow this protocol:
 
 1. **Redirect stdout to a log:** `agctl mock run > mock.log 2>&1 &` (and capture the PID).
 2. **Poll** `mock.log` for the `started` line **before** running the SUT — don't sleep a
@@ -276,8 +276,11 @@ green**. Always follow this protocol:
 3. **Stop with `SIGTERM` and `wait`** — never `SIGKILL` (it skips the shutdown handler, the
    `summary` line, and the exit code).
 4. **Grep the log for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` /
-   `kafka.error` regardless of the test result** — any hit is a failure, even if the
-   assertions passed. `--fail-fast` is the synchronous alternative for `--duration` runs.
+   `kafka.error` / `capture.missing` regardless of the test result** — any hit is a failure,
+   even if the assertions passed. `capture.missing` is non-fatal at runtime (the mock
+   substitutes empty string and continues), but it marks a `capture.from` that resolved to
+   nothing — usually a misconfigured path silently yielding a plausible-but-wrong field.
+   `--fail-fast` is the synchronous alternative for `--duration` runs.
 
 ```bash
 nohup agctl mock run > mock.log 2>&1 &
@@ -285,7 +288,7 @@ MOCK_PID=$!
 until grep -q '"event":"started"' mock.log; do sleep 0.1; done    # poll, don't guess
 # … run the SUT / assertions, pointing the SUT at the mock's listen address …
 kill -TERM "$MOCK_PID"; wait "$MOCK_PID"                            # SIGTERM + wait, never SIGKILL
-grep -E 'http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error' mock.log && exit 1
+grep -E 'http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error|capture.missing' mock.log && exit 1
 ```
 
 ## Recipes

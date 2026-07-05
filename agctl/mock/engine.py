@@ -23,6 +23,7 @@ from typing import Any, Callable
 from ..assertions import compile_jq
 from ..config.models import MocksConfig, parse_listen
 from ..errors import ConfigError
+from .capture_validate import collect_capture_placement_errors
 from .http_server import MockHTTPServer
 from .jq_precompile import iter_mock_jq_expressions
 from .kafka_reactor import KafkaReactor as KafkaReactorClass
@@ -179,6 +180,16 @@ class MockEngine:
             # HTTP-only runs (D5 loud-on-typo, D6 jq-imported-at-startup).
             for label, expr in iter_mock_jq_expressions(self._mocks):
                 compile_jq(expr, label=label)
+
+            # Step 0b: Static check for object-capture misplacement (Task 5).
+            # An object-typed capture used inline / in a string-only slot
+            # (reaction.key, reaction.headers) would render incorrectly at
+            # request time; fail fast at startup instead. Mirrors the compile_jq
+            # fail-fast above and propagates the same way (outer try ->
+            # shutdown -> re-raise -> mock_run's AgctlError envelope, exit 2).
+            errs = collect_capture_placement_errors(self._mocks)
+            if errs:
+                raise ConfigError(errs[0]["message"], {"path": errs[0]["path"]})
 
             # Step 1: Probe Kafka brokers (if run_kafka)
             if self._run_kafka:

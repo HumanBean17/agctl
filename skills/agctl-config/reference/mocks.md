@@ -28,9 +28,12 @@ own request *is* the input. So `{name}` means **"capture this from the trigger"*
 
 - **HTTP** `{name}` in a stub `path` (`/orders/{order_id}`) captures that path segment from
   the incoming request; `{name}` in `response.body`/`response.headers` is then filled from
-  the capture context (path params ∪ top-level keys of the JSON request body).
-- **Kafka** `{name}` in `reaction.value`/`key`/`headers` is filled from the top-level keys
-  of the matched message's JSON value.
+  the capture context. Implicit capture = path params ∪ top-level keys of the JSON request
+  body; an explicit `capture:` block (below) reaches nested fields and headers too.
+- **Kafka** `{name}` in `reaction.value`/`key`/`headers` is filled from the capture context.
+  Implicit capture = top-level keys of the matched message's JSON value; an explicit
+  `capture:` block (below) also reaches the message `.key`, `.headers.*`, and nested
+  `.value.*`.
 
 `match.body` (HTTP) and `match` (Kafka jq) are **filters** that narrow *when* the stub/
 reactor fires — they are **not** capture sources. `${ENV}` still resolves at config **load**
@@ -98,12 +101,95 @@ mocks need neither.
 
 ## Capture value coercion (load-bearing)
 
-Captured values are frequently non-string (numeric IDs, bools). Every captured value is
-stringified via `str()` before `{name}` substitution — so `orderId` `42` becomes `"42"`,
-`true` → `"True"`, `null` → `"None"`. **JSON-type pass-through is not supported**: a
-reaction field always receives a string. If a downstream consumer strictly types a field,
-this can bite (see Not covered) — design the reaction to be type-tolerant, or echo a
-literal.
+Captured values are frequently non-string (numeric IDs, bools, nested objects). How a
+value lands in the rendered response/reaction depends on its **type**, and `type` lives
+on the capture name (set in `capture:`, below). Implicit captures (path params, top-level
+body/value keys) enter as `scalar` and stay that way unless an explicit `capture:` entry
+overrides the name (which also promotes the type).
+
+- **`scalar`** (default) — `str(value)` inline. `orderId` `42` → `"42"`, `true` → `"True"`,
+  `null` → `"None"`. Valid inline or as a whole field; always yields a string.
+- **`object`** — passes the **live Python value** through (a real JSON object/array field,
+  not a stringified one). Legal **only as a whole-field placeholder** — a field whose
+  string value is exactly `"{name}"`. Used inline within a larger string, or in a
+  string-only slot (`reaction.key`, a `reaction.headers` value), it is a startup
+  `ConfigError` (exit 2) caught by a static placement check. This is the one way to
+  satisfy a strict-typed downstream consumer that needs the actual object.
+- **`json`** — emits `json.dumps(value)` as a string. Use when a field must carry a JSON
+  *string* (a serialized document), distinct from `object` which yields the live value.
+
+`null`/missing resolves to the empty string `""` regardless of declared type (and emits
+`capture.missing`, below).
+
+## Explicit `capture:` — envelope-rooted extraction (HTTP stubs & Kafka reactors)
+
+Implicit capture (path params + top-level body/value keys, always `scalar`) cannot reach
+nested fields, the Kafka message key, or headers. An optional **`capture:`** block on a
+stub or reactor fixes that with one mechanism: each entry reads a jq path **off the whole
+incoming message envelope** into a named slot, then `{name}` substitutes it (same
+placeholder syntax, same name charset — the path lives in `from`, never inside `{}`).
+
+```yaml
+# YAML shape — both stubs and reactors
+capture:
+  <name>: { from: "<jq path>", type: scalar|object|json }   # type defaults to scalar
+```
+
+- **`from`** — a jq path evaluated against the **envelope** (not the payload). `match`
+  stays payload-rooted (body/value only); `capture.from` roots one level up. This `.`-
+  root divergence is deliberate (additive) and tracked for unification in #22.
+- **`type`** — `scalar` (default) / `object` / `json`. See "Capture value coercion" above
+  for what each renders. `object` is the only way to produce a real JSON object/array
+  field; it requires the placeholder to occupy the **whole field** (`ctx: "{ctx}"`, not
+  `ctx: "prefix-{ctx}"`) — anything else is a startup `ConfigError`.
+- **Envelope roots** (where `from` starts):
+  - **HTTP request envelope** — `{ method, path, headers, body }`. `headers` keys are
+    **lowercased** (HTTP headers are case-insensitive; write `.headers.authorization`,
+    never `.headers.Authorization`). `body` is the parsed JSON body (or `null`).
+  - **Kafka message envelope** — `{ key, value, partition, offset, timestamp, headers }`.
+    `headers` keys are **case-sensitive as-produced** (Kafka header keys are bytes; do
+    **not** lowercase — use the producer's exact name, e.g. `.headers.rqUID`). `value` is
+    the parsed JSON value (or `null`); `key` is the decoded message key (`str | None`).
+- **Explicit overrides implicit** — when a name appears in both the implicit context and
+  `capture:`, the explicit entry wins, supplying both its value (re-extracted from the
+  envelope via `from`) **and** its type. This is how a top-level key that implicit
+  capture would stringify becomes a true object: add an explicit
+  `ctx: { from: ".value.context", type: object }` and `context: "{ctx}"` renders the live
+  object.
+- **Compile loud, evaluate soft** — a malformed `from` (jq typo) fails loud at startup
+  (`config validate` AND `mock run` Step 0 pre-compile, exit 2), same as `match.jq`. A
+  `from` that *compiles* but resolves to `null`/missing against a particular message is a
+  **soft miss**: it emits a `capture.missing` NDJSON event and substitutes `""`; the mock
+  continues.
+- **`capture.missing` joins the failure-stream grep set** — alongside `http.unmatched`,
+  `kafka.skipped`, `kafka.error`. It is **non-fatal** (the mock substitutes empty string
+  and continues), but it marks a `from` that produced nothing — usually a misconfigured
+  path silently yielding a plausible-but-wrong (empty) field. An agent grepping the mock
+  log for failure events must include `capture.missing` (see the `agctl` skill's mock
+  lifecycle protocol for the grep command). A missing `jq` library is a different, fatal
+  failure: `ConfigError` at startup (exit 2), pointing at `pip install 'agctl[jq]'`.
+
+```yaml
+# HTTP — nested body path + header reach
+graphql-operatorById:
+  method: POST
+  path: /graphql
+  match: { jq: '.query | test("operatorById")' }   # body-rooted (unchanged)
+  capture: { op_id: { from: ".body.variables.id" } }   # envelope-rooted
+  response: { body: { id: "{op_id}" } }
+
+# Kafka — key + case-sensitive header + object pass-through
+chatx-it-mock:
+  topic: chatx.commands
+  match: '.command == "SEARCH"'                     # value-rooted (unchanged)
+  capture:
+    tid:   { from: ".key" }
+    rqUID: { from: ".headers.rqUID" }               # exact producer casing
+    ctx:   { from: ".value.context", type: object } # whole-field "{ctx}" only
+  reaction:
+    topic: chatx.events
+    value: { threadId: "{tid}", rs_headers: { rqUID: "{rqUID}" }, context: "{ctx}" }
+```
 
 ## Idempotent reactions (at-least-once delivery)
 
@@ -187,12 +273,8 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
 - **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** — cannot connect to a
   plaintext mock at all (payments/auth/healthcare are disproportionately affected).
 - **Cross-transport sagas** (Kafka trigger → HTTP callback) — no causal linkage.
-- **Header-borne correlation IDs** (`traceparent`, CloudEvents `ce-*`) — headers aren't
-  capturable, so a correlatable reply can't be produced.
 - **Non-JSON Kafka values** (Avro/Protobuf/schema-registry) — emitted as `kafka.skipped`
   (visible), but effectively un-mockable.
-- **JSON-type pass-through** — captured values are stringified; a strict-typed downstream
-  may reject the reaction.
 - **Pinned `consumer_group` reused across runs/devs** — partition split or resume-past-
   messages → silently missing/old reactions. Mitigated by the unique-per-run default.
 - **Wrong-branch match (predicate logic error)** — two stubs sharing method+path and
@@ -213,8 +295,18 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
 - Mocks are **not** surfaced by `agctl discover` (no `mocks` category) — navigate the
   `mocks:` section directly. Verify with `agctl config validate` and a `mock run --duration`
   smoke (see the `agctl` skill).
-- A jq **typo** in `match.jq` / reactor `match` fails loud at startup (exit 2); a jq
-  **eval error** against a particular request/message is a soft non-match (falls through).
+- A jq **typo** in `match.jq` / reactor `match` / `capture.*.from` fails loud at startup
+  (exit 2); a jq **eval error** (or a `from` resolving to `null`) against a particular
+  request/message is a soft non-match / `capture.missing` (falls through, empty string).
   Two different guards for two different error classes — see "jq match semantics" above.
-- `match.jq` / reactor `match` need `pip install 'agctl[jq]'` (bundled in `agctl[kafka]`
-  and `agctl[db]`). A stub with no `match.jq` and a reactor with no `match` import nothing.
+- `match` is **payload-rooted** (body/value only); `capture.from` is **envelope-rooted**
+  (one level up — reaches headers, Kafka `.key`, nested fields). The same `.amount` means
+  different things on either side (`.amount` vs `.body.amount` / `.value.amount`); this
+  `.`-root divergence is deliberate and tracked for unification in #22.
+- HTTP `headers` in the capture envelope are **lowercased** (`.headers.authorization`);
+  Kafka `headers` are **case-sensitive as-produced** (`.headers.rqUID`, exact producer
+  casing). Don't lowercase Kafka header names.
+- `type: object` must occupy the **whole field** (`key: "{name}"` exactly) — inline use
+  or a string-only slot (`reaction.key`, a header value) is a startup `ConfigError`.
+- `match.jq` / reactor `match` / `capture.*.from` need `pip install 'agctl[jq]'` (bundled
+  in `agctl[kafka]` and `agctl[db]`). A stub/reactor with none of these imports nothing.

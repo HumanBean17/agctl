@@ -760,3 +760,99 @@ class TestMockRunKafka:
 
         finally:
             reactor_consumer.close()
+
+
+class TestMockConfigValidate:
+    """``agctl config validate`` surfaces mock-capture placement errors (Task 5).
+
+    Drives the real CLI as a subprocess so the wiring in ``config_commands.py``
+    (the ``collect_capture_placement_errors`` merge alongside
+    ``collect_jq_compile_errors``) is exercised end-to-end. No live broker or
+    socket is required — ``config validate`` never binds or connects.
+    """
+
+    def test_config_validate_reports_inline_object_capture(self, tmp_path):
+        """An HTTP stub whose ``object``-typed capture ``{ctx}`` is used inline
+        in ``response.body`` is reported by ``config validate`` with exit code 2
+        and a ``mocks.http.stubs.<name>`` path — the placement error surfaced
+        alongside jq-compile errors (Task 5)."""
+        config_content = _build_config({
+            "http": {
+                "listen": "127.0.0.1:0",
+                "stubs": {
+                    "echo": {
+                        "description": "inline object capture (invalid)",
+                        "method": "POST",
+                        "path": "/echo",
+                        "capture": {
+                            "ctx": {"from": ".body.ctx", "type": "object"},
+                        },
+                        "response": {
+                            "status": 200,
+                            "body": {"msg": "pre={ctx}"},
+                        },
+                    }
+                }
+            }
+        })
+        config_file = tmp_path / "agctl.yaml"
+        config_file.write_text(config_content)
+
+        proc = subprocess.run(
+            ["python3", "-m", "agctl.cli", "--config", str(config_file),
+             "config", "validate"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+        )
+
+        assert proc.returncode == 2, (
+            f"expected exit 2, got {proc.returncode}; stderr={proc.stderr!r}"
+        )
+        payload = json.loads(proc.stdout)
+        assert payload["result"]["valid"] is False
+        paths = [e["path"] for e in payload["result"]["errors"]]
+        assert "mocks.http.stubs.echo" in paths, (
+            f"expected mocks.http.stubs.echo in errors; got {paths}"
+        )
+
+    def test_config_validate_accepts_whole_field_object_capture(self, tmp_path):
+        """An object capture occupying a whole body field ('{ctx}' alone) is
+        valid -> ``config validate`` exits 0 (Task 5's placement check does not
+        flag the canonical placement)."""
+        config_content = _build_config({
+            "http": {
+                "listen": "127.0.0.1:0",
+                "stubs": {
+                    "echo": {
+                        "method": "POST",
+                        "path": "/echo",
+                        "capture": {
+                            "ctx": {"from": ".body.ctx", "type": "object"},
+                        },
+                        "response": {
+                            "status": 200,
+                            "body": {"context": "{ctx}"},
+                        },
+                    }
+                }
+            }
+        })
+        config_file = tmp_path / "agctl.yaml"
+        config_file.write_text(config_content)
+
+        proc = subprocess.run(
+            ["python3", "-m", "agctl.cli", "--config", str(config_file),
+             "config", "validate"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+        )
+
+        assert proc.returncode == 0, (
+            f"expected exit 0, got {proc.returncode}; stderr={proc.stderr!r}"
+        )
+        payload = json.loads(proc.stdout)
+        assert payload["result"]["valid"] is True

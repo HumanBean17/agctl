@@ -9,10 +9,12 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from agctl.assertions import jq_bool, json_subset
+from agctl.mock.capture import resolve_captures
 from agctl.mock.routing import match_path
-from agctl.resolution import fill_placeholders
+from agctl.resolution import CaptureValue, render_typed
 
 __all__ = ["MockHTTPServer", "make_handler"]
 
@@ -215,7 +217,7 @@ def make_handler(
 
             # Step 3: Match stubs
             matched_stub = None
-            captures: dict[str, str] = {}
+            captures: dict[str, CaptureValue] = {}
 
             for stub_name, stub in stubs.items():
                 # Match method (case-insensitive)
@@ -241,7 +243,9 @@ def make_handler(
 
                 # Found a match
                 matched_stub = (stub_name, stub)
-                captures = path_captures.copy()
+                captures = {
+                    k: CaptureValue(v, "scalar") for k, v in path_captures.items()
+                }
                 break
 
             # Step 4: No match -> 404. The capture-context build is skipped on
@@ -264,18 +268,41 @@ def make_handler(
                 return
 
             # Step 5: Build capture context for the matched stub only.
-            # Path params are already in `captures`; merge top-level body keys
-            # when the body parsed to a dict (str(v) stringification).
+            # Implicit: top-level body keys as scalar CaptureValues (raw value;
+            # render_typed applies str() for scalar — preserves today's coercion
+            # of numerics/bools to strings).
+            # Explicit: envelope-rooted jq extraction (stub.capture) overrides
+            # implicit on name collision, including type promotion (e.g. an
+            # implicit scalar promoted to object for true pass-through).
             stub_name, stub = matched_stub
             if isinstance(parsed_body, dict):
                 for key, value in parsed_body.items():
-                    captures[key] = str(value)
+                    captures[key] = CaptureValue(value, "scalar")
+
+            if stub.capture is not None:
+                envelope = {
+                    "method": self.command,
+                    "path": urlsplit(self.path).path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "body": parsed_body,
+                }
+                explicit, missing = resolve_captures(envelope, stub.capture)
+                captures.update(explicit)
+                for cap_name, from_path in missing:
+                    emit_event(
+                        {
+                            "event": "capture.missing",
+                            "stub": stub_name,
+                            "name": cap_name,
+                            "from": from_path,
+                        }
+                    )
 
             # Step 6: React
-            # Render response via fill_placeholders
-            rendered_body = fill_placeholders(stub.response.body, captures)
+            # Render response via typed capture substitution.
+            rendered_body = render_typed(stub.response.body, captures)
             rendered_headers = (
-                fill_placeholders(stub.response.headers or {}, captures)
+                render_typed(stub.response.headers or {}, captures)
                 if stub.response.headers
                 else {}
             )

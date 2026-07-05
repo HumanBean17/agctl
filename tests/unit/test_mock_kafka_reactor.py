@@ -11,7 +11,7 @@ import time
 import pytest
 
 from agctl.clients.kafka_client import ReactionResult
-from agctl.config.models import KafkaReaction, KafkaReactor
+from agctl.config.models import CaptureSpec, KafkaReaction, KafkaReactor
 from agctl.mock.kafka_reactor import KafkaReactor as Reactor
 from agctl.errors import ConnectionFailure, ConfigError
 
@@ -598,3 +598,182 @@ def test_reactor_no_match_config_processes_all(emit_event, stop_event):
     assert len(client.produce_calls) == 1
     assert len(emit_event.events) == 1
     assert emit_event.events[0]["event"] == "kafka.reacted"
+
+
+def test_reactor_capture_from_key(emit_event, stop_event):
+    """capture.from '.key' reads the message key (gap 2)."""
+    config = KafkaReactor(
+        topic="chatx.commands",
+        match='.command == "SEARCH"',
+        capture={"tid": CaptureSpec.model_validate({"from": ".key"})},
+        reaction=KafkaReaction(topic="chatx.events", value={"threadId": "{tid}"}),
+    )
+    client = FakeKafkaClient(
+        messages=[
+            {
+                "value": {"command": "SEARCH"},
+                "key": "k-9",
+                "partition": 0,
+                "offset": 1,
+                "timestamp": 1719660000000,
+                "headers": {},
+            }
+        ]
+    )
+    reactor = Reactor(
+        name="chatx",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+    )
+    reactor.run()
+    assert len(client.produce_calls) == 1
+    assert client.produce_calls[0]["value"] == {"threadId": "k-9"}
+
+
+def test_reactor_capture_from_header_case_sensitive(emit_event, stop_event):
+    """capture.from '.headers.rqUID' (case-sensitive, as-produced) (gap 2)."""
+    config = KafkaReactor(
+        topic="chatx.commands",
+        capture={"rqUID": CaptureSpec.model_validate({"from": ".headers.rqUID"})},
+        reaction=KafkaReaction(
+            topic="chatx.events",
+            value={"rs_headers": {"rqUID": "{rqUID}"}},
+        ),
+    )
+    client = FakeKafkaClient(
+        messages=[
+            {
+                "value": {"command": "SEARCH"},
+                "key": None,
+                "partition": 0,
+                "offset": 1,
+                "timestamp": 1719660000000,
+                "headers": {"rqUID": "r-1"},
+            }
+        ]
+    )
+    reactor = Reactor(
+        name="chatx",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+    )
+    reactor.run()
+    assert len(client.produce_calls) == 1
+    assert client.produce_calls[0]["value"] == {"rs_headers": {"rqUID": "r-1"}}
+
+
+def test_reactor_capture_object_passthrough_context_echo(emit_event, stop_event):
+    """type:object copies the context object from value to reaction (gap 3)."""
+    config = KafkaReactor(
+        topic="chatx.commands",
+        capture={"ctx": CaptureSpec.model_validate({"from": ".value.context", "type": "object"})},
+        reaction=KafkaReaction(topic="chatx.events", value={"context": "{ctx}"}),
+    )
+    client = FakeKafkaClient(
+        messages=[
+            {
+                "value": {
+                    "command": "SEARCH",
+                    "context": {"conversationId": "abc", "eventType": "X"},
+                },
+                "key": None,
+                "partition": 0,
+                "offset": 1,
+                "timestamp": 1719660000000,
+                "headers": {},
+            }
+        ]
+    )
+    reactor = Reactor(
+        name="chatx",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+    )
+    reactor.run()
+    assert len(client.produce_calls) == 1
+    # Real object, not a stringified dict (kafkaThreadHistoryFlow expectation).
+    assert client.produce_calls[0]["value"] == {
+        "context": {"conversationId": "abc", "eventType": "X"}
+    }
+
+
+def test_reactor_capture_object_overrides_implicit_scalar(emit_event, stop_event):
+    """Explicit object capture overrides an implicit same-name scalar."""
+    config = KafkaReactor(
+        topic="chatx.commands",
+        capture={"context": CaptureSpec.model_validate({"from": ".value.context", "type": "object"})},
+        reaction=KafkaReaction(topic="chatx.events", value={"context": "{context}"}),
+    )
+    client = FakeKafkaClient(
+        messages=[
+            {
+                "value": {"context": {"k": 1}},
+                "key": None,
+                "partition": 0,
+                "offset": 1,
+                "timestamp": 1719660000000,
+                "headers": {},
+            }
+        ]
+    )
+    reactor = Reactor(
+        name="chatx",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+    )
+    reactor.run()
+    assert client.produce_calls[0]["value"] == {"context": {"k": 1}}
+
+
+def test_reactor_capture_missing_emits_event_and_empty(emit_event, stop_event):
+    """A from resolving to nothing -> capture.missing + empty substitution."""
+    config = KafkaReactor(
+        topic="chatx.commands",
+        capture={"x": CaptureSpec.model_validate({"from": ".value.nope"})},
+        reaction=KafkaReaction(topic="chatx.events", value={"x": "{x}"}),
+    )
+    client = FakeKafkaClient(
+        messages=[
+            {
+                "value": {"command": "SEARCH"},
+                "key": None,
+                "partition": 0,
+                "offset": 1,
+                "timestamp": 1719660000000,
+                "headers": {},
+            }
+        ]
+    )
+    reactor = Reactor(
+        name="chatx",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+    )
+    reactor.run()
+    assert len(client.produce_calls) == 1
+    assert client.produce_calls[0]["value"] == {"x": ""}
+    missing = [e for e in emit_event.events if e["event"] == "capture.missing"]
+    assert len(missing) == 1
+    assert missing[0]["reactor"] == "chatx"
+    assert missing[0]["name"] == "x"
+    assert missing[0]["from"] == ".value.nope"

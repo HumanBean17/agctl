@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def parse_listen(listen: str) -> tuple[str, int]:
@@ -178,6 +178,24 @@ class HttpMatch(BaseModel):
     jq: str | None = None
 
 
+class CaptureSpec(BaseModel):
+    """A single capture declaration for a mock stub or Kafka reactor.
+
+    Reads a value off the *incoming* envelope (HTTP request or Kafka consumed
+    message) at the jq path ``from`` and stores it under the capture key. ``type``
+    controls how the resolver renders the captured value into a reaction
+    (``"scalar"`` -> JSON scalar, ``"object"`` -> merged object, ``"json"`` ->
+    raw JSON). This is the first aliased field in agctl's config schema: the YAML
+    key is the Python keyword ``from``, so the attribute is ``from_`` and
+    ``populate_by_name`` lets callers also construct via ``from_=...``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from")
+    type: Literal["scalar", "object", "json"] = "scalar"
+
+
 class HttpStub(BaseModel):
     """HTTP mock stub definition."""
 
@@ -185,6 +203,7 @@ class HttpStub(BaseModel):
     method: str
     path: str
     match: HttpMatch | None = None
+    capture: dict[str, CaptureSpec] | None = None
     response: HttpResponse
     delay_ms: int = 0
 
@@ -241,6 +260,7 @@ class KafkaReactor(BaseModel):
     topic: str
     consumer_group: str | None = None
     match: str | None = None
+    capture: dict[str, CaptureSpec] | None = None
     reaction: KafkaReaction
 
 

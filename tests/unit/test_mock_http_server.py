@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
-from agctl.config.models import HttpMatch, HttpStub, HttpResponse
+from agctl.config.models import CaptureSpec, HttpMatch, HttpStub, HttpResponse
 from agctl.mock.http_server import MockHTTPServer
 
 
@@ -796,5 +796,167 @@ class TestJqPredicate:
             assert len(event_sink) == 1
             assert event_sink[0]["event"] == "http.unmatched"
             assert event_sink[0]["status"] == 404
+        finally:
+            server.shutdown()
+
+
+class TestCapture:
+    """Envelope-rooted capture (Task 6)."""
+
+    def test_capture_nested_body_path(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """capture.from '.body.variables.id' reaches a nested GraphQL variable."""
+        stubs = {
+            "graphql-operatorById": HttpStub(
+                method="POST",
+                path="/graphql",
+                capture={"op_id": CaptureSpec.model_validate({"from": ".body.variables.id"})},
+                response=HttpResponse(body={"id": "{op_id}"}),
+            )
+        }
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/graphql",
+                    json={"query": "{ operatorById }", "variables": {"id": 7}},
+                )
+            assert response.status_code == 200
+            assert response.json() == {"id": "7"}
+        finally:
+            server.shutdown()
+
+    def test_capture_header_lowercased(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """capture.from '.headers.authorization' (envelope header keys lowercased)."""
+        stubs = {
+            "auth-echo": HttpStub(
+                method="POST",
+                path="/echo",
+                capture={"auth": CaptureSpec.model_validate({"from": ".headers.authorization"})},
+                response=HttpResponse(body={"a": "{auth}"}),
+            )
+        }
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/echo",
+                    json={},
+                    headers={"Authorization": "Bearer z"},
+                )
+            assert response.status_code == 200
+            assert response.json() == {"a": "Bearer z"}
+        finally:
+            server.shutdown()
+
+    def test_capture_object_pass_through(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """type:object substitutes a real object, not a stringified dict."""
+        stubs = {
+            "ctx-echo": HttpStub(
+                method="POST",
+                path="/ctx",
+                capture={"ctx": CaptureSpec.model_validate({"from": ".body.ctx", "type": "object"})},
+                response=HttpResponse(body={"context": "{ctx}"}),
+            )
+        }
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/ctx",
+                    json={"ctx": {"conversationId": "abc", "eventType": "X"}},
+                )
+            assert response.status_code == 200
+            assert response.json() == {"context": {"conversationId": "abc", "eventType": "X"}}
+        finally:
+            server.shutdown()
+
+    def test_capture_object_overrides_implicit_scalar(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """Explicit object capture overrides an implicit same-name scalar.
+
+        Without override the implicit ctx would stringify (Python str(dict));
+        with the object capture the field is a real object.
+        """
+        stubs = {
+            "override": HttpStub(
+                method="POST",
+                path="/override",
+                capture={"ctx": CaptureSpec.model_validate({"from": ".body.ctx", "type": "object"})},
+                response=HttpResponse(body={"context": "{ctx}"}),
+            )
+        }
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/override",
+                    json={"ctx": {"k": 1}},
+                )
+            assert response.json() == {"context": {"k": 1}}
+        finally:
+            server.shutdown()
+
+    def test_capture_missing_emits_event_and_empty(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """A from resolving to nothing -> capture.missing event + empty substitution."""
+        stubs = {
+            "maybe": HttpStub(
+                method="POST",
+                path="/maybe",
+                capture={"x": CaptureSpec.model_validate({"from": ".body.nope"})},
+                response=HttpResponse(body={"x": "{x}"}),
+            )
+        }
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/maybe",
+                    json={},
+                )
+            assert response.status_code == 200
+            assert response.json() == {"x": ""}
+            missing = [e for e in event_sink if e["event"] == "capture.missing"]
+            assert len(missing) == 1
+            assert missing[0]["stub"] == "maybe"
+            assert missing[0]["name"] == "x"
+            assert missing[0]["from"] == ".body.nope"
+        finally:
+            server.shutdown()
+
+    def test_implicit_numeric_capture_still_stringified(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """Regression: a stub with NO capture stringifies body keys (42 -> '42')."""
+        stubs = {
+            "implicit": HttpStub(
+                method="POST",
+                path="/n",
+                response=HttpResponse(body={"n": "{n}"}),
+            )
+        }
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/n",
+                    json={"n": 42},
+                )
+            assert response.status_code == 200
+            assert response.json() == {"n": "42"}
         finally:
             server.shutdown()

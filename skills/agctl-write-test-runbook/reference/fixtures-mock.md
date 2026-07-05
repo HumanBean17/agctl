@@ -52,9 +52,10 @@ failure that flips the run verdict to FAIL:
 - `http.body_parse_skipped` — a stub matched but the request body didn't parse and the response had unresolved placeholders.
 - `kafka.skipped` — messages consumed but not matched (e.g. non-object value).
 - `kafka.error` — a reaction produce failure or reactor error.
+- `capture.missing` — an explicit `capture.<name>.from` resolved to `null`/missing. Non-fatal (the mock substitutes empty string and continues), but it marks a `from` that produced nothing — usually a misconfigured path silently yielding a plausible-but-wrong field.
 
 ```bash
-grep -E 'http\.unmatched|http\.body_parse_skipped|kafka\.skipped|kafka\.error' mock.log
+grep -E 'http\.unmatched|http\.body_parse_skipped|kafka\.skipped|kafka\.error|capture\.missing' mock.log
 ```
 
 A non-zero match count → FAIL.

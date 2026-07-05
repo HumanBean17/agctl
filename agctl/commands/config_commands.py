@@ -27,6 +27,7 @@ import click
 
 from ..config import ConfigError, load_config
 from ..config.validator import validate_config
+from ..mock.capture_validate import collect_capture_placement_errors
 from ..mock.jq_precompile import collect_jq_compile_errors
 from ..output import emit
 
@@ -140,6 +141,10 @@ def config_validate(ctx: click.Context, config_path: str | None) -> None:
     # Task 10). The collector lives in mock.jq_precompile (not validator.py)
     # so config/* stays free of an assertions dependency.
     errors = errors + collect_jq_compile_errors(cfg.mocks)
+    # Surface object-capture placement violations (Task 5): an object-typed
+    # capture used inline / in a string-only slot has no honest render. Same
+    # pure-Python, no-assertions constraint as the jq collector above.
+    errors = errors + collect_capture_placement_errors(cfg.mocks)
     if errors:
         summary = f"Configuration has {len(errors)} error(s)"
         emit(

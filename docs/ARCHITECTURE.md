@@ -124,6 +124,8 @@ agctl/
 │   ├── http_server.py          # stdlib ThreadingHTTPServer + handler
 │   ├── kafka_reactor.py        # Kafka consumer loop + jq match + reaction
 │   ├── jq_precompile.py        # walks mocks → (label, expr) pairs; compile-only validate
+│   ├── capture.py              # envelope capture resolver: jq_value(envelope, from) → typed CaptureValue
+│   ├── capture_validate.py     # walks mocks → object-capture placement errors; pure Python (no jq)
 │   └── engine.py               # MockEngine lifecycle (start/run/shutdown; Step 0 pre-compiles jq)
 ├── data/
 │   └── sample-config.yaml      # packaged starter config (read via importlib.resources)
@@ -315,7 +317,7 @@ results as they happen, so it violates "one object per invocation":
 **The second streaming exception — `mock run`.** Like `http ping`, the mock server must stream events as they happen:
 
 - Not wrapped by `@envelope`.
-- Emits one JSON object **per event** (`started`, `http.hit`, `http.unmatched`, `http.body_parse_skipped`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, `summary`) directly as they occur.
+- Emits one JSON object **per event** (`started`, `http.hit`, `http.unmatched`, `http.body_parse_skipped`, `capture.missing`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, `summary`) directly as they occur.
 - All emission goes through a single-writer path (`threading.Lock` in `MockEngine.emit_event` or a dedicated writer thread) — concurrent HTTP handler threads and Kafka reactor threads emit safely without interleaved lines.
 - Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary, http_hits, http_unmatched, http_body_parse_skipped, kafka_reactions, kafka_skipped, kafka_errors, duration_ms}` and exits `0` (clean, no runtime errors) or `1` (runtime errors occurred, or `--fail-fast` triggered).
 - Startup errors emit a single structured envelope **before** any event line.
@@ -541,6 +543,14 @@ Primitives in `assertions.py`, composed by the command layer. Five families:
   and `--contains` JSON shape pre-request (`ConfigError` exit 2, before the
   request is sent). `coerce_db_value` is intentionally not reused — HTTP
   response bodies are already JSON-native.
+- **`mock run` capture extraction** — `mock/capture.py::resolve_captures` reuses
+  `jq_value(envelope, spec.from_)` to read each explicit `capture.<name>.from`
+  off the live message envelope (HTTP request or Kafka message), producing a
+  typed `CaptureValue` map consumed by `resolution.render_typed`. So `jq_value`
+  now powers mock capture in addition to HTTP response assertions
+  (`--jq-path`); a `from` resolving to `null`/missing is the soft-miss path
+  (emits `capture.missing`, substitutes empty string), distinct from a missing
+  `jq` library which re-raises as `ConfigError` (exit 2).
 
 ### Custom assertion modes (`assertion_registry.py`)
 
@@ -766,8 +776,7 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
 - **Stateful flows** (OAuth/token exchange, create-then-GET, idempotency-key replay, pagination) — static engine returns same canned response → false green.
 - **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** — cannot intercept HTTPS → integration untested → false green.
 - **Cross-transport sagas** (Kafka trigger → HTTP callback) — no causal linkage → false green.
-- **Header-borne correlation IDs** — reactor cannot capture from headers → cannot produce correlatable reply → false green.
 - **Non-JSON Kafka values** (Avro/Protobuf/schema-registry) — emitted as `kafka.skipped` → false green.
-- **JSON-type pass-through** — captured values are stringified → strict downstream may reject → false failure.
+- **`match` / `capture` `.`-root divergence (#22)** — explicit `capture.<name>.from` roots at the whole message envelope (so nested fields, the Kafka `.key`, and headers are all reachable, and `type: object` passes the live value through for true JSON-type fields), but `match.jq` (HTTP) / reactor `match` (Kafka) remain payload-rooted (body/value only). The same `.amount` means different things on either side of that fence. Unifying `match` onto the envelope root is breaking and tracked as #22; until then, author `match` payload-rooted and `capture.from` envelope-rooted.
 - **Containerized SUT topology** — operator must target `host.docker.internal` / host LAN IP and avoid SUT that swallows connection errors → false green.
 - **Shared broker + pinned `consumer_group` reused across runs/devs** — partition split or resume-past-messages → silently missing/old reactions → false green (mitigated by unique-per-run default).
