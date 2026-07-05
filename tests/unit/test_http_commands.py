@@ -422,7 +422,7 @@ def test_http_call_status_assertion_fail(mock_transport, captured):
 
 
 def test_http_request_match_assertion_pass(mock_transport, captured):
-    """(d) --match '.status=="PENDING"' on {"status":"PENDING"} -> ok:true."""
+    """(d) --match '.body.status=="PENDING"' on {"status":"PENDING"} -> ok:true."""
     http_commands.set_default_transport(
         _transport_returning(200, {"status": "PENDING"})
     )
@@ -440,7 +440,7 @@ def test_http_request_match_assertion_pass(mock_transport, captured):
                 "--path",
                 "/x",
                 "--match",
-                '.status=="PENDING"',
+                '.body.status=="PENDING"',
             ]
         )
         payload = json.loads(result.output)
@@ -452,7 +452,7 @@ def test_http_request_match_assertion_pass(mock_transport, captured):
 
 
 def test_http_request_match_assertion_fail(mock_transport, captured):
-    """(d) --match '.status=="PENDING"' on {"status":"PAID"} -> ok:false, exit 1."""
+    """(d) --match '.body.status=="PENDING"' on {"status":"PAID"} -> ok:false, exit 1."""
     http_commands.set_default_transport(_transport_returning(200, {"status": "PAID"}))
     try:
         result = _run(
@@ -468,7 +468,7 @@ def test_http_request_match_assertion_fail(mock_transport, captured):
                 "--path",
                 "/x",
                 "--match",
-                '.status=="PENDING"',
+                '.body.status=="PENDING"',
             ]
         )
         payload = json.loads(result.output)
@@ -477,8 +477,38 @@ def test_http_request_match_assertion_fail(mock_transport, captured):
         assert payload["ok"] is False
         assert payload["error"]["type"] == "AssertionError"
         assert payload["error"]["detail"]["failures"] == [
-            {"mode": "match", "expr": '.status=="PENDING"', "result": False}
+            {"mode": "match", "expr": '.body.status=="PENDING"', "result": False}
         ]
+    finally:
+        http_commands.set_default_transport(None)
+
+
+def test_http_request_match_on_status_code(mock_transport, captured):
+    """--match '.status_code == 201' reaches the response envelope (not the body):
+    against a 201 with empty body -> ok:true. Body-rooting would resolve
+    .status_code against {} -> null -> predicate false -> assertion failure."""
+    http_commands.set_default_transport(_transport_returning(201, {}))
+    try:
+        result = _run(
+            [
+                "--config",
+                str(FIXTURE),
+                "http",
+                "request",
+                "--service",
+                "order-service",
+                "--method",
+                "POST",
+                "--path",
+                "/x",
+                "--match",
+                ".status_code == 201",
+            ]
+        )
+        payload = json.loads(result.output)
+
+        assert result.exit_code == 0
+        assert payload["ok"] is True
     finally:
         http_commands.set_default_transport(None)
 
