@@ -864,7 +864,13 @@ class _InterleavingConsumer:
         self.poll_calls = 0
         self.closed = False
 
-    def subscribe(self, topics, on_assign=None, on_revoke=None):
+    def subscribe(self, topics, on_assign=_UNSET, on_revoke=_UNSET):
+        # Mirror confluent_kafka's callable-or-omit contract (see FakeConsumer);
+        # an explicit None raises so a consume_loop subscribe regression is
+        # caught here too, not silently accepted (#28).
+        for _name, _cb in (("on_assign", on_assign), ("on_revoke", on_revoke)):
+            if _cb is not _UNSET and not callable(_cb):
+                raise TypeError(f"{_name} expects a callable")
         self.subscribe_calls.append(list(topics))
 
     def seek(self, tp):
