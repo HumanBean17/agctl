@@ -1,5 +1,8 @@
 """Tests for packaging configuration in pyproject.toml."""
 
+import subprocess
+import sys
+
 import tomllib
 from pathlib import Path
 
@@ -20,3 +23,15 @@ def test_jq_extra_exists():
     assert optional_deps["http"] == ["httpx>=0.27"], "http extra should be unchanged"
     assert optional_deps["kafka"] == ["confluent-kafka>=2.4", "jq>=1.6"], "kafka extra should be unchanged"
     assert optional_deps["db"] == ["psycopg[binary]>=3.1", "jq>=1.6"], "db extra should be unchanged"
+
+
+def test_python_m_agctl_module_entry():
+    """Test that `python -m agctl --help` works as a subprocess (enables daemon spawn)."""
+    result = subprocess.run(
+        [sys.executable, "-m", "agctl", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"python -m agctl --help failed: {result.stderr}"
+    assert "mock" in result.stdout, "mock group should appear in help output"
+
