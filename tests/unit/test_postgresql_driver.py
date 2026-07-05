@@ -1249,6 +1249,32 @@ def test_describe_schema_level2_standalone_unique_index_only_list_indkey():
     ]
 
 
+def test_describe_schema_level2_expression_unique_index_skipped():
+    """A standalone unique index over an EXPRESSION (indkey placeholder 0, e.g.
+    ``CREATE UNIQUE INDEX ... ON t (lower(email))``) is SKIPPED: it has no
+    column list to map, and emitting ``{"columns": []}`` would mislead an agent
+    into thinking a uniqueness exists over no columns. The column-oriented
+    ``unique_constraints`` contract can't honestly represent an expression.
+    """
+    conn, _ = _level2_catalog_conn(
+        relations=[_l2_relation(16384, "public", "orders")],
+        columns=[
+            _l2_column(1, "email", "text", True),
+        ],
+        constraints=[],
+        # indkey "0" is the expression-column placeholder (the real expression
+        # lives in pg_index.indexprs). Must be skipped, not surfaced.
+        unique_indexes=[
+            _l2_unique_index("orders_email_lower_uidx", "0"),
+        ],
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.describe_schema(table="orders", schema=None)
+
+    assert result["matches"][0]["unique_constraints"] == []
+
+
 def test_describe_schema_level2_primary_key_not_duplicated_and_constraint_counted_once():
     """A primary key is NOT duplicated into unique_constraints, and a
     pg_constraint unique constraint is captured exactly once (by the

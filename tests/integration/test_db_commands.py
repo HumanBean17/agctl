@@ -377,6 +377,8 @@ def test_db_schema_standalone_unique_index_surfaces(require_postgres):
         "id integer PRIMARY KEY, "
         "email text NOT NULL, "
         "external_ref text, "
+        "code text, "
+        "tag text, "
         "UNIQUE (email)"  # pg_constraint-backed unique (contype='u')
         ")"
     )
@@ -385,6 +387,18 @@ def test_db_schema_standalone_unique_index_surfaces(require_postgres):
     _exec_ddl(
         "CREATE UNIQUE INDEX t_external_ref_uidx "
         "ON agctl_uniq_test.t (external_ref)"
+    )
+    # Expression unique index: indkey placeholder is 0, so it has no column
+    # list to map. Must be SKIPPED (not surfaced as a misleading empty-cols
+    # entry). The driver filters this at the row-mapping layer.
+    _exec_ddl(
+        "CREATE UNIQUE INDEX t_code_lower_uidx "
+        "ON agctl_uniq_test.t (lower(code))"
+    )
+    # Partial unique index: excluded by the ``indpred IS NULL`` predicate.
+    _exec_ddl(
+        "CREATE UNIQUE INDEX t_tag_partial_uidx "
+        "ON agctl_uniq_test.t (tag) WHERE tag IS NOT NULL"
     )
     # Plain (non-unique) index: must NOT appear in unique_constraints.
     _exec_ddl("CREATE INDEX t_id_nonunique ON agctl_uniq_test.t (id)")
@@ -420,6 +434,11 @@ def test_db_schema_standalone_unique_index_surfaces(require_postgres):
     assert all("id" != tuple(u["columns"]) for u in uqs)
     # Plain non-unique index must not leak in.
     assert all(u["name"] != "t_id_nonunique" for u in uqs)
+    # Expression unique index (indkey=0) skipped — no misleading empty-cols entry.
+    assert all(u["name"] != "t_code_lower_uidx" for u in uqs)
+    assert all(u["columns"] != [] for u in uqs)
+    # Partial unique index excluded by the indpred IS NULL predicate.
+    assert all(u["name"] != "t_tag_partial_uidx" for u in uqs)
     # No duplicate entries overall.
     assert len(uqs) == len({u["name"] for u in uqs})
 
