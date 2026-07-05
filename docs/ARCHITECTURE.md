@@ -478,9 +478,10 @@ delegates to the driver and returns its dict unchanged.
 `PostgreSQLDriver.describe_schema` reads `pg_catalog` (relations from `pg_class`/
 `pg_namespace`/`pg_attribute`; columns from `pg_attribute`/`pg_type`; defaults,
 enum values, comments, and constraints from `pg_attrdef`/`pg_enum`/
-`pg_description`/`pg_constraint`) and excludes schemas whose name starts with
-`pg_` or equals `information_schema`. Third-party drivers may omit it
-(non-introspection drivers remain valid for `db query`/`assert`/`execute`).
+`pg_description`/`pg_constraint`; and standalone unique indexes from `pg_index`,
+appending each to `unique_constraints` in the same shape) and excludes schemas
+whose name starts with `pg_` or equals `information_schema`. Third-party drivers
+may omit it (non-introspection drivers remain valid for `db query`/`assert`/`execute`).
 
 **`db schema` lifecycle** — the Click `db_schema` command dispatches on
 `--table`: absent → `_db_schema_tables_core` (Level 1, command tag
@@ -526,7 +527,9 @@ Primitives in `assertions.py`, composed by the command layer. Five families:
   when valid (`"0"`→`0`, `"true"`→`True`, `"null"`→`None`) else treats it as a
   string; `coerce_db_value` normalizes a DB cell (`bool` before `int`,
   `Decimal`→int/float, datetime→ISO 8601, `UUID`→str); `type_aware_equal`
-  compares strictly — a number never equals a string (`0` ≠ `"0"`).
+  compares strictly — a number never equals a string (`0` ≠ `"0"`). For two
+  strings that both parse as ISO 8601 datetimes, `type_aware_equal` normalizes
+  via UTC so `'...Z'` and `'...+00:00'` for the same instant compare equal.
 
 **Where used:**
 

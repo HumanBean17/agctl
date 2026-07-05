@@ -338,6 +338,7 @@ All commands share these global flags:
 |---|---|---|
 | `--config <path>` | auto-discovered | Explicit path to `agctl.yaml` |
 | `--timeout <seconds>` | from config `defaults` | Override request/operation timeout |
+| `--version` | — | Print version and exit |
 
 ### 3.1 `agctl http` — HTTP Requests
 
@@ -760,7 +761,7 @@ agctl db schema
 ```
 
 - **Level 1 (no `--table`)** — list relations (tables and views) the agent can drill into.
-- **Level 2 (`--table <name>`)** — return the single matching relation's columns, primary key, foreign keys, and unique constraints. `--table` accepts views. Match is **exact-case** on the stored name; `--schema` disambiguates when the same name exists in multiple schemas.
+- **Level 2 (`--table <name>`)** — return the single matching relation's columns, primary key, foreign keys, and unique constraints (both `pg_constraint`-backed UNIQUE constraints and standalone `CREATE UNIQUE INDEX` indexes). `--table` accepts views. Match is **exact-case** on the stored name; `--schema` disambiguates when the same name exists in multiple schemas.
 
 **Capability gate:** schema discovery requires the driver to implement the optional `describe_schema` capability (see §9.1). A driver without it is valid for `db query`/`assert`/`execute` but ineligible for `db schema`; the command fails fast with `ConfigError` (exit 2) **without opening a connection**.
 
