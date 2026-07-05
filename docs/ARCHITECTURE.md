@@ -97,6 +97,7 @@ One responsibility per module. The directory tree as it exists today:
 
 ```
 agctl/
+├── __main__.py                 # python -m agctl entry point (enables `mock start` daemon spawn)
 ├── cli.py                      # Click entry point; registers groups; loads plugins; secret masking
 ├── command.py                  # @envelope decorator + load_config_or_raise
 ├── output.py                   # emit() — the single permitted stdout write path
@@ -118,7 +119,7 @@ agctl/
 │   ├── check_commands.py       # check ready
 │   ├── config_commands.py      # config validate / show / init
 │   ├── discover_commands.py    # discover summary / category / item / search
-│   └── mock_commands.py        # mock run (HTTP mock + Kafka reactors)
+│   └── mock_commands.py        # mock run / start / stop / status (HTTP mock + Kafka reactors)
 ├── mock/                       # mock server implementation (HTTP + Kafka)
 │   ├── routing.py              # path-template matching (pure functions)
 │   ├── http_server.py          # stdlib ThreadingHTTPServer + handler
@@ -126,6 +127,7 @@ agctl/
 │   ├── jq_precompile.py        # walks mocks → (label, expr) pairs; compile-only validate
 │   ├── capture.py              # envelope capture resolver: jq_value(envelope, from) → typed CaptureValue
 │   ├── capture_validate.py     # walks mocks → object-capture placement errors; pure Python (no jq)
+│   ├── daemon.py               # daemon lifecycle: pidfile, liveness, target resolution, NDJSON log parser, failure taxonomy
 │   └── engine.py               # MockEngine lifecycle (start/run/shutdown; Step 0 pre-compiles jq)
 ├── data/
 │   └── sample-config.yaml      # packaged starter config (read via importlib.resources)
@@ -321,6 +323,13 @@ results as they happen, so it violates "one object per invocation":
 - All emission goes through a single-writer path (`threading.Lock` in `MockEngine.emit_event` or a dedicated writer thread) — concurrent HTTP handler threads and Kafka reactor threads emit safely without interleaved lines.
 - Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary, http_hits, http_unmatched, http_body_parse_skipped, kafka_reactions, kafka_skipped, kafka_errors, duration_ms}` and exits `0` (clean, no runtime errors) or `1` (runtime errors occurred, or `--fail-fast` triggered).
 - Startup errors emit a single structured envelope **before** any event line.
+
+**The managed daemon commands — `mock start`/`stop`/`status`** are NOT streaming exceptions. Each is a normal `@envelope`-wrapped command that emits exactly one JSON object and exits 0/1/2:
+
+- `mock start` blocks until the daemon's `started` line appears in the log (or a startup error or timeout), then returns the `mock.start` envelope (`ok:true` with pid/listen/log_path/stubs/reactors/started_at).
+- `mock stop` signals the daemon, waits for shutdown, parses the log for summary + failure events, and returns the `mock.stop` verdict (`stopped`/`pid`/`signal`/`summary`/`failures`). When fatal failures are found, it raises `AssertionFailure` (exit 1) with the verdict in `error.detail`.
+- `mock status` reads the live log and returns the `mock.status` snapshot (`running`/`pid`/`listen`/`uptime_ms`/`summary_so_far`/`failures_so_far`).
+- All three commands are wrapped by `@envelope` and follow the one-emit contract; they do NOT stream NDJSON like `mock run`.
 
 **stdout vs stderr** — all machine-readable output on stdout; stderr carries
 only diagnostics an agent must never parse (plugin-load failures, entry-point
@@ -778,6 +787,7 @@ divergence is introduced.
 
 What the system does **not** do today (as-built; see DESIGN §10 for the roadmap):
 
+- **Bounded statelessness carve-out — mock daemon state.** The managed daemon commands (`mock start`/`stop`/`status`) introduce the sole on-disk state in the system: a pidfile (`mock-<port>.pid`) and NDJSON log (`mock-<port>.log`) under `<state-dir>/` (default `./.agctl/`). This is a deliberate, scoped exception to the stateless-invocation principle, confined to the daemon lifecycle. No other commands read or write cross-invocation state.
 - **No Schema Registry / Avro/Protobuf decoding** — Kafka values are raw JSON;
   `schema_registry_url` is parsed but unused.
 - **No retry/polling DSL** — eventually-consistent assertions need a caller-side

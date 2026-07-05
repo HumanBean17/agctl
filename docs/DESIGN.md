@@ -793,6 +793,8 @@ agctl check ready --all
 
 ### 3.5 `agctl mock` — Mock Server (HTTP & Kafka)
 
+The `agctl mock` command group provides two ways to run mock servers: foreground streaming (`mock run`) and managed daemon lifecycle (`mock start`/`stop`/`status`). Both share the same engine and configuration; choose the mode that fits your testing workflow.
+
 #### `agctl mock run`
 
 Run an HTTP mock server and/or Kafka reactors, streaming NDJSON events to stdout. The mock is SUT-facing: the real application's HTTP client points at the mock's `listen` address, and Kafka reactors join the SUT's real broker as consumers. The command blocks until stopped (foreground process, designed for backgrounding via `&` like `http ping`).
@@ -862,6 +864,172 @@ agctl mock run --only http --http-listen 127.0.0.1:18080
 # Fail-fast synchronous run with duration
 agctl mock run --duration 30 --fail-fast
 ```
+
+#### `agctl mock start` — managed daemon (start)
+
+Start the mock server as a detached daemon with automatic pidfile management and readiness polling. The daemon runs the same engine as `mock run` but in the background, with its stdout redirected to a log file. The command returns a single JSON envelope once the daemon is ready (the `started` line has appeared in the log).
+
+```
+agctl mock start
+    [--config <path>]            # auto-discovered by default
+    [--http-listen <host:port>]  # literal (NO ${} interpolation); overrides mocks.http.listen
+    [--only http|kafka]          # run a single engine
+    [--fail-fast]                # forwarded to the daemon
+    [--duration <seconds>]       # forwarded; daemon self-stops after N s
+    [--state-dir <path>]         # default ./.agctl
+```
+
+`--until-stopped` is dropped (it is the daemon's default behavior). The flag set is `run`'s minus the streaming-lifecycle flags.
+
+**Result shape (`mock.start`):**
+
+```json
+{
+  "ok": true,
+  "command": "mock.start",
+  "result": {
+    "pid": 12345,
+    "listen": "0.0.0.0:18080",
+    "log_path": "./.agctl/mock-18080.log",
+    "stubs": 2,
+    "reactors": ["order-command-handler"],
+    "started_at": "2026-07-05T09:00:00Z"
+  },
+  "duration_ms": 312
+}
+```
+
+The daemon writes its pidfile to `<state-dir>/mock-<port>.pid` (or `mock-kafka.pid` for Kafka-only mocks) and its NDJSON log to `<state-dir>/mock-<port>.log`. If a mock is already running on the resolved port, `start` fails with `ConfigError` (exit 2).
+
+#### `agctl mock stop` — managed daemon (stop)
+
+Stop a running mock daemon by signaling it, waiting for graceful shutdown, parsing the log for the final summary, and returning the verdict. If any fatal failure events are found (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`), `stop` surfaces them and exits 1 (the strict rule). `capture.missing` is included in the failure list but is non-fatal.
+
+```
+agctl mock stop
+    [--listen <host:port>]       # select when >1 running
+    [--pid <pid>]                # explicit selector
+    [--all]                      # stop every running mock in --state-dir
+    [--timeout <seconds>]        # graceful-wait budget (default 10); SIGKILL after
+    [--state-dir <path>]
+```
+
+Selector resolution: no-arg works when exactly one mock is running in `--state-dir`; otherwise `--listen`, `--pid`, or `--all` is required (else `ConfigError` exit 2).
+
+**Result shape (`mock.stop`) — clean stop (no fatal failures):**
+
+```json
+{
+  "ok": true,
+  "command": "mock.stop",
+  "result": {
+    "stopped": true,
+    "pid": 12345,
+    "signal": "SIGTERM",
+    "summary": {
+      "http_hits": 7,
+      "http_unmatched": 0,
+      "http_body_parse_skipped": 0,
+      "kafka_reactions": 3,
+      "kafka_skipped": 0,
+      "kafka_errors": 0,
+      "duration_ms": 45213
+    },
+    "failures": []
+  },
+  "duration_ms": 8
+}
+```
+
+**Failure shape (`mock.stop`) — fatal failures found (exit 1):**
+
+When fatal failures are detected, `stop` raises `AssertionFailure` (exit 1) and carries the verdict in `error.detail`:
+
+```json
+{
+  "ok": false,
+  "command": "mock.stop",
+  "result": null,
+  "error": {
+    "type": "AssertionError",
+    "message": "mock run had 2 fatal failure event(s)",
+    "detail": {
+      "stopped": true,
+      "pid": 12345,
+      "signal": "SIGTERM",
+      "summary": {
+        "http_hits": 7,
+        "http_unmatched": 2,
+        "http_body_parse_skipped": 0,
+        "kafka_reactions": 3,
+        "kafka_skipped": 0,
+        "kafka_errors": 1,
+        "duration_ms": 45213
+      },
+      "failures": [
+        {"event": "http.unmatched", "method": "GET", "path": "/x", "timestamp": "..."},
+        {"event": "kafka.error", "reactor": "order-command-handler", "error": "...", "timestamp": "..."}
+      ]
+    }
+  },
+  "duration_ms": 8
+}
+```
+
+**`--all` shape:** with `--all`, `stop` iterates every running mock in `--state-dir`, collecting one verdict per mock. On success the verdicts are returned in `result.stopped` as an **array**; if **any** stopped mock had a fatal failure, `stop` raises `AssertionFailure` (exit 1) and the array is carried in `error.detail.stopped`.
+
+#### `agctl mock status` — managed daemon (status)
+
+Query whether a mock daemon is running and, if so, report live statistics by reading the log file. This command never signals the daemon and never removes the pidfile — it is read-only introspection.
+
+```
+agctl mock status
+    [--listen <host:port>]
+    [--state-dir <path>]
+```
+
+**Result shape (`mock.status`) — running:**
+
+```json
+{
+  "ok": true,
+  "command": "mock.status",
+  "result": {
+    "running": true,
+    "pid": 12345,
+    "listen": "0.0.0.0:18080",
+    "uptime_ms": 12034,
+    "summary_so_far": {
+      "http_hits": 3,
+      "http_unmatched": 0,
+      "http_body_parse_skipped": 0,
+      "kafka_reactions": 1,
+      "kafka_skipped": 0,
+      "kafka_errors": 0
+    },
+    "failures_so_far": []
+  },
+  "duration_ms": 2
+}
+```
+
+A not-running mock returns `{running:false}` (and `ok:true`, exit 0). Stale pidfiles (dead pid) are detected and cleaned up automatically.
+
+#### Simplified lifecycle with managed daemons
+
+The managed daemon commands collapse the four-step `mock run` protocol into two commands:
+
+```bash
+# Start the daemon (blocks until ready)
+agctl mock start
+
+# ... run the SUT / assertions ...
+
+# Stop the daemon and get the verdict (fatal failures → exit 1)
+agctl mock stop
+```
+
+The old protocol (redirect log → poll `started` → SIGTERM+wait → grep log) is now handled by `start`/`stop` internally. Agents no longer need to manage the PID file, log redirection, or failure grepping manually.
 
 ---
 
@@ -1839,6 +2007,8 @@ Stderr is reserved for unexpected internal errors and stack traces. An agent mus
 
 No session files, no lock files, no local state databases. Each invocation is fully self-contained. Kafka consumer groups are used for offset tracking when needed; that state lives in Kafka, not on disk.
 
+**Bounded exception — mock daemon state.** The managed daemon commands (`mock start`/`stop`/`status`) introduce a deliberate, scoped carve-out: a pidfile (`mock-<port>.pid`) and NDJSON log (`mock-<port>.log`) under `<state-dir>/` (default `./.agctl/`). This is the sole exception to "no session files" and is confined to the daemon lifecycle only. No other commands write disk state.
+
 ### Windowed assertions (reliable send-then-assert)
 
 `kafka assert`/`consume` seek to `now - --lookback` and read forward, rather than subscribing at "latest". This makes the send-then-assert pattern reliable without subscribe-before-produce gymnastics: the lookback window catches events published just before the command started. See §3.2.
@@ -1969,7 +2139,7 @@ These items are intentionally deferred. Do not implement them until the core des
 | **`--match-all` flag (HTTP / Kafka)** | The "every item" case (e.g. all order items satisfy a predicate). Today covered by a jq idiom (`all(.items[]; .predicate)`); a dedicated sibling flag is deferred. |
 | **Mock: cross-transport reactions** | HTTP trigger → Kafka produce; Kafka trigger → HTTP callback. The trigger→reaction model admits this later without a rewrite. |
 | **Mock: stateful / scenario mocks** | Sequences, "Nth call → Y", reactor behavior change after N messages. |
-| **Mock: managed daemon** | `mock start/stop/status` with pidfile + control socket, behind `--detach`. |
+| **Mock: control socket / runtime RPC** | A control socket for live runtime control (add stub at runtime, live counter queries) is deferred. The current daemon model uses signal + log-file parsing for observation only (start/stop/status). |
 | **Mock: record / replay** | Record real traffic into stubs for later replay. |
 | **Mock: exactly-once reactor delivery** | Reaction retry/backoff on broker errors (today: at-least-once with idempotent reactions). |
 | **Mock: TLS / HTTPS mock** | Cert-pinned SUT clients cannot connect to a plaintext mock. |

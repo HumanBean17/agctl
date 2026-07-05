@@ -99,9 +99,13 @@ agctl discover --category <http-templates|kafka-patterns|db-templates> --name <n
 
 **Mocks have no `discover` category** — `agctl discover` does not surface `mocks:` (only
 `services` / `http-templates` / `kafka-patterns` / `db-templates`). For a `mock` edit,
-verify with `agctl config validate` and a smoke run (`agctl mock run --duration 5`,
-checking the `started` line and that no `http.unmatched` / `kafka.error` appears) — see the
-`agctl` skill.
+verify with `agctl config validate` and a smoke run (`agctl mock start` followed by
+`agctl mock stop`, checking for failures) — see the `agctl` skill.
+
+**Mock daemon state directory:** The managed daemon commands (`mock start`/`stop`/`status`)
+write a pidfile (`mock-<port>.pid`) and NDJSON log (`mock-<port>.log`) under `<state-dir>/`
+(default `./.agctl/`). This is the sole on-disk state in `agctl`, confined to the daemon
+lifecycle. Clean up with `rm -rf .agctl`.
 
 If `agctl` isn't installed, run the **structural checklist** below instead and tell the user
 live validation was skipped. **Never** declare done on config that doesn't validate.
@@ -119,6 +123,7 @@ live validation was skipped. **Never** declare done on config that doesn't valid
 - [ ] `mocks.http.listen` (if set) parses as `host:port` (IPv6 hosts bracketed, e.g. `[::1]:18080`).
 - [ ] Every `mocks.http.stubs` / `mocks.kafka.reactors` entry has a non-empty `description`.
 - [ ] Every `mocks.kafka.reactors.*.reaction.headers` value (if set) is a string.
+- [ ] `mock start`/`stop`/`status` daemon state (pidfile + log under `<state-dir>/`) is scoped to `.agctl/` by default; verify `--state-dir` if a custom location is used.
 
 ## Worked example (HTTP, Spring)
 
