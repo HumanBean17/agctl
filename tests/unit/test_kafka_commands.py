@@ -649,6 +649,12 @@ def test_kafka_assert_no_match_is_assertion_error(install_fake):
     assert payload["ok"] is False
     assert payload["error"]["type"] == "AssertionError"
     assert payload["error"]["detail"]["topic"] == "t"
+    # Self-debugging fields: echo the active modes with their jq roots so the
+    # agent sees --contains roots at the message value (not the envelope).
+    assert payload["error"]["detail"]["modes"] == [
+        {"mode": "contains", "root": "message value", "needle": {"a": 1}}
+    ]
+    assert payload["error"]["detail"]["messages_scanned"] >= 1
 
 
 def test_kafka_assert_pattern_fills_placeholder_and_infers_topic(install_fake):

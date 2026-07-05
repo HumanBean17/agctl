@@ -413,7 +413,7 @@ agctl http request \
   --path /api/v1/orders/ord-789
 ```
 
-**Response assertions (`http call` and `http request`):** Optional flags let you assert on the response in the same invocation, with the same exit-code discipline as `kafka assert` / `db assert`. Zero flags (the default) leaves behavior unchanged — a 4xx/5xx response is still `ok:true` (HTTP status is a result, not an assertion). Supplying ≥1 flag enters assertion mode; all active flags must pass (AND). A failed flag raises `AssertionError` (exit 1) with `error.detail = {response, failures}`, where `response` is the full HTTP result and `failures` lists every failing mode (no short-circuit).
+**Response assertions (`http call` and `http request`):** Optional flags let you assert on the response in the same invocation, with the same exit-code discipline as `kafka assert` / `db assert`. Zero flags (the default) leaves behavior unchanged — a 4xx/5xx response is still `ok:true` (HTTP status is a result, not an assertion). Supplying ≥1 flag enters assertion mode; all active flags must pass (AND). A failed flag raises `AssertionError` (exit 1) with `error.detail = {response, failures}`, where `response` is the full HTTP result and `failures` lists every failing mode (no short-circuit). Each failure entry includes a `root` label and a payload snapshot (e.g. `contains`/`jq-path` failures include `"root": "response body"` + `"body": <result["body"]>`, while `match` failures include `"root": "response envelope"` + `"body": <result["body"]>`) so an agent can self-correct a mis-rooted expression without dropping the flag and re-running raw.
 
 - `--status <code>` — exact HTTP status code the response must return.
 - `--contains '{...}'` — JSON subset match against the response body.

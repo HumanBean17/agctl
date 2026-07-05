@@ -477,7 +477,13 @@ def test_http_request_match_assertion_fail(mock_transport, captured):
         assert payload["ok"] is False
         assert payload["error"]["type"] == "AssertionError"
         assert payload["error"]["detail"]["failures"] == [
-            {"mode": "match", "expr": '.body.status=="PENDING"', "result": False}
+            {
+                "mode": "match",
+                "expr": '.body.status=="PENDING"',
+                "result": False,
+                "root": "response envelope",
+                "body": {"status": "PAID"},
+            }
         ]
     finally:
         http_commands.set_default_transport(None)
@@ -569,7 +575,13 @@ def test_http_request_contains_assertion_fail(mock_transport, captured):
         assert payload["ok"] is False
         assert payload["error"]["type"] == "AssertionError"
         assert payload["error"]["detail"]["failures"] == [
-            {"mode": "contains", "needle": {"status": "PENDING"}, "matched": False}
+            {
+                "mode": "contains",
+                "needle": {"status": "PENDING"},
+                "matched": False,
+                "root": "response body",
+                "body": {"status": "PAID"},
+            }
         ]
     finally:
         http_commands.set_default_transport(None)
@@ -661,3 +673,13 @@ def test_http_request_match_with_jq_missing_is_config_error(
     assert payload["ok"] is False
     assert payload["error"]["type"] == "ConfigError"
     assert "agctl[jq]" in payload["error"]["message"]
+
+
+def test_http_match_help_states_response_envelope_root():
+    """Regression (battle-test incident): the agent trusted --help's old
+    'response body' wording and wrote body-rooted .data.operator. The --match
+    help MUST now name the response envelope so the root is unambiguous."""
+    for cmd in (http_commands.http_call, http_commands.http_request):
+        match_opt = next(p for p in cmd.params if p.name == "match")
+        assert "response envelope" in match_opt.help
+        assert "response body" not in match_opt.help

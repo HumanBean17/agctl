@@ -290,10 +290,20 @@ def evaluate_http_assertions(
 
     Per-mode failure entry shapes (pinned, parsed by downstream agents):
       - ``status``:   ``{"mode":"status","expected":<status>,"actual":<status_code>}``
-      - ``contains``: ``{"mode":"contains","needle":<parsed>,"matched":False}``
-      - ``match``:    ``{"mode":"match","expr":<match>,"result":False}``
+      - ``contains``: ``{"mode":"contains","needle":<parsed>,"matched":False,
+                        "root":"response body","body":<result["body"]>}``
+      - ``match``:    ``{"mode":"match","expr":<match>,"result":False,
+                        "root":"response envelope","body":<result["body"]>}``
       - ``jq-path``:  ``{"mode":"jq-path","path":<jq_path>,
-                        "expected":<parse_equals(equals)>,"actual":<jq_value or None>}``
+                        "expected":<parse_equals(equals)>,"actual":<jq_value or None>,
+                        "root":"response body","body":<result["body"]>}``
+
+    The ``root`` label + ``body`` snapshot make a failed assertion self-debugging:
+    an agent sees *what* the expression was evaluated against and the actual payload,
+    so it can correct a mis-rooted expression (e.g. ``.x`` → ``.body.x``) without
+    dropping the flag and re-running to inspect raw output. ``root`` differs per mode
+    because the modes root differently (DESIGN §3.1): ``--match`` at the response
+    envelope, ``--contains``/``--jq-path`` at the response body.
     """
     if all(arg is None for arg in (status, contains, match, jq_path, equals)):
         return None
@@ -310,7 +320,15 @@ def evaluate_http_assertions(
     if contains is not None:
         needle = json.loads(contains)  # validated safe by validate_http_assertion_args
         if not json_subset(needle, result["body"]):
-            failures.append({"mode": "contains", "needle": needle, "matched": False})
+            failures.append(
+                {
+                    "mode": "contains",
+                    "needle": needle,
+                    "matched": False,
+                    "root": "response body",
+                    "body": result["body"],
+                }
+            )
 
     if match is not None:
         try:
@@ -318,7 +336,15 @@ def evaluate_http_assertions(
         except ConfigError:
             raise _missing_jq_config_error("match", {"expr": match}) from None
         if not ok:
-            failures.append({"mode": "match", "expr": match, "result": False})
+            failures.append(
+                {
+                    "mode": "match",
+                    "expr": match,
+                    "result": False,
+                    "root": "response envelope",
+                    "body": result["body"],
+                }
+            )
 
     if jq_path is not None:  # equals is non-None too (validated pairing)
         expected = parse_equals(equals)
@@ -333,6 +359,8 @@ def evaluate_http_assertions(
                     "path": jq_path,
                     "expected": expected,
                     "actual": actual,
+                    "root": "response body",
+                    "body": result["body"],
                 }
             )
 

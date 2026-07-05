@@ -466,7 +466,13 @@ def test_evaluate_contains_fail_raises_with_failure_entry():
             equals=None,
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "contains", "needle": {"status": "PAID"}, "matched": False}
+        {
+            "mode": "contains",
+            "needle": {"status": "PAID"},
+            "matched": False,
+            "root": "response body",
+            "body": RESULT["body"],
+        }
     ]
 
 
@@ -496,7 +502,13 @@ def test_evaluate_match_fail_raises_with_failure_entry():
             equals=None,
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "match", "expr": '.body.status=="PAID"', "result": False}
+        {
+            "mode": "match",
+            "expr": '.body.status=="PAID"',
+            "result": False,
+            "root": "response envelope",
+            "body": RESULT["body"],
+        }
     ]
 
 
@@ -553,7 +565,14 @@ def test_evaluate_jq_path_fail_raises_with_failure_entry():
             equals='"PAID"',
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "jq-path", "path": ".status", "expected": "PAID", "actual": "PENDING"}
+        {
+            "mode": "jq-path",
+            "path": ".status",
+            "expected": "PAID",
+            "actual": "PENDING",
+            "root": "response body",
+            "body": RESULT["body"],
+        }
     ]
 
 
@@ -638,7 +657,13 @@ def test_evaluate_non_json_body_contains_fails_matched_false():
             equals=None,
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "contains", "needle": {"x": 1}, "matched": False}
+        {
+            "mode": "contains",
+            "needle": {"x": 1},
+            "matched": False,
+            "root": "response body",
+            "body": body_string_result["body"],
+        }
     ]
 
 
@@ -658,5 +683,37 @@ def test_evaluate_non_json_body_jq_path_actual_null():
             equals="whatever",
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "jq-path", "path": ".status", "expected": "whatever", "actual": None}
+        {
+            "mode": "jq-path",
+            "path": ".status",
+            "expected": "whatever",
+            "actual": None,
+            "root": "response body",
+            "body": body_string_result["body"],
+        }
     ]
+
+
+def test_evaluate_match_wrong_root_self_documents_envelope_and_body():
+    """Regression (battle-test incident): an agent wrote `--match '.data.operator
+    != null'` (body-rooted, trusting the stale 'response body' help wording) and
+    got a silent result:false, then had to drop --match and re-run raw to find the
+    path. The failure entry must now carry root='response envelope' + the actual
+    body, so the agent derives `.body.data.operator` in one read."""
+    from agctl.errors import AssertionFailure
+
+    resp = {**RESULT, "body": {"data": {"operator": "ACME"}}}
+    with pytest.raises(AssertionFailure) as exc_info:
+        evaluate_http_assertions(
+            resp,
+            status=None,
+            contains=None,
+            match=".data.operator != null",
+            jq_path=None,
+            equals=None,
+        )
+    failure = exc_info.value.detail["failures"][0]
+    assert failure["mode"] == "match"
+    assert failure["result"] is False
+    assert failure["root"] == "response envelope"
+    assert failure["body"] == {"data": {"operator": "ACME"}}

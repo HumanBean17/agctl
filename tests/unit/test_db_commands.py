@@ -318,6 +318,10 @@ def test_db_assert_expect_value_fail(install_fake):
     assert payload["error"]["type"] == "AssertionError"
     assert payload["error"]["detail"]["expected"] == "CONFIRMED"
     assert payload["error"]["detail"]["actual"] == "PENDING"
+    # Self-debugging fields (issue #5): --path roots at the first row, and the
+    # failure echoes that row so the agent need not re-run `db query`.
+    assert payload["error"]["detail"]["root"] == "first row"
+    assert payload["error"]["detail"]["row"] == {"status": "PENDING"}
 
 
 # --------------------------------------------------------------------------- #

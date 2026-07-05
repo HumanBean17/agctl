@@ -226,7 +226,12 @@ def _kafka_consume_core(
 @click.option("--topic", "topic", required=True, help="Kafka topic to consume")
 @click.option("--timeout", "timeout", type=float, default=None, help="Poll timeout (s)")
 @click.option("--lookback", "lookback", type=float, default=None, help="Lookback window (s)")
-@click.option("--match", "match", default=None, help="jq predicate filter")
+@click.option(
+    "--match",
+    "match",
+    default=None,
+    help="jq predicate against the message envelope {key, value, partition, offset, timestamp, headers}; reach value fields via .value.<field>",
+)
 @click.option(
     "--filter-key",
     "filter_key",
@@ -419,9 +424,28 @@ def _kafka_assert_core(
     elapsed_ms = int((time.monotonic() - start) * 1000)
 
     if matched is None:
+        # Echo the active assertion modes with their jq roots so a "no match"
+        # is self-debugging: the agent sees which modes were AND-ed and that
+        # --match/--pattern root at the message envelope while --contains/--path
+        # root at the message value (no need to drop the flag and re-run consume).
+        modes = []
+        if contains is not None:
+            entry = {"mode": "contains", "root": "message value", "needle": json.loads(contains)}
+            if path is not None:
+                entry["path"] = path
+            modes.append(entry)
+        if match is not None:
+            modes.append({"mode": "match", "root": "message envelope", "expr": match})
+        if pattern is not None:
+            modes.append({"mode": "pattern", "root": "message envelope", "pattern": pattern})
         raise AssertionFailure(
             f"No matching message within {resolved_timeout}s window",
-            {"topic": inferred_topic, "timeout": resolved_timeout},
+            {
+                "topic": inferred_topic,
+                "timeout": resolved_timeout,
+                "messages_scanned": scanned,
+                "modes": modes,
+            },
         )
 
     return {
@@ -436,10 +460,20 @@ def _kafka_assert_core(
 @click.command("assert")
 @click.option("--topic", "topic", default=None, help="Kafka topic")
 @click.option("--contains", "contains", default=None, help="JSON subset to match")
-@click.option("--match", "match", default=None, help="jq predicate")
+@click.option(
+    "--match",
+    "match",
+    default=None,
+    help="jq predicate against the message envelope {key, value, partition, offset, timestamp, headers}; reach value fields via .value.<field>",
+)
 @click.option("--pattern", "pattern", default=None, help="Named kafka pattern")
 @click.option("--param", "param", multiple=True, help="k=v pattern placeholder")
-@click.option("--path", "path", default=None, help="jq path to narrow --contains target")
+@click.option(
+    "--path",
+    "path",
+    default=None,
+    help="jq path into the MESSAGE VALUE that narrows --contains (e.g. .eventType)",
+)
 @click.option("--lookback", "lookback", type=float, default=None, help="Lookback window (s)")
 @click.option("--timeout", "timeout", type=float, required=True, help="Poll timeout (s)")
 @click.option("--from-beginning", "from_beginning", is_flag=True, default=False)
