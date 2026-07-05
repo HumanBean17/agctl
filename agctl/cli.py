@@ -89,12 +89,30 @@ def _load_plugins(cli_group: click.Group) -> None:
         print(f"agctl: plugin loader error: {exc}", file=sys.stderr)
 
 
+def _ensure_utf8_streams() -> None:
+    """Force stdout/stderr to UTF-8 so non-ASCII JSON renders instead of crashing.
+
+    The envelope emits raw UTF-8 (``ensure_ascii=False``, RFC 8259-valid) rather
+    than ``\\uXXXX`` escapes. On a non-UTF-8 stdout (``PYTHONIOENCODING=ascii``,
+    the ``C`` locale, legacy Windows) that would raise ``UnicodeEncodeError`` —
+    turning a successful invocation into a leaked traceback. Reconfigure once at
+    bootstrap so every emitter (``emit``, ``mock`` NDJSON, ``http ping`` NDJSON)
+    is covered. No-op on streams we don't own (pytest capsys, Click CliRunner
+    ``StringIO``) — they lack ``reconfigure``.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
+
+
 @click.group()
 @click.version_option(version=__version__, message="agctl %(version)s")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
 @click.pass_context
 def cli(ctx: click.Context, config_path: str | None) -> None:
     """agctl — agent-facing CLI harness for testing distributed systems."""
+    _ensure_utf8_streams()
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
 

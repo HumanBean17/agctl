@@ -82,7 +82,7 @@ def render_typed(value: Any, captures: dict[str, CaptureValue]) -> Any:
     carries a ``type`` controlling how its value is rendered:
 
     - ``scalar`` -> ``str(capture.value)``.
-    - ``json`` -> ``json.dumps(capture.value)``.
+    - ``json`` -> ``json.dumps(capture.value, ensure_ascii=False)``.
     - ``object`` -> the live ``capture.value``, but ONLY when the containing
       field string is exactly ``"{name}"`` (whole-field). Used inline (e.g.
       ``"pre={name}"``) -> ``ValueError``. Valid configs never reach this —
