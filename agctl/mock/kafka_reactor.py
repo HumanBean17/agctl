@@ -23,7 +23,8 @@ class KafkaReactor:
 
     The reactor runs a single consume_loop on its own thread. Each message is:
     1. Validated: non-object values → kafka.skipped + COMMIT (visible, not silent).
-    2. Matched: if config.match is set and jq_bool(value, match) is False → COMMIT.
+    2. Matched: if config.match is set and jq_bool(msg, match) is False → COMMIT
+       (predicate rooted at the whole message envelope — peer of capture).
     3. Captured: implicit top-level value keys (scalar) + explicit envelope-rooted
        capture (jq over the whole message; overrides implicit incl. type). A from
        resolving to nothing emits capture.missing.
@@ -143,7 +144,7 @@ class KafkaReactor:
 
         # Step 2: Match if configured
         if self._config.match is not None:
-            if not jq_bool(value, self._config.match):
+            if not jq_bool(msg, self._config.match):
                 # Non-match → silent commit (like `kafka consume --match`)
                 return ReactionResult.COMMIT
 

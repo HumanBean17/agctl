@@ -13,9 +13,11 @@ this file is the extraction detail.
 ## Extraction
 
 1. **topic** — the literal topic string. If the code computes it, ask for the concrete value.
-2. **match** — a jq boolean predicate over the message **value** that identifies *this* event.
-   Use `{placeholder}` for the value that varies per assert
-   (e.g. `.payload.orderId == "{orderId}"`).
+2. **match** — a jq boolean predicate over the message **envelope** (`{key, value, partition,
+   offset, timestamp, headers}`) that identifies *this* event. Prefix payload fields with
+   `.value.` (e.g. `.value.eventType`, `.value.payload.orderId == "{orderId}"`). Reach the
+   message key / a header with `.key` / `.headers.<name>` (header keys are **case-sensitive** —
+   use the producer's exact name). Use `{placeholder}` for the value that varies per assert.
 3. **description** — one line.
 4. **name** — kebab-case from the event (`ORDER_CREATED` → `order-created`;
    `PAYMENT_FAILED` → `payment-failed`).
@@ -29,13 +31,13 @@ stale events from prior runs on busy topics.
 
 - `kafkaTemplate.send("orders.created", event)` → topic + (read the event class for `match`).
 - `@KafkaListener(topics = "orders.created")` → topic.
-- Event class fields → jq paths (`.eventType`, `.payload.orderId`).
+- Event class fields → jq paths under `.value.` (`.value.eventType`, `.value.payload.orderId`).
 
 ### Python
 
 - `confluent_kafka` / `aiokafka` `Producer.produce(topic, value=…)`, `faust` agents → topic +
   value shape.
-- A Pydantic / dataclass event → jq paths.
+- A Pydantic / dataclass event → jq paths under `.value.`.
 
 ### Node
 
@@ -43,13 +45,23 @@ stale events from prior runs on busy topics.
 
 ## Writing the jq `match`
 
-- The predicate runs over `.value` (agctl parses the message value as JSON):
-  `.eventType == "ORDER_CREATED"`.
-- Combine with `and`: `.eventType == "ORDER_CREATED" and .payload.orderId == "{orderId}"`.
-- Drill nested fields: `.payload.customer.id`.
+- The predicate runs over the message **envelope**, not the bare value — so payload fields
+  live under `.value.`: `.value.eventType == "ORDER_CREATED"`.
+- Combine with `and`: `.value.eventType == "ORDER_CREATED" and .value.payload.orderId == "{orderId}"`.
+- Drill nested fields: `.value.payload.customer.id`.
+- Reach the message key (`.key`) or a header (`.headers.<name>` — exact producer casing, do
+  **not** lowercase). These reach transport-level metadata the value alone can't see.
 - The **only** substitution here is `{placeholder}` (call-time, via `--param`). Never `${}` or `:`.
 - Prefer a sharp `--match` predicate over `--contains` (subset) for large/variable payloads —
   patterns live in config precisely so you can write one.
+
+## Migrating from dialect `"1"`
+
+If the repo's `agctl.yaml` is still at `version: "1"`, `agctl` rejects it (exit 2) with a
+pointer to `agctl config migrate`. Run that to rewrite every `kafka.patterns.<name>.match`
+(and reactor `match`) by prepending `.value | ` and bumping `version` to `"2"` — backups and
+`--dry-run` are supported; CLI `--match` flags in scripts/prompts are **not** rewritten
+(prefix those by hand).
 
 ## What to clarify
 

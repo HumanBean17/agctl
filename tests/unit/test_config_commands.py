@@ -37,7 +37,7 @@ def test_validate_malformed_http_stub_jq_exits_2(tmp_path):
     ``mocks.http.stubs.<name>.match.jq`` (the jq-compile error surfaced by
     collect_jq_compile_errors)."""
     yaml_text = """
-version: "1"
+version: "2"
 mocks:
   http:
     stubs:
@@ -65,7 +65,7 @@ def test_validate_malformed_kafka_reactor_match_exits_2(tmp_path):
     """A Kafka reactor whose match is malformed -> exit 2 and an error whose
     path is ``mocks.kafka.reactors.<name>.match``."""
     yaml_text = """
-version: "1"
+version: "2"
 kafka:
   brokers:
     - localhost:9092
@@ -95,7 +95,7 @@ def test_validate_fully_valid_config_exits_0(tmp_path):
     """A config with a well-formed match.jq and reactor match -> exit 0,
     ``valid: true`` (no jq-compile errors)."""
     yaml_text = """
-version: "1"
+version: "2"
 kafka:
   brokers:
     - localhost:9092
@@ -132,7 +132,7 @@ mocks:
 
 def test_validate_no_mocks_section_exits_0(tmp_path):
     """A config with no ``mocks`` section -> exit 0 (collector returns [])."""
-    result = _validate(tmp_path, 'version: "1"\n')
+    result = _validate(tmp_path, 'version: "2"\n')
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["result"]["valid"] is True

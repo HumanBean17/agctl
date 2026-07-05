@@ -149,7 +149,7 @@ def test_chatx_context_echo_acceptance(emit_event, stop_event):
     """
     config = KafkaReactor(
         topic="chatx.commands",
-        match='.command == "SEARCH"',
+        match='.value.command == "SEARCH"',
         capture={
             "tid": CaptureSpec.model_validate({"from": ".key"}),
             "rqUID": CaptureSpec.model_validate({"from": ".headers.rqUID"}),

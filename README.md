@@ -198,8 +198,8 @@ version is the same file with secrets/hosts moved into `${...}` and sourced from
 
 ```yaml
 # agctl.yaml
-# Version tracks the agctl MAJOR version only (currently "1").
-version: "1"
+# Version tracks the agctl MAJOR version only (currently "2").
+version: "2"
 
 # --- services: named HTTP base URLs for services under test -----------------
 services:
@@ -236,18 +236,18 @@ kafka:
 
   # patterns: named Kafka filters, analogous to HTTP templates.
   #   topic: Kafka topic
-  #   match: jq boolean predicate over each message value;
+  #   match: jq boolean predicate over each message envelope;
   #          supports {placeholder} substitution via --param at assert time
   patterns:
     order-created:
       description: "An ORDER_CREATED event for a specific order"
       topic: orders.created
-      match: '.eventType == "ORDER_CREATED" and .payload.orderId == "{orderId}"'
+      match: '.value.eventType == "ORDER_CREATED" and .value.payload.orderId == "{orderId}"'
 
     payment-failed:
       description: "Any PAYMENT_FAILED event regardless of order"
       topic: payments.events
-      match: '.eventType == "PAYMENT_FAILED"'
+      match: '.value.eventType == "PAYMENT_FAILED"'
 
 # --- database: named connection profiles and SQL templates ------------------
 database:

@@ -109,7 +109,7 @@ live validation was skipped. **Never** declare done on config that doesn't valid
 ### Structural checklist (fallback when agctl is absent)
 
 - [ ] YAML parses.
-- [ ] `version` is present, major part `"1"`.
+- [ ] `version` is present, major part `"2"` (the jq-dialect switch — `"2"` = envelope-rooted `match`).
 - [ ] Every `templates.*.service` ∈ `services`.
 - [ ] Every `database.templates.*.connection` (if set) ∈ `database.connections`.
 - [ ] `defaults.database_connection` (if set) ∈ `database.connections`.

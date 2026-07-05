@@ -216,7 +216,7 @@ discovers, parses, and validates `agctl.yaml` from scratch. This is what makes
 
 ```
 discover_config_path → yaml.safe_load → interpolate → apply_env_overrides
-                                                → _check_version (major == "1")
+                                                → _check_version (major == "2")
                                                 → Config.model_validate (Pydantic v2)
    (caller then runs validate_config → cross-refs)
 ```
@@ -253,7 +253,7 @@ deep-merged with highest precedence. Two refinements beyond the spec:
 - `database.connections.*.writable` — write safety gate must be set explicitly in config
 - `database.templates.*.mode` — read/write mode is a template authoring intent, not runtime config
 
-**Version guard** — major only, currently `"1"`; mismatch → `ConfigError`. The `mocks` section is additive under major `1` — no version bump.
+**Version guard** — major only; `_check_version` (`loader.py`) rejects `major != TOOL_MAJOR_VERSION` (`"2"`) with a `ConfigError` whose message points at `agctl config migrate`. The version is the jq-dialect switch: `"2"` = envelope-rooted `match` (`.body.x` for HTTP, `.value.x` for Kafka); `"1"` (the legacy payload-rooted dialect) is rejected, not silently re-interpreted. `agctl config migrate` performs the file-level rewrite (`.body | ` / `.value | ` prefix on the three `match`-site families — see `config/migrate.py::migrate_match_exprs`); CLI `--match` flags in scripts/prompts are out of its scope and must be prefixed manually.
 
 **Typed validation** (`Config.model_validate`, `models.py`) — Pydantic v2 tree
 (`Config` → `ServiceConfig`, `KafkaConfig`/`KafkaSSL`, `DatabaseConfig`/…,
@@ -531,18 +531,18 @@ Primitives in `assertions.py`, composed by the command layer. Five families:
   vs `parse_equals(equals)` via `type_aware_equal`.
 - **`db assert --expect-rows`** — row-count comparison.
 - **`kafka assert`** — `_build_assert_predicate` combines `--contains`
-  (`json_subset`, optionally narrowed by `--path`), `--match` (`jq_bool`), and
-  `--pattern` (named config pattern, `{param}`-filled, then `jq_bool`). **All**
-  active modes must pass.
-- **`kafka consume --match`** — a `jq_bool` predicate, with short-circuit on
-  `--expect-count`.
+  (`json_subset`, optionally narrowed by `--path`), `--match` (`jq_bool` over
+  the message envelope), and `--pattern` (named config pattern, `{param}`-filled,
+  then `jq_bool` over the message envelope). **All** active modes must pass.
+- **`kafka consume --match`** — a `jq_bool` predicate over the message envelope,
+  with short-circuit on `--expect-count`.
 - **`http call` / `http request`** — `evaluate_http_assertions` composes
-  `jq_bool` (`--match`), `json_subset` (`--contains`), and `jq_value` +
-  `parse_equals` + `type_aware_equal` (`--jq-path` + `--equals`) against the
-  response; `validate_http_assertion_args` gates `--jq-path`/`--equals` pairing
-  and `--contains` JSON shape pre-request (`ConfigError` exit 2, before the
-  request is sent). `coerce_db_value` is intentionally not reused — HTTP
-  response bodies are already JSON-native.
+  `jq_bool` (`--match`, over the response envelope), `json_subset` (`--contains`,
+  body-rooted), and `jq_value` + `parse_equals` + `type_aware_equal`
+  (`--jq-path` + `--equals`, body-rooted); `validate_http_assertion_args` gates
+  `--jq-path`/`--equals` pairing and `--contains` JSON shape pre-request
+  (`ConfigError` exit 2, before the request is sent). `coerce_db_value` is
+  intentionally not reused — HTTP response bodies are already JSON-native.
 - **`mock run` capture extraction** — `mock/capture.py::resolve_captures` reuses
   `jq_value(envelope, spec.from_)` to read each explicit `capture.<name>.from`
   off the live message envelope (HTTP request or Kafka message), producing a
@@ -551,6 +551,19 @@ Primitives in `assertions.py`, composed by the command layer. Five families:
   (`--jq-path`); a `from` resolving to `null`/missing is the soft-miss path
   (emits `capture.missing`, substitutes empty string), distinct from a missing
   `jq` library which re-raises as `ConfigError` (exit 2).
+
+**Dialect `"2"` — five `match` eval sites are envelope-rooted.** Under the v2
+dialect (gated by `_check_version`), `jq_bool` feeds the whole envelope — not
+the payload — at each of five sites: HTTP stub `match.jq` (request envelope
+`{method, path, headers (lowercased), body}`), Kafka reactor `match` and
+`kafka assert/consume --match` and `kafka.patterns[].match` (message envelope
+`{key, value, partition, offset, timestamp, headers (case-sensitive)}`), and
+`http call`/`http request --match` (response envelope `{status_code,
+response_time_ms, headers (lowercased), body, url, method}`). So `.body.amount` /
+`.value.eventType` / `.status_code` / `.headers.x` reach the right field, and
+mock `match.jq` / reactor `match` share their root with `capture.*.from`
+(unifying the divergence tracked as #22). Body-rooted `match.body` (json_subset),
+`--contains`, `--path`, `--jq-path`/`--equals`, and `--status` are unchanged.
 
 ### Custom assertion modes (`assertion_registry.py`)
 
@@ -777,6 +790,6 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
 - **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** — cannot intercept HTTPS → integration untested → false green.
 - **Cross-transport sagas** (Kafka trigger → HTTP callback) — no causal linkage → false green.
 - **Non-JSON Kafka values** (Avro/Protobuf/schema-registry) — emitted as `kafka.skipped` → false green.
-- **`match` / `capture` `.`-root divergence (#22)** — explicit `capture.<name>.from` roots at the whole message envelope (so nested fields, the Kafka `.key`, and headers are all reachable, and `type: object` passes the live value through for true JSON-type fields), but `match.jq` (HTTP) / reactor `match` (Kafka) remain payload-rooted (body/value only). The same `.amount` means different things on either side of that fence. Unifying `match` onto the envelope root is breaking and tracked as #22; until then, author `match` payload-rooted and `capture.from` envelope-rooted.
+- **`match` is envelope-rooted under dialect `"2"`** (was: payload-rooted under `"1"`). The five `match` eval sites (HTTP stub `match.jq`, Kafka reactor `match`, `kafka.patterns[].match`, `kafka assert/consume --match`, `http call`/`request --match`) feed the whole envelope; `capture.*.from` shares the same root. `match.body` / `--contains` / `--path` / `--jq-path`+`--equals` / `--status` remain payload-rooted. A v1 config is rejected by `_check_version`; rewrite with `agctl config migrate`.
 - **Containerized SUT topology** — operator must target `host.docker.internal` / host LAN IP and avoid SUT that swallows connection errors → false green.
 - **Shared broker + pinned `consumer_group` reused across runs/devs** — partition split or resume-past-messages → silently missing/old reactions → false green (mitigated by unique-per-run default).

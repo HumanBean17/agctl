@@ -136,7 +136,7 @@ def sample_config():
         description="Test reactor",
         topic="commands",
         consumer_group="test-group",
-        match='.command == "CREATE_ORDER"',
+        match='.value.command == "CREATE_ORDER"',
         reaction=KafkaReaction(
             topic="events",
             key="{orderId}",
@@ -242,7 +242,7 @@ def test_reactor_match_capture_react(emit_event, stop_event):
     """Match + capture + template reaction → kafka.reacted event."""
     config = KafkaReactor(
         topic="commands",
-        match='.command == "CREATE_ORDER"',
+        match='.value.command == "CREATE_ORDER"',
         reaction=KafkaReaction(
             topic="events",
             key="{orderId}",
@@ -334,7 +334,7 @@ def test_reactor_jq_non_match_commits_no_event(emit_event, stop_event):
     """jq non-match → COMMIT, no event emitted."""
     config = KafkaReactor(
         topic="commands",
-        match='.command == "SHIP_ORDER"',
+        match='.value.command == "SHIP_ORDER"',
         reaction=KafkaReaction(topic="events", value={}),
     )
     client = FakeKafkaClient(
@@ -364,6 +364,59 @@ def test_reactor_jq_non_match_commits_no_event(emit_event, stop_event):
     # No produce call, no event
     assert len(client.produce_calls) == 0
     assert len(emit_event.events) == 0
+
+
+def test_reactor_match_on_key_envelope(emit_event, stop_event):
+    """Reactor match roots at the message envelope, so .key is reachable.
+
+    Two messages with value={"command": "X"}: key="ord-1" matches '.key ==
+    "ord-1"' → reaction emitted; key="other" does not → silent commit, no
+    reaction. Under the prior value-rooted impl, .key against the value dict
+    is null → no match for either → no reaction.
+    """
+    config = KafkaReactor(
+        topic="commands",
+        match='.key == "ord-1"',
+        reaction=KafkaReaction(topic="out", value={}),
+    )
+    client = FakeKafkaClient(
+        messages=[
+            {
+                "value": {"command": "X"},
+                "key": "ord-1",
+                "partition": 0,
+                "offset": 0,
+                "timestamp": 1719660000000,
+                "headers": [],
+            },
+            {
+                "value": {"command": "X"},
+                "key": "other",
+                "partition": 0,
+                "offset": 1,
+                "timestamp": 1719660000000,
+                "headers": [],
+            },
+        ]
+    )
+    reactor = Reactor(
+        name="key-match",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+    )
+
+    reactor.run()
+
+    # Exactly one reaction (key="ord-1" matched; key="other" did not).
+    assert len(client.produce_calls) == 1
+    reacted = [e for e in emit_event.events if e["event"] == "kafka.reacted"]
+    assert len(reacted) == 1
+    assert reacted[0]["reactor"] == "key-match"
+    assert reacted[0]["topic"] == "out"
 
 
 def test_reactor_non_object_value_skipped(emit_event, stop_event):
@@ -604,7 +657,7 @@ def test_reactor_capture_from_key(emit_event, stop_event):
     """capture.from '.key' reads the message key (gap 2)."""
     config = KafkaReactor(
         topic="chatx.commands",
-        match='.command == "SEARCH"',
+        match='.value.command == "SEARCH"',
         capture={"tid": CaptureSpec.model_validate({"from": ".key"})},
         reaction=KafkaReaction(topic="chatx.events", value={"threadId": "{tid}"}),
     )
@@ -777,3 +830,70 @@ def test_reactor_capture_missing_emits_event_and_empty(emit_event, stop_event):
     assert missing[0]["reactor"] == "chatx"
     assert missing[0]["name"] == "x"
     assert missing[0]["from"] == ".value.nope"
+
+
+def test_match_and_capture_share_envelope_root_kafka(emit_event, stop_event):
+    """Acceptance test for #22: match and capture share one `.` root.
+
+    A single reactor carries BOTH ``match='.value.command == "SEARCH"'`` AND
+    ``capture.rq.from='.headers.rqUID'``, with a reaction value that renders
+    the captured header. Feeding a message with
+    ``value={"command":"SEARCH"}`` and ``headers={"rqUID":"abc-123"}`` produces
+    one reaction whose rendered value carries ``rq == "abc-123"`` -- proving
+    reactor ``match`` (``.value.command``) and ``capture`` (``.headers.rqUID``)
+    share the message envelope (the ``.value`` and ``.headers`` subtrees hang
+    off one root). A message with ``value={"command":"OTHER"}`` produces no
+    reaction (match misses).
+
+    Under the pre-#22 value-rooted ``match``, ``.value.command`` would resolve
+    against the value as ``value.value.command`` -> ``null`` -> no SEARCH match
+    -> no reaction, and the header echo would be impossible.
+    """
+    config = KafkaReactor(
+        topic="chatx.commands",
+        match='.value.command == "SEARCH"',
+        capture={"rq": CaptureSpec.model_validate({"from": ".headers.rqUID"})},
+        reaction=KafkaReaction(
+            topic="chatx.events",
+            value={"rq": "{rq}"},
+        ),
+    )
+    client = FakeKafkaClient(
+        messages=[
+            {
+                "value": {"command": "SEARCH"},
+                "key": None,
+                "partition": 0,
+                "offset": 0,
+                "timestamp": 1719660000000,
+                "headers": {"rqUID": "abc-123"},
+            },
+            {
+                "value": {"command": "OTHER"},
+                "key": None,
+                "partition": 0,
+                "offset": 1,
+                "timestamp": 1719660000000,
+                "headers": {"rqUID": "xyz"},
+            },
+        ]
+    )
+    reactor = Reactor(
+        name="search-reactor",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+    )
+    reactor.run()
+
+    # Exactly one reaction: SEARCH matched and its rqUID was captured+rendered
+    # (proves .value.command and .headers.rqUID agree on one envelope root).
+    assert len(client.produce_calls) == 1
+    assert client.produce_calls[0]["value"] == {"rq": "abc-123"}
+
+    reacted = [e for e in emit_event.events if e["event"] == "kafka.reacted"]
+    assert len(reacted) == 1
+    assert reacted[0]["reactor"] == "search-reactor"

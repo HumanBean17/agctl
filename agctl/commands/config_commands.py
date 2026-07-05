@@ -19,19 +19,23 @@ one-directional (``cli → config_commands``) and avoids a circular import.
 from __future__ import annotations
 
 import importlib.resources
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 import click
+import yaml
 
 from ..config import ConfigError, load_config
+from ..config.loader import discover_config_path
+from ..config.migrate import migrate_match_exprs
 from ..config.validator import validate_config
 from ..mock.capture_validate import collect_capture_placement_errors
 from ..mock.jq_precompile import collect_jq_compile_errors
 from ..output import emit
 
-__all__ = ["config_init", "config_validate", "config_show", "set_plugins_provider"]
+__all__ = ["config_init", "config_validate", "config_show", "config_migrate", "set_plugins_provider"]
 
 # --- masking ---------------------------------------------------------------
 
@@ -260,3 +264,83 @@ def config_init(ctx: click.Context, output: str | None, force: bool) -> None:
         },
         duration_ms=_ms(start),
     )
+
+
+# --- config migrate --------------------------------------------------------
+
+#: Fixed operator-facing reminder that CLI ``--match`` flags are NOT rewritten
+#: by ``agctl config migrate`` (the migration only walks the config file). Note
+#: ``agctl mock run`` has NO ``--match`` CLI flag (mock matchers are config-file
+#: only — and ARE rewritten); the deprecated ``--filter-key`` alias on
+#: ``agctl kafka consume`` is, like ``--match``, envelope-rooted under v2 and
+#: equally out of this command's reach.
+_CLI_FLAGS_NOTE = (
+    "CLI --match flags (and the deprecated --filter-key alias) on "
+    "`agctl http` / `agctl kafka` live in shell scripts and agent prompts — "
+    "this command cannot reach them. Prefix those manually with `.body | ` "
+    "(HTTP) or `.value | ` (Kafka). Mock `match` expressions live in the "
+    "config file and ARE rewritten by this command."
+)
+
+#: yaml.safe_dump reformats the file and drops comments; the original is
+#: preserved in ``<path>.bak``. Surfaced in the result so the operator is not
+#: surprised that the "prepend + bump version" migration touches most lines.
+_FORMATTING_NOTE = (
+    "yaml.safe_dump reformats the file and drops comments; the original is "
+    "preserved in <path>.bak. Review the full diff before committing."
+)
+
+
+@click.command("migrate")
+@click.option("--config", "config_path", default=None)
+@click.option("--dry-run", is_flag=True, default=False, help="Preview; do not write.")
+@click.pass_context
+def config_migrate(
+    ctx: click.Context, config_path: str | None, dry_run: bool
+) -> None:
+    """Rewrite a v1 agctl.yaml to dialect \"2\" (envelope-rooted match exprs).
+
+    Backs up the original to ``<path>.bak`` and writes the rewritten config
+    back to ``<path>``. With ``--dry-run`` the rewrite is reported but nothing
+    is written. A config already at dialect \"2\" is a clean no-op.
+    """
+    start = time.monotonic()
+    explicit = config_path or ctx.obj.get("config_path")
+    try:
+        path = discover_config_path(explicit=explicit, env=os.environ)
+        raw = path.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(raw) or {}
+        result = migrate_match_exprs(parsed)
+        # Write only when migrating for real (not already_v2, not --dry-run).
+        will_write = not result.already_v2 and not dry_run
+        base_result = {
+            "path": str(path),
+            "already_v2": result.already_v2,
+            "from_version": result.from_version,
+            "to_version": result.to_version,
+            "rewritten": result.rewrites,
+            "cli_flags_note": _CLI_FLAGS_NOTE,
+            # Surfaced only when the file is actually rewritten — on --dry-run
+            # and already_v2 nothing is reformatted, so the note would be noise.
+            "formatting_note": _FORMATTING_NOTE if will_write else None,
+        }
+        if will_write:
+            backup = path.with_suffix(path.suffix + ".bak")
+            # Refuse to clobber an existing backup — silently overwriting would
+            # destroy the safety net this command promises. Surfaces as the
+            # standard ConfigError envelope (exit 2), consistent with the rest.
+            if backup.exists():
+                raise ConfigError(
+                    f"Backup {backup} already exists; remove or rename it first, "
+                    f"then re-run.",
+                    {"backup": str(backup)},
+                )
+            backup.write_text(raw, encoding="utf-8")
+            path.write_text(
+                yaml.safe_dump(result.config, sort_keys=False, default_flow_style=False),
+                encoding="utf-8",
+            )
+    except ConfigError as err:
+        _emit_config_error("config.migrate", err, start)
+        raise SystemExit(2)
+    emit(ok=True, command="config.migrate", result=base_result, duration_ms=_ms(start))

@@ -492,7 +492,7 @@ def test_kafka_consume_match_filters_messages(install_fake):
             "--lookback",
             "10",
             "--match",
-            ".x==1",
+            ".value.x==1",
         ]
     )
     payload = _payload(result)
@@ -524,7 +524,7 @@ def test_kafka_consume_filter_key_is_alias_of_match(install_fake):
             "--lookback",
             "10",
             "--filter-key",
-            ".x==1",
+            ".value.x==1",
         ]
     )
     payload = _payload(result)
@@ -549,9 +549,9 @@ def test_kafka_consume_match_and_filter_key_both_given_errors(install_fake):
             "--lookback",
             "10",
             "--match",
-            ".x==1",
+            ".value.x==1",
             "--filter-key",
-            ".x==2",
+            ".value.x==2",
         ]
     )
     payload = _payload(result)
@@ -747,7 +747,7 @@ def test_kafka_assert_match_filters_with_valid_expr(install_fake):
             "--topic",
             "t",
             "--match",
-            '.status=="OK"',
+            '.value.status=="OK"',
             "--lookback",
             "10",
             "--timeout",
@@ -757,6 +757,34 @@ def test_kafka_assert_match_filters_with_valid_expr(install_fake):
     payload = _payload(result)
 
     assert result.exit_code == 0
+    assert payload["result"]["matched"] is True
+
+
+def test_kafka_assert_match_on_key(install_fake):
+    """Envelope-root reach: --match '.key == "..."' matches by message key, not
+    a value field. Under the prior value-rooted predicate, .key evaluated
+    against the value dict was null -> no match -> AssertionError."""
+    install_fake([_msg("t", {"eventType": "X"}, "ord-1")])
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "kafka",
+            "assert",
+            "--topic",
+            "t",
+            "--match",
+            '.key == "ord-1"',
+            "--lookback",
+            "10",
+            "--timeout",
+            "0.02",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
     assert payload["result"]["matched"] is True
 
 
@@ -941,7 +969,7 @@ def test_kafka_assert_custom_mode_mutually_exclusive_with_match(install_fake):
             "--config", str(FIXTURE),
             "kafka", "assert",
             "--topic", "t",
-            "--match", ".a==1",
+            "--match", ".value.a==1",
             "--assertion", "x",
             "--timeout", "0.02",
         ]

@@ -52,7 +52,7 @@ def test_validate_structural_error_envelope(tmp_path):
     cfg_path = _write_config(
         tmp_path,
         """
-version: "1"
+version: "2"
 services:
   order-service:
     base_url: "http://localhost:8081"
@@ -121,7 +121,7 @@ def test_show_does_not_mask_ssl_key_path(tmp_path):
     'key' fragment in _is_secret must not match the key_* prefix."""
     cfg_path = _write_config(
         tmp_path,
-        'version: "1"\n'
+        'version: "2"\n'
         "kafka:\n"
         "  brokers: [host:9092]\n"
         "  ssl:\n"

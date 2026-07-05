@@ -269,7 +269,7 @@ def evaluate_http_assertions(
 
     if match is not None:
         try:
-            ok = jq_bool(result["body"], match)
+            ok = jq_bool(result, match)
         except ConfigError:
             raise _missing_jq_config_error("match", {"expr": match}) from None
         if not ok:

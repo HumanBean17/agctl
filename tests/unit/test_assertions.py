@@ -393,7 +393,7 @@ def test_evaluate_match_pass_no_raise():
         RESULT,
         status=None,
         contains=None,
-        match='.status=="PENDING"',
+        match='.body.status=="PENDING"',
         jq_path=None,
         equals=None,
     )
@@ -408,12 +408,12 @@ def test_evaluate_match_fail_raises_with_failure_entry():
             RESULT,
             status=None,
             contains=None,
-            match='.status=="PAID"',
+            match='.body.status=="PAID"',
             jq_path=None,
             equals=None,
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "match", "expr": '.status=="PAID"', "result": False}
+        {"mode": "match", "expr": '.body.status=="PAID"', "result": False}
     ]
 
 
@@ -423,7 +423,7 @@ def test_evaluate_match_any_truthy_pass_no_raise():
         RESULT,
         status=None,
         contains=None,
-        match=".items[].amount > 1000",
+        match=".body.items[].amount > 1000",
         jq_path=None,
         equals=None,
     )
@@ -438,7 +438,7 @@ def test_evaluate_match_any_truthy_fail_raises():
             RESULT,
             status=None,
             contains=None,
-            match=".items[].amount > 9999",
+            match=".body.items[].amount > 9999",
             jq_path=None,
             equals=None,
         )
@@ -484,7 +484,7 @@ def test_evaluate_two_failures_no_short_circuit_and_response_preserved():
             RESULT,
             status=200,
             contains=None,
-            match='.status=="PAID"',
+            match='.body.status=="PAID"',
             jq_path=None,
             equals=None,
         )

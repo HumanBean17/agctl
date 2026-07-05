@@ -62,7 +62,7 @@ Never put real secret values in it.
 
 ## Close-out
 
-- Put `version: "1"` at the top.
+- Put `version: "2"` at the top.
 - Write `.env.example` (above), then have the user copy & fill it: `cp .env.example .env`
   (edit the secrets).
 - Source it before validating, so required `${VAR}`s resolve: `set -a; . ./.env; set +a`.

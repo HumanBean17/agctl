@@ -51,9 +51,10 @@
 ```yaml
 # agctl.yaml
 # ---------------
-# Version tracks the agctl MAJOR version only (currently "1"). A major-version
-# mismatch is a ConfigError (exit 2); minor/patch are not tracked.
-version: "1"
+# Version is the jq-dialect switch: "2" = envelope-rooted `match` (`.body.x`
+# for HTTP, `.value.x` for Kafka). A major-version mismatch is a ConfigError
+# (exit 2) pointing at `agctl config migrate`; minor/patch are not tracked.
+version: "2"
 
 # ---------------------------------------------------------------------------
 # services — named HTTP base URLs for services under test.
@@ -99,19 +100,21 @@ kafka:
 # ---------------------------------------------------------------------------
 # kafka.patterns — named Kafka filter patterns, analogous to HTTP templates.
 # topic:   Kafka topic name
-# match:   jq predicate expression evaluated against each message value;
-#          supports {placeholder} substitution via --param at assert time
+# match:   jq predicate expression evaluated against each message envelope
+#          ({key, value, partition, offset, timestamp, headers}); so .value.eventType,
+#          .value.payload.orderId, .key, .headers.<name>. Supports {placeholder}
+#          substitution via --param at assert time.
 # ---------------------------------------------------------------------------
   patterns:
     order-created:
       description: "An ORDER_CREATED event for a specific order"
       topic: orders.created
-      match: '.eventType == "ORDER_CREATED" and .payload.orderId == "{orderId}"'
+      match: '.value.eventType == "ORDER_CREATED" and .value.payload.orderId == "{orderId}"'
 
     payment-failed:
       description: "Any PAYMENT_FAILED event regardless of order"
       topic: payments.events
-      match: '.eventType == "PAYMENT_FAILED"'
+      match: '.value.eventType == "PAYMENT_FAILED"'
 
 # ---------------------------------------------------------------------------
 # mocks — HTTP mock server and Kafka reactors (DESIGN §3.3).
@@ -129,14 +132,17 @@ mocks:
         method: POST
         path: "/api/v1/orders"
         match:
-          body: { "priority": "high" }    # optional: json_subset containment filter
-          # jq: '.amount > 1000'          # optional: jq predicate, AND-ed with body
-        # capture: OPTIONAL envelope-rooted extraction (peer of `match` on both
-        # HttpStub and KafkaReactor). Each entry is { from, type }:
+          body: { "priority": "high" }    # optional: json_subset containment filter (body-rooted)
+          # jq: '.body.amount > 1000'     # optional: jq predicate, AND-ed with body.
+          #                                 Under dialect "2" `match.jq` is envelope-rooted
+          #                                 (HTTP request {method, path, headers (lowercased),
+          #                                 body}), so .body.amount / .headers.authorization.
+        # capture: OPTIONAL envelope-rooted extraction (same root as `match.jq`).
+        # Each entry is { from, type }:
         #   from: jq path evaluated against the whole incoming message envelope
         #         (HTTP request {method, path, headers (lowercased), body} /
-        #         Kafka message {key, value, headers (case-sensitive), ...}). `match`
-        #         stays payload-rooted (body/value only).
+        #         Kafka message {key, value, headers (case-sensitive), ...}). `match.jq`
+        #         shares this root under dialect "2".
         #   type: scalar (default, str()) | object (live pass-through; whole-field
         #         placeholder "{name}" only) | json (json.dumps as a string).
         # Explicit entries override implicit top-level-body/value captures on name
@@ -166,9 +172,10 @@ mocks:
         description: "Mock the service that consumes order commands"
         topic: orders.commands
         consumer_group: agctl-mock-order-handler   # OPTIONAL; omit → unique per-run group
-        match: '.command == "CREATE_ORDER"'         # payload-rooted (message value only)
-        # capture: same CaptureSpec shape as HTTP stubs; `from` roots at the Kafka
-        # message envelope ({key, value, partition, offset, timestamp, headers}).
+        match: '.value.command == "CREATE_ORDER"'    # envelope-rooted (whole Kafka message)
+        # capture: same CaptureSpec shape as HTTP stubs; `from` shares the `match`
+        # root — the Kafka message envelope ({key, value, partition, offset,
+        # timestamp, headers}).
         # Header keys are case-sensitive here (as-produced) — do NOT lowercase them
         # (unlike HTTP headers). Reaches `.key`, `.headers.<name>`, nested `.value.*`.
         # capture:
@@ -347,7 +354,9 @@ agctl http call <template-name>
     # Response assertions (≥1 flag => assertion mode; all active flags AND together):
     [--status <code>]       # exact HTTP status code the response must return
     [--contains '{...}']    # JSON needle that must be a subset of the response body
-    [--match <jq-expr>]     # jq predicate; true on ANY truthy output against the body
+    [--match <jq-expr>]     # jq predicate; true on ANY truthy output against the response
+                            #   envelope {status_code, response_time_ms, headers (lowercased),
+                            #   body, url, method} — so .body.x, .status_code, .headers.x
     [--jq-path <jq>]        # jq path into the body (must be paired with --equals)
     [--equals <value>]      # expected value for --jq-path (JSON-parsed when valid; strict compare)
 ```
@@ -387,7 +396,9 @@ agctl http request
     # Response assertions (≥1 flag => assertion mode; all active flags AND together):
     [--status <code>]       # exact HTTP status code the response must return
     [--contains '{...}']    # JSON needle that must be a subset of the response body
-    [--match <jq-expr>]     # jq predicate; true on ANY truthy output against the body
+    [--match <jq-expr>]     # jq predicate; true on ANY truthy output against the response
+                            #   envelope {status_code, response_time_ms, headers (lowercased),
+                            #   body, url, method} — so .body.x, .status_code, .headers.x
     [--jq-path <jq>]        # jq path into the body (must be paired with --equals)
     [--equals <value>]      # expected value for --jq-path (JSON-parsed when valid; strict compare)
 ```
@@ -405,10 +416,12 @@ agctl http request \
 
 - `--status <code>` — exact HTTP status code the response must return.
 - `--contains '{...}'` — JSON subset match against the response body.
-- `--match <jq>` — jq predicate; true on ANY truthy output (`.items[].x > 100` means "≥1 item qualifies," not "all"). To assert "all," use the jq form `all(.items[]; .x > 100)`.
-- `--jq-path <jq>` + `--equals <v>` — extract a value via jq and compare strictly (type-aware: `0` ≠ `"0"`). The two flags must be used together; one without the other → `ConfigError` (exit 2).
+- `--match <jq>` — jq predicate evaluated against the **response envelope** (`{status_code, response_time_ms, headers (lowercased keys), body, url, method}`), so `.body.x`, `.status_code`, `.headers.x`. True on ANY truthy output (`.body.items[].x > 100` means "≥1 item qualifies," not "all"). To assert "all," use the jq form `all(.body.items[]; .x > 100)`.
+- `--jq-path <jq>` + `--equals <v>` — extract a value via jq (rooted at the response **body**) and compare strictly (type-aware: `0` ≠ `"0"`). The two flags must be used together; one without the other → `ConfigError` (exit 2).
 
 `--match` and `--jq-path` require the `jq` extra (`pip install 'agctl[jq]'`); a missing library surfaces as `ConfigError` (exit 2), not a crash.
+
+> **v1 → v2 migration:** under dialect `"1"` `--match` was body-rooted (`.x` meant a body field). Under dialect `"2"` it is envelope-rooted, so `.x` resolves against the response envelope — prefix legacy expressions with `.body | ` (e.g. `.status == "PENDING"` → `.body | .status == "PENDING"`, or simply `.body.status == "PENDING"`). `agctl config migrate` does **not** rewrite CLI flags in scripts/prompts — only the config file.
 
 #### `agctl http ping`
 
@@ -470,8 +483,9 @@ agctl kafka consume
     --topic <name>
     [--timeout <seconds>]       # default: kafka.timeout_seconds from config
     [--lookback <seconds>]      # seek to now - lookback before reading; default: = --timeout
-    [--match <jq-expr>]         # jq boolean predicate; only messages where the expression
-                                #   is true are counted/returned
+    [--match <jq-expr>]         # jq boolean predicate over the message envelope
+                                #   ({key, value, partition, offset, timestamp, headers}); only
+                                #   messages where the expression is true are counted/returned
     [--filter-key <jq-expr>]    # DEPRECATED alias for --match; prefer --match
     [--expect-count <n>]        # if set, exit 1 (AssertionError) if fewer than n matching
                                 #   messages are received within the window
@@ -479,7 +493,7 @@ agctl kafka consume
     [--consumer-group <name>]   # override default consumer group (default: agctl-consumer)
 ```
 
-`--match` is a jq boolean expression evaluated against each message value. Messages where the expression returns `false` or raises an error are silently skipped. This enables partial matching — you do not need to know the full message structure.
+`--match` is a jq boolean expression evaluated against each message **envelope** (`{key, value, partition, offset, timestamp, headers}`) — so `.value.eventType`, `.key`, `.headers.rqUID`. Header keys are case-sensitive (as-produced). Messages where the expression returns `false` or raises an error are silently skipped. This enables partial matching — you do not need to know the full message structure.
 
 **Examples:**
 
@@ -493,14 +507,14 @@ agctl kafka consume \
 # Only count messages where orderId matches, ignoring all others
 agctl kafka consume \
   --topic orders.created \
-  --match '.payload.orderId == "ord-789"' \
+  --match '.value.payload.orderId == "ord-789"' \
   --timeout 10 \
   --expect-count 1
 
 # Filter by eventType without caring about other fields
 agctl kafka consume \
   --topic orders.created \
-  --match '.eventType == "ORDER_CREATED" and .payload.customerId != null' \
+  --match '.value.eventType == "ORDER_CREATED" and .value.payload.customerId != null' \
   --timeout 15
 ```
 
@@ -531,7 +545,7 @@ Assert that a message matching a predicate or pattern appears on a topic within 
 
 Supports three matching modes, usable together:
 - `--contains` — JSON subset match against the full message value
-- `--match` — jq boolean predicate for partial/complex filtering (preferred for real systems)
+- `--match` — jq boolean predicate over the message **envelope** (`{key, value, partition, offset, timestamp, headers}`), so `.value.eventType`, `.key`, `.headers.rqUID` (preferred for real systems)
 - `--pattern` — reference a named pattern from `kafka.patterns` in config
 
 When multiple modes are combined, all conditions must be satisfied.
@@ -540,7 +554,7 @@ When multiple modes are combined, all conditions must be satisfied.
 agctl kafka assert
     [--topic <name>]            # required unless --pattern is used (topic inferred from pattern)
     [--contains '{...}']        # JSON subset that must be present in the message value
-    [--match <jq-expr>]         # jq boolean predicate; more flexible than --contains
+    [--match <jq-expr>]         # jq boolean predicate over the message envelope; more flexible than --contains
     [--pattern <name>]          # use a named pattern from config
     [--param key=value]         # repeatable; fills {placeholder} in pattern match expression
     [--path <jq-path>]          # narrow --contains match to a sub-path, e.g. ".event_type"
@@ -562,7 +576,7 @@ agctl kafka assert \
 # Predicate match — partial, no need to know full message structure
 agctl kafka assert \
   --topic orders.created \
-  --match '.payload.orderId == "ord-789" and .eventType != null' \
+  --match '.value.payload.orderId == "ord-789" and .value.eventType != null' \
   --timeout 5
 
 # Named pattern with param substitution (topic inferred from pattern)
@@ -881,6 +895,49 @@ agctl config init
     [--force]                   # overwrite if exists
 ```
 
+#### `agctl config migrate`
+
+Rewrite a dialect-`"1"` config to dialect `"2"` (envelope-rooted `match`). Backs up the original to `<path>.bak` and writes the rewritten config back to `<path>`. A config already at `"2"` is a clean no-op (`already_v2: true`, `rewrites: []`). Refuses to clobber an existing `<path>.bak` (`ConfigError`, exit 2 — remove or rename it first); the backup is the only safety net for the reformat the rewrite performs.
+
+```
+agctl config migrate
+    [--config <path>]           # auto-discovered by default
+    [--dry-run]                 # preview the rewrite; do not write
+```
+
+The rewrite walks the three `match`-site families and prepends the envelope prefix:
+
+- `mocks.http.stubs.<name>.match.jq` → prefix `.body | ` (e.g. `.amount > 1000` → `.body | .amount > 1000`).
+- `mocks.kafka.reactors.<name>.match` → prefix `.value | `.
+- `kafka.patterns.<name>.match` → prefix `.value | `.
+
+Then bumps `version` to `"2"`. `capture.*.from` and `match.body` are **not** visited (out of scope). Idempotent — expressions that already start with the prefix are not double-prefixed; an already-`"2"` config is returned unchanged.
+
+**`cli_flags_note` (load-bearing caveat):** CLI `--match` flags (and the deprecated `--filter-key` alias) passed to `agctl http` / `agctl kafka` in shell scripts, agent prompts, or runbooks are **not** rewritten by this command (it walks the config file only). Prefix them manually: `.body | ` for HTTP, `.value | ` for Kafka. (`agctl mock run` has no `--match` CLI flag — mock matchers are config-file only, and ARE rewritten.)
+
+**`formatting_note`:** the rewritten file is emitted via `yaml.safe_dump`, which normalizes indentation/quotes and drops comments; the original is preserved verbatim in `<path>.bak`. Review the full diff before committing.
+
+**Result shape (excerpt):**
+
+```json
+{
+  "ok": true,
+  "command": "config.migrate",
+  "result": {
+    "path": "./agctl.yaml",
+    "already_v2": false,
+    "from_version": "1",
+    "to_version": "2",
+    "rewritten": [
+      {"path": "mocks.http.stubs.create-order.match.jq", "before": ".amount > 1000", "after": ".body | .amount > 1000"}
+    ],
+    "cli_flags_note": "CLI --match flags (and the deprecated --filter-key alias) on `agctl http` / `agctl kafka` … must be prefixed manually: `.body | ` for HTTP, `.value | ` for Kafka.",
+    "formatting_note": "yaml.safe_dump reformats the file and drops comments; the original is preserved in <path>.bak …"
+  },
+  "duration_ms": 3
+}
+```
+
 ---
 
 ### 3.7 `agctl discover` — Lazy Scoped Discovery
@@ -1093,7 +1150,7 @@ Every invocation writes exactly one JSON object to stdout (the sole exception is
 | Type | Exit code | Applies when |
 |---|---|---|
 | `AssertionError` | 1 | An assertion was evaluated and failed — including `kafka assert` timing out (no matching message within the window), `kafka consume --expect-count` receiving fewer than expected, and `http call`/`http request` response assertions (`--status`/`--contains`/`--match`/`--jq-path`/`--equals`) evaluating false |
-| `ConfigError` | 2 | Config missing/invalid, an unresolvable **required** env var, or a major-version mismatch |
+| `ConfigError` | 2 | Config missing/invalid, an unresolvable **required** env var, or a major-version (jq-dialect) mismatch — a v1 config under the v2 tool is rejected with a pointer to `agctl config migrate` |
 | `ConnectionError` | 2 | Could not reach a service, broker, or database |
 | `TimeoutError` | 1 | A non-assertion operation exceeded its time budget (e.g. a slow HTTP request or a hung DB query) |
 | `TemplateNotFound` | 2 | Named template/pattern/connection does not exist in config |
@@ -1913,7 +1970,6 @@ These items are intentionally deferred. Do not implement them until the core des
 | **Mock: stateful / scenario mocks** | Sequences, "Nth call → Y", reactor behavior change after N messages. |
 | **Mock: managed daemon** | `mock start/stop/status` with pidfile + control socket, behind `--detach`. |
 | **Mock: record / replay** | Record real traffic into stubs for later replay. |
-| **Mock: unify `match` onto the envelope root (#22)** | `match.jq` (HTTP) / reactor `match` (Kafka) stay payload-rooted while `capture.*.from` roots at the whole incoming message envelope — a `.`-root divergence accepted as the cost of additive capture. Nested fields, headers, and the Kafka key are reachable today via `capture:` (envelope-rooted); implicit capture (top-level body/value keys) remains payload-rooted. Migrating `match` is breaking (needs a major-version bump or a `match_root` compat shim); tracked as #22, deliberately not implemented here. |
 | **Mock: exactly-once reactor delivery** | Reaction retry/backoff on broker errors (today: at-least-once with idempotent reactions). |
 | **Mock: TLS / HTTPS mock** | Cert-pinned SUT clients cannot connect to a plaintext mock. |
 | **Mock: multiple HTTP servers / ports** | One server, many stubs (path-routed) is the only model today. |
@@ -1975,7 +2031,7 @@ echo $RESULT | jq '.result.status_code'        # expect 201
 ORDER_ID=$(echo $RESULT | jq -r '.result.body.order_id')
 
 # Step 7 — assert Kafka event published
-agctl kafka assert   --topic orders.created   --match ".payload.orderId == "$ORDER_ID""   --timeout 10
+agctl kafka assert   --topic orders.created   --match ".value.payload.orderId == "$ORDER_ID""   --timeout 10
 
 # Step 8 — assert DB state
 agctl db assert   --template find-order   --param orderId=$ORDER_ID   --expect-rows 1
@@ -2109,7 +2165,7 @@ agctl db assert --template find-order --param orderId=$OID1 --expect-rows 1
 
 # Flow 2: payment processing
 agctl http call process-payment --param order_id=$OID1 --param amount_cents=4999
-agctl kafka assert --topic payments.events   --match ".orderId == "$OID1" and .status == "SUCCESS""   --timeout 10
+agctl kafka assert --topic payments.events   --match ".value.orderId == "$OID1" and .value.status == "SUCCESS""   --timeout 10
 agctl db assert --template find-order --param orderId=$OID1   --expect-value --path ".status" --equals "PAID"
 
 # Flow 3: order cancellation
@@ -2144,7 +2200,7 @@ agctl db assert   --template count-failed-payments   --param since=$(date -u -d 
 agctl http call create-order   --param customer_id=cust-flaky   --param sku=WIDGET-001
 
 # Step 2 — consume broadly to see what actually arrived and when
-agctl kafka consume   --topic orders.created   --timeout 30   --match '.payload.customerId == "cust-flaky"'
+agctl kafka consume   --topic orders.created   --timeout 30   --match '.value.payload.customerId == "cust-flaky"'
 # Inspect: how many messages? what timestamps? what fields?
 
 # Step 3 — query raw DB state immediately
@@ -2152,7 +2208,7 @@ agctl db query   --sql "SELECT id, status, created_at, updated_at FROM orders WH
 # Inspect: is the row there? what status? any timing anomaly?
 
 # Step 4 — re-run assertion with a longer timeout to confirm it's a timing issue
-agctl kafka assert   --topic orders.created   --match '.payload.customerId == "cust-flaky"'   --timeout 30
+agctl kafka assert   --topic orders.created   --match '.value.payload.customerId == "cust-flaky"'   --timeout 30
 # If this passes but --timeout 5 fails: confirmed race condition, increase default timeout
 ```
 
