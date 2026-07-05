@@ -47,15 +47,16 @@ def test_agctl_override_applied(tmp_path):
 
 def test_version_mismatch_raises(tmp_path):
     bad = tmp_path / "agctl.yaml"
-    bad.write_text('version: "2"\n')
+    bad.write_text('version: "1"\n')
     with pytest.raises(ConfigError) as exc:
         load_config(str(bad), env={})
-    assert exc.value.detail["tool_major"] == "1"
+    assert exc.value.detail["tool_major"] == "2"
+    assert "config migrate" in exc.value.message
 
 
 def test_invalid_schema_raises(tmp_path):
     bad = tmp_path / "agctl.yaml"
-    bad.write_text('version: "1"\ntemplates:\n  x:\n    method: GET\n')  # missing service/path
+    bad.write_text('version: "2"\ntemplates:\n  x:\n    method: GET\n')  # missing service/path
     with pytest.raises(ConfigError):
         load_config(str(bad), env={})
 
@@ -64,7 +65,7 @@ def test_kafka_ssl_loaded_from_config(tmp_path):
     """kafka.ssl sub-block loads into the typed KafkaSSL model (DESIGN §2.1)."""
     cfg_file = tmp_path / "agctl.yaml"
     cfg_file.write_text(
-        'version: "1"\n'
+        'version: "2"\n'
         "kafka:\n"
         "  brokers: [host:9092]\n"
         "  ssl:\n"
@@ -90,7 +91,7 @@ def test_kafka_ssl_env_override(tmp_path):
     """AGCTL_KAFKA__SSL__* overrides reach the typed model for free (§8)."""
     cfg_file = tmp_path / "agctl.yaml"
     cfg_file.write_text(
-        'version: "1"\n'
+        'version: "2"\n'
         "kafka:\n"
         "  brokers: [host:9092]\n"
     )
@@ -108,7 +109,7 @@ def test_kafka_ssl_path_interpolated(tmp_path):
     primary TLS config mechanism); ${VAR:-} resolves to empty (== unset)."""
     cfg_file = tmp_path / "agctl.yaml"
     cfg_file.write_text(
-        'version: "1"\n'
+        'version: "2"\n'
         "kafka:\n"
         "  brokers: [host:9092]\n"
         "  ssl:\n"
@@ -126,7 +127,7 @@ def test_kafka_ssl_invalid_security_protocol_raises(tmp_path):
     not as an opaque connect-time error."""
     cfg_file = tmp_path / "agctl.yaml"
     cfg_file.write_text(
-        'version: "1"\n'
+        'version: "2"\n'
         "kafka:\n"
         "  brokers: [host:9092]\n"
         "  ssl:\n"
@@ -140,7 +141,7 @@ def test_kafka_ssl_security_protocol_normalized(tmp_path):
     """security.protocol is normalized to librdkafka's uppercase form."""
     cfg_file = tmp_path / "agctl.yaml"
     cfg_file.write_text(
-        'version: "1"\n'
+        'version: "2"\n'
         "kafka:\n"
         "  brokers: [host:9092]\n"
         "  ssl:\n"

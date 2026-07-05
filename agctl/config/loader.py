@@ -81,7 +81,7 @@ def discover_config_path(explicit: str | None = None, env: dict[str, str] | None
     raise ConfigError("No agctl.yaml found (use --config or AGCTL_CONFIG, or add agctl.yaml)", {})
 
 
-TOOL_MAJOR_VERSION = "1"
+TOOL_MAJOR_VERSION = "2"
 
 
 def load_config(path: str | None = None, env: dict[str, str] | None = None):
@@ -103,6 +103,9 @@ def _check_version(data: dict) -> None:
     major = version.split(".")[0] if version else ""
     if major != TOOL_MAJOR_VERSION:
         raise ConfigError(
-            f"Version mismatch: config major '{major}' != tool major '{TOOL_MAJOR_VERSION}'",
+            f"Config dialect v{major} is no longer supported by agctl v{TOOL_MAJOR_VERSION} "
+            f"(config_version='{version}'). Run `agctl config migrate` to upgrade, "
+            f"or manually bump `version: \"{TOOL_MAJOR_VERSION}\"` and prefix any jq "
+            f"`match` expressions with `.payload`.",
             {"config_version": version, "tool_major": TOOL_MAJOR_VERSION},
         )

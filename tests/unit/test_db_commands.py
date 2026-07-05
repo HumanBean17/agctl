@@ -1163,7 +1163,7 @@ def test_db_schema_no_default_no_connection_raises_config_error(install_fake, tm
     install_fake(schema_result={"items": []})
     cfg = tmp_path / "agctl.yaml"
     cfg.write_text(
-        'version: "1"\n'
+        'version: "2"\n'
         "database:\n"
         "  connections:\n"
         "    main-db:\n"

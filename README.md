@@ -198,8 +198,8 @@ version is the same file with secrets/hosts moved into `${...}` and sourced from
 
 ```yaml
 # agctl.yaml
-# Version tracks the agctl MAJOR version only (currently "1").
-version: "1"
+# Version tracks the agctl MAJOR version only (currently "2").
+version: "2"
 
 # --- services: named HTTP base URLs for services under test -----------------
 services:
