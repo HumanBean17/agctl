@@ -964,7 +964,7 @@ agctl discover
     "http_templates": 12,
     "kafka_patterns": 5,
     "db_templates": 8,
-    "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates"
+    "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates, mock-http-stubs, mock-kafka-reactors"
   },
   "duration_ms": 1
 }
@@ -976,7 +976,7 @@ Returns names and one-line descriptions for all items in a category. No params, 
 
 ```bash
 agctl discover --category <name>
-# <name>: services | http-templates | kafka-patterns | db-templates
+# <name>: services | http-templates | kafka-patterns | db-templates | mock-http-stubs | mock-kafka-reactors
 ```
 
 **Example — `agctl discover --category http-templates`:**
@@ -1367,7 +1367,7 @@ Every service entry always includes `response_time_ms` (an integer on success, `
   "http_templates": 12,
   "kafka_patterns": 5,
   "db_templates": 8,
-  "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates"
+  "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates, mock-http-stubs, mock-kafka-reactors"
 }
 ```
 

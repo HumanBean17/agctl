@@ -36,11 +36,19 @@ __all__ = ["discover"]
 _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _SQL_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
 
-_VALID_CATEGORIES = ("services", "http-templates", "kafka-patterns", "db-templates")
+_VALID_CATEGORIES = (
+    "services",
+    "http-templates",
+    "kafka-patterns",
+    "db-templates",
+    "mock-http-stubs",
+    "mock-kafka-reactors",
+)
 
 _SUMMARY_HINT = (
     "Run 'agctl discover --category <name>' to list items. "
-    "Categories: services, http-templates, kafka-patterns, db-templates"
+    "Categories: services, http-templates, kafka-patterns, db-templates, "
+    "mock-http-stubs, mock-kafka-reactors"
 )
 _CATEGORY_HINT = "Run 'agctl discover --category <c> --name <name>' for full detail"
 _SEARCH_HINT = (
@@ -127,6 +135,54 @@ def _db_example(name: str, params: list[str], mode: str = "read") -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Mock helpers (mock-http-stubs / mock-kafka-reactors categories)
+#
+# Mocks are declared under the optional top-level ``mocks:`` config section and
+# have no runtime registry, so these accessors treat absent sections as empty
+# (graceful zero in summary/listing, never an error).
+# --------------------------------------------------------------------------- #
+
+
+def _mock_http_stubs(cfg) -> dict:
+    """``cfg.mocks.http.stubs``, or ``{}`` when mocks/http are absent."""
+    if cfg.mocks is None or cfg.mocks.http is None:
+        return {}
+    return cfg.mocks.http.stubs
+
+
+def _mock_kafka_reactors(cfg) -> dict:
+    """``cfg.mocks.kafka.reactors``, or ``{}`` when mocks/kafka are absent."""
+    if cfg.mocks is None or cfg.mocks.kafka is None:
+        return {}
+    return cfg.mocks.kafka.reactors
+
+
+def _mock_http_listen(cfg) -> str:
+    """Configured HTTP mock listen address (default ``0.0.0.0:18080``)."""
+    if cfg.mocks is None or cfg.mocks.http is None:
+        return "0.0.0.0:18080"
+    return cfg.mocks.http.listen
+
+
+def _mock_http_example(stub, listen: str) -> str:
+    # Normalize the wildcard bind to localhost so the URL is copy-pasteable.
+    host, sep, port = listen.partition(":")
+    if host in ("0.0.0.0", "::", ""):
+        host = "localhost"
+    url = f"http://{host}{sep}{port}{stub.path}" if sep else f"http://{host}{stub.path}"
+    return f"curl -i -X {stub.method} {url}"
+
+
+def _mock_kafka_example(reactor) -> str:
+    # Reactors consume from ``topic``; trigger by producing, then the reactor
+    # emits to ``reaction.topic``. ``--message`` is required by kafka produce.
+    return (
+        f"agctl kafka produce --topic {reactor.topic} --message '<json>'"
+        f"  # reactor emits to {reactor.reaction.topic}"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Mode cores (each wrapped in its own envelope)
 # --------------------------------------------------------------------------- #
 
@@ -138,6 +194,8 @@ def _summary_core(config_path: str | None) -> dict:
         "http_templates": len(cfg.templates),
         "kafka_patterns": len(cfg.kafka.patterns),
         "db_templates": len(cfg.database.templates),
+        "mock_http_stubs": len(_mock_http_stubs(cfg)),
+        "mock_kafka_reactors": len(_mock_kafka_reactors(cfg)),
         "hint": _SUMMARY_HINT,
     }
 
@@ -163,6 +221,26 @@ def _category_core(config_path: str | None, category: str) -> dict:
     elif category == "db-templates":
         for name, tpl in cfg.database.templates.items():
             items.append({"name": name, "description": tpl.description, "mode": tpl.mode})
+    elif category == "mock-http-stubs":
+        for name, stub in _mock_http_stubs(cfg).items():
+            items.append(
+                {
+                    "name": name,
+                    "description": stub.description,
+                    "method": stub.method,
+                    "path": stub.path,
+                }
+            )
+    elif category == "mock-kafka-reactors":
+        for name, reactor in _mock_kafka_reactors(cfg).items():
+            items.append(
+                {
+                    "name": name,
+                    "description": reactor.description,
+                    "topic": reactor.topic,
+                    "consumer_group": reactor.consumer_group,
+                }
+            )
 
     return {
         "category": category,
@@ -237,6 +315,61 @@ def _item_core(config_path: str | None, category: str, name: str) -> dict:
             item["match"] = pat.match
         return item
 
+    if category == "mock-http-stubs":
+        stubs = _mock_http_stubs(cfg)
+        if name not in stubs:
+            raise TemplateNotFound(
+                f"Unknown mock HTTP stub: {name}",
+                {"path": f"mocks.http.stubs.{name}"},
+            )
+        stub = stubs[name]
+        item = {
+            "category": "mock-http-stubs",
+            "name": name,
+            "description": stub.description,
+            "method": stub.method,
+            "path": stub.path,
+            "response": stub.response.model_dump(by_alias=True, exclude_none=True),
+            "delay_ms": stub.delay_ms,
+            "example": _mock_http_example(stub, _mock_http_listen(cfg)),
+            "note": "Served only while `agctl mock run` is running on this listen address.",
+        }
+        if stub.match is not None:
+            item["match"] = stub.match.model_dump(by_alias=True, exclude_none=True)
+        if stub.capture:
+            item["capture"] = {
+                k: v.model_dump(by_alias=True, exclude_none=True)
+                for k, v in stub.capture.items()
+            }
+        return item
+
+    if category == "mock-kafka-reactors":
+        reactors = _mock_kafka_reactors(cfg)
+        if name not in reactors:
+            raise TemplateNotFound(
+                f"Unknown mock Kafka reactor: {name}",
+                {"path": f"mocks.kafka.reactors.{name}"},
+            )
+        reactor = reactors[name]
+        item = {
+            "category": "mock-kafka-reactors",
+            "name": name,
+            "description": reactor.description,
+            "topic": reactor.topic,
+            "consumer_group": reactor.consumer_group,
+            "reaction": reactor.reaction.model_dump(by_alias=True, exclude_none=True),
+            "example": _mock_kafka_example(reactor),
+            "note": "Active only while `agctl mock run` (kafka engine) is running.",
+        }
+        if reactor.match is not None:
+            item["match"] = reactor.match
+        if reactor.capture:
+            item["capture"] = {
+                k: v.model_dump(by_alias=True, exclude_none=True)
+                for k, v in reactor.capture.items()
+            }
+        return item
+
     # category == "db-templates"
     if name not in cfg.database.templates:
         raise TemplateNotFound(
@@ -304,6 +437,34 @@ def _search_core(config_path: str | None, term: str) -> dict:
                     "name": name,
                     "description": tpl.description,
                     "mode": tpl.mode,
+                }
+            )
+
+    for name, stub in _mock_http_stubs(cfg).items():
+        if (
+            needle in name.lower()
+            or _matches(stub.description)
+            or needle in stub.path.lower()
+        ):
+            matches.append(
+                {
+                    "category": "mock-http-stubs",
+                    "name": name,
+                    "description": stub.description,
+                }
+            )
+
+    for name, reactor in _mock_kafka_reactors(cfg).items():
+        if (
+            needle in name.lower()
+            or _matches(reactor.description)
+            or needle in reactor.topic.lower()
+        ):
+            matches.append(
+                {
+                    "category": "mock-kafka-reactors",
+                    "name": name,
+                    "description": reactor.description,
                 }
             )
 

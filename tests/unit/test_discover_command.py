@@ -41,6 +41,25 @@ def _payload(result):
     return json.loads(result.output)
 
 
+def _run_with(args, config_yaml, tmp_path, monkeypatch):
+    """Run discover against an ad-hoc config written to ``tmp_path``.
+
+    Used for cases that don't fit the shared fixture: the absent-mocks
+    zero-count path and item detail with a capture (kept out of the shared
+    fixture to avoid its finicky placement validation).
+    """
+    cfg_file = tmp_path / "agctl.yaml"
+    cfg_file.write_text(config_yaml)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--config", str(cfg_file), "discover", *args],
+        env=ENV,
+        standalone_mode=False,
+    )
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # Level 0 — summary
 # --------------------------------------------------------------------------- #
@@ -57,6 +76,8 @@ def test_summary_counts_and_hint(monkeypatch):
     assert counts["http_templates"] == 4
     assert counts["kafka_patterns"] == 2
     assert counts["db_templates"] == 4
+    assert counts["mock_http_stubs"] == 2
+    assert counts["mock_kafka_reactors"] == 2
     assert "hint" in counts
 
 
@@ -313,3 +334,205 @@ def test_search_includes_mode_field(monkeypatch):
     assert db_matches["seed-order"]["mode"] == "write"
     # find-order has mode read
     assert db_matches["find-order"]["mode"] == "read"
+
+
+# --------------------------------------------------------------------------- #
+# Mock categories (mock-http-stubs / mock-kafka-reactors)
+# --------------------------------------------------------------------------- #
+
+
+def test_category_mock_http_stubs(monkeypatch):
+    result = _run(["--category", "mock-http-stubs"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.category"
+    res = payload["result"]
+    assert res["category"] == "mock-http-stubs"
+    assert res["count"] == 2
+    by_name = {item["name"]: item for item in res["items"]}
+    assert set(by_name) == {"charge-ok", "healthz"}
+    for item in res["items"]:
+        # Listing is name + description + method + path only.
+        assert set(item.keys()) == {"name", "description", "method", "path"}
+    assert by_name["charge-ok"]["method"] == "POST"
+    assert by_name["charge-ok"]["path"] == "/v1/charge"
+    assert by_name["healthz"]["method"] == "GET"
+
+
+def test_category_mock_kafka_reactors(monkeypatch):
+    result = _run(["--category", "mock-kafka-reactors"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["category"] == "mock-kafka-reactors"
+    assert res["count"] == 2
+    by_name = {item["name"]: item for item in res["items"]}
+    assert set(by_name) == {"order-confirmation", "payment-audit"}
+    for item in res["items"]:
+        assert set(item.keys()) == {"name", "description", "topic", "consumer_group"}
+    assert by_name["order-confirmation"]["topic"] == "orders.created"
+    assert by_name["order-confirmation"]["consumer_group"] == "mock-order-reactor"
+
+
+def test_item_mock_http_stub_with_match(monkeypatch):
+    result = _run(["--category", "mock-http-stubs", "--name", "charge-ok"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.item"
+    res = payload["result"]
+    assert res["category"] == "mock-http-stubs"
+    assert res["name"] == "charge-ok"
+    assert res["method"] == "POST"
+    assert res["path"] == "/v1/charge"
+    assert res["response"]["status"] == 200
+    assert res["response"]["body"] == {"status": "ok"}
+    assert res["match"] == {"body": {"amount_cents": 1000}}
+    assert "capture" not in res  # fixture stub has no capture
+    assert res["delay_ms"] == 0
+    # 0.0.0.0 bind normalized to localhost for a copy-pasteable URL.
+    assert res["example"] == "curl -i -X POST http://localhost:18080/v1/charge"
+    assert "mock run" in res["note"]
+
+
+def test_item_mock_http_stub_minimal(monkeypatch):
+    result = _run(["--category", "mock-http-stubs", "--name", "healthz"], monkeypatch)
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["name"] == "healthz"
+    assert res["method"] == "GET"
+    assert res["path"] == "/healthz"
+    # No match/capture on this stub — those keys are omitted.
+    assert "match" not in res
+    assert "capture" not in res
+    assert res["example"] == "curl -i -X GET http://localhost:18080/healthz"
+
+
+def test_item_mock_kafka_reactor_with_match(monkeypatch):
+    result = _run(
+        ["--category", "mock-kafka-reactors", "--name", "order-confirmation"],
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.item"
+    res = payload["result"]
+    assert res["category"] == "mock-kafka-reactors"
+    assert res["name"] == "order-confirmation"
+    assert res["topic"] == "orders.created"
+    assert res["consumer_group"] == "mock-order-reactor"
+    assert res["match"] == '.value.eventType == "ORDER_CREATED"'
+    assert res["reaction"] == {
+        "topic": "orders.confirmed",
+        "value": {"event": "ORDER_CONFIRMED"},
+    }
+    assert res["example"].startswith("agctl kafka produce --topic orders.created")
+    assert "orders.confirmed" in res["example"]
+    assert "mock run" in res["note"]
+
+
+def test_item_mock_kafka_reactor_no_match(monkeypatch):
+    result = _run(
+        ["--category", "mock-kafka-reactors", "--name", "payment-audit"], monkeypatch
+    )
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["name"] == "payment-audit"
+    assert res["topic"] == "payments.events"
+    # No match on this reactor — omitted.
+    assert "match" not in res
+    assert res["reaction"]["topic"] == "audit.events"
+
+
+def test_item_mock_http_stub_unknown(monkeypatch):
+    result = _run(["--category", "mock-http-stubs", "--name", "nope"], monkeypatch)
+    assert result.exit_code == 2
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "TemplateNotFound"
+
+
+def test_item_mock_kafka_reactor_unknown(monkeypatch):
+    result = _run(["--category", "mock-kafka-reactors", "--name", "nope"], monkeypatch)
+    assert result.exit_code == 2
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "TemplateNotFound"
+
+
+def test_search_finds_mock_http_stub(monkeypatch):
+    result = _run(["--search", "charge"], monkeypatch)
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    by_key = {(m["category"], m["name"]) for m in res["matches"]}
+    assert ("mock-http-stubs", "charge-ok") in by_key
+
+
+def test_search_finds_mock_kafka_reactor(monkeypatch):
+    # "audit" matches the payment-audit reactor (name + description).
+    result = _run(["--search", "audit"], monkeypatch)
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    by_key = {(m["category"], m["name"]) for m in res["matches"]}
+    assert ("mock-kafka-reactors", "payment-audit") in by_key
+
+
+_NO_MOCKS_CONFIG = (
+    'version: "2"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+)
+
+
+def test_summary_absent_mocks_counts_zero(tmp_path, monkeypatch):
+    result = _run_with([], _NO_MOCKS_CONFIG, tmp_path, monkeypatch)
+    assert result.exit_code == 0
+    counts = _payload(result)["result"]
+    assert counts["mock_http_stubs"] == 0
+    assert counts["mock_kafka_reactors"] == 0
+
+
+def test_category_mock_http_stubs_absent_is_empty(tmp_path, monkeypatch):
+    result = _run_with(["--category", "mock-http-stubs"], _NO_MOCKS_CONFIG, tmp_path, monkeypatch)
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["count"] == 0
+    assert res["items"] == []
+
+
+_CAPTURE_CONFIG = (
+    'version: "2"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+    "mocks:\n"
+    "  http:\n"
+    "    stubs:\n"
+    "      echo-ctx:\n"
+    '        description: "Echo the request ctx"\n'
+    "        method: POST\n"
+    "        path: /echo\n"
+    "        capture:\n"
+    "          ctx:\n"
+    "            from: .body.ctx\n"
+    "            type: object\n"
+    "        response:\n"
+    "          status: 200\n"
+    "          body:\n"
+    '            context: "{ctx}"\n'
+)
+
+
+def test_item_mock_http_stub_with_capture(tmp_path, monkeypatch):
+    """Capture branch: a stub with a capture surfaces it under ``capture``
+    with the YAML-facing ``from`` alias preserved."""
+    result = _run_with(
+        ["--category", "mock-http-stubs", "--name", "echo-ctx"],
+        _CAPTURE_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["name"] == "echo-ctx"
+    assert res["capture"] == {"ctx": {"from": ".body.ctx", "type": "object"}}

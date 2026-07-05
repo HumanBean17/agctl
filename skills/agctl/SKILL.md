@@ -32,7 +32,7 @@ agctl discover --category http-templates              # names + one-line descrip
 agctl discover --category http-templates --name NAME  # params + a copy-paste example
 agctl discover --search payment                       # cross-category keyword search
 ```
-Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`.
+Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`, `mock-http-stubs`, `mock-kafka-reactors`.
 
 ## Which command for which intent
 

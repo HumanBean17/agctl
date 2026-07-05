@@ -295,9 +295,10 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
 - `reaction.headers` values must be strings — a non-string is a config error.
 - `description` is optional but effectively required (contract #4); its absence degrades
   `discover` and earns a validate warning.
-- Mocks are **not** surfaced by `agctl discover` (no `mocks` category) — navigate the
-  `mocks:` section directly. Verify with `agctl config validate` and a `mock run --duration`
-  smoke (see the `agctl` skill).
+- Mocks **are** surfaced by `agctl discover`: `--category mock-http-stubs` /
+  `mock-kafka-reactors` (and `--name <key>` for full detail). After editing, confirm the item
+  lists, then verify with `agctl config validate` and a `mock run --duration` smoke (see the
+  `agctl` skill).
 - A jq **typo** in `match.jq` / reactor `match` / `capture.*.from` fails loud at startup
   (exit 2); a jq **eval error** (or a `from` resolving to `null`) against a particular
   request/message is a soft non-match / `capture.missing` (falls through, empty string).
