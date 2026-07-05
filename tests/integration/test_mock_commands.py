@@ -574,7 +574,7 @@ class TestMockRunKafka:
         """Run Kafka reactor, produce command, assert reaction appears.
 
         Test flow:
-        1. Create config with kafka.mocks.reactors that captures from orders.commands
+        1. Create config with mocks.kafka.reactors that captures from orders.commands
            and reacts to orders.events
         2. Produce a command message to orders.commands
         3. Run mock run --only kafka --duration 2
@@ -603,20 +603,24 @@ class TestMockRunKafka:
             "version": "2.0",
             "kafka": {
                 "brokers": [broker],
-                "reactors": {
-                    "order-processor": {
-                        "description": "Process order commands",
-                        "topic": commands_topic,
-                        "consumer_group": f"agctl-test-{test_id}",
-                        "match": ".value.command == \"create\"",
-                        "reaction": {
-                            "topic": events_topic,
-                            "key": "{order_id}",
-                            "value": {
-                                "event": "OrderCreated",
-                                "order_id": "{order_id}",
-                                "amount": "{amount}",
-                                "status": "pending"
+            },
+            "mocks": {
+                "kafka": {
+                    "reactors": {
+                        "order-processor": {
+                            "description": "Process order commands",
+                            "topic": commands_topic,
+                            "consumer_group": f"agctl-test-{test_id}",
+                            "match": ".value.command == \"create\"",
+                            "reaction": {
+                                "topic": events_topic,
+                                "key": "{order_id}",
+                                "value": {
+                                    "event": "OrderCreated",
+                                    "order_id": "{order_id}",
+                                    "amount": "{amount}",
+                                    "status": "pending"
+                                }
                             }
                         }
                     }
@@ -720,7 +724,9 @@ class TestMockRunKafka:
                     break
 
             assert reaction_found, "Reaction message not found in events topic"
-            assert reaction_value["amount"] == 250.00
+            # Scalar captures stringify the source value (str(250.0) -> "250.0"),
+            # so the reacted amount is the string "250.0", not the number 250.0.
+            assert reaction_value["amount"] == "250.0"
             assert reaction_value["status"] == "pending"
 
         finally:
