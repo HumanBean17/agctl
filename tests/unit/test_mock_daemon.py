@@ -419,6 +419,26 @@ class TestParseLog:
         }
         assert parsed.failures == []
 
+    def test_parse_log_unreadable_file_returns_empty_parsed_log(self, tmp_path):
+        """parse_log on unreadable file (directory) returns empty ParsedLog."""
+        from agctl.mock.daemon import parse_log
+
+        # Pass a directory path to trigger OSError (IsADirectoryError)
+        parsed = parse_log(tmp_path)
+
+        assert parsed.started is None
+        assert parsed.startup_error is None
+        assert parsed.summary is None
+        assert parsed.summary_so_far == {
+            "http_hits": 0,
+            "http_unmatched": 0,
+            "http_body_parse_skipped": 0,
+            "kafka_reactions": 0,
+            "kafka_skipped": 0,
+            "kafka_errors": 0,
+        }
+        assert parsed.failures == []
+
 
 class TestHasFatalFailure:
     """Tests for has_fatal_failure."""
