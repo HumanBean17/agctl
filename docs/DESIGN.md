@@ -897,7 +897,7 @@ agctl config init
 
 #### `agctl config migrate`
 
-Rewrite a dialect-`"1"` config to dialect `"2"` (envelope-rooted `match`). Backs up the original to `<path>.bak` and writes the rewritten config back to `<path>`. A config already at `"2"` is a clean no-op (`already_v2: true`, `rewrites: []`).
+Rewrite a dialect-`"1"` config to dialect `"2"` (envelope-rooted `match`). Backs up the original to `<path>.bak` and writes the rewritten config back to `<path>`. A config already at `"2"` is a clean no-op (`already_v2: true`, `rewrites: []`). Refuses to clobber an existing `<path>.bak` (`ConfigError`, exit 2 — remove or rename it first); the backup is the only safety net for the reformat the rewrite performs.
 
 ```
 agctl config migrate
@@ -913,7 +913,9 @@ The rewrite walks the three `match`-site families and prepends the envelope pref
 
 Then bumps `version` to `"2"`. `capture.*.from` and `match.body` are **not** visited (out of scope). Idempotent — expressions that already start with the prefix are not double-prefixed; an already-`"2"` config is returned unchanged.
 
-**`cli_flags_note` (load-bearing caveat):** CLI `--match` flags passed to `agctl http` / `agctl kafka` / `agctl mock run` in shell scripts, agent prompts, or runbooks are **not** rewritten by this command (it walks the config file only). Prefix them manually: `.body | ` for HTTP, `.value | ` for Kafka.
+**`cli_flags_note` (load-bearing caveat):** CLI `--match` flags (and the deprecated `--filter-key` alias) passed to `agctl http` / `agctl kafka` in shell scripts, agent prompts, or runbooks are **not** rewritten by this command (it walks the config file only). Prefix them manually: `.body | ` for HTTP, `.value | ` for Kafka. (`agctl mock run` has no `--match` CLI flag — mock matchers are config-file only, and ARE rewritten.)
+
+**`formatting_note`:** the rewritten file is emitted via `yaml.safe_dump`, which normalizes indentation/quotes and drops comments; the original is preserved verbatim in `<path>.bak`. Review the full diff before committing.
 
 **Result shape (excerpt):**
 
@@ -929,7 +931,8 @@ Then bumps `version` to `"2"`. `capture.*.from` and `match.body` are **not** vis
     "rewritten": [
       {"path": "mocks.http.stubs.create-order.match.jq", "before": ".amount > 1000", "after": ".body | .amount > 1000"}
     ],
-    "cli_flags_note": "CLI --match flags passed to `agctl http`, … must be prefixed manually: `.body | ` for HTTP, `.value | ` for Kafka."
+    "cli_flags_note": "CLI --match flags (and the deprecated --filter-key alias) on `agctl http` / `agctl kafka` … must be prefixed manually: `.body | ` for HTTP, `.value | ` for Kafka.",
+    "formatting_note": "yaml.safe_dump reformats the file and drops comments; the original is preserved in <path>.bak …"
   },
   "duration_ms": 3
 }

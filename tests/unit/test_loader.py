@@ -65,6 +65,18 @@ def test_missing_version_raises_with_clear_message(tmp_path):
     assert "missing a `version`" in exc.value.message
 
 
+def test_bare_version_key_treated_as_missing(tmp_path):
+    """A bare ``version:`` parses as YAML ``None``; ``str(None)`` would yield
+    the wrong-major branch ("Config dialect vNone ..."). Treat ``None`` as
+    missing so the clear "missing a `version`" path fires."""
+    bad = tmp_path / "agctl.yaml"
+    bad.write_text('version:\nkafka:\n  brokers: [h:9092]\n')
+    with pytest.raises(ConfigError) as exc:
+        load_config(str(bad), env={})
+    assert "missing a `version`" in exc.value.message
+    assert "vNone" not in exc.value.message
+
+
 def test_invalid_schema_raises(tmp_path):
     bad = tmp_path / "agctl.yaml"
     bad.write_text('version: "2"\ntemplates:\n  x:\n    method: GET\n')  # missing service/path

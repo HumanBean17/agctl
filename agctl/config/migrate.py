@@ -9,7 +9,9 @@ drive it for both real runs and ``--dry-run`` previews.
 
 Semantics (DESIGN §3.5; Task 6 brief):
 
-- ``source_major = str(config.get("version", "")).split(".")[0]``.
+- ``source_major = str(config.get("version", "")).strip().split(".")[0]`` — the
+  ``.strip()`` mirrors the loader's ``_check_version`` so a loader-accepted
+  ``version: " 2 "`` is seen as already-v2 here too (not force-rewritten).
 - If ``source_major == "2"``: already-v2 — return ``already_v2=True``, deep
   copy unchanged, ``rewrites=[]``. A v2-native config may carry a v2-style
   expr like ``.body.amount`` (no ``.body | `` prefix); the helper must NOT
@@ -144,7 +146,10 @@ def migrate_match_exprs(config: dict[str, Any]) -> MigrateResult:
     :class:`MigrateResult` whose ``config`` is always a fresh deep copy — the
     caller's input is never mutated.
     """
-    from_version = str(config.get("version", ""))
+    # Match the loader's _check_version exactly: str(...).strip(). Without the
+    # strip, a loader-accepted `version: " 2 "` reads as source_major " 2 " and
+    # force-rewrites a v2-native config (double-prefixing exprs like .body.amount).
+    from_version = str(config.get("version", "")).strip()
     source_major = from_version.split(".")[0]
     if source_major == TO_VERSION:
         return MigrateResult(

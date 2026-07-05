@@ -155,6 +155,26 @@ def test_migrate_missing_sections_no_crash():
     assert result.already_v2 is False
 
 
+def test_migrate_strips_version_whitespace_already_v2():
+    """``migrate_match_exprs`` must compute ``source_major`` with ``.strip()``
+    exactly as the loader's ``_check_version`` does. A loader-accepted
+    ``version: " 2 "`` is therefore already-v2 here too — a v2-native expr like
+    ``.body.amount`` is NOT force-rewritten (which would double-prefix it into
+    the broken ``.body | .body.amount``)."""
+    config = {
+        "version": " 2 ",
+        "mocks": {"http": {"stubs": {"s": {"match": {"jq": ".body.amount > 1000"}}}}},
+    }
+    result = migrate_match_exprs(config)
+    assert result.already_v2 is True
+    assert result.rewrites == []
+    # The v2-native expr is unchanged — not double-prefixed.
+    assert (
+        result.config["mocks"]["http"]["stubs"]["s"]["match"]["jq"]
+        == ".body.amount > 1000"
+    )
+
+
 # --- Step 5: command tests ---------------------------------------------------
 
 
@@ -317,3 +337,161 @@ def test_config_migrate_result_carries_cli_flags_note(tmp_path):
     note = payload["result"]["cli_flags_note"]
     assert isinstance(note, str)
     assert "--match" in note
+
+
+def test_config_migrate_round_trip_proves_behavior(tmp_path):
+    """After migrating a v1 config and loading the result, the rewritten HTTP
+    stub ``match.jq`` actually matches an envelope with a qualifying body and
+    rejects one without. Guards that the ``.body | `` prepend is semantically
+    correct (envelope-rooted), not just syntactically present."""
+    from agctl.assertions import jq_bool
+
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "1"\n'
+        "mocks:\n"
+        "  http:\n"
+        "    stubs:\n"
+        "      s:\n"
+        "        method: POST\n"
+        "        path: /charge\n"
+        "        match:\n"
+        '          jq: ".amount > 1000"\n'
+        "        response:\n"
+        "          status: 200\n"
+    )
+
+    result = _migrate(tmp_path, ["--config", str(cfg)])
+    assert result.exit_code == 0
+
+    loaded = load_config(str(cfg), env={})
+    expr = loaded.mocks.http.stubs["s"].match.jq
+    assert expr == ".body | .amount > 1000"
+
+    matching = {
+        "method": "POST",
+        "path": "/x",
+        "headers": {},
+        "body": {"amount": 2000},
+    }
+    nonmatching = {
+        "method": "POST",
+        "path": "/x",
+        "headers": {},
+        "body": {"amount": 500},
+    }
+    assert jq_bool(matching, expr) is True
+    assert jq_bool(nonmatching, expr) is False
+
+
+def test_config_migrate_result_carries_formatting_note(tmp_path):
+    """When the command actually writes the file, the result includes a
+    ``formatting_note`` warning that ``yaml.safe_dump`` reformats / drops
+    comments and the original is in ``<path>.bak``."""
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "1"\n'
+        "mocks:\n"
+        "  http:\n"
+        "    stubs:\n"
+        "      s:\n"
+        "        match:\n"
+        '          jq: ".amount > 1000"\n'
+    )
+
+    result = _migrate(tmp_path, ["--config", str(cfg)])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    note = payload["result"]["formatting_note"]
+    assert isinstance(note, str)
+    assert "safe_dump" in note
+    assert ".bak" in note
+
+
+def test_config_migrate_formatting_note_null_on_dry_run_and_already_v2(tmp_path):
+    """``formatting_note`` is ``null`` when nothing is reformatted (--dry-run
+    or already_v2) — the caveat would be noise in those cases."""
+    # --dry-run: no write.
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "1"\n'
+        "mocks:\n"
+        "  http:\n"
+        "    stubs:\n"
+        "      s:\n"
+        "        match:\n"
+        '          jq: ".amount > 1000"\n'
+    )
+    dry = _migrate(tmp_path, ["--config", str(cfg), "--dry-run"])
+    assert json.loads(dry.output)["result"]["formatting_note"] is None
+
+    # already_v2: no write.
+    cfg2 = tmp_path / "agctl2.yaml"
+    cfg2.write_text(
+        'version: "2"\n'
+        "mocks:\n"
+        "  http:\n"
+        "    stubs:\n"
+        "      s:\n"
+        "        match:\n"
+        '          jq: ".body | .amount > 1000"\n'
+    )
+    already = _migrate(tmp_path, ["--config", str(cfg2)])
+    assert json.loads(already.output)["result"]["formatting_note"] is None
+
+
+def test_migrate_preserves_env_interpolation(tmp_path):
+    """``${VAR:-default}`` tokens are resolved at LOAD time, not migrate time —
+    the rewritten file on disk must still contain them verbatim. Do NOT call
+    ``load_config`` here (env unresolved)."""
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "1"\n'
+        "services:\n"
+        "  s:\n"
+        '    base_url: "${ORDER_SERVICE_URL:-http://fallback}"\n'
+        "mocks:\n"
+        "  http:\n"
+        "    stubs:\n"
+        "      s:\n"
+        "        match:\n"
+        '          jq: ".amount > 1000"\n'
+    )
+
+    result = _migrate(tmp_path, ["--config", str(cfg)])
+    assert result.exit_code == 0
+
+    text = cfg.read_text()
+    assert "${ORDER_SERVICE_URL:-http://fallback}" in text
+
+
+def test_config_migrate_refuses_to_clobber_existing_backup(tmp_path):
+    """A pre-existing ``<path>.bak`` is NOT silently overwritten (that would
+    destroy the safety net). The command emits ``ok:false`` /
+    ``error.type ConfigError`` / exit 2 and leaves BOTH files untouched."""
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "1"\n'
+        "mocks:\n"
+        "  http:\n"
+        "    stubs:\n"
+        "      s:\n"
+        "        match:\n"
+        '          jq: ".amount > 1000"\n'
+    )
+    original = cfg.read_text()
+
+    bak = tmp_path / "agctl.yaml.bak"
+    bak.write_text("PREVIOUS BACKUP - DO NOT LOSE\n")
+
+    result = _migrate(tmp_path, ["--config", str(cfg)])
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert payload["error"]["detail"]["backup"] == str(bak)
+
+    # Both files untouched: config not rewritten, backup preserved.
+    assert cfg.read_text() == original
+    assert bak.read_text() == "PREVIOUS BACKUP - DO NOT LOSE\n"

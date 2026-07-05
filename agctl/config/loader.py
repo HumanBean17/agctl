@@ -99,7 +99,12 @@ def load_config(path: str | None = None, env: dict[str, str] | None = None):
 
 
 def _check_version(data: dict) -> None:
-    version = str(data.get("version", "")).strip()
+    # A bare `version:` parses as YAML None — treat it as missing (clear message)
+    # rather than stringifying to "None" ("Config dialect vNone ..."). A real
+    # `0` / `False` / string still stringifies normally (so `or ""` is wrong here
+    # — it would swallow `version: 0`).
+    raw = data.get("version")
+    version = "" if raw is None else str(raw).strip()
     major = version.split(".")[0] if version else ""
     if major != TOOL_MAJOR_VERSION:
         if not version:

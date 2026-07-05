@@ -269,14 +269,25 @@ def config_init(ctx: click.Context, output: str | None, force: bool) -> None:
 # --- config migrate --------------------------------------------------------
 
 #: Fixed operator-facing reminder that CLI ``--match`` flags are NOT rewritten
-#: by ``agctl config migrate`` (the migration only walks the config file).
-#: Shell scripts and agent prompts that pass ``--match`` to ``agctl http`` /
-#: ``agctl kafka`` / ``agctl mock run`` must be prefixed manually.
+#: by ``agctl config migrate`` (the migration only walks the config file). Note
+#: ``agctl mock run`` has NO ``--match`` CLI flag (mock matchers are config-file
+#: only — and ARE rewritten); the deprecated ``--filter-key`` alias on
+#: ``agctl kafka consume`` is, like ``--match``, envelope-rooted under v2 and
+#: equally out of this command's reach.
 _CLI_FLAGS_NOTE = (
-    "CLI --match flags passed to `agctl http`, `agctl kafka`, or "
-    "`agctl mock run` in shell scripts or agent prompts are NOT rewritten "
-    "by this command and must be prefixed manually: `.body | ` for HTTP, "
-    "`.value | ` for Kafka."
+    "CLI --match flags (and the deprecated --filter-key alias) on "
+    "`agctl http` / `agctl kafka` live in shell scripts and agent prompts — "
+    "this command cannot reach them. Prefix those manually with `.body | ` "
+    "(HTTP) or `.value | ` (Kafka). Mock `match` expressions live in the "
+    "config file and ARE rewritten by this command."
+)
+
+#: yaml.safe_dump reformats the file and drops comments; the original is
+#: preserved in ``<path>.bak``. Surfaced in the result so the operator is not
+#: surprised that the "prepend + bump version" migration touches most lines.
+_FORMATTING_NOTE = (
+    "yaml.safe_dump reformats the file and drops comments; the original is "
+    "preserved in <path>.bak. Review the full diff before committing."
 )
 
 
@@ -299,24 +310,37 @@ def config_migrate(
         path = discover_config_path(explicit=explicit, env=os.environ)
         raw = path.read_text(encoding="utf-8")
         parsed = yaml.safe_load(raw) or {}
+        result = migrate_match_exprs(parsed)
+        # Write only when migrating for real (not already_v2, not --dry-run).
+        will_write = not result.already_v2 and not dry_run
+        base_result = {
+            "path": str(path),
+            "already_v2": result.already_v2,
+            "from_version": result.from_version,
+            "to_version": result.to_version,
+            "rewritten": result.rewrites,
+            "cli_flags_note": _CLI_FLAGS_NOTE,
+            # Surfaced only when the file is actually rewritten — on --dry-run
+            # and already_v2 nothing is reformatted, so the note would be noise.
+            "formatting_note": _FORMATTING_NOTE if will_write else None,
+        }
+        if will_write:
+            backup = path.with_suffix(path.suffix + ".bak")
+            # Refuse to clobber an existing backup — silently overwriting would
+            # destroy the safety net this command promises. Surfaces as the
+            # standard ConfigError envelope (exit 2), consistent with the rest.
+            if backup.exists():
+                raise ConfigError(
+                    f"Backup {backup} already exists; remove or rename it first, "
+                    f"then re-run.",
+                    {"backup": str(backup)},
+                )
+            backup.write_text(raw, encoding="utf-8")
+            path.write_text(
+                yaml.safe_dump(result.config, sort_keys=False, default_flow_style=False),
+                encoding="utf-8",
+            )
     except ConfigError as err:
         _emit_config_error("config.migrate", err, start)
         raise SystemExit(2)
-    result = migrate_match_exprs(parsed)
-    base_result = {
-        "path": str(path),
-        "already_v2": result.already_v2,
-        "from_version": result.from_version,
-        "to_version": result.to_version,
-        "rewritten": result.rewrites,
-        "cli_flags_note": _CLI_FLAGS_NOTE,
-    }
-    # Write only when migrating for real (not already_v2, not --dry-run).
-    if not result.already_v2 and not dry_run:
-        backup = path.with_suffix(path.suffix + ".bak")
-        backup.write_text(raw, encoding="utf-8")
-        path.write_text(
-            yaml.safe_dump(result.config, sort_keys=False, default_flow_style=False),
-            encoding="utf-8",
-        )
     emit(ok=True, command="config.migrate", result=base_result, duration_ms=_ms(start))
