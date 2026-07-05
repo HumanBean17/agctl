@@ -105,7 +105,8 @@ def _check_version(data: dict) -> None:
         raise ConfigError(
             f"Config dialect v{major} is no longer supported by agctl v{TOOL_MAJOR_VERSION} "
             f"(config_version='{version}'). Run `agctl config migrate` to upgrade, "
-            f"or manually bump `version: \"{TOOL_MAJOR_VERSION}\"` and prefix any jq "
-            f"`match` expressions with `.payload`.",
+            f"or manually bump `version: \"{TOOL_MAJOR_VERSION}\"` and prefix each HTTP "
+            f"`match` expression with `.body | ` and each Kafka `match` expression with "
+            f"`.value | `.",
             {"config_version": version, "tool_major": TOOL_MAJOR_VERSION},
         )
