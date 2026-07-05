@@ -127,6 +127,13 @@ class FakeCMsg:
         return None
 
 
+# Sentinel distinguishing "kwarg omitted" from "kwarg passed as None". The real
+# confluent_kafka binding (2.15.0) rejects an explicit None for on_assign /
+# on_revoke but accepts omission — FakeConsumer replicates that contract so the
+# consume_loop subscribe-call can be regression-tested without a broker (#28).
+_UNSET = object()
+
+
 class FakeConsumer:
     """Fake consumer that models the D6 lookback window.
 
@@ -150,7 +157,7 @@ class FakeConsumer:
         self.poll_error = poll_error
         # New for consume_loop/probe tests
         self.subscribe_calls = []
-        self.store_offset_calls = []
+        self.store_offsets_calls = []
         self.commit_calls = []
         self.seek_calls = []
         self.poll_calls = 0
@@ -159,13 +166,28 @@ class FakeConsumer:
         self.on_assign = None
         self.on_revoke = None
 
-    def subscribe(self, topics, on_assign=None, on_revoke=None):
+    def subscribe(self, topics, on_assign=_UNSET, on_revoke=_UNSET):
+        # Mirror confluent_kafka 2.15.0: on_assign/on_revoke must be callable OR
+        # omitted; an explicit None is rejected with TypeError (#28). The
+        # sentinel lets us tell "omitted" (fine) from "passed None" (error).
+        for _name, _cb in (("on_assign", on_assign), ("on_revoke", on_revoke)):
+            if _cb is not _UNSET and not callable(_cb):
+                raise TypeError(f"{_name} expects a callable")
         self._topics = list(topics)
-        self.on_assign = on_assign
-        self.on_revoke = on_revoke
-        self.subscribe_calls.append({"topics": list(topics), "on_assign": on_assign, "on_revoke": on_revoke})
+        self.on_assign = on_assign if on_assign is not _UNSET else None
+        self.on_revoke = on_revoke if on_revoke is not _UNSET else None
+        self.subscribe_calls.append(
+            {
+                "topics": list(topics),
+                "on_assign": self.on_assign,
+                "on_revoke": self.on_revoke,
+                # True only when the caller actually passed the kwarg (#28).
+                "on_assign_passed": on_assign is not _UNSET,
+                "on_revoke_passed": on_revoke is not _UNSET,
+            }
+        )
         # Simulate immediate assignment for tests
-        if on_assign:
+        if callable(on_assign):
             t = topics[0]
             on_assign([TopicPartition(t, 0), TopicPartition(t, 1)])
 
@@ -225,9 +247,14 @@ class FakeConsumer:
             self._cursor += 1  # Skip messages that don't meet seek offset
         return None
 
-    def store_offset(self, msg):
-        """Record store_offset calls (used in consume_loop commit path)."""
-        self.store_offset_calls.append(msg)
+    def store_offsets(self, msg):
+        """Record store_offsets calls (used in consume_loop commit path).
+
+        Named to match the real confluent_kafka Consumer (plural); the singular
+        ``store_offset`` does not exist and a regression to it crashes at commit
+        (#28 second half).
+        """
+        self.store_offsets_calls.append(msg)
 
     def commit(self, offsets=None):
         """Record commit calls (used in consume_loop commit path)."""
@@ -709,7 +736,7 @@ def test_consume_loop_commits_all_messages():
     assert handle_calls[1] == ("k2", 1, False)
     # Both messages were committed
     assert len(consumer.commit_calls) == 2
-    assert len(consumer.store_offset_calls) == 2
+    assert len(consumer.store_offsets_calls) == 2
     assert consumer.closed is True
 
 
@@ -810,9 +837,9 @@ def test_consume_loop_retry_on_final_treated_as_commit():
     assert len(handle_calls) == 2
     assert handle_calls[0] == ("k1", 1, False)
     assert handle_calls[1] == ("k1", 2, True)
-    # Message was committed despite RETRY on final (Fix 4: also assert store_offset)
+    # Message was committed despite RETRY on final (Fix 4: also assert store_offsets)
     assert len(consumer.commit_calls) == 1
-    assert len(consumer.store_offset_calls) == 1  # Fix 4: assert store_offset was called
+    assert len(consumer.store_offsets_calls) == 1  # Fix 4: assert store_offsets was called
     assert consumer.closed is True
 
 
@@ -831,7 +858,7 @@ class _InterleavingConsumer:
         self._other = other
         self._stage = 0  # 0 → poison, 1 → other, 2+ → None
         self.subscribe_calls = []
-        self.store_offset_calls = []
+        self.store_offsets_calls = []
         self.commit_calls = []
         self.seek_calls = []
         self.poll_calls = 0
@@ -853,8 +880,8 @@ class _InterleavingConsumer:
             return self._other
         return None
 
-    def store_offset(self, msg):
-        self.store_offset_calls.append(msg)
+    def store_offsets(self, msg):
+        self.store_offsets_calls.append(msg)
 
     def commit(self, offsets=None):
         self.commit_calls.append(offsets)
@@ -1087,6 +1114,116 @@ def test_consume_loop_registers_rebalance_callbacks():
     assert consumer.subscribe_calls[0]["on_assign"] is on_assign
     assert consumer.subscribe_calls[0]["on_revoke"] is on_revoke
     assert len(assign_calls) == 1  # Called immediately by FakeConsumer
+
+
+def test_consume_loop_omits_rebalance_callbacks_when_unset():
+    """Regression for #28: consume_loop called WITHOUT on_assign/on_revoke (the
+    KafkaReactor.run path) must not forward explicit None to Consumer.subscribe.
+
+    confluent_kafka 2.15.0 rejects ``subscribe([t], on_assign=None,
+    on_revoke=None)`` with ``TypeError: on_assign expects a callable`` — which
+    the engine surfaces as a fatal ``kafka.error`` that kills every reactor on
+    startup, before any message is consumed. FakeConsumer.subscribe now mirrors
+    that contract (raises on explicit None, accepts omission).
+
+    Pre-fix this errors at subscribe(); post-fix the kwargs are omitted, the
+    subscription succeeds, and the consumer is closed cleanly.
+    """
+    topic = "orders"
+    consumer = FakeConsumer({}, messages=[])
+    client = KafkaClient(["host:9092"], consumer_factory=lambda conf: consumer)
+    stop_event = threading.Event()
+    stop_event.set()  # subscribe() runs before the poll loop; set to exit fast
+
+    client.consume_loop(
+        topic,
+        group_id="g",
+        stop_event=stop_event,
+        handle=lambda msg, *, attempt, final: ReactionResult.COMMIT,
+        poll_timeout=0.1,
+        max_retries=3,
+        # on_assign/on_revoke deliberately omitted — mirrors KafkaReactor.run.
+    )
+
+    # subscribe called exactly once, with neither rebalance kwarg forwarded.
+    assert len(consumer.subscribe_calls) == 1
+    call = consumer.subscribe_calls[0]
+    assert call["on_assign_passed"] is False
+    assert call["on_revoke_passed"] is False
+    assert consumer.closed is True
+
+
+def test_consume_loop_commit_uses_store_offsets_plural():
+    """Regression for the second half of #28: consume_loop's commit path must
+    call ``consumer.store_offsets(msg)`` (plural).
+
+    confluent_kafka's Consumer exposes ``store_offsets`` — never ``store_offset``
+    — and the singular call raised ``AttributeError`` at commit time, surfacing
+    as a fatal ``kafka.error`` that killed every reactor right after its first
+    successful reaction. This was masked by the subscribe crash (#28 first half)
+    and by the unit fakes previously defining the wrong singular name.
+
+    FakeConsumer now defines ONLY ``store_offsets`` (matching the real API), so a
+    regression to the singular name fails at the commit step.
+    """
+    topic = "orders"
+    now_ms = int(time.time() * 1000)
+    messages = [FakeCMsg(topic, 0, 0, "k1", b'{"i":1}', now_ms)]
+    consumer = FakeConsumer({}, messages=messages)
+
+    client = KafkaClient(["host:9092"], consumer_factory=lambda conf: consumer)
+    stop_event = threading.Event()
+
+    def handle(msg, *, attempt, final):
+        stop_event.set()
+        return ReactionResult.COMMIT
+
+    client.consume_loop(
+        topic,
+        group_id="g",
+        stop_event=stop_event,
+        handle=handle,
+        poll_timeout=0.1,
+        max_retries=3,
+    )
+
+    # The commit path invoked store_offsets (plural) — recorded, no AttributeError.
+    assert len(consumer.store_offsets_calls) == 1
+    assert len(consumer.commit_calls) == 1
+    # The singular name is genuinely absent — matches real confluent_kafka, so a
+    # regression to consumer.store_offset(...) would crash here, not pass.
+    assert not hasattr(consumer, "store_offset")
+    assert consumer.closed is True
+
+
+def test_build_consumer_disables_auto_offset_store_for_manual_commit():
+    """Regression for the third half of #28: the consumer must be built with
+    ``enable.auto.offset.store=False``.
+
+    consume_loop's commit path calls ``consumer.store_offsets(msg)`` explicitly,
+    which confluent_kafka rejects with ``_INVALID_ARG`` when auto offset storage
+    is on (the librdkafka default). Disabling it also makes the at-least-once
+    semantics correct: the offset is stored only after the reaction succeeds,
+    not on poll(). A config-shape assertion is the right guard here — the flag
+    is the fix, and dropping it reintroduces the crash.
+    """
+    captured = {}
+
+    def factory(conf):
+        captured["conf"] = conf
+        return FakeConsumer(conf, messages=[])
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+    stop_event = threading.Event()
+    stop_event.set()
+    client.consume_loop(
+        "t", group_id="g", stop_event=stop_event,
+        handle=lambda msg, *, attempt, final: ReactionResult.COMMIT,
+        poll_timeout=0.1, max_retries=3,
+    )
+
+    assert captured["conf"]["enable.auto.offset.store"] is False
+    assert captured["conf"]["enable.auto.commit"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -325,7 +325,7 @@ class KafkaClient:
         and ``final`` (True when attempt >= max_retries) and returns a
         :class:`ReactionResult`:
 
-        - ``COMMIT``: message processed → ``store_offset(msg)`` + ``commit()``.
+        - ``COMMIT``: message processed → ``store_offsets(msg)`` + ``commit()``.
         - ``RETRY``: transient failure → re-handle the same in-memory message
           (only when ``final`` is False). ``RETRY`` on ``final`` is treated as
           ``COMMIT`` (defensive poison-message guard). No seek/re-poll: see the
@@ -354,7 +354,15 @@ class KafkaClient:
         consumer = self._build_consumer(group_id=group_id)
 
         try:
-            consumer.subscribe([topic], on_assign=on_assign, on_revoke=on_revoke)
+            # confluent_kafka rejects an explicit None for on_assign/on_revoke
+            # ("on_assign expects a callable"); they must be callable OR omitted.
+            # Forward each only when the caller actually provided one (#28).
+            subscribe_kwargs = {}
+            if on_assign is not None:
+                subscribe_kwargs["on_assign"] = on_assign
+            if on_revoke is not None:
+                subscribe_kwargs["on_revoke"] = on_revoke
+            consumer.subscribe([topic], **subscribe_kwargs)
 
             while not stop_event.is_set():
                 msg = consumer.poll(poll_timeout)
@@ -376,7 +384,7 @@ class KafkaClient:
                 # guard and emitting no kafka.error (violating the fail-loudly
                 # contract, DESIGN §11). The handler only needs the normalized
                 # dict, so re-handling in-memory is correct and simpler; the
-                # commit offset advances only on store_offset+commit, so
+                # commit offset advances only on store_offsets+commit, so
                 # crash-recovery positioning is unaffected.
                 normalized = self._normalize_message(msg)
                 for attempt in range(1, max_retries + 1):
@@ -393,7 +401,7 @@ class KafkaClient:
                     if result == ReactionResult.COMMIT or (result == ReactionResult.RETRY and final):
                         # COMMIT (or forced COMMIT on RETRY-at-final)
                         try:
-                            consumer.store_offset(msg)
+                            consumer.store_offsets(msg)
                             consumer.commit()
                         except KafkaException as exc:
                             raise ConnectionFailure(message=str(exc)) from exc
@@ -472,6 +480,11 @@ class KafkaClient:
             "group.id": effective_group_id,
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
+            # Manual offset storage so consume_loop can store_offsets(msg) only
+            # AFTER a successful reaction (at-least-once). The librdkafka default
+            # (True) stores on poll() — ahead of the reaction — and ALSO makes a
+            # later store_offsets(msg) fail with _INVALID_ARG (#28 third half).
+            "enable.auto.offset.store": False,
         }
         conf.update(self._extra_conf)
 
