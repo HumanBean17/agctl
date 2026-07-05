@@ -236,18 +236,18 @@ kafka:
 
   # patterns: named Kafka filters, analogous to HTTP templates.
   #   topic: Kafka topic
-  #   match: jq boolean predicate over each message value;
+  #   match: jq boolean predicate over each message envelope;
   #          supports {placeholder} substitution via --param at assert time
   patterns:
     order-created:
       description: "An ORDER_CREATED event for a specific order"
       topic: orders.created
-      match: '.eventType == "ORDER_CREATED" and .payload.orderId == "{orderId}"'
+      match: '.value.eventType == "ORDER_CREATED" and .value.payload.orderId == "{orderId}"'
 
     payment-failed:
       description: "Any PAYMENT_FAILED event regardless of order"
       topic: payments.events
-      match: '.eventType == "PAYMENT_FAILED"'
+      match: '.value.eventType == "PAYMENT_FAILED"'
 
 # --- database: named connection profiles and SQL templates ------------------
 database:

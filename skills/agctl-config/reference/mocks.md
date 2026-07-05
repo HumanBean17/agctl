@@ -58,12 +58,13 @@ reactor fires — they are **not** capture sources. `${ENV}` still resolves at c
 3. **path** — copy the route; each variable segment is `{name}`. **Trailing slash is
    significant** (`/orders` ≠ `/orders/`); the query string is stripped before matching.
 4. **match.body** *(optional)* — a JSON subset the request body must contain for this stub
-   to fire (reuses `json_subset`). Omit = match on method+path alone.
-5. **match.jq** *(optional)* — a jq boolean predicate over the parsed request body
-   (e.g. `.amount > 1000`), AND-ed with `match.body` when both are present. `body` is
-   declarative subset containment; `jq` is a predicate (`.amount > 1000`,
-   `has("priority") and .priority != "low"`, regex/membership) — same split as `kafka
-   assert --contains` vs `--match`. Needs `pip install 'agctl[jq]'`.
+   to fire (reuses `json_subset`, **body-rooted**). Omit = match on method+path alone.
+5. **match.jq** *(optional)* — a jq boolean predicate over the **request envelope**
+   (`{method, path, headers (lowercased), body}`), so `.body.amount > 1000`,
+   `.headers.authorization != null`, `.path == "/x"`. AND-ed with `match.body` when both
+   are present. `body` is declarative subset containment (body-rooted); `jq` is an
+   envelope-rooted predicate — same split as `kafka assert --contains` vs `--match`.
+   Needs `pip install 'agctl[jq]'`.
 6. **response** — `status` (100–599), `headers` (optional; `Content-Type` defaults to
    `application/json` for a dict/list body, `text/plain` otherwise), `body` (any). Render
    `{name}` against the capture context.
@@ -85,9 +86,10 @@ jq-shadowing warning (see Gotchas).
    unique per-run group (`agctl-mock-<name>-<runid>`) so a restart never silently resumes
    past messages produced between runs. Pinning a stable group is opt-in and carries a
    resume hazard (see Not covered).
-3. **match** *(optional)* — a jq boolean predicate over the message **value**
-   (`.command == "CREATE_ORDER"`). Omit = match all. Non-JSON / non-object values never
-   match — they're visibly skipped, not silently dropped.
+3. **match** *(optional)* — a jq boolean predicate over the **message envelope**
+   (`{key, value, partition, offset, timestamp, headers}`), so `.value.command == "CREATE_ORDER"`,
+   `.key`, `.headers.rqUID` (header keys are **case-sensitive**). Omit = match all. Non-JSON /
+   non-object values never match — they're visibly skipped, not silently dropped.
 4. **reaction** — what to **produce** back: `topic` (the **event** topic), `key` (optional),
    `value` (JSON-serializable), `headers` (optional; **string values only** — a non-string
    value is a config error). Render `{name}` against the message-value context.
@@ -135,9 +137,10 @@ capture:
   <name>: { from: "<jq path>", type: scalar|object|json }   # type defaults to scalar
 ```
 
-- **`from`** — a jq path evaluated against the **envelope** (not the payload). `match`
-  stays payload-rooted (body/value only); `capture.from` roots one level up. This `.`-
-  root divergence is deliberate (additive) and tracked for unification in #22.
+- **`from`** — a jq path evaluated against the **envelope** (not the payload). Under
+  dialect `"2"` `match` shares this root (envelope-rooted); `capture.from` and `match`
+  reach the same fields. (Under dialect `"1"` `match` was payload-rooted — a `.`
+  divergence unified by #22 and the v2 dialect switch.)
 - **`type`** — `scalar` (default) / `object` / `json`. See "Capture value coercion" above
   for what each renders. `object` is the only way to produce a real JSON object/array
   field; it requires the placeholder to occupy the **whole field** (`ctx: "{ctx}"`, not
@@ -170,22 +173,22 @@ capture:
   failure: `ConfigError` at startup (exit 2), pointing at `pip install 'agctl[jq]'`.
 
 ```yaml
-# HTTP — nested body path + header reach
+# HTTP — envelope-rooted match.jq + envelope-rooted capture (same root)
 graphql-operatorById:
   method: POST
   path: /graphql
-  match: { jq: '.query | test("operatorById")' }   # body-rooted (unchanged)
-  capture: { op_id: { from: ".body.variables.id" } }   # envelope-rooted
+  match: { jq: '.body.query | test("operatorById")' }   # envelope-rooted under "2"
+  capture: { op_id: { from: ".body.variables.id" } }     # same envelope root
   response: { body: { id: "{op_id}" } }
 
-# Kafka — key + case-sensitive header + object pass-through
+# Kafka — envelope-rooted match + key + case-sensitive header + object pass-through
 chatx-it-mock:
   topic: chatx.commands
-  match: '.command == "SEARCH"'                     # value-rooted (unchanged)
+  match: '.value.command == "SEARCH"'                  # envelope-rooted under "2"
   capture:
     tid:   { from: ".key" }
-    rqUID: { from: ".headers.rqUID" }               # exact producer casing
-    ctx:   { from: ".value.context", type: object } # whole-field "{ctx}" only
+    rqUID: { from: ".headers.rqUID" }                  # exact producer casing
+    ctx:   { from: ".value.context", type: object }    # whole-field "{ctx}" only
   reaction:
     topic: chatx.events
     value: { threadId: "{tid}", rs_headers: { rqUID: "{rqUID}" }, context: "{ctx}" }
@@ -212,7 +215,7 @@ treats **authoring typos** and **data-variance errors** differently. Conflating 
   extends to the *existing* Kafka reactor `match` — a config that previously started and ran
   silently inert now fails loud.
 - **Runtime eval error (data-dependent)** — treated as a **soft non-match**. If the
-  predicate raises against a particular body/value (e.g. `.amount > 1000` against a body
+  predicate raises against a particular envelope (e.g. `.body.amount > 1000` against a body
   missing `amount`), `jq_bool` swallows it to `false` — the stub/reactor falls through, the
   request goes to the next stub (or `404` + `http.unmatched`), the message is skipped. This
   is deliberate: partial matching must never crash the server.
@@ -257,7 +260,7 @@ fire fails loudly (exit 1). See the `agctl` skill for the assertion flags.
 
 ## Where it writes
 
-Under top-level `mocks:` (additive — no `version` bump). Idempotent: if the stub/reactor key
+Under top-level `mocks:`. Idempotent: if the stub/reactor key
 exists, diff and confirm (contract #5).
 
 ## Not covered — don't trust a false green
@@ -299,10 +302,11 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
   (exit 2); a jq **eval error** (or a `from` resolving to `null`) against a particular
   request/message is a soft non-match / `capture.missing` (falls through, empty string).
   Two different guards for two different error classes — see "jq match semantics" above.
-- `match` is **payload-rooted** (body/value only); `capture.from` is **envelope-rooted**
-  (one level up — reaches headers, Kafka `.key`, nested fields). The same `.amount` means
-  different things on either side (`.amount` vs `.body.amount` / `.value.amount`); this
-  `.`-root divergence is deliberate and tracked for unification in #22.
+- Under dialect `"2"`, **`match` and `capture.from` share an envelope root** — `.body.amount`
+  (HTTP) / `.value.command` (Kafka) on both sides. Under dialect `"1"` `match` was
+  payload-rooted; `agctl config migrate` rewrites a v1 config (`.body | ` / `.value | `
+  prefix on the three match-site families) but does **not** touch CLI `--match` flags in
+  shell scripts / prompts.
 - HTTP `headers` in the capture envelope are **lowercased** (`.headers.authorization`);
   Kafka `headers` are **case-sensitive as-produced** (`.headers.rqUID`, exact producer
   casing). Don't lowercase Kafka header names.
