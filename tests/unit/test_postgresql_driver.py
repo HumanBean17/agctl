@@ -733,6 +733,10 @@ def test_describe_schema_level1_does_not_close_injected_connection():
 #   defaults    -> 'pg_attrdef'
 #   enum values -> 'pg_enum'
 #   comments    -> 'pg_description'
+#   unique idxs -> 'pg_index'       (staged BEFORE pg_constraint; the unique-
+#                                   index query SQL embeds a pg_constraint NOT
+#                                   EXISTS subquery, so a bare pg_constraint
+#                                   stage would shadow it)
 #   constraints -> 'pg_constraint'
 #   ref attnums -> '%(ref_oid)s'    (only the FK-target attnum query uses it)
 
@@ -768,6 +772,7 @@ _CON_DESC = [
     _col("ref_oid"),
 ]
 _REF_ATTR_DESC = [_col("ref_attnum"), _col("ref_attname")]
+_IDX_DESC = [_col("indexname"), _col("indkey")]
 
 
 def _l2_relation(oid, schema, name, relkind="r", relispartition=False):
@@ -789,6 +794,15 @@ def _l2_constraint(
     return (name, contype, conkey, confkey, ref_schema, ref_table, ref_oid)
 
 
+def _l2_unique_index(name, indkey):
+    """One canned pg_index row for the standalone-unique-index query.
+
+    ``indkey`` models ``pg_index.indkey`` (an int2vector). Pass either a
+    string ("1 2") or a list ([1, 2]) to exercise both normalization paths.
+    """
+    return (name, indkey)
+
+
 def _level2_catalog_conn(
     *,
     relations,
@@ -798,6 +812,7 @@ def _level2_catalog_conn(
     comments=(),
     constraints=(),
     ref_attrs=(),
+    unique_indexes=(),
 ):
     """Build a (CatalogFakeConn, CatalogFakeCursor) staging Level-2 rowsets.
 
@@ -812,6 +827,13 @@ def _level2_catalog_conn(
     if enum_rows:
         cur.stage("pg_enum", _ENUM_DESC, list(enum_rows))
     cur.stage("pg_description", _COMMENT_DESC, list(comments))
+    # pg_index MUST be staged before pg_constraint, and unconditionally: the
+    # driver always issues the standalone-unique-index query after the
+    # constraint loop, and that query's SQL embeds a pg_constraint lookup
+    # inside its NOT EXISTS subquery. Without this earlier stage the
+    # unique-index query would misroute to the pg_constraint rowset. Staging
+    # pg_index first routes it here (default empty when no standalone indexes).
+    cur.stage("pg_index", _IDX_DESC, list(unique_indexes))
     cur.stage("pg_constraint", _CON_DESC, list(constraints))
     if ref_attrs:
         cur.stage("%(ref_oid)s", _REF_ATTR_DESC, list(ref_attrs))
@@ -1152,3 +1174,121 @@ def test_describe_schema_level2_does_not_close_injected_connection():
     driver.describe_schema(table="orders", schema=None)
 
     assert conn.closed is False
+
+
+# --- describe_schema() Level 2 standalone unique index tests ---------------
+#
+# Standalone unique indexes (CREATE UNIQUE INDEX ...) have NO pg_constraint
+# entry, so the pg_constraint loop misses them. A second query against
+# pg_index (unique, non-primary, non-partial, NOT backing a pg_constraint)
+# appends each to unique_constraints in the same {"name", "columns"} shape.
+# The driver filters primary-key indexes and pg_constraint-backed indexes at
+# SQL level (NOT i.indisprimary / NOT EXISTS). The CatalogFakeCursor cannot
+# evaluate SQL predicates -- it returns whatever rows are staged for the
+# pg_index substring -- so these tests model the post-filter rowset directly
+# and assert the observable guarantees; the SQL-level NOT EXISTS / NOT
+# indisprimary filtering is exercised against live Postgres by the
+# integration test (test_db_schema_live_introspection).
+
+
+def test_describe_schema_level2_unique_constraint_and_standalone_unique_index():
+    """A pg_constraint unique constraint AND a standalone unique index both
+    appear in unique_constraints; constraints-then-indexes ordering is preserved.
+
+    The standalone index's indkey is staged as a STRING ("3") to exercise the
+    int2vector string-normalization branch.
+    """
+    conn, _ = _level2_catalog_conn(
+        relations=[_l2_relation(16384, "public", "orders")],
+        columns=[
+            _l2_column(1, "status", "text", True),
+            _l2_column(2, "customer_id", "uuid", True),
+            _l2_column(3, "external_ref", "text", True),
+        ],
+        constraints=[
+            _l2_constraint("orders_status_customer_key", "u", [1, 2]),
+        ],
+        # int2vector returned by psycopg as a STRING -> single-column index.
+        unique_indexes=[
+            _l2_unique_index("orders_external_ref_uidx", "3"),
+        ],
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.describe_schema(table="orders", schema=None)
+
+    # The pg_constraint entry is listed first, then the standalone index
+    # captured by the pg_index loop.
+    assert result["matches"][0]["unique_constraints"] == [
+        {"name": "orders_status_customer_key", "columns": ["status", "customer_id"]},
+        {"name": "orders_external_ref_uidx", "columns": ["external_ref"]},
+    ]
+
+
+def test_describe_schema_level2_standalone_unique_index_only_list_indkey():
+    """A standalone unique index with NO pg_constraint unique is captured via
+    pg_index; the int2vector LIST form ([1, 2]) is normalized to column names."""
+    conn, _ = _level2_catalog_conn(
+        relations=[_l2_relation(16384, "public", "orders")],
+        columns=[
+            _l2_column(1, "tenant_id", "uuid", True),
+            _l2_column(2, "code", "text", True),
+        ],
+        constraints=[],  # no unique constraint, only a standalone index
+        # int2vector returned by psycopg as a LIST -> multi-column index.
+        unique_indexes=[
+            _l2_unique_index("orders_tenant_code_uidx", [1, 2]),
+        ],
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.describe_schema(table="orders", schema=None)
+
+    assert result["matches"][0]["unique_constraints"] == [
+        {"name": "orders_tenant_code_uidx", "columns": ["tenant_id", "code"]},
+    ]
+
+
+def test_describe_schema_level2_primary_key_not_duplicated_and_constraint_counted_once():
+    """A primary key is NOT duplicated into unique_constraints, and a
+    pg_constraint unique constraint is captured exactly once (by the
+    constraint loop, not the pg_index loop).
+
+    The driver's pg_index query filters ``NOT i.indisprimary`` (excludes the
+    PK's backing index) and ``NOT EXISTS (... con.conindid = i.indexrelid)``
+    (excludes any index backing a pg_constraint, so the unique constraint's
+    internal index is NOT double-counted). The CatalogFakeCursor cannot
+    evaluate those SQL predicates, so we stage an empty pg_index rowset
+    (mirroring the post-filter result a real Postgres returns when every
+    unique index backs a pg_constraint entry) and assert the observable
+    outcome: PK appears only in primary_key, the unique constraint appears
+    exactly once in unique_constraints, and no PK echo leaks in. The SQL
+    predicate itself is verified end-to-end by the integration test.
+    """
+    conn, _ = _level2_catalog_conn(
+        relations=[_l2_relation(16384, "public", "orders")],
+        columns=[
+            _l2_column(1, "id", "uuid", True),
+            _l2_column(2, "status", "text", True),
+        ],
+        constraints=[
+            _l2_constraint("orders_pkey", "p", [1]),
+            _l2_constraint("orders_status_key", "u", [2]),
+        ],
+        # Empty: in a real DB the PK index is excluded by NOT indisprimary and
+        # the unique constraint's backing index by NOT EXISTS, yielding no
+        # standalone rows from pg_index.
+        unique_indexes=[],
+    )
+    driver = PostgreSQLDriver(connectable=conn)
+
+    result = driver.describe_schema(table="orders", schema=None)
+    match = result["matches"][0]
+
+    # Primary key surfaces ONLY in primary_key, never in unique_constraints.
+    assert match["primary_key"] == ["id"]
+    # The unique constraint appears exactly once (captured by the
+    # pg_constraint loop; the pg_index loop adds nothing).
+    assert match["unique_constraints"] == [
+        {"name": "orders_status_key", "columns": ["status"]},
+    ]
