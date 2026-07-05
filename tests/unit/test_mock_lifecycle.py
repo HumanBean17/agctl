@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -306,3 +307,458 @@ def test_mock_start_forwards_flags():
             os.unlink(cfg_path)
         except:
             pass
+
+
+# ----------------------------------------------------------------------------
+# Task 5: `mock stop` tests (7 scenarios)
+# ----------------------------------------------------------------------------
+
+import subprocess
+import signal
+
+
+def test_mock_stop_clean():
+    """Scenario 1: stop clean - daemon exits cleanly, summary parsed, no fatal failures."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Spawn a real sleeper process that handles signals gracefully
+        sleeper_code = """
+import signal
+import sys
+import time
+
+# Custom signal handler that sets a flag
+should_exit = False
+def handler(signum, frame):
+    global should_exit
+    should_exit = True
+
+signal.signal(signal.SIGTERM, handler)
+
+# Sleep in very short increments to allow signal handling
+end_time = time.time() + 30
+while time.time() < end_time and not should_exit:
+    time.sleep(0.001)
+"""
+        sleeper = subprocess.Popen([sys.executable, "-c", sleeper_code])
+
+        # Pre-write the log with started + clean summary
+        log_path = tmp_path / "mock-18080.log"
+        log_path.write_text('{"event":"started","http":{"listen":"127.0.0.1:18080","stubs":1},"kafka":null}\n')
+        with open(log_path, 'a') as f:
+            f.write('{"event":"summary","http_hits":10,"http_unmatched":0,"kafka_reactions":0,"kafka_errors":0}\n')
+
+        # Write pidfile
+        pidfile_path = tmp_path / "mock-18080.pid"
+        pidfile_path.write_text(json.dumps({
+            "pid": sleeper.pid,
+            "listen": "127.0.0.1:18080",
+            "port": 18080,
+            "log_path": str(log_path),
+            "config_path": None,
+            "started_at": "2024-01-01T00:00:00Z",
+            "run_id": "test-run"
+        }))
+
+        # Invoke stop (no selector - exactly one running)
+        result, payload = _run(["mock", "stop", "--timeout", "60", "--state-dir", str(tmp_path)])
+
+        # Assert exit_code == 0, envelope ok:true
+        assert result.exit_code == 0, f"stdout: {result.output}"
+        assert payload is not None
+        assert payload["ok"] is True
+        assert payload["command"] == "mock.stop"
+        assert payload["result"]["stopped"] is True
+        assert payload["result"]["signal"] == "SIGTERM"
+        assert payload["result"]["summary"]["http_hits"] == 10
+        assert payload["result"]["failures"] == []
+
+        # Verify sleeper process has terminated
+        sleeper.wait(timeout=2)
+        assert sleeper.poll() is not None
+
+        # Verify pidfile was removed
+        assert not pidfile_path.exists()
+
+
+def test_mock_stop_with_fatal_failures():
+    """Scenario 2: stop with fatal failures - log has http.unmatched + kafka.error, exit 1."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Spawn a real sleeper process that handles signals gracefully
+        sleeper_code = """
+import signal
+import sys
+import time
+
+# Custom signal handler that sets a flag
+should_exit = False
+def handler(signum, frame):
+    global should_exit
+    should_exit = True
+
+signal.signal(signal.SIGTERM, handler)
+
+# Sleep in very short increments to allow signal handling
+end_time = time.time() + 30
+while time.time() < end_time and not should_exit:
+    time.sleep(0.001)
+"""
+        sleeper = subprocess.Popen([sys.executable, "-c", sleeper_code])
+
+        # Pre-write the log with started + summary + fatal failures
+        log_path = tmp_path / "mock-18080.log"
+        log_path.write_text('{"event":"started","http":{"listen":"127.0.0.1:18080","stubs":1},"kafka":null}\n')
+        with open(log_path, 'a') as f:
+            f.write('{"event":"http.unmatched","method":"GET","path":"/not-found","ts":"2024-01-01T00:00:00Z"}\n')
+            f.write('{"event":"kafka.error","reactor":"test-reactor","message":"delivery failed","ts":"2024-01-01T00:00:00Z"}\n')
+            f.write('{"event":"summary","http_hits":0,"http_unmatched":1,"kafka_reactions":0,"kafka_errors":1}\n')
+
+        # Write pidfile
+        pidfile_path = tmp_path / "mock-18080.pid"
+        pidfile_path.write_text(json.dumps({
+            "pid": sleeper.pid,
+            "listen": "127.0.0.1:18080",
+            "port": 18080,
+            "log_path": str(log_path),
+            "config_path": None,
+            "started_at": "2024-01-01T00:00:00Z",
+            "run_id": "test-run"
+        }))
+
+        # Invoke stop
+        result, payload = _run(["mock", "stop", "--timeout", "60", "--state-dir", str(tmp_path)])
+
+        # Assert exit_code == 1, envelope ok:false, error.type == AssertionError
+        assert result.exit_code == 1, f"stdout: {result.output}"
+        assert payload is not None
+        assert payload["ok"] is False
+        assert payload["result"] is None
+        assert payload["error"]["type"] == "AssertionError"
+        assert "fatal failure" in payload["error"]["message"].lower()
+        assert payload["error"]["detail"]["stopped"] is True
+        assert len(payload["error"]["detail"]["failures"]) == 2
+        assert payload["error"]["detail"]["summary"]["http_unmatched"] == 1
+
+        # Verify sleeper process has terminated
+        sleeper.wait(timeout=2)
+        assert sleeper.poll() is not None
+
+
+def test_mock_stop_capture_missing_non_fatal():
+    """Scenario 3: stop with capture.missing - non-fatal, exit 0, failure in list for visibility."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Spawn a real sleeper process that handles signals gracefully
+        sleeper_code = """
+import signal
+import sys
+import time
+
+# Custom signal handler that sets a flag
+should_exit = False
+def handler(signum, frame):
+    global should_exit
+    should_exit = True
+
+signal.signal(signal.SIGTERM, handler)
+
+# Sleep in very short increments to allow signal handling
+end_time = time.time() + 30
+while time.time() < end_time and not should_exit:
+    time.sleep(0.001)
+"""
+        sleeper = subprocess.Popen([sys.executable, "-c", sleeper_code])
+
+        # Pre-write the log with started + summary + capture.missing (non-fatal)
+        log_path = tmp_path / "mock-18080.log"
+        log_path.write_text('{"event":"started","http":{"listen":"127.0.0.1:18080","stubs":1},"kafka":null}\n')
+        with open(log_path, 'a') as f:
+            f.write('{"event":"capture.missing","expectation_id":"test-exp","ts":"2024-01-01T00:00:00Z"}\n')
+            f.write('{"event":"summary","http_hits":10,"http_unmatched":0,"kafka_reactions":0,"kafka_errors":0}\n')
+
+        # Write pidfile
+        pidfile_path = tmp_path / "mock-18080.pid"
+        pidfile_path.write_text(json.dumps({
+            "pid": sleeper.pid,
+            "listen": "127.0.0.1:18080",
+            "port": 18080,
+            "log_path": str(log_path),
+            "config_path": None,
+            "started_at": "2024-01-01T00:00:00Z",
+            "run_id": "test-run"
+        }))
+
+        # Invoke stop
+        result, payload = _run(["mock", "stop", "--timeout", "60", "--state-dir", str(tmp_path)])
+
+        # Assert exit_code == 0, envelope ok:true, failure in list
+        assert result.exit_code == 0, f"stdout: {result.output}"
+        assert payload is not None
+        assert payload["ok"] is True
+        assert payload["result"]["stopped"] is True
+        assert payload["result"]["signal"] == "SIGTERM"
+        assert len(payload["result"]["failures"]) == 1
+        assert payload["result"]["failures"][0]["event"] == "capture.missing"
+
+        # Verify sleeper process has terminated
+        sleeper.wait(timeout=2)
+        assert sleeper.poll() is not None
+        assert not pidfile_path.exists()
+
+
+def test_mock_stop_not_running():
+    """Scenario 4: stop not-running - empty state dir, no selector, return stopped:false."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Empty state dir (no pidfiles)
+        result, payload = _run(["mock", "stop", "--state-dir", str(tmp_path)])
+
+        # Assert exit_code == 0, stopped:false
+        assert result.exit_code == 0, f"stdout: {result.output}"
+        assert payload is not None
+        assert payload["ok"] is True
+        assert payload["result"]["stopped"] is False
+
+
+def test_mock_stop_ambiguous():
+    """Scenario 5: stop ambiguous - two running mocks, no selector, ConfigError."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Spawn two sleepers that handle signals gracefully
+        sleeper_code = """
+import signal
+import sys
+import time
+
+# Custom signal handler that sets a flag
+should_exit = False
+def handler(signum, frame):
+    global should_exit
+    should_exit = True
+
+signal.signal(signal.SIGTERM, handler)
+
+# Sleep in very short increments to allow signal handling
+end_time = time.time() + 30
+while time.time() < end_time and not should_exit:
+    time.sleep(0.001)
+"""
+        sleeper1 = subprocess.Popen([sys.executable, "-c", sleeper_code])
+        sleeper2 = subprocess.Popen([sys.executable, "-c", sleeper_code])
+
+        # Write two pidfiles with clean logs
+        log_path1 = tmp_path / "mock-18080.log"
+        log_path1.write_text('{"event":"started","http":{"listen":"127.0.0.1:18080","stubs":1},"kafka":null}\n')
+        with open(log_path1, 'a') as f:
+            f.write('{"event":"summary","http_hits":10,"http_unmatched":0,"kafka_reactions":0,"kafka_errors":0}\n')
+
+        pidfile1 = tmp_path / "mock-18080.pid"
+        pidfile1.write_text(json.dumps({
+            "pid": sleeper1.pid,
+            "listen": "127.0.0.1:18080",
+            "port": 18080,
+            "log_path": str(log_path1),
+            "config_path": None,
+            "started_at": "2024-01-01T00:00:00Z",
+            "run_id": "test-run-1"
+        }))
+
+        log_path2 = tmp_path / "mock-18081.log"
+        log_path2.write_text('{"event":"started","http":{"listen":"127.0.0.1:18081","stubs":1},"kafka":null}\n')
+        with open(log_path2, 'a') as f:
+            f.write('{"event":"summary","http_hits":10,"http_unmatched":0,"kafka_reactions":0,"kafka_errors":0}\n')
+
+        pidfile2 = tmp_path / "mock-18081.pid"
+        pidfile2.write_text(json.dumps({
+            "pid": sleeper2.pid,
+            "listen": "127.0.0.1:18081",
+            "port": 18081,
+            "log_path": str(log_path2),
+            "config_path": None,
+            "started_at": "2024-01-01T00:00:00Z",
+            "run_id": "test-run-2"
+        }))
+
+        # Invoke stop with no selector (ambiguous)
+        result, payload = _run(["mock", "stop", "--state-dir", str(tmp_path)])
+
+        # Assert exit_code == 2, ConfigError, mentions multiple
+        assert result.exit_code == 2, f"stdout: {result.output}"
+        assert payload is not None
+        assert payload["ok"] is False
+        assert payload["error"]["type"] == "ConfigError"
+        assert "multiple" in payload["error"]["message"].lower()
+        assert set(payload["error"]["detail"]["candidates"]) == {"127.0.0.1:18080", "127.0.0.1:18081"}
+
+        # Cleanup sleepers
+        sleeper1.terminate()
+        sleeper2.terminate()
+        sleeper1.wait(timeout=2)
+        sleeper2.wait(timeout=2)
+
+
+def test_mock_stop_all():
+    """Scenario 6: stop --all - two running mocks, both stopped, list of 2 entries."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Spawn two sleepers that handle signals gracefully
+        sleeper_code = """
+import signal
+import sys
+import time
+
+# Custom signal handler that sets a flag
+should_exit = False
+def handler(signum, frame):
+    global should_exit
+    should_exit = True
+
+signal.signal(signal.SIGTERM, handler)
+
+# Sleep in very short increments to allow signal handling
+end_time = time.time() + 30
+while time.time() < end_time and not should_exit:
+    time.sleep(0.001)
+"""
+        sleeper1 = subprocess.Popen([sys.executable, "-c", sleeper_code])
+        sleeper2 = subprocess.Popen([sys.executable, "-c", sleeper_code])
+
+        # Write two pidfiles with clean logs
+        log_path1 = tmp_path / "mock-18080.log"
+        log_path1.write_text('{"event":"started","http":{"listen":"127.0.0.1:18080","stubs":1},"kafka":null}\n')
+        with open(log_path1, 'a') as f:
+            f.write('{"event":"summary","http_hits":10,"http_unmatched":0,"kafka_reactions":0,"kafka_errors":0}\n')
+
+        pidfile1 = tmp_path / "mock-18080.pid"
+        pidfile1.write_text(json.dumps({
+            "pid": sleeper1.pid,
+            "listen": "127.0.0.1:18080",
+            "port": 18080,
+            "log_path": str(log_path1),
+            "config_path": None,
+            "started_at": "2024-01-01T00:00:00Z",
+            "run_id": "test-run-1"
+        }))
+
+        log_path2 = tmp_path / "mock-18081.log"
+        log_path2.write_text('{"event":"started","http":{"listen":"127.0.0.1:18081","stubs":1},"kafka":null}\n')
+        with open(log_path2, 'a') as f:
+            f.write('{"event":"summary","http_hits":10,"http_unmatched":0,"kafka_reactions":0,"kafka_errors":0}\n')
+
+        pidfile2 = tmp_path / "mock-18081.pid"
+        pidfile2.write_text(json.dumps({
+            "pid": sleeper2.pid,
+            "listen": "127.0.0.1:18081",
+            "port": 18081,
+            "log_path": str(log_path2),
+            "config_path": None,
+            "started_at": "2024-01-01T00:00:00Z",
+            "run_id": "test-run-2"
+        }))
+
+        # Invoke stop with --all
+        result, payload = _run(["mock", "stop", "--all", "--state-dir", str(tmp_path)])
+
+        # Assert exit_code == 0, stopped is list of 2
+        assert result.exit_code == 0, f"stdout: {result.output}"
+        assert payload is not None
+        assert payload["ok"] is True
+        assert isinstance(payload["result"]["stopped"], list)
+        assert len(payload["result"]["stopped"]) == 2
+        assert all(entry["stopped"] is True for entry in payload["result"]["stopped"])
+        assert all(entry["signal"] == "SIGTERM" for entry in payload["result"]["stopped"])
+
+        # Verify both sleepers terminated
+        sleeper1.wait(timeout=2)
+        sleeper2.wait(timeout=2)
+        assert sleeper1.poll() is not None
+        assert sleeper2.poll() is not None
+
+        # Verify both pidfiles removed
+        assert not pidfile1.exists()
+        assert not pidfile2.exists()
+
+
+def test_mock_stop_sigkill_fallback():
+    """Scenario 7: stop SIGKILL fallback - daemon ignores SIGTERM, timeout → SIGKILL, warning set."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+
+        # Spawn a sleeper that ignores SIGTERM
+        sleeper_code = """
+import signal
+import time
+import sys
+
+# Set up signal handler BEFORE any other work
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+# Write to stdout to signal readiness
+sys.stdout.write('READY\\n')
+sys.stdout.flush()
+
+# Then sleep
+time.sleep(30)
+"""
+        sleeper = subprocess.Popen([sys.executable, "-c", sleeper_code], stdout=subprocess.PIPE)
+
+        # Wait for sleeper to be ready
+        line = sleeper.stdout.readline()
+        assert line == b'READY\n', f"Sleeper not ready: {line!r}"
+
+        # Pre-write the log with only started (no summary - daemon never shuts down cleanly)
+        log_path = tmp_path / "mock-18080.log"
+        log_path.write_text('{"event":"started","http":{"listen":"127.0.0.1:18080","stubs":1},"kafka":null}\n')
+
+        # Write pidfile
+        pidfile_path = tmp_path / "mock-18080.pid"
+        pidfile_path.write_text(json.dumps({
+            "pid": sleeper.pid,
+            "listen": "127.0.0.1:18080",
+            "port": 18080,
+            "log_path": str(log_path),
+            "config_path": None,
+            "started_at": "2024-01-01T00:00:00Z",
+            "run_id": "test-run"
+        }))
+
+        # Invoke stop with --timeout 1
+        result, payload = _run(["mock", "stop", "--timeout", "1", "--state-dir", str(tmp_path)])
+
+        # Assert exit_code == 0, signal == SIGKILL, warning set
+        assert result.exit_code == 0, f"stdout: {result.output}"
+        assert payload is not None
+        assert payload["ok"] is True
+        assert payload["result"]["stopped"] is True
+        assert payload["result"]["signal"] == "SIGKILL"
+        assert "warning" in payload["result"]
+        assert "SIGKILL" in payload["result"]["warning"]
+        assert "1s" in payload["result"]["warning"]  # timeout value mentioned
+
+        # Verify sleeper process has terminated (SIGKILL got through)
+        sleeper.wait(timeout=2)
+        assert sleeper.poll() is not None
+
+        # Verify pidfile was removed
+        assert not pidfile_path.exists()

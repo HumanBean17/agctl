@@ -7,6 +7,7 @@ in @envelope, instead hand-rolling try/except → emit + SystemExit.
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import subprocess
@@ -20,14 +21,14 @@ import click
 
 from ..command import envelope, load_config_or_raise
 from ..config.models import MocksConfig, parse_listen
-from ..errors import AgctlError, ConfigError, ConnectionFailure
+from ..errors import AgctlError, AssertionFailure, ConfigError, ConnectionFailure
 from ..output import emit
 
 if TYPE_CHECKING:
     from ..config.models import KafkaConfig
     from ..clients.kafka_client import KafkaClient
 
-__all__ = ["mock_run", "new_mock_engine", "mock_start"]
+__all__ = ["mock_run", "new_mock_engine", "mock_start", "mock_stop"]
 
 # Import from kafka_commands to avoid duplication (no circular import)
 from .kafka_commands import new_kafka_client
@@ -456,3 +457,154 @@ def mock_run(
 
     # Exit with the engine's exit code
     raise SystemExit(code)
+
+
+# ----------------------------------------------------------------------------
+# Task 5: mock stop command
+# ----------------------------------------------------------------------------
+
+# Import daemon lifecycle helpers (Task 2: pidfile, liveness; Task 3: log parser)
+from ..mock.daemon import (
+    FATAL_FAILURE_EVENTS,
+    is_alive,
+    parse_log,
+    read_pidfile,
+    remove_pidfile,
+    resolve_target,
+)
+
+
+def _mock_stop_core(
+    listen: str | None,
+    pid: int | None,
+    all_: bool,
+    timeout: float,
+    state_dir: str,
+) -> dict:
+    """Core logic for `mock stop` (Task 5).
+
+    Stops running mock daemon(s), sends SIGTERM/SIGKILL, parses log for verdict.
+
+    Returns:
+        Dict with keys: stopped (bool or list), signal, summary, failures, etc.
+        For single target: {stopped: True, pid: ..., signal: ..., summary: ..., failures: [...]}
+        For --all: {stopped: [{...}, {...}]}
+        For not-running (single): {stopped: False}
+        For not-running (--all): {stopped: []}
+
+    Raises:
+        AssertionFailure: When any stopped mock had fatal failure events.
+    """
+    state_path = Path(state_dir)
+
+    # Step 1: Resolve targets
+    targets = resolve_target(state_path, listen, pid, all_)
+
+    # Step 2: Handle not-running case
+    if not targets:
+        if all_:
+            return {"stopped": []}
+        return {"stopped": False}
+
+    # Step 3: Stop each target and collect entries
+    entries = []
+    for target in targets:
+        sig = "SIGTERM"
+        warning = None
+
+        # Step 3a: Send SIGTERM (best-effort)
+        try:
+            os.kill(target.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # Already dead is fine
+
+        # Step 3b: Wait loop (poll is_alive until False or timeout)
+        start = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - start
+
+            # Try to reap zombie child first (non-blocking)
+            try:
+                pid, status = os.waitpid(target.pid, os.WNOHANG)
+                if pid == target.pid:
+                    # Child has exited and been reaped
+                    break
+            except (ChildProcessError, OSError):
+                # Not our child or doesn't exist - check with is_alive
+                if not is_alive(target.pid):
+                    break
+
+            # Check timeout BEFORE sleeping
+            if elapsed >= timeout:
+                # Step 3c: Timeout - send SIGKILL
+                try:
+                    os.kill(target.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # Already dead
+                sig = "SIGKILL"
+                timeout_str = str(int(timeout)) if timeout == int(timeout) else str(timeout)
+                warning = f"process did not exit on SIGTERM within {timeout_str}s; sent SIGKILL; summary may be incomplete"
+                break
+            time.sleep(0.05)
+
+        # Step 3d: Parse log
+        parsed = parse_log(Path(target.log_path))
+
+        # Step 3e: Build entry
+        entry = {
+            "stopped": True,
+            "pid": target.pid,
+            "signal": sig,
+            "summary": parsed.summary or {},
+            "failures": parsed.failures,
+        }
+        if warning is not None:
+            entry["warning"] = warning
+
+        entries.append(entry)
+
+        # Step 3f: Remove pidfile (after parsing log)
+        remove_pidfile(target.pidfile_path)
+
+    # Step 4: Aggregate and check for fatal failures
+    if not all_:
+        # Single target
+        verdict = entries[0]
+        fatal = [f for f in verdict["failures"] if f.get("event") in FATAL_FAILURE_EVENTS]
+        if fatal:
+            raise AssertionFailure(
+                f"mock run had {len(fatal)} fatal failure event(s)",
+                verdict,
+            )
+        return verdict
+    else:
+        # --all: check for any bad entries
+        bad = [e for e in entries if any(f.get("event") in FATAL_FAILURE_EVENTS for f in e["failures"])]
+        if bad:
+            raise AssertionFailure(
+                f"{len(bad)} of {len(entries)} mock(s) had fatal failures",
+                {"stopped": entries},
+            )
+        return {"stopped": entries}
+
+
+@click.command("stop")
+@click.option("--listen", "listen", type=str, default=None, help="Listen address (e.g., 127.0.0.1:18080)")
+@click.option("--pid", "pid", type=int, default=None, help="Process ID")
+@click.option("--all", "all_", is_flag=True, default=False, help="Stop all running mocks")
+@click.option("--timeout", "timeout", type=float, default=30.0, help="Seconds to wait for SIGTERM before SIGKILL")
+@click.option("--state-dir", "state_dir", default="./.agctl", help="Directory for mock state (pidfiles, logs)")
+@click.pass_context
+def mock_stop(
+    ctx: click.Context,
+    listen: str | None,
+    pid: int | None,
+    all_: bool,
+    timeout: float,
+    state_dir: str,
+) -> None:
+    """Stop a running mock daemon with SIGTERM/SIGKILL and parse verdict."""
+    _mock_stop_envelope(listen, pid, all_, timeout, state_dir)
+
+
+_mock_stop_envelope = envelope("mock.stop")(_mock_stop_core)
