@@ -14,7 +14,8 @@ from typing import Callable
 from ..assertions import jq_bool
 from ..clients.kafka_client import KafkaClient, ReactionResult
 from ..config.models import KafkaReactor as KafkaReactorConfig
-from ..resolution import fill_placeholders
+from ..resolution import CaptureValue, render_typed
+from .capture import resolve_captures
 
 
 class KafkaReactor:
@@ -23,8 +24,10 @@ class KafkaReactor:
     The reactor runs a single consume_loop on its own thread. Each message is:
     1. Validated: non-object values → kafka.skipped + COMMIT (visible, not silent).
     2. Matched: if config.match is set and jq_bool(value, match) is False → COMMIT.
-    3. Captured: top-level keys of value dict, each stringified via str().
-    4. Reacted: templates rendered via fill_placeholders, message produced.
+    3. Captured: implicit top-level value keys (scalar) + explicit envelope-rooted
+       capture (jq over the whole message; overrides implicit incl. type). A from
+       resolving to nothing emits capture.missing.
+    4. Reacted: templates rendered via render_typed, message produced.
     5. On success: kafka.reacted event + COMMIT.
     6. On failure: RETRY (not final) or kafka.error + COMMIT/STOP (final).
 
@@ -144,22 +147,44 @@ class KafkaReactor:
                 # Non-match → silent commit (like `kafka consume --match`)
                 return ReactionResult.COMMIT
 
-        # Step 3: Capture context (top-level keys, stringified)
-        capture_context = {k: str(v) for k, v in value.items()}
+        # Step 3: Capture context. Implicit: top-level value keys as scalar
+        # CaptureValues (raw value; render_typed applies str() for scalar —
+        # preserves today's coercion of numerics/bools to strings).
+        capture_context = {
+            k: CaptureValue(v, "scalar") for k, v in value.items()
+        }
+
+        # Explicit capture: envelope-rooted jq extraction over the whole
+        # normalized message (key/value/headers/...) overrides implicit on
+        # name collision, including type promotion (e.g. scalar -> object for
+        # true pass-through). A from resolving to nothing emits a non-fatal
+        # capture.missing event.
+        if self._config.capture is not None:
+            explicit, missing = resolve_captures(msg, self._config.capture)
+            capture_context.update(explicit)
+            for cap_name, from_path in missing:
+                self._emit_event(
+                    {
+                        "event": "capture.missing",
+                        "reactor": self._name,
+                        "name": cap_name,
+                        "from": from_path,
+                    }
+                )
 
         # Step 4: React (render templates and produce)
         try:
-            rendered_value = fill_placeholders(
+            rendered_value = render_typed(
                 self._config.reaction.value, capture_context
             )
             rendered_key = None
             if self._config.reaction.key is not None:
-                rendered_key = fill_placeholders(
+                rendered_key = render_typed(
                     self._config.reaction.key, capture_context
                 )
             rendered_headers = None
             if self._config.reaction.headers is not None:
-                rendered_headers = fill_placeholders(
+                rendered_headers = render_typed(
                     self._config.reaction.headers, capture_context
                 )
 
