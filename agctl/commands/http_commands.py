@@ -361,7 +361,7 @@ def _emit_stdout_line(line: dict) -> None:
     """Write one NDJSON ping/summary line directly to stdout (NOT via emit)."""
     import sys
 
-    sys.stdout.write(json.dumps(line))
+    sys.stdout.write(json.dumps(line, ensure_ascii=False))
     sys.stdout.write("\n")
     sys.stdout.flush()
 
