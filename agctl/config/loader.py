@@ -12,7 +12,19 @@ from ..errors import ConfigError
 from .models import Config
 from .resolver import apply_env_overrides
 
-_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(:-([^}]*))?\}")
+# Matches the *inner* text of a ${...} expression: VAR, VAR:-default, or VAR:-.
+# DOTALL lets a default span newlines. The default is `.*` (not `[^}]*`) because
+# by the time we match, the brace-counting walker has already extracted the
+# balanced inner text — so stray `}` inside a default aren't a concern (an
+# earlier literal `}` would have closed the outer expression instead, same as
+# the legacy single-pass regex).
+_VAR_INNER_RE = re.compile(r"^([A-Z_][A-Z0-9_]*)(:-(.*))?$", re.DOTALL)
+
+# Cap on iterative substitution passes. Lets a value that itself contains
+# ${...} (chained refs) resolve, while guaranteeing termination on pathological
+# self-reference like ${A:-${A}} (which resolves to ${A} then stabilises —
+# never spins). 25 is far above any realistic chain depth.
+_MAX_INTERP_PASSES = 25
 
 
 def interpolate(obj: Any, env: dict[str, str]) -> Any:
@@ -42,16 +54,99 @@ def _interpolate(obj: Any, env: dict[str, str], unresolved: list[str]) -> Any:
 
 
 def _interpolate_str(s: str, env: dict[str, str], unresolved: list[str]) -> str:
-    def repl(match: re.Match[str]) -> str:
-        var, has_default, default = match.group(1), match.group(2), match.group(3)
-        if var in env:
-            return env[var]
-        if has_default is not None:
-            return default  # "" for ${VAR:-}, the literal for ${VAR:-x}
-        unresolved.append(var)
-        return match.group(0)
+    """Resolve ${VAR}, ${VAR:-default}, ${VAR:-} with nested-default support.
 
-    return _VAR_RE.sub(repl, s)
+    Two layers cooperate:
+
+    * `_substitute_once` does a single left-to-right pass that matches each
+      ${...} by *brace depth*, so a nested expression like ${A:-${B}} is
+      treated as ONE outer expression whose default text is `${B}`.
+    * This outer loop re-runs the pass until the string stops changing, so a
+      var whose VALUE itself contains ${...} (chained refs like
+      A -> ${B} -> "final") also resolves. The `_MAX_INTERP_PASSES` cap turns
+      self-reference into best-effort rather than an infinite loop.
+
+    Defaults are resolved by recursing through `_interpolate_str` (inside
+    `_resolve_var`), so deeply nested defaults ${A:-${B:-${C}}} resolve
+    inside-out on the first pass already.
+    """
+    for _ in range(_MAX_INTERP_PASSES):
+        if "${" not in s:
+            return s
+        new_s = _substitute_once(s, env, unresolved)
+        if new_s == s:
+            return s
+        s = new_s
+    return s  # cap reached: best-effort, leave remaining ${...} literal
+
+
+def _substitute_once(s: str, env: dict[str, str], unresolved: list[str]) -> str:
+    """One left-to-right pass. Matches ${...} by counting ${ / } depth so a
+    nested ${A:-${B}} binds as a single outer expression (the legacy
+    single-pass regex used `[^}]*` which could not span the inner `}`).
+
+    A `${` with no matching `}` is emitted literally (and we stop, since the
+    remainder can no longer contain a balanced expression).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == "$" and i + 1 < n and s[i + 1] == "{":
+            close = _find_matching_brace(s, i + 2)
+            if close == -1:
+                # Unbalanced ${ with no close: emit the rest verbatim.
+                out.append(s[i:])
+                return "".join(out)
+            inner = s[i + 2 : close]
+            out.append(_resolve_var(inner, env, unresolved))
+            i = close + 1
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def _find_matching_brace(s: str, start: int) -> int:
+    """Index of the `}` that closes the `${` whose content begins at `start`,
+    counting ${ / } depth so nested expressions belong to the outer one.
+    Returns -1 if unbalanced (no matching close)."""
+    depth = 1
+    i = start
+    n = len(s)
+    while i < n:
+        if s[i] == "$" and i + 1 < n and s[i + 1] == "{":
+            depth += 1
+            i += 2
+            continue
+        if s[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _resolve_var(inner: str, env: dict[str, str], unresolved: list[str]) -> str:
+    """Resolve the text between one matched `${ ... }`.
+
+    inner is e.g. `VAR`, `VAR:-default`, or `VAR:-${OTHER}`. A default is
+    itself passed back through `_interpolate_str` so nested defaults resolve.
+    Non-var `${...}` (e.g. lowercase `${foo}`, or `${}`) is left literal,
+    preserving the legacy "UPPER_CASE only" rule.
+    """
+    m = _VAR_INNER_RE.match(inner)
+    if not m:
+        return "${" + inner + "}"
+    var = m.group(1)
+    if var in env:
+        return env[var]
+    if m.group(2) is not None:  # the `:-` separator is present (incl. `VAR:-`)
+        default = m.group(3) or ""
+        return _interpolate_str(default, env, unresolved)
+    # Bare ${VAR}, no default, var unset.
+    unresolved.append(var)
+    return "${" + inner + "}"
 
 
 def discover_config_path(explicit: str | None = None, env: dict[str, str] | None = None) -> pathlib.Path:
