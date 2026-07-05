@@ -574,6 +574,36 @@ mock `match.jq` / reactor `match` share their root with `capture.*.from`
 (unifying the divergence tracked as #22). Body-rooted `match.body` (json_subset),
 `--contains`, `--path`, `--jq-path`/`--equals`, and `--status` are unchanged.
 
+**Self-debugging failure entries** — assertion failures now carry a `root` label
+and a payload snapshot so an agent can correct a mis-rooted jq expression without
+dropping the flag and re-running raw. The `root` field names the evaluation root
+(e.g. `"response envelope"` vs `"response body"`) and differs per mode; the
+payload field (`"body"`, `"row"`, `"rows"`, or `"modes"`) carries the actual
+data evaluated against. Root-per-mode mapping:
+
+- **HTTP** (`assertions.py::evaluate_http_assertions`):
+  - `--match` failures → `"root": "response envelope"` + `"body": <response body snapshot>`
+  - `--contains` / `--jq-path` failures → `"root": "response body"` + `"body": <response body snapshot>`
+  - The `body` snapshot is size-capped via `_response_body_snapshot` (~4 KB; the
+    full body always remains at `detail.response.body`) so a multi-mode failure
+    can't duplicate a large body once per entry.
+  - `--status` unchanged (no root label)
+
+- **DB** (`db_commands.py::_db_assert_core`):
+  - `--expect-value` mismatches → `"root": "first row"` + `"row": <first_row>`
+  - `--expect-rows` mismatches → `"rows": <rows[:5]>` (sample; `actual` holds the true count)
+  - No-rows case → `"rows": []`
+
+- **Kafka** (`kafka_commands.py::_kafka_assert_core`):
+  - No-match failure → `"messages_scanned": <n>` + `"modes": [{"mode","root",...}, ...]`
+    listing each active mode with its root (`--match`/`--pattern` → `"message envelope"`;
+    `--contains`/`--path` → `"message value"`)
+
+This implements the self-debugging contract (DESIGN §3.1) so agents read the root
+and payload from `error.detail.failures[]` (or `error.detail` for db/kafka) and
+correct the expression in one shot instead of falling back to a raw inspection
+call.
+
 ### Custom assertion modes (`assertion_registry.py`)
 
 `AssertionRegistry` resolves named modes reached via `db/kafka assert --assertion

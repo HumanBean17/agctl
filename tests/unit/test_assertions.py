@@ -466,7 +466,13 @@ def test_evaluate_contains_fail_raises_with_failure_entry():
             equals=None,
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "contains", "needle": {"status": "PAID"}, "matched": False}
+        {
+            "mode": "contains",
+            "needle": {"status": "PAID"},
+            "matched": False,
+            "root": "response body",
+            "body": RESULT["body"],
+        }
     ]
 
 
@@ -496,7 +502,13 @@ def test_evaluate_match_fail_raises_with_failure_entry():
             equals=None,
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "match", "expr": '.body.status=="PAID"', "result": False}
+        {
+            "mode": "match",
+            "expr": '.body.status=="PAID"',
+            "result": False,
+            "root": "response envelope",
+            "body": RESULT["body"],
+        }
     ]
 
 
@@ -553,7 +565,14 @@ def test_evaluate_jq_path_fail_raises_with_failure_entry():
             equals='"PAID"',
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "jq-path", "path": ".status", "expected": "PAID", "actual": "PENDING"}
+        {
+            "mode": "jq-path",
+            "path": ".status",
+            "expected": "PAID",
+            "actual": "PENDING",
+            "root": "response body",
+            "body": RESULT["body"],
+        }
     ]
 
 
@@ -638,7 +657,13 @@ def test_evaluate_non_json_body_contains_fails_matched_false():
             equals=None,
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "contains", "needle": {"x": 1}, "matched": False}
+        {
+            "mode": "contains",
+            "needle": {"x": 1},
+            "matched": False,
+            "root": "response body",
+            "body": body_string_result["body"],
+        }
     ]
 
 
@@ -658,5 +683,75 @@ def test_evaluate_non_json_body_jq_path_actual_null():
             equals="whatever",
         )
     assert exc_info.value.detail["failures"] == [
-        {"mode": "jq-path", "path": ".status", "expected": "whatever", "actual": None}
+        {
+            "mode": "jq-path",
+            "path": ".status",
+            "expected": "whatever",
+            "actual": None,
+            "root": "response body",
+            "body": body_string_result["body"],
+        }
     ]
+
+
+def test_evaluate_match_wrong_root_self_documents_envelope_and_body():
+    """Regression (battle-test incident): an agent wrote `--match '.data.operator
+    != null'` (body-rooted, trusting the stale 'response body' help wording) and
+    got a silent result:false, then had to drop --match and re-run raw to find the
+    path. The failure entry must now carry root='response envelope' + the actual
+    body, so the agent derives `.body.data.operator` in one read."""
+    from agctl.errors import AssertionFailure
+
+    resp = {**RESULT, "body": {"data": {"operator": "ACME"}}}
+    with pytest.raises(AssertionFailure) as exc_info:
+        evaluate_http_assertions(
+            resp,
+            status=None,
+            contains=None,
+            match=".data.operator != null",
+            jq_path=None,
+            equals=None,
+        )
+    failure = exc_info.value.detail["failures"][0]
+    assert failure["mode"] == "match"
+    assert failure["result"] is False
+    assert failure["root"] == "response envelope"
+    assert failure["body"] == {"data": {"operator": "ACME"}}
+
+
+def test_evaluate_non_json_body_match_failure_echoes_string_body():
+    """A non-dict (string) response body is a real path (non-JSON 200). A failed
+    --match must still carry root + the body snapshot (the raw string) safely."""
+    from agctl.errors import AssertionFailure
+
+    body_string_result = {**RESULT, "body": "not-json"}
+    with pytest.raises(AssertionFailure) as exc_info:
+        evaluate_http_assertions(
+            body_string_result,
+            status=None,
+            contains=None,
+            match=".body.data.operator != null",
+            jq_path=None,
+            equals=None,
+        )
+    failure = exc_info.value.detail["failures"][0]
+    assert failure["mode"] == "match"
+    assert failure["root"] == "response envelope"
+    assert failure["body"] == "not-json"  # snapshot passes small values through
+
+
+def test_response_body_snapshot_truncates_large_payload():
+    """A large response body must not be duplicated verbatim into every failing
+    mode entry (context bloat). The snapshot collapses to a truncation marker
+    pointing at the full body in detail.response.body."""
+    from agctl.assertions import _response_body_snapshot, _DETAIL_SNAPSHOT_LIMIT
+
+    small = {"status": "PENDING"}
+    assert _response_body_snapshot(small) is small  # pass-through
+
+    # A body whose JSON form exceeds the limit collapses to a marker.
+    huge = {"blob": "x" * (_DETAIL_SNAPSHOT_LIMIT + 200)}
+    snap = _response_body_snapshot(huge)
+    assert snap["_truncated"] is True
+    assert snap["full_in"] == "error.detail.response.body"
+    assert len(snap["preview"]) == _DETAIL_SNAPSHOT_LIMIT

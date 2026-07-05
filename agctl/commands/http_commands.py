@@ -172,7 +172,7 @@ def _http_call_core(
     "--match",
     "match",
     default=None,
-    help="jq predicate that must evaluate truthy against the response body",
+    help="jq predicate against the response envelope {status_code, body, headers, url, method}; reach body fields via .body.<field> (e.g. .body.order_id)",
 )
 @click.option(
     "--jq-path",
@@ -302,7 +302,7 @@ def _http_request_core(
     "--match",
     "match",
     default=None,
-    help="jq predicate that must evaluate truthy against the response body",
+    help="jq predicate against the response envelope {status_code, body, headers, url, method}; reach body fields via .body.<field> (e.g. .body.order_id)",
 )
 @click.option(
     "--jq-path",

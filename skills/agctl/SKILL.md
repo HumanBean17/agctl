@@ -21,6 +21,12 @@ invocation prints **one JSON object** on stdout and exits deterministically:
 Read `ok` first; on `false` read `error.type`. Parse **stdout only** — stderr is
 diagnostics. For any command's exact flags run `agctl <cmd> --help`.
 
+**Pin the version you target.** `--match`/`--jq-path` roots and failure shapes
+moved in agctl ≥1.0 (dialect v2). A stale global install (e.g. `0.1.0`, where
+`--match` was body-rooted) silently contradicts this skill. After upgrading the
+project's agctl, reinstall in every environment that runs it
+(`pip install -U 'agctl[jq]'`) so `--help` and behavior match the docs.
+
 ## Orient first: `agctl discover`
 
 `discover` is a map, not a dump — it tells you what's configured. Don't guess
@@ -152,6 +158,15 @@ agctl config migrate [--config <path>] [--dry-run]
     connection cannot actually `SELECT` from — discovering a name is not a
     grant. Treat the listing as "visible," not "accessible"; let the
     subsequent `SELECT` fail loudly if privileges are missing.
+12. **Assertion failures now self-document their root + payload.**
+    When `--match`/`--jq-path`/`--contains`/`--path`/`--equals` assertions fail,
+    read `error.detail.failures[].root` (HTTP) or `error.detail.root` (DB) or
+    `error.detail.modes[].root` (Kafka) to see what the expression was evaluated
+    against: `"response envelope"` vs `"response body"` (HTTP), `"message envelope"`
+    vs `"message value"` (Kafka), `"first row"` (DB `--path`). The payload snapshot
+    (`"body"` / `"row"` / `"rows"` / `"modes"`) shows the actual data so you can
+    correct a mis-rooted jq path (e.g. `.data.operator` → `.body.data.operator`)
+    without dropping the flag and re-running raw.
 
 ## Discover live schema before authoring SQL
 

@@ -263,6 +263,39 @@ def validate_http_assertion_args(
     return None
 
 
+# Per-failure-entry body snapshots are a *convenience* echo of data already
+# present in ``detail.response`` (the full HTTP result). Cap their serialized
+# size so a multi-mode failure against a large response body does not duplicate
+# that body once per failing entry (up to 3) and bloat the agent's context —
+# the same failure mode as the incident this fixes. The full, untruncated body
+# always remains at ``error.detail.response.body``.
+_DETAIL_SNAPSHOT_LIMIT = 4096
+
+
+def _response_body_snapshot(value):
+    """Return ``value`` for a failure-detail ``body`` field, truncating large
+    payloads to keep multi-mode failure envelopes bounded.
+
+    Small values pass through unchanged (the common case — the agent sees the
+    real body and self-corrects the jq root). Oversized payloads collapse to
+    ``{"_truncated": True, "preview": <json prefix>, "full_in":
+    "error.detail.response.body"}`` so the agent still sees the top-level shape
+    (enough to fix a mis-rooted ``.x`` → ``.body.x``) and knows where the full
+    body lives.
+    """
+    try:
+        rendered = json.dumps(value, default=str)
+    except (TypeError, ValueError):
+        rendered = str(value)
+    if len(rendered) <= _DETAIL_SNAPSHOT_LIMIT:
+        return value
+    return {
+        "_truncated": True,
+        "preview": rendered[:_DETAIL_SNAPSHOT_LIMIT],
+        "full_in": "error.detail.response.body",
+    }
+
+
 def evaluate_http_assertions(
     result: dict,
     *,
@@ -290,10 +323,23 @@ def evaluate_http_assertions(
 
     Per-mode failure entry shapes (pinned, parsed by downstream agents):
       - ``status``:   ``{"mode":"status","expected":<status>,"actual":<status_code>}``
-      - ``contains``: ``{"mode":"contains","needle":<parsed>,"matched":False}``
-      - ``match``:    ``{"mode":"match","expr":<match>,"result":False}``
+      - ``contains``: ``{"mode":"contains","needle":<parsed>,"matched":False,
+                        "root":"response body","body":<response body snapshot>}``
+      - ``match``:    ``{"mode":"match","expr":<match>,"result":False,
+                        "root":"response envelope","body":<response body snapshot>}``
       - ``jq-path``:  ``{"mode":"jq-path","path":<jq_path>,
-                        "expected":<parse_equals(equals)>,"actual":<jq_value or None>}``
+                        "expected":<parse_equals(equals)>,"actual":<jq_value or None>,
+                        "root":"response body","body":<response body snapshot>}``
+
+    The ``root`` label + ``body`` snapshot make a failed assertion self-debugging:
+    an agent sees *what* the expression was evaluated against and the actual payload,
+    so it can correct a mis-rooted expression (e.g. ``.x`` → ``.body.x``) without
+    dropping the flag and re-running to inspect raw output. ``root`` differs per mode
+    because the modes root differently (DESIGN §3.1): ``--match`` at the response
+    envelope, ``--contains``/``--jq-path`` at the response body. The ``body`` snapshot
+    is size-capped via :func:`_response_body_snapshot` (the full body always remains
+    at ``detail.response.body``) so a multi-mode failure can't balloon the envelope
+    by duplicating a large body once per entry.
     """
     if all(arg is None for arg in (status, contains, match, jq_path, equals)):
         return None
@@ -310,7 +356,15 @@ def evaluate_http_assertions(
     if contains is not None:
         needle = json.loads(contains)  # validated safe by validate_http_assertion_args
         if not json_subset(needle, result["body"]):
-            failures.append({"mode": "contains", "needle": needle, "matched": False})
+            failures.append(
+                {
+                    "mode": "contains",
+                    "needle": needle,
+                    "matched": False,
+                    "root": "response body",
+                    "body": _response_body_snapshot(result["body"]),
+                }
+            )
 
     if match is not None:
         try:
@@ -318,7 +372,15 @@ def evaluate_http_assertions(
         except ConfigError:
             raise _missing_jq_config_error("match", {"expr": match}) from None
         if not ok:
-            failures.append({"mode": "match", "expr": match, "result": False})
+            failures.append(
+                {
+                    "mode": "match",
+                    "expr": match,
+                    "result": False,
+                    "root": "response envelope",
+                    "body": _response_body_snapshot(result["body"]),
+                }
+            )
 
     if jq_path is not None:  # equals is non-None too (validated pairing)
         expected = parse_equals(equals)
@@ -333,6 +395,8 @@ def evaluate_http_assertions(
                     "path": jq_path,
                     "expected": expected,
                     "actual": actual,
+                    "root": "response body",
+                    "body": _response_body_snapshot(result["body"]),
                 }
             )
 
