@@ -419,11 +419,12 @@ class TestMockRunHTTP:
         """Two same-method+path stubs distinguished by ``match.jq`` route by amount.
 
         Models the DESIGN §3.2 branching case: a single POST endpoint whose
-        response is decided by a jq predicate over the request body.
+        response is decided by a jq predicate rooted at the request envelope
+        over the request body.
 
         Stubs (both POST /api/v1/payments):
-          - ``high-value-payment`` (``.amount > 1000``)  -> 201 / {"status":"APPROVED"}
-          - ``low-value-payment``  (``.amount <= 1000``) -> 202 / {"status":"QUEUED"}
+          - ``high-value-payment`` (``.body.amount > 1000``)  -> 201 / {"status":"APPROVED"}
+          - ``low-value-payment``  (``.body.amount <= 1000``) -> 202 / {"status":"QUEUED"}
 
         Asserts:
         - POST {amount:1500} -> 201, body.status == "APPROVED"
@@ -448,7 +449,7 @@ class TestMockRunHTTP:
                         "description": "High-value payment (amount > 1000) -> approved",
                         "method": "POST",
                         "path": "/api/v1/payments",
-                        "match": {"jq": ".amount > 1000"},
+                        "match": {"jq": ".body.amount > 1000"},
                         "response": {
                             "status": 201,
                             "headers": {"Content-Type": "application/json"},
@@ -459,7 +460,7 @@ class TestMockRunHTTP:
                         "description": "Low-value payment (amount <= 1000) -> queued",
                         "method": "POST",
                         "path": "/api/v1/payments",
-                        "match": {"jq": ".amount <= 1000"},
+                        "match": {"jq": ".body.amount <= 1000"},
                         "response": {
                             "status": 202,
                             "headers": {"Content-Type": "application/json"},

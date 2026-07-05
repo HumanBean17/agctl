@@ -563,12 +563,12 @@ class TestJqPredicate:
     def test_jq_predicate_match(
         self, emit_event: callable, event_sink: list[dict[str, Any]]
     ) -> None:
-        """(a) POST amount:1500 against stub match.jq='.amount > 1000' -> 201 + hit."""
+        """(a) POST amount:1500 against stub match.jq='.body.amount > 1000' -> 201 + hit."""
         stubs = {
             "big-payment": HttpStub(
                 method="POST",
                 path="/payments",
-                match=HttpMatch(jq=".amount > 1000"),
+                match=HttpMatch(jq=".body.amount > 1000"),
                 response=HttpResponse(status=201, body={"status": "OK"}),
             )
         }
@@ -598,12 +598,12 @@ class TestJqPredicate:
     def test_jq_predicate_false_falls_through(
         self, emit_event: callable, event_sink: list[dict[str, Any]]
     ) -> None:
-        """(b) POST amount:500 against stub match.jq='.amount > 1000' -> 404 + unmatched."""
+        """(b) POST amount:500 against stub match.jq='.body.amount > 1000' -> 404 + unmatched."""
         stubs = {
             "big-payment": HttpStub(
                 method="POST",
                 path="/payments",
-                match=HttpMatch(jq=".amount > 1000"),
+                match=HttpMatch(jq=".body.amount > 1000"),
                 response=HttpResponse(status=201),
             )
         }
@@ -641,7 +641,7 @@ class TestJqPredicate:
             "high-value": HttpStub(
                 method="POST",
                 path="/payments",
-                match=HttpMatch(jq=".amount > 1000"),
+                match=HttpMatch(jq=".body.amount > 1000"),
                 response=HttpResponse(status=201, body={"decision": "APPROVED"}),
             ),
             "low-value": HttpStub(
@@ -691,7 +691,7 @@ class TestJqPredicate:
             "priority-big": HttpStub(
                 method="POST",
                 path="/orders",
-                match=HttpMatch(body={"priority": "high"}, jq=".amount > 1000"),
+                match=HttpMatch(body={"priority": "high"}, jq=".body.amount > 1000"),
                 response=HttpResponse(status=201, body={"ok": True}),
             )
         }
@@ -728,17 +728,18 @@ class TestJqPredicate:
     def test_jq_predicate_raises_is_soft_nonmatch(
         self, emit_event: callable, event_sink: list[dict[str, Any]]
     ) -> None:
-        """(e) match.jq='.x[0]' on a string body -> 404 + unmatched (no 500).
+        """(e) match.jq='.body.x[0]' on a string body field -> 404 + unmatched (no 500).
 
-        ``.x[0]`` on ``{"x": "str"}`` unambiguously raises a jq type error
-        ("Cannot index string with number"); jq_bool swallows it to False, so
-        the stub is a soft non-match and the request falls through cleanly.
+        ``.body.x[0]`` resolves ``.body.x`` to ``"str"`` then indexes it with a
+        number, which unambiguously raises a jq type error ("Cannot index
+        string with number"); jq_bool swallows it to False, so the stub is a
+        soft non-match and the request falls through cleanly.
         """
         stubs = {
             "deep": HttpStub(
                 method="POST",
                 path="/items",
-                match=HttpMatch(jq=".x[0]"),
+                match=HttpMatch(jq=".body.x[0]"),
                 response=HttpResponse(status=200, body={"hit": True}),
             )
         }
@@ -750,7 +751,7 @@ class TestJqPredicate:
             with httpx.Client() as client:
                 response = client.post(
                     f"http://127.0.0.1:{port}/items",
-                    json={"x": "str"},  # .x[0] on a string -> jq type error (raises)
+                    json={"x": "str"},  # .body.x[0] on a string -> jq type error (raises)
                 )
 
             assert response.status_code == 404
@@ -767,14 +768,15 @@ class TestJqPredicate:
     ) -> None:
         """(f) match.jq on a non-JSON body -> 404 + unmatched.
 
-        parsed_body is None for plain text; jq_bool(None, expr) -> False ->
-        soft non-match -> fall through.
+        parsed_body is None for plain text, so envelope.body is None and
+        ``.body.amount`` is null; ``null > 1000`` is false -> soft non-match
+        -> fall through.
         """
         stubs = {
             "big-payment": HttpStub(
                 method="POST",
                 path="/payments",
-                match=HttpMatch(jq=".amount > 1000"),
+                match=HttpMatch(jq=".body.amount > 1000"),
                 response=HttpResponse(status=201),
             )
         }
@@ -796,6 +798,60 @@ class TestJqPredicate:
             assert len(event_sink) == 1
             assert event_sink[0]["event"] == "http.unmatched"
             assert event_sink[0]["status"] == 404
+        finally:
+            server.shutdown()
+
+    def test_stub_jq_match_envelope_root(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """match.jq roots at the request envelope, not the parsed body.
+
+        Stub: POST /orders, match.jq='.body.amount > 1000' -> 200.
+        Under the OLD payload-rooted impl, ``.body.amount`` would resolve
+        against the body as ``body.body.amount`` -> ``null`` -> predicate
+        False -> 404 for BOTH requests, so the 2000 case fails. With the
+        envelope root, ``.body.amount`` reaches the body's ``amount`` field
+        and the predicate behaves as intended.
+        """
+        stubs = {
+            "big-order": HttpStub(
+                method="POST",
+                path="/orders",
+                match=HttpMatch(jq=".body.amount > 1000"),
+                response=HttpResponse(status=200),
+            )
+        }
+
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+
+        try:
+            with httpx.Client() as client:
+                r_high = client.post(
+                    f"http://127.0.0.1:{port}/orders",
+                    json={"amount": 2000},
+                )
+                r_low = client.post(
+                    f"http://127.0.0.1:{port}/orders",
+                    json={"amount": 500},
+                )
+
+            assert r_high.status_code == 200
+
+            assert r_low.status_code == 404
+            assert r_low.json() == {"mock_error": "no matching stub"}
+
+            hit_events = [e for e in event_sink if e["event"] == "http.hit"]
+            unmatched_events = [
+                e for e in event_sink if e["event"] == "http.unmatched"
+            ]
+            assert len(hit_events) == 1
+            assert hit_events[0]["stub"] == "big-order"
+            assert hit_events[0]["method"] == "POST"
+            assert hit_events[0]["path"] == "/orders"
+            assert hit_events[0]["status"] == 200
+            assert len(unmatched_events) == 1
+            assert unmatched_events[0]["status"] == 404
         finally:
             server.shutdown()
 

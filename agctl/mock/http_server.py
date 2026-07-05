@@ -215,6 +215,18 @@ def make_handler(
             # Step 2: Parse body as JSON
             parsed_body = self._parse_json_body(raw_body)
 
+            # Request envelope: built ONCE per request, shared by match.jq
+            # (predicate input) and resolve_captures (capture input) so the two
+            # features share a single root. Field set and casing are load-bearing
+            # (capture tests pin them): method, path, headers (lowercased keys),
+            # body (= parsed_body).
+            envelope = {
+                "method": self.command,
+                "path": urlsplit(self.path).path,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": parsed_body,
+            }
+
             # Step 3: Match stubs
             matched_stub = None
             captures: dict[str, CaptureValue] = {}
@@ -229,16 +241,18 @@ def make_handler(
                 if path_captures is None:
                     continue
 
-                # Match body filter if present
+                # Match body filter if present. json_subset (match.body) stays
+                # rooted at parsed_body — only the jq predicate changed roots.
                 if stub.match and stub.match.body is not None:
                     if not json_subset(stub.match.body, parsed_body):
                         continue  # Body filter failed
 
-                # Match jq predicate if present. jq_bool swallows compile/runtime
-                # errors to False (soft non-match per DESIGN §3.2): a non-JSON
-                # body (parsed_body is None) or a raising predicate -> continue.
+                # Match jq predicate if present. The predicate is rooted at the
+                # request envelope (`.body.<field>` / `.headers.<name>` / `.method`
+                # / `.path`), mirroring capture.from. jq_bool swallows compile/
+                # runtime errors to False (soft non-match per DESIGN §3.2).
                 if stub.match and stub.match.jq is not None:
-                    if not jq_bool(parsed_body, stub.match.jq):
+                    if not jq_bool(envelope, stub.match.jq):
                         continue  # jq predicate failed
 
                 # Found a match
@@ -280,12 +294,6 @@ def make_handler(
                     captures[key] = CaptureValue(value, "scalar")
 
             if stub.capture is not None:
-                envelope = {
-                    "method": self.command,
-                    "path": urlsplit(self.path).path,
-                    "headers": {k.lower(): v for k, v in self.headers.items()},
-                    "body": parsed_body,
-                }
                 explicit, missing = resolve_captures(envelope, stub.capture)
                 captures.update(explicit)
                 for cap_name, from_path in missing:
