@@ -102,11 +102,21 @@ def _check_version(data: dict) -> None:
     version = str(data.get("version", "")).strip()
     major = version.split(".")[0] if version else ""
     if major != TOOL_MAJOR_VERSION:
+        if not version:
+            message = (
+                f"Config is missing a `version`. agctl speaks dialect v{TOOL_MAJOR_VERSION}; "
+                f"add `version: \"{TOOL_MAJOR_VERSION}\"` (or run `agctl config migrate` "
+                f"on a v1 config)."
+            )
+        else:
+            message = (
+                f"Config dialect v{major} is no longer supported by agctl v{TOOL_MAJOR_VERSION} "
+                f"(config_version='{version}'). Run `agctl config migrate` to upgrade, "
+                f"or manually bump `version: \"{TOOL_MAJOR_VERSION}\"` and prefix each HTTP "
+                f"`match` expression with `.body | ` and each Kafka `match` expression with "
+                f"`.value | `."
+            )
         raise ConfigError(
-            f"Config dialect v{major} is no longer supported by agctl v{TOOL_MAJOR_VERSION} "
-            f"(config_version='{version}'). Run `agctl config migrate` to upgrade, "
-            f"or manually bump `version: \"{TOOL_MAJOR_VERSION}\"` and prefix each HTTP "
-            f"`match` expression with `.body | ` and each Kafka `match` expression with "
-            f"`.value | `.",
+            message,
             {"config_version": version, "tool_major": TOOL_MAJOR_VERSION},
         )

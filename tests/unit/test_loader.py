@@ -54,6 +54,17 @@ def test_version_mismatch_raises(tmp_path):
     assert "config migrate" in exc.value.message
 
 
+def test_missing_version_raises_with_clear_message(tmp_path):
+    """A config with no `version` field gets a clear missing-version message
+    (not the awkward `Config dialect v is no longer supported ...`)."""
+    bad = tmp_path / "agctl.yaml"
+    bad.write_text('kafka:\n  brokers: [h:9092]\n')
+    with pytest.raises(ConfigError) as exc:
+        load_config(str(bad), env={})
+    assert exc.value.detail["tool_major"] == "2"
+    assert "missing a `version`" in exc.value.message
+
+
 def test_invalid_schema_raises(tmp_path):
     bad = tmp_path / "agctl.yaml"
     bad.write_text('version: "2"\ntemplates:\n  x:\n    method: GET\n')  # missing service/path

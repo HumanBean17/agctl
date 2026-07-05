@@ -608,7 +608,7 @@ class TestMockRunKafka:
                         "description": "Process order commands",
                         "topic": commands_topic,
                         "consumer_group": f"agctl-test-{test_id}",
-                        "match": ".command == \"create\"",
+                        "match": ".value.command == \"create\"",
                         "reaction": {
                             "topic": events_topic,
                             "key": "{order_id}",
