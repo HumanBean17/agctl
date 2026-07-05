@@ -94,14 +94,14 @@ Every edit ends with these two commands (the config must stay valid):
 
 ```bash
 agctl config validate                                                       # ok:true, exit 0 (warnings fine; errors are not)
-agctl discover --category <http-templates|kafka-patterns|db-templates> --name <new-key>   # must list expected params
+agctl discover --category <http-templates|kafka-patterns|db-templates|mock-http-stubs|mock-kafka-reactors> --name <new-key>   # must list expected params
 ```
 
-**Mocks have no `discover` category** — `agctl discover` does not surface `mocks:` (only
-`services` / `http-templates` / `kafka-patterns` / `db-templates`). For a `mock` edit,
-verify with `agctl config validate` and a smoke run (`agctl mock run --duration 5`,
-checking the `started` line and that no `http.unmatched` / `kafka.error` appears) — see the
-`agctl` skill.
+**Mocks are discoverable** via `agctl discover --category <mock-http-stubs|mock-kafka-reactors>`
+(and `--name <stub-or-reactor>` for full detail). For a `mock` edit, confirm the new/changed
+item appears in `discover`, then verify with `agctl config validate` and a smoke run
+(`agctl mock run --duration 5`, checking the `started` line and that no `http.unmatched` /
+`kafka.error` appears) — see the `agctl` skill.
 
 If `agctl` isn't installed, run the **structural checklist** below instead and tell the user
 live validation was skipped. **Never** declare done on config that doesn't validate.
