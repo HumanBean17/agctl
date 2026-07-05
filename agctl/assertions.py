@@ -7,9 +7,16 @@ and D8 (equals coercion + type-aware comparison rules).
 import datetime
 import decimal
 import json
+import re
 import uuid
 
 from .errors import AssertionFailure, ConfigError
+
+# A dotted jq path whose final segment contains a hyphen, e.g.
+# ``.headers.x-request-id`` or ``.body.event-type``. jq parses such segments
+# as subtraction, producing a baffling compile error; this lets ``compile_jq``
+# append a targeted bracket-notation hint.
+_HYPHEN_KEY_PATH = re.compile(r"\.[\w.]*\.[A-Za-z_][\w-]*-[\w-]+")
 
 
 def _jq():
@@ -99,8 +106,14 @@ def compile_jq(expr: str, *, label: str | None = None) -> None:
     try:
         jq_lib.compile(expr)
     except Exception as exc:
+        msg = f"{context}invalid jq expression {expr!r}: {exc}"
+        if _HYPHEN_KEY_PATH.search(expr):
+            msg += (
+                " (header/field keys containing '-' need bracket notation, "
+                'e.g. .headers["x-request-id"])'
+            )
         raise ConfigError(
-            f"{context}invalid jq expression {expr!r}: {exc}",
+            msg,
             {"expr": expr, "label": label},
         ) from exc
     return None
@@ -170,17 +183,49 @@ def coerce_db_value(value):
     return value
 
 
+def _parse_iso_datetime(s):
+    """Parse ``s`` as an ISO 8601 datetime string, or return ``None``.
+
+    The ``'T'`` gate avoids mis-treating date-only (``"2026-06-29"``) or
+    pure-time strings as timestamps. Both ``'...Z'`` and ``'...+00:00'`` are
+    accepted (Python's ``fromisoformat`` pre-3.11 doesn't handle ``'Z'``
+    directly, so it's normalized first)."""
+    if not isinstance(s, str) or "T" not in s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _to_utc(dt):
+    """Normalize ``dt`` to UTC. Naive datetimes are treated as UTC (matches
+    DESIGN's ``Z`` == UTC convention). Two aware datetimes compared in UTC
+    never raise."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
 def type_aware_equal(expected, actual) -> bool:
     """DESIGN D8 step 4: strict, type-aware equality. 0 != '0' (number vs string).
 
-    A number never equals a string of the same digits. Otherwise compares with ==,
-    recursing element-wise for dict/list.
+    A number never equals a string of the same digits. For two strings that
+    both parse as ISO 8601 datetimes, comparison normalizes via ``_to_utc``
+    so ``'...Z'`` and ``'...+00:00'`` for the same UTC instant compare equal
+    (the comparison layer tolerates the ``Z`` vs ``+00:00`` spelling
+    difference; ``coerce_db_value``'s ``.isoformat()`` output is unchanged).
+    Otherwise compares with ==, recursing element-wise for dict/list.
     """
     # number-vs-string mismatch (in either order) -> never equal
     if isinstance(expected, (int, float, decimal.Decimal, bool)) and isinstance(actual, str):
         return False
     if isinstance(actual, (int, float, decimal.Decimal, bool)) and isinstance(expected, str):
         return False
+    if isinstance(expected, str) and isinstance(actual, str):
+        te, ta = _parse_iso_datetime(expected), _parse_iso_datetime(actual)
+        if te is not None and ta is not None:
+            return _to_utc(te) == _to_utc(ta)
     return expected == actual
 
 
