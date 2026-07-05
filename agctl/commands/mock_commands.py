@@ -593,7 +593,7 @@ def _mock_stop_core(
 @click.option("--listen", "listen", type=str, default=None, help="Listen address (e.g., 127.0.0.1:18080)")
 @click.option("--pid", "pid", type=int, default=None, help="Process ID")
 @click.option("--all", "all_", is_flag=True, default=False, help="Stop all running mocks")
-@click.option("--timeout", "timeout", type=float, default=30.0, help="Seconds to wait for SIGTERM before SIGKILL")
+@click.option("--timeout", "timeout", type=float, default=10.0, help="Seconds to wait for SIGTERM before SIGKILL")
 @click.option("--state-dir", "state_dir", default="./.agctl", help="Directory for mock state (pidfiles, logs)")
 @click.pass_context
 def mock_stop(
