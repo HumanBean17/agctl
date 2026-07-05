@@ -84,7 +84,7 @@ step that depends on a failed one produces cascade noise, not signal.
 
 - Kill heartbeat PIDs.
 - `SIGTERM` the mock PID, then `wait`.
-- **Grep `mock.log` for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` / `kafka.error`** — any hit is a failure that flips the overall verdict to FAIL.
+- **Grep `mock.log` for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` / `kafka.error` / `capture.missing`** — any hit is a failure that flips the overall verdict to FAIL. (`capture.missing` is non-fatal at runtime — the mock substitutes empty string and continues — but it marks a `capture.from` that resolved to nothing, usually a misconfigured path silently yielding a plausible-but-wrong field.)
 - Optional: reset seed data.
 
 Record each in the report's `## Teardown` block.

@@ -131,6 +131,20 @@ mocks:
         match:
           body: { "priority": "high" }    # optional: json_subset containment filter
           # jq: '.amount > 1000'          # optional: jq predicate, AND-ed with body
+        # capture: OPTIONAL envelope-rooted extraction (peer of `match` on both
+        # HttpStub and KafkaReactor). Each entry is { from, type }:
+        #   from: jq path evaluated against the whole incoming message envelope
+        #         (HTTP request {method, path, headers (lowercased), body} /
+        #         Kafka message {key, value, headers (case-sensitive), ...}). `match`
+        #         stays payload-rooted (body/value only).
+        #   type: scalar (default, str()) | object (live pass-through; whole-field
+        #         placeholder "{name}" only) | json (json.dumps as a string).
+        # Explicit entries override implicit top-level-body/value captures on name
+        # collision (value AND type). A `from` resolving to null emits a non-fatal
+        # `capture.missing` event and substitutes empty string.
+        # capture:
+        #   cust_id: { from: ".body.customer_id" }            # nested path / header reachable
+        #   ctx:     { from: ".body.context", type: object }  # whole-object pass-through
         response:
           status: 201
           headers: { Content-Type: "application/json" }
@@ -152,7 +166,15 @@ mocks:
         description: "Mock the service that consumes order commands"
         topic: orders.commands
         consumer_group: agctl-mock-order-handler   # OPTIONAL; omit → unique per-run group
-        match: '.command == "CREATE_ORDER"'
+        match: '.command == "CREATE_ORDER"'         # payload-rooted (message value only)
+        # capture: same CaptureSpec shape as HTTP stubs; `from` roots at the Kafka
+        # message envelope ({key, value, partition, offset, timestamp, headers}).
+        # Header keys are case-sensitive here (as-produced) — do NOT lowercase them
+        # (unlike HTTP headers). Reaches `.key`, `.headers.<name>`, nested `.value.*`.
+        # capture:
+        #   tid:   { from: ".key" }
+        #   rqUID: { from: ".headers.rqUID" }
+        #   ctx:   { from: ".value.context", type: object }
         reaction:
           topic: orders.events
           key: "{orderId}"
@@ -785,6 +807,7 @@ agctl mock run
 {"event":"http.hit","stub":"create-order","method":"POST","path":"/api/v1/orders","status":201,"duration_ms":3,"timestamp":"…"}
 {"event":"http.unmatched","method":"GET","path":"/api/v1/unknown","status":404,"timestamp":"…"}
 {"event":"http.body_parse_skipped","stub":"oauth-token","method":"POST","path":"/oauth/token","reason":"non-JSON body; response has unresolved placeholders","timestamp":"…"}
+{"event":"capture.missing","stub":"epk-chatSearch","name":"ucp","from":".body.ucpID","timestamp":"…"}
 {"event":"kafka.reacted","reactor":"order-command-handler","topic":"orders.events","key":"ord-789","duration_ms":1,"timestamp":"…"}
 {"event":"kafka.skipped","reactor":"order-command-handler","topic":"orders.commands","reason":"non-object message value","count":3,"timestamp":"…"}
 {"event":"kafka.error","reactor":"order-command-handler","topic":"orders.commands","offset":1043,"partition":2,"error":"…","fatal":false,"timestamp":"…"}
@@ -793,12 +816,12 @@ agctl mock run
 
 **Agent failure-stream protocol (load-bearing):**
 
-The mock's failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`) live **only** on stdout, and the exit-1-at-shutdown escalation arrives only on a clean `SIGTERM`. The background `&`/`kill` pattern loses both by default. Agents must follow this protocol:
+The mock's failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`, `capture.missing`) live **only** on stdout, and the exit-1-at-shutdown escalation arrives only on a clean `SIGTERM`. The background `&`/`kill` pattern loses both by default. Agents must follow this protocol:
 
 1. Redirect the mock's stdout to a log file: `agctl mock run > mock.log 2>&1 &`.
 2. **Poll** `mock.log` for the `started` line before running the SUT (do not sleep a fixed delay).
 3. Terminate with `SIGTERM` and `wait` — **never `SIGKILL`** (which skips shutdown/summary/exit-code).
-4. After the test, **grep the log for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` / `kafka.error`** regardless of the test result, and treat any hit as a failure.
+4. After the test, **grep the log for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` / `kafka.error` / `capture.missing`** regardless of the test result, and treat any hit as a failure. `capture.missing` is non-fatal (the mock substitutes empty string and continues), but it marks a likely-misconfigured `from` silently producing a plausible-but-wrong response — investigate rather than ignore.
 
 **`--fail-fast` synchronous alternative:**
 
@@ -1390,6 +1413,7 @@ Refused to overwrite (without `--force`):
 | `kafka.reacted` | Emitted per Kafka message that matched a reactor and produced a reaction. Includes `reactor`, `topic`, `key`, `duration_ms`. |
 | `kafka.skipped` | Emitted when messages are consumed but not matched (e.g., non-object value). Includes `reactor`, `topic`, `reason`, `count`. |
 | `kafka.error` | Emitted on a reaction produce failure or reactor error. Includes `reactor`, `topic`, `error`, `fatal`. Under `--fail-fast`, the run exits `1` immediately after a fatal error. |
+| `capture.missing` | Emitted when an explicit `capture.<name>.from` resolves to `null`/missing at runtime (HTTP stub or Kafka reactor). Includes `stub` *or* `reactor`, `name`, `from`. Non-fatal: the mock substitutes empty string and continues; investigate as a likely-misconfigured `from`. |
 | `summary` | Emitted once at shutdown. Includes `http_hits`, `http_unmatched`, `http_body_parse_skipped`, `kafka_reactions`, `kafka_skipped`, `kafka_errors`, `duration_ms`. |
 
 **Agent protocol (load-bearing):** See `agctl mock` §3.5 for the background lifecycle protocol (redirect stdout → log, poll for `started`, SIGTERM+wait, grep log for errors). Without this, "fail loudly" is aspirational — a silent false-positive is possible.
@@ -1889,7 +1913,7 @@ These items are intentionally deferred. Do not implement them until the core des
 | **Mock: stateful / scenario mocks** | Sequences, "Nth call → Y", reactor behavior change after N messages. |
 | **Mock: managed daemon** | `mock start/stop/status` with pidfile + control socket, behind `--detach`. |
 | **Mock: record / replay** | Record real traffic into stubs for later replay. |
-| **Mock: nested-field / header capture** | Capture from request headers or nested JSON fields (currently top-level keys only). |
+| **Mock: unify `match` onto the envelope root (#22)** | `match.jq` (HTTP) / reactor `match` (Kafka) stay payload-rooted while `capture.*.from` roots at the whole incoming message envelope — a `.`-root divergence accepted as the cost of additive capture. Nested fields, headers, and the Kafka key are reachable today via `capture:` (envelope-rooted); implicit capture (top-level body/value keys) remains payload-rooted. Migrating `match` is breaking (needs a major-version bump or a `match_root` compat shim); tracked as #22, deliberately not implemented here. |
 | **Mock: exactly-once reactor delivery** | Reaction retry/backoff on broker errors (today: at-least-once with idempotent reactions). |
 | **Mock: TLS / HTTPS mock** | Cert-pinned SUT clients cannot connect to a plaintext mock. |
 | **Mock: multiple HTTP servers / ports** | One server, many stubs (path-routed) is the only model today. |
@@ -1903,9 +1927,7 @@ The mock MVP covers **stateless, single-consumer, value-keyed, plaintext** flows
 | **Stateful flows** (OAuth/token exchange, create-then-GET lifecycle, idempotency-key replay, pagination cursors, 429-then-retry) | Static engine returns the same canned response regardless of prior calls. | State-propagation and dedupe logic go untested → false green. |
 | **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** | Plaintext mock only; cannot intercept HTTPS. | Integration is untested → false green (especially for payments/auth/healthcare). |
 | **Cross-transport sagas** (Kafka trigger → HTTP callback) | No causal linkage; requires manual orchestration. | End-to-end flow goes unexercised → false green. |
-| **Header-borne correlation IDs** (sync Kafka request/reply keyed by header; CloudEvents `ce-*`, `traceparent`) | Reactor cannot capture from headers (only top-level JSON keys). | Cannot produce correlatable reply → routes through SUT's reply-timeout fallback → false green. |
 | **Non-JSON Kafka values** (Avro/Protobuf/schema-registry-backed topics) | Emitted as `kafka.skipped` (visible), but topic is effectively un-mockable until decoding lands. | Topic appears idle → false green if consumer expects a reaction. |
-| **JSON-type pass-through in reactions** | Captured values are stringified before `{placeholder}` substitution (D11). | Strict downstream expecting numeric field may reject reaction → false failure (but type-tolerant reactions are fine). |
 | **Containerized SUT topology** (docker-compose) | `0.0.0.0` bind works, but operator must target `host.docker.internal` / host LAN IP and avoid a SUT that swallows connection errors. | SUT may silently fail to connect → false green if it treats network errors as "fallback worked." |
 | **Shared broker + pinned `consumer_group` reused across runs/devs** | Partition split or resume-past-messages. | Silently missing/old reactions → false green. (Mitigated by unique-per-run default.) |
 
