@@ -1,7 +1,7 @@
 # `agctl` — Architecture Document
 
 **Status:** Source-of-truth (as-built).
-**Last updated:** 2026-07-02
+**Last updated:** 2026-07-06
 
 > `ARCHITECTURE.md` is the **source of truth for how the system works today** —
 > the as-built runtime, module boundaries, data flows, and extension model. Its
@@ -401,6 +401,11 @@ httpx wrapper. `request()` returns the §4.2 result dict (`status_code`,
 `response_time_ms`, lowercased `headers`, `body`, `url`, `method`). Header merge
 is case-insensitive (per-call wins). Body parses as JSON when content-type says
 so, else text.
+
+Both `http request` and `http ping` accept a `--url <full-url>` mode (mutually
+exclusive with `--service`/`--path`); `http_commands._split_url` derives the
+`(base_url, path)` pair fed to this constructor, so URL mode needs no
+client-side change.
 
 Exception mapping: `ConnectError`/`ConnectTimeout` → `ConnectionFailure`;
 `ReadTimeout`/other `TimeoutException` → `OperationTimeout`; other `HTTPError`

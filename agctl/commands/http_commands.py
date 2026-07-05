@@ -19,6 +19,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import click
 
@@ -71,6 +72,31 @@ def resolve_timeout(
 def _parse_headers(values: tuple[str, ...]) -> dict[str, str]:
     """Turn ``--header k=v`` tuples into a dict (same rule as ``--param``)."""
     return parse_params(values)
+
+
+def _split_url(url: str) -> tuple[str, str]:
+    """Split a full request URL into ``(base_url, path)`` for :class:`HttpClient`.
+
+    ``base_url`` is ``scheme://netloc``; ``path`` carries the path plus any query
+    string. Only ``http``/``https`` URLs with a host are accepted — anything else
+    (schemeless, hostless, or a non-HTTP scheme such as ``ftp://``) is rejected
+    as :class:`ConfigError` (exit 2) so a bad URL fails loudly here rather than
+    surfacing as a confusing httpx-layer error later. Fragments are dropped
+    (never sent over the wire). The resulting pair feeds the existing
+    ``HttpClient(base_url, …).request(method, path, …)`` contract unchanged, so
+    the ``--url`` mode needs no client-side changes.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.netloc:
+        raise ConfigError(
+            f"--url must be an http(s) URL with a host: {url!r}", {"url": url}
+        )
+    base_url = f"{scheme}://{parts.netloc}"
+    path = parts.path or "/"
+    if parts.query:
+        path = f"{path}?{parts.query}"
+    return base_url, path
 
 
 # --------------------------------------------------------------------------- #
@@ -227,12 +253,13 @@ _http_call_envelope = envelope("http.call")(_http_call_core)
 
 def _http_request_core(
     config_path: str | None,
-    service: str,
+    service: str | None,
     method: str,
-    path: str,
+    path: str | None,
     body: str | None,
     header: tuple[str, ...],
     timeout: float | None,
+    url: str | None = None,
     status: int | None = None,
     contains: str | None = None,
     match: str | None = None,
@@ -241,17 +268,36 @@ def _http_request_core(
 ) -> dict:
     cfg = load_config_or_raise(config_path)
 
-    if service not in cfg.services:
-        raise ConfigError(
-            f"Unknown service: {service}", {"service": service}
-        )
+    if url is not None:
+        # URL mode: a full request URL, no configured service required. This is
+        # the HTTP analog of ``db query --sql`` — free-form, opt-out of config.
+        if service is not None or path is not None:
+            raise ConfigError(
+                "--url is mutually exclusive with --service and --path", {}
+            )
+        client_base, client_path = _split_url(url)
+        service_timeout = None
+    else:
+        # Service mode: --service + --path resolved against cfg.services.
+        if service is None or path is None:
+            raise ConfigError(
+                "http request requires either --url or both --service and --path",
+                {},
+            )
+        if service not in cfg.services:
+            raise ConfigError(
+                f"Unknown service: {service}", {"service": service}
+            )
+        service_cfg = cfg.services[service]
+        client_base = service_cfg.base_url
+        client_path = path
+        service_timeout = service_cfg.timeout_seconds
 
     resolved_body = json.loads(body) if body is not None else None
     resolved_headers = _parse_headers(header)
 
-    service_cfg = cfg.services[service]
     effective_timeout = resolve_timeout(
-        timeout, service_cfg.timeout_seconds, cfg.defaults.timeout_seconds
+        timeout, service_timeout, cfg.defaults.timeout_seconds
     )
 
     # Pre-request gate: fail pairing/bad-JSON misuse BEFORE the request is sent
@@ -264,9 +310,9 @@ def _http_request_core(
         equals=equals,
     )
 
-    client = new_client(service_cfg.base_url, effective_timeout)
+    client = new_client(client_base, effective_timeout)
     result = client.request(
-        method, path, headers=resolved_headers or None, body=resolved_body
+        method, client_path, headers=resolved_headers or None, body=resolved_body
     )
     evaluate_http_assertions(
         result,
@@ -280,14 +326,24 @@ def _http_request_core(
 
 
 @click.command("request")
-@click.option("--service", "service", required=True)
+@click.option(
+    "--url",
+    "url",
+    default=None,
+    help=(
+        "Full request URL (e.g. https://host/path). Mutually exclusive with "
+        "--service/--path; use for endpoints not registered as a service."
+    ),
+)
+@click.option("--service", "service", default=None, help="Configured service name (or use --url)")
 @click.option(
     "--method",
     "method",
-    required=True,
+    default="GET",
     type=click.Choice(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+    help="HTTP method (default GET)",
 )
-@click.option("--path", "path", required=True)
+@click.option("--path", "path", default=None, help="Request path (resolved against the service base URL)")
 @click.option("--body", "body", default=None, help="JSON body")
 @click.option("--header", "header", multiple=True, help="k=v header")
 @click.option("--timeout", "timeout", type=float, default=None)
@@ -319,9 +375,10 @@ def _http_request_core(
 @click.pass_context
 def http_request(
     ctx: click.Context,
-    service: str,
+    url: str | None,
+    service: str | None,
     method: str,
-    path: str,
+    path: str | None,
     body: str | None,
     header: tuple[str, ...],
     timeout: float | None,
@@ -331,7 +388,7 @@ def http_request(
     jq_path: str | None,
     equals: str | None,
 ) -> None:
-    """Send a free-form HTTP request against a configured service."""
+    """Send a free-form HTTP request against a configured service or a full URL."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     _http_request_envelope(
         config_path,
@@ -341,6 +398,7 @@ def http_request(
         body,
         header,
         timeout,
+        url,
         status,
         contains,
         match,
@@ -432,14 +490,31 @@ def _resolve_ping_request(
     header: tuple[str, ...],
     param: tuple[str, ...],
     timeout: float | None,
+    url: str | None = None,
 ):
-    """Resolve the request components for a ping (template OR free-form).
+    """Resolve the request components for a ping (template, URL, or free-form).
 
     Returns ``(client, method, path, headers, body_dict_or_None)``.
     """
     cfg = load_config_or_raise(config_path)
 
-    if template_name is not None:
+    # --url is mutually exclusive with the template positional and --service/--path.
+    if url is not None and (
+        template_name is not None or service is not None or path is not None
+    ):
+        raise ConfigError(
+            "--url is mutually exclusive with a template name, --service, and --path",
+            {},
+        )
+
+    if url is not None:
+        # URL mode: full request URL, no configured service required.
+        client_base, resolved_path = _split_url(url)
+        resolved_body = json.loads(body) if body is not None else None
+        resolved_headers = _parse_headers(header)
+        resolved_method = method or "GET"
+        service_timeout = None
+    elif template_name is not None:
         if template_name not in cfg.templates:
             raise TemplateNotFound(
                 f"Unknown HTTP template: {template_name}", {"name": template_name}
@@ -469,10 +544,12 @@ def _resolve_ping_request(
 
         resolved_method = method or tpl.method
         svc = cfg.services[tpl.service]
+        client_base = svc.base_url
+        service_timeout = svc.timeout_seconds
     else:
         if not service or not path:
             raise ConfigError(
-                "http ping requires either a template name or --service + --path",
+                "http ping requires a template name, --url, or --service + --path",
                 {},
             )
         if service not in cfg.services:
@@ -483,11 +560,13 @@ def _resolve_ping_request(
         resolved_path = path
         resolved_method = method or "GET"
         svc = cfg.services[service]
+        client_base = svc.base_url
+        service_timeout = svc.timeout_seconds
 
     effective_timeout = resolve_timeout(
-        timeout, svc.timeout_seconds, cfg.defaults.timeout_seconds
+        timeout, service_timeout, cfg.defaults.timeout_seconds
     )
-    client = new_client(svc.base_url, effective_timeout)
+    client = new_client(client_base, effective_timeout)
     return client, resolved_method, resolved_path, resolved_headers, resolved_body
 
 
@@ -508,6 +587,16 @@ def _run_pings(send_one, *, emit_line=_emit_stdout_line, **loop_kwargs):
 
 @click.command("ping")
 @click.argument("template_name", required=False)
+@click.option(
+    "--url",
+    "url",
+    default=None,
+    help=(
+        "Full request URL (e.g. https://host/health). Mutually exclusive with a "
+        "template name, --service, and --path. (--param is template-only: no "
+        "effect in URL mode.)"
+    ),
+)
 @click.option("--service", "service", default=None)
 @click.option("--path", "path", default=None)
 @click.option("--interval", "interval", type=float, required=True, help="Seconds between pings")
@@ -527,6 +616,7 @@ def _run_pings(send_one, *, emit_line=_emit_stdout_line, **loop_kwargs):
 def http_ping(
     ctx: click.Context,
     template_name: str | None,
+    url: str | None,
     service: str | None,
     path: str | None,
     interval: float,
@@ -567,6 +657,7 @@ def http_ping(
             header,
             param,
             timeout,
+            url=url,
         )
     except AgctlError as err:
         # Startup config/template errors (ConfigError, TemplateNotFound) -> structured

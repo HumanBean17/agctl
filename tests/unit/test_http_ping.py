@@ -528,3 +528,169 @@ def test_emit_stdout_line_renders_non_ascii_utf8(capsys):
     assert "пример" in out
     assert "\\u" not in out
     assert json.loads(out)["url"] == "https://пример.рф"
+
+
+# --------------------------------------------------------------------------- #
+# http ping --url mode (free-form URL, no configured service required)
+# --------------------------------------------------------------------------- #
+
+
+def test_http_ping_url_mode_end_to_end(monkeypatch):
+    """--url drives the ping against a full URL; no configured service needed."""
+    captured_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_urls.append(str(request.url))
+        return httpx.Response(200, json={"ok": True})
+
+    http_commands.set_default_transport(httpx.MockTransport(handler))
+    try:
+
+        def fake_ping_loop(send_one, *, emit_line, **kwargs):
+            ping_lines, total_ms = ping_loop(
+                send_one,
+                interval=0,
+                max_pings=2,
+                sleep_fn=NOOP_SLEEP,
+                emit_line=emit_line,
+            )
+            failed = sum(1 for p in ping_lines if not p.get("ok"))
+            return len(ping_lines), failed, total_ms
+
+        monkeypatch.setattr(http_commands, "_run_pings", fake_ping_loop)
+
+        result = _run(
+            [
+                "--config",
+                str(FIXTURE),
+                "http",
+                "ping",
+                "--url",
+                "https://host/health",
+                "--interval",
+                "1",
+                "--duration",
+                "5",
+            ]
+        )
+        lines = [ln for ln in result.output.splitlines() if ln.strip()]
+        ping_lines = [json.loads(ln) for ln in lines[:-1]]
+        summary = json.loads(lines[-1])
+
+        assert result.exit_code == 0
+        assert all(pl["ok"] is True for pl in ping_lines)
+        assert all(pl["status_code"] == 200 for pl in ping_lines)
+        assert summary["total_pings"] == 2
+        assert captured_urls == ["https://host/health", "https://host/health"]
+    finally:
+        http_commands.set_default_transport(None)
+
+
+def test_http_ping_url_mutually_exclusive_with_template(monkeypatch):
+    """--url + a template positional -> ConfigError startup envelope, exit 2."""
+
+    def fake_run_pings(*args, **kwargs):
+        raise AssertionError("should not reach the loop")
+
+    monkeypatch.setattr(http_commands, "_run_pings", fake_run_pings)
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "ping",
+            "get-order",
+            "--url",
+            "https://host/x",
+            "--interval",
+            "1",
+            "--until-stopped",
+        ]
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["ok"] is False
+    assert data["error"]["type"] == "ConfigError"
+
+
+def test_http_ping_url_mutually_exclusive_with_service(monkeypatch):
+    """--url + --service -> ConfigError startup envelope, exit 2."""
+
+    def fake_run_pings(*args, **kwargs):
+        raise AssertionError("should not reach the loop")
+
+    monkeypatch.setattr(http_commands, "_run_pings", fake_run_pings)
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "ping",
+            "--url",
+            "https://host/x",
+            "--service",
+            "order-service",
+            "--interval",
+            "1",
+            "--until-stopped",
+        ]
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["error"]["type"] == "ConfigError"
+
+
+def test_http_ping_url_mutually_exclusive_with_path(monkeypatch):
+    """--url + --path -> ConfigError startup envelope, exit 2."""
+
+    def fake_run_pings(*args, **kwargs):
+        raise AssertionError("should not reach the loop")
+
+    monkeypatch.setattr(http_commands, "_run_pings", fake_run_pings)
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "ping",
+            "--url",
+            "https://host/x",
+            "--path",
+            "/y",
+            "--interval",
+            "1",
+            "--until-stopped",
+        ]
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["error"]["type"] == "ConfigError"
+
+
+def test_http_ping_url_malformed(monkeypatch):
+    """A schemeless --url -> ConfigError startup envelope, exit 2."""
+
+    def fake_run_pings(*args, **kwargs):
+        raise AssertionError("should not reach the loop")
+
+    monkeypatch.setattr(http_commands, "_run_pings", fake_run_pings)
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "http",
+            "ping",
+            "--url",
+            "host/x",
+            "--interval",
+            "1",
+            "--until-stopped",
+        ]
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["error"]["type"] == "ConfigError"

@@ -1,7 +1,7 @@
 # `agctl` — CLI Design Document
 
 **Version:** 0.6-draft  
-**Last updated:** 2026-07-02  
+**Last updated:** 2026-07-06  
 **Status:** Foundation design — hardened; ready for implementation  
 **Change spec:** [`docs/superpowers/specs/2026-07-02-agctl-design-hardening.md`](./superpowers/specs/2026-07-02-agctl-design-hardening.md)
 
@@ -384,13 +384,21 @@ agctl http call create-order \
 
 #### `agctl http request`
 
-Free-form HTTP request — escape hatch for cases not covered by templates.
+Free-form HTTP request — escape hatch for cases not covered by templates. Two mutually-exclusive invocation modes:
+
+- **Service mode** — `--service <name>` + `--path <path>`, resolved against a configured service's base URL.
+- **URL mode** — `--url <full-url>` for a complete request URL with **no service registration required** (the HTTP analog of `db query --sql`). Use this for endpoints not in config: external APIs, ngrok tunnels, ephemeral ports, URLs pulled from logs.
+
+`--url` cannot be combined with `--service` or `--path` (`ConfigError`, exit 2); exactly one mode is required. `${ENV}` interpolation does **not** apply to `--url` — CLI args are never `${}`-interpolated (only YAML values are), so use shell `$VAR` expansion.
 
 ```
 agctl http request
-    --service <name>        # must match a services key in config
-    --method GET|POST|PUT|PATCH|DELETE
-    --path <path>           # e.g. /api/v1/orders/ord-123
+    # --- exactly one mode (mutually exclusive) ---
+    [--service <name>]      # service mode: must match a services key in config
+    [--path <path>]         # service mode: e.g. /api/v1/orders/ord-123
+    [--url <full-url>]      # URL mode: full request URL, e.g. https://host/path?q=1
+    # --- common ---
+    [--method GET|POST|PUT|PATCH|DELETE]   # default: GET
     [--body '{...}']
     [--header key=value]    # repeatable
     [--timeout <seconds>]
@@ -404,13 +412,17 @@ agctl http request
     [--equals <value>]      # expected value for --jq-path (JSON-parsed when valid; strict compare)
 ```
 
-**Example:**
+**Examples:**
 
 ```bash
-agctl http request \
-  --service order-service \
-  --method GET \
-  --path /api/v1/orders/ord-789
+# Service mode (method defaults to GET)
+agctl http request --service order-service --path /api/v1/orders/ord-789
+
+# URL mode — full URL, no service registration needed
+agctl http request --url https://abc123.ngrok.io/api/v1/orders/ord-789
+
+# URL mode with a POST + body
+agctl http request --url https://host/api/v1/orders --method POST --body '{"customer_id":"cust-42"}'
 ```
 
 **Response assertions (`http call` and `http request`):** Optional flags let you assert on the response in the same invocation, with the same exit-code discipline as `kafka assert` / `db assert`. Zero flags (the default) leaves behavior unchanged — a 4xx/5xx response is still `ok:true` (HTTP status is a result, not an assertion). Supplying ≥1 flag enters assertion mode; all active flags must pass (AND). A failed flag raises `AssertionError` (exit 1) with `error.detail = {response, failures}`, where `response` is the full HTTP result and `failures` lists every failing mode (no short-circuit). Each failure entry includes a `root` label and a (size-capped) payload snapshot (e.g. `contains`/`jq-path` failures include `"root": "response body"` + `"body": <response body>`, while `match` failures include `"root": "response envelope"` + `"body": <response body>`) so an agent can self-correct a mis-rooted expression without dropping the flag and re-running raw. The full, untruncated body always remains at `error.detail.response.body`.
@@ -432,7 +444,7 @@ Unlike all other `agt` commands, `agctl http ping` emits one JSON object **per p
 
 ```
 agctl http ping
-    <template-name> | --service <name> --path <path>
+    <template-name> | --service <name> --path <path> | --url <full-url>
     --interval <seconds>           # delay between pings (e.g. 5)
     [--method GET|POST|...]        # default: GET (or template method)
     [--body '{...}']
@@ -1679,6 +1691,10 @@ kill $HEARTBEAT_PID
 
 - **Prefer templates over free-form requests.** Use `agctl http call <template>` unless no
   suitable template exists. Templates encode the correct service, path, and headers.
+- **For endpoints not in config (external APIs, ngrok, ephemeral ports, URLs from logs), use
+  `agctl http request --url <full-url>`** rather than shelling out to `curl` — you keep the
+  JSON envelope, deterministic exit codes, and response assertions. `--url` is mutually
+  exclusive with `--service`/`--path`.
 - **Do not swallow non-zero exit codes.** Treat exit code `1` as a test failure. Stop
   and diagnose before proceeding.
 - **Do not assume service availability.** Run `agctl check ready --all` at the start of
@@ -2221,7 +2237,7 @@ agctl kafka assert   --topic orders.created   --match '.value.payload.customerId
 |---|---|
 | Understand what the system offers | `agctl discover` (levels 0→1→2) |
 | Send a known request type | `agctl http call <template>` |
-| Send an ad-hoc request | `agctl http request --service ... --path ...` |
+| Send an ad-hoc request | `agctl http request --service ... --path ...` (or `--url <full-url>` when no service is configured) |
 | Keep a session alive during a long test | `agctl http ping <template> --interval N --until-stopped` |
 | Verify an event was published | `agctl kafka assert --pattern / --match` |
 | Inspect what was actually published | `agctl kafka consume --match` |

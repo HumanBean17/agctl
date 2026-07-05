@@ -46,7 +46,7 @@ Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`, `moc
 |---|---|
 | What can I do here? | `agctl discover` |
 | Send a known request | `agctl http call <tpl> [--param k=v]…` |
-| Ad-hoc request | `agctl http request --service S --method M --path P` |
+| Ad-hoc request | `agctl http request --service S --path P` or `--url <full-url>` |
 | Assert an HTTP response | `agctl http call <tpl> --status N [--contains '{…}'] [--match '<jq>'] [--jq-path .x --equals v]` |
 | Verify an event was published | `agctl kafka assert --topic T <mode> --timeout N` |
 | See what was published | `agctl kafka consume --topic T [--match <jq>]` |
@@ -70,9 +70,9 @@ Only `--config <path>` is global. `--timeout` is **not** global (see gotchas).
 ```
 agctl http call   <tpl> [--param k=v]… [--body '{…}'] [--header k=v]… [--timeout N]
                     [--status N] [--contains '{…}'] [--match '<jq>'] [--jq-path <jq> --equals <v>]
-agctl http request --service S --method GET|POST|PUT|PATCH|DELETE --path P [--body '{…}'] [--header k=v]…
+agctl http request (--service S --path P | --url <full-url>) [--method GET|POST|PUT|PATCH|DELETE] [--body '{…}'] [--header k=v]…
                     [--status N] [--contains '{…}'] [--match '<jq>'] [--jq-path <jq> --equals <v>]
-agctl http ping   [<tpl> | --service S --path P] --interval N [--duration N | --until-stopped]   # streams NDJSON; background it
+agctl http ping   [<tpl> | --service S --path P | --url <full-url>] --interval N [--duration N | --until-stopped]   # streams NDJSON; background it
 
 agctl kafka assert [--topic T] <mode> [--param k=v]… [--path <jq>] --timeout N [--from-beginning]
 agctl kafka consume --topic T [--timeout N] [--match '<jq>'] [--expect-count N] [--from-beginning]
@@ -336,6 +336,9 @@ agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001 
   --status 201 --match '.body.order_id != null' --contains '{"status": "PENDING"}'
 # Type-aware value equality via jq path (0 ≠ "0"; pairing needs both flags)
 agctl http call get-order --param order_id=ord-789 --jq-path '.status' --equals '"CONFIRMED"'
+
+# Ad-hoc request to a URL not in config (no service registration needed)
+agctl http request --url https://abc123.ngrok.io/api/v1/orders/ord-789
 
 # E2E: thread an ID through HTTP → Kafka → DB
 OID=$(agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001 | jq -r '.result.body.order_id')
