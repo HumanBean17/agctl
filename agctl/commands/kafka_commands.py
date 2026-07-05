@@ -186,7 +186,7 @@ def _kafka_consume_core(
     predicate = None
     if match_expr is not None:
         def predicate(msg, _expr=match_expr):
-            return jq_bool(msg["value"], _expr)
+            return jq_bool(msg, _expr)
 
     client = new_kafka_client(cfg.kafka, group_id=group)
     matched = client.consume_window(
@@ -281,9 +281,10 @@ def _build_assert_predicate(
 ) -> Callable[[dict], bool]:
     """Build a single predicate combining all supplied assertion modes.
 
-    ALL active modes must pass for a message to match. Modes referencing
-    ``msg["value"]`` degrade gracefully when the value is not a dict (jq/subset
-    return False).
+    ALL active modes must pass for a message to match. ``--contains``/``--path``
+    reference ``msg["value"]`` and degrade gracefully when the value is not a dict
+    (jq/subset return False); ``--match``/``--pattern`` reference the whole ``msg``
+    (always a dict).
     """
     needle = json.loads(contains) if contains is not None else None
     filled_pattern_match = None
@@ -302,11 +303,11 @@ def _build_assert_predicate(
                 return False
         # --match mode
         if match is not None:
-            if not jq_bool(value, match):
+            if not jq_bool(msg, match):
                 return False
         # --pattern mode
         if filled_pattern_match is not None:
-            if not jq_bool(value, filled_pattern_match):
+            if not jq_bool(msg, filled_pattern_match):
                 return False
         return True
 
