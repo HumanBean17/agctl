@@ -1016,3 +1016,68 @@ class TestCapture:
             assert response.json() == {"n": "42"}
         finally:
             server.shutdown()
+
+
+class TestMatchAndCaptureShareEnvelopeRoot:
+    """Acceptance tests for #22: match and capture share one `.` root."""
+
+    def test_match_and_capture_share_envelope_root_http(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """Acceptance test for #22: match and capture share one `.` root.
+
+        A single stub carries BOTH ``match.jq='.body.amount > 1000'`` AND
+        ``capture.amt.from='.body.amount'``, with a response body that renders
+        the captured value. POST ``{"amount": 2000}`` -> 200, ``http.hit``, and
+        the body echoes ``"2000"`` -- proving ``match`` (``.body.amount``) and
+        ``capture`` (``.body.amount``) resolved against the SAME request
+        envelope. POST ``{"amount": 500}`` -> 404 (match fails; capture never
+        reached).
+
+        Under the pre-#22 payload-rooted ``match``, ``.body.amount`` would
+        resolve against the body as ``body.body.amount`` -> ``null``, so the
+        2000 case would NOT match and no capture/render could occur -- the echo
+        would be impossible.
+        """
+        stubs = {
+            "echo-big": HttpStub(
+                method="POST",
+                path="/echo",
+                match=HttpMatch(jq=".body.amount > 1000"),
+                capture={"amt": CaptureSpec.model_validate({"from": ".body.amount"})},
+                response=HttpResponse(status=200, body={"echo": "{amt}"}),
+            )
+        }
+        server = start_server(stubs, emit_event)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                r_high = client.post(
+                    f"http://127.0.0.1:{port}/echo",
+                    json={"amount": 2000},
+                )
+                r_low = client.post(
+                    f"http://127.0.0.1:{port}/echo",
+                    json={"amount": 500},
+                )
+
+            # Match + capture share the root: 2000 matches AND its amount is
+            # captured+rendered (proves both .body.amount sites agree).
+            assert r_high.status_code == 200
+            assert r_high.json() == {"echo": "2000"}
+
+            # 500 fails the match -> 404, capture never reached.
+            assert r_low.status_code == 404
+            assert r_low.json() == {"mock_error": "no matching stub"}
+
+            hit_events = [e for e in event_sink if e["event"] == "http.hit"]
+            unmatched_events = [
+                e for e in event_sink if e["event"] == "http.unmatched"
+            ]
+            assert len(hit_events) == 1
+            assert hit_events[0]["stub"] == "echo-big"
+            assert hit_events[0]["status"] == 200
+            assert len(unmatched_events) == 1
+            assert unmatched_events[0]["status"] == 404
+        finally:
+            server.shutdown()
