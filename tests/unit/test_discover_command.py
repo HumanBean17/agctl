@@ -536,3 +536,47 @@ def test_item_mock_http_stub_with_capture(tmp_path, monkeypatch):
     res = _payload(result)["result"]
     assert res["name"] == "echo-ctx"
     assert res["capture"] == {"ctx": {"from": ".body.ctx", "type": "object"}}
+
+
+_IPV6_CONFIG = (
+    'version: "2"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+    "mocks:\n"
+    "  http:\n"
+    '    listen: "[::1]:19090"\n'
+    "    stubs:\n"
+    "      ping:\n"
+    "        method: GET\n"
+    "        path: /ping\n"
+    "        response:\n"
+    "          status: 204\n"
+)
+
+
+def test_item_mock_http_stub_ipv6_listen(tmp_path, monkeypatch):
+    """A bracketed IPv6 listen address yields a valid bracketed example URL."""
+    result = _run_with(
+        ["--category", "mock-http-stubs", "--name", "ping"],
+        _IPV6_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["example"] == "curl -i -X GET http://[::1]:19090/ping"
+
+
+def test_item_mock_http_stub_ipv6_wildcard_normalized(tmp_path, monkeypatch):
+    """The IPv6 wildcard ``[::]`` is normalized to localhost, mirroring ``0.0.0.0``."""
+    config_yaml = _IPV6_CONFIG.replace('listen: "[::1]:19090"', 'listen: "[::]:19090"')
+    result = _run_with(
+        ["--category", "mock-http-stubs", "--name", "ping"],
+        config_yaml,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["example"] == "curl -i -X GET http://localhost:19090/ping"

@@ -26,6 +26,7 @@ from typing import Any
 import click
 
 from ..command import envelope, load_config_or_raise
+from ..config.models import parse_listen
 from ..errors import ConfigError, TemplateNotFound
 
 __all__ = ["discover"]
@@ -165,12 +166,14 @@ def _mock_http_listen(cfg) -> str:
 
 
 def _mock_http_example(stub, listen: str) -> str:
-    # Normalize the wildcard bind to localhost so the URL is copy-pasteable.
-    host, sep, port = listen.partition(":")
+    # Parse with the canonical parser (handles ``[ipv6]:port``) and normalize a
+    # wildcard bind — IPv4 ``0.0.0.0`` or IPv6 ``::`` — to localhost so the URL
+    # is copy-pasteable. IPv6 hosts are re-bracketed for a valid URL.
+    host, port = parse_listen(listen)
     if host in ("0.0.0.0", "::", ""):
         host = "localhost"
-    url = f"http://{host}{sep}{port}{stub.path}" if sep else f"http://{host}{stub.path}"
-    return f"curl -i -X {stub.method} {url}"
+    bracketed = f"[{host}]" if ":" in host else host
+    return f"curl -i -X {stub.method} http://{bracketed}:{port}{stub.path}"
 
 
 def _mock_kafka_example(reactor) -> str:
