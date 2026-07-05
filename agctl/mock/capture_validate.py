@@ -19,9 +19,9 @@ Placement rule for an ``object``-typed name ``N`` (per stub/reactor):
   - (c) any ``reaction.headers`` value is or contains ``"{N}"`` (Kafka only).
 - ``scalar``/``json``-typed names are NEVER flagged.
 
-Pure Python: imports only :mod:`config.models` and the placeholder regex from
-:mod:`resolution` — no jq, no ``assertions`` dependency. That keeps ``config/*``
-free of an assertions dependency when ``config_commands.py`` calls this.
+Pure Python: imports only :mod:`config.models` and inlines a placeholder regex
+(no :mod:`resolution` import) — no jq, no ``assertions`` dependency. That keeps
+``config/*`` free of an assertions dependency when ``config_commands.py`` calls this.
 """
 
 from __future__ import annotations
