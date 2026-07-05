@@ -295,3 +295,161 @@ class TestResolveTarget:
 
         assert len(result) == 2
         assert {r.port for r in result} == {18080, 18081}
+
+
+class TestTaxonomyConstants:
+    """Tests for failure-event taxonomy constants."""
+
+    def test_fatal_failure_events_has_exact_four_names(self):
+        """FATAL_FAILURE_EVENTS contains exactly the four fatal names."""
+        from agctl.mock.daemon import FATAL_FAILURE_EVENTS
+
+        assert FATAL_FAILURE_EVENTS == {
+            "http.unmatched",
+            "http.body_parse_skipped",
+            "kafka.skipped",
+            "kafka.error",
+        }
+
+    def test_all_failure_events_includes_capture_missing(self):
+        """ALL_FAILURE_EVENTS equals the four plus capture.missing."""
+        from agctl.mock.daemon import ALL_FAILURE_EVENTS, FATAL_FAILURE_EVENTS
+
+        expected = FATAL_FAILURE_EVENTS | {"capture.missing"}
+        assert ALL_FAILURE_EVENTS == expected
+
+
+class TestParseLog:
+    """Tests for parse_log NDJSON parser."""
+
+    def test_parse_log_happy_path(self, tmp_path):
+        """parse_log reads started, events, summary correctly."""
+        log_file = tmp_path / "test.log"
+
+        # Write NDJSON log lines
+        lines = [
+            '{"event":"started","http":{"listen":"0.0.0.0:18080","stubs":2},"kafka":null}',
+            '{"event":"http.hit","method":"GET","path":"/"}',
+            '{"event":"http.unmatched","method":"POST","path":"/unknown"}',
+            '{"event":"kafka.error","message":"delivery failed"}',
+            '{"event":"capture.missing","type":"http","key":"req"}',
+            '{"event":"summary","http_hits":1,"http_unmatched":1,"http_body_parse_skipped":0,"kafka_reactions":0,"kafka_skipped":0,"kafka_errors":1,"duration_ms":500}',
+        ]
+        log_file.write_text("\n".join(lines))
+
+        from agctl.mock.daemon import parse_log
+
+        parsed = parse_log(log_file)
+
+        # Check started
+        assert parsed.started == {
+            "event": "started",
+            "http": {"listen": "0.0.0.0:18080", "stubs": 2},
+            "kafka": None,
+        }
+
+        # Check summary
+        assert parsed.summary == {
+            "event": "summary",
+            "http_hits": 1,
+            "http_unmatched": 1,
+            "http_body_parse_skipped": 0,
+            "kafka_reactions": 0,
+            "kafka_skipped": 0,
+            "kafka_errors": 1,
+            "duration_ms": 500,
+        }
+
+        # Check summary_so_far
+        assert parsed.summary_so_far == {
+            "http_hits": 1,
+            "http_unmatched": 1,
+            "http_body_parse_skipped": 0,
+            "kafka_reactions": 0,
+            "kafka_skipped": 0,
+            "kafka_errors": 1,
+        }
+
+        # Check failures - should have 3 entries (unmatched, kafka.error, capture.missing)
+        assert len(parsed.failures) == 3
+        assert parsed.failures[0]["event"] == "http.unmatched"
+        assert parsed.failures[1]["event"] == "kafka.error"
+        assert parsed.failures[2]["event"] == "capture.missing"
+
+    def test_parse_log_startup_error_path(self, tmp_path):
+        """parse_log handles startup-error envelope (no event key)."""
+        log_file = tmp_path / "startup-error.log"
+
+        # Write a startup-error envelope (no "event" key)
+        line = '{"ok":false,"command":"mock.run","error":{"type":"ConfigError","message":"bad"}}'
+        log_file.write_text(line)
+
+        from agctl.mock.daemon import parse_log
+
+        parsed = parse_log(log_file)
+
+        # Should have startup_error set
+        assert parsed.startup_error == {
+            "ok": False,
+            "command": "mock.run",
+            "error": {"type": "ConfigError", "message": "bad"},
+        }
+
+        # Nothing else should be set
+        assert parsed.started is None
+        assert parsed.summary is None
+        assert parsed.failures == []
+
+    def test_parse_log_missing_file_returns_empty_parsed_log(self, tmp_path):
+        """parse_log on non-existent path returns empty ParsedLog."""
+        from agctl.mock.daemon import parse_log
+
+        parsed = parse_log(tmp_path / "does-not-exist.log")
+
+        assert parsed.started is None
+        assert parsed.startup_error is None
+        assert parsed.summary is None
+        assert parsed.summary_so_far == {
+            "http_hits": 0,
+            "http_unmatched": 0,
+            "http_body_parse_skipped": 0,
+            "kafka_reactions": 0,
+            "kafka_skipped": 0,
+            "kafka_errors": 0,
+        }
+        assert parsed.failures == []
+
+
+class TestHasFatalFailure:
+    """Tests for has_fatal_failure."""
+
+    def test_has_fatal_failure_with_only_capture_missing_returns_false(self):
+        """Only capture.missing (non-fatal) returns False."""
+        from agctl.mock.daemon import ParsedLog, has_fatal_failure
+
+        parsed = ParsedLog(
+            started=None,
+            startup_error=None,
+            summary=None,
+            summary_so_far={},
+            failures=[{"event": "capture.missing", "type": "http"}],
+        )
+
+        assert has_fatal_failure(parsed) is False
+
+    def test_has_fatal_failure_with_http_unmatched_returns_true(self):
+        """Adding http.unmatched (fatal) returns True."""
+        from agctl.mock.daemon import ParsedLog, has_fatal_failure
+
+        parsed = ParsedLog(
+            started=None,
+            startup_error=None,
+            summary=None,
+            summary_so_far={},
+            failures=[
+                {"event": "capture.missing", "type": "http"},
+                {"event": "http.unmatched", "method": "POST"},
+            ],
+        )
+
+        assert has_fatal_failure(parsed) is True

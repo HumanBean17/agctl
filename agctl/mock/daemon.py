@@ -237,3 +237,145 @@ def resolve_target(
         "multiple mocks running; specify --listen or --pid",
         {"candidates": [r.listen for r in candidates]},
     )
+
+
+# ----------------------------------------------------------------------------
+# NDJSON log parser and failure taxonomy (Task 3)
+# ----------------------------------------------------------------------------
+
+FATAL_FAILURE_EVENTS: frozenset[str] = frozenset(
+    {
+        "http.unmatched",
+        "http.body_parse_skipped",
+        "kafka.skipped",
+        "kafka.error",
+    }
+)
+
+ALL_FAILURE_EVENTS: frozenset[str] = FATAL_FAILURE_EVENTS | {"capture.missing"}
+
+EVENT_TO_COUNTER: dict[str, str] = {
+    "http.hit": "http_hits",
+    "http.unmatched": "http_unmatched",
+    "http.body_parse_skipped": "http_body_parse_skipped",
+    "kafka.reacted": "kafka_reactions",
+    "kafka.skipped": "kafka_skipped",
+    "kafka.error": "kafka_errors",
+}
+
+
+@dataclass
+class ParsedLog:
+    """Parsed NDJSON log from a mock daemon.
+
+    Attributes:
+        started: The "started" event object, if present.
+        startup_error: The startup-error envelope (ok=false), if present.
+        summary: The "summary" event object, if present.
+        summary_so_far: Counter increments accumulated during parsing.
+        failures: List of all failure events in order of appearance.
+    """
+
+    started: dict[str, Any] | None
+    startup_error: dict[str, Any] | None
+    summary: dict[str, Any] | None
+    summary_so_far: dict[str, int]
+    failures: list[dict[str, Any]]
+
+
+def parse_log(path: Path) -> ParsedLog:
+    """Read and parse an NDJSON log file from a mock daemon.
+
+    Args:
+        path: Path to the log file (may not exist).
+
+    Returns:
+        A ParsedLog with started, startup_error, summary, summary_so_far,
+        and failures populated from the log lines.
+    """
+    started: dict[str, Any] | None = None
+    startup_error: dict[str, Any] | None = None
+    summary: dict[str, Any] | None = None
+    failures: list[dict[str, Any]] = []
+
+    # Initialize summary_so_far with all counters at zero
+    summary_so_far = {field: 0 for field in EVENT_TO_COUNTER.values()}
+
+    # Return empty ParsedLog if file doesn't exist
+    if not path.exists():
+        return ParsedLog(
+            started=started,
+            startup_error=startup_error,
+            summary=summary,
+            summary_so_far=summary_so_far,
+            failures=failures,
+        )
+
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        # File exists but is unreadable
+        return ParsedLog(
+            started=started,
+            startup_error=startup_error,
+            summary=summary,
+            summary_so_far=summary_so_far,
+            failures=failures,
+        )
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            # Skip unparseable lines silently
+            continue
+
+        # Check if this is an event line
+        if "event" in obj:
+            event = obj["event"]
+
+            # Handle specific event types
+            if event == "started":
+                started = obj
+            elif event == "summary":
+                summary = obj
+            elif event in ALL_FAILURE_EVENTS:
+                failures.append(obj)
+
+            # Update summary_so_far if this event maps to a counter
+            if event in EVENT_TO_COUNTER:
+                counter_field = EVENT_TO_COUNTER[event]
+                summary_so_far[counter_field] += 1
+
+        else:
+            # No "event" key — check for startup-error envelope
+            if obj.get("ok") is False:
+                startup_error = obj
+
+    return ParsedLog(
+        started=started,
+        startup_error=startup_error,
+        summary=summary,
+        summary_so_far=summary_so_far,
+        failures=failures,
+    )
+
+
+def has_fatal_failure(parsed: ParsedLog) -> bool:
+    """Check if a parsed log contains any fatal failure events.
+
+    Args:
+        parsed: A ParsedLog instance.
+
+    Returns:
+        True if any entry in parsed.failures has an event in FATAL_FAILURE_EVENTS.
+    """
+    for failure in parsed.failures:
+        event = failure.get("event")
+        if event in FATAL_FAILURE_EVENTS:
+            return True
+    return False
