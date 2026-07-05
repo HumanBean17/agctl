@@ -19,19 +19,23 @@ one-directional (``cli → config_commands``) and avoids a circular import.
 from __future__ import annotations
 
 import importlib.resources
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 import click
+import yaml
 
 from ..config import ConfigError, load_config
+from ..config.loader import discover_config_path
+from ..config.migrate import migrate_match_exprs
 from ..config.validator import validate_config
 from ..mock.capture_validate import collect_capture_placement_errors
 from ..mock.jq_precompile import collect_jq_compile_errors
 from ..output import emit
 
-__all__ = ["config_init", "config_validate", "config_show", "set_plugins_provider"]
+__all__ = ["config_init", "config_validate", "config_show", "config_migrate", "set_plugins_provider"]
 
 # --- masking ---------------------------------------------------------------
 
@@ -260,3 +264,59 @@ def config_init(ctx: click.Context, output: str | None, force: bool) -> None:
         },
         duration_ms=_ms(start),
     )
+
+
+# --- config migrate --------------------------------------------------------
+
+#: Fixed operator-facing reminder that CLI ``--match`` flags are NOT rewritten
+#: by ``agctl config migrate`` (the migration only walks the config file).
+#: Shell scripts and agent prompts that pass ``--match`` to ``agctl http`` /
+#: ``agctl kafka`` / ``agctl mock run`` must be prefixed manually.
+_CLI_FLAGS_NOTE = (
+    "CLI --match flags passed to `agctl http`, `agctl kafka`, or "
+    "`agctl mock run` in shell scripts or agent prompts are NOT rewritten "
+    "by this command and must be prefixed manually: `.body | ` for HTTP, "
+    "`.value | ` for Kafka."
+)
+
+
+@click.command("migrate")
+@click.option("--config", "config_path", default=None)
+@click.option("--dry-run", is_flag=True, default=False, help="Preview; do not write.")
+@click.pass_context
+def config_migrate(
+    ctx: click.Context, config_path: str | None, dry_run: bool
+) -> None:
+    """Rewrite a v1 agctl.yaml to dialect \"2\" (envelope-rooted match exprs).
+
+    Backs up the original to ``<path>.bak`` and writes the rewritten config
+    back to ``<path>``. With ``--dry-run`` the rewrite is reported but nothing
+    is written. A config already at dialect \"2\" is a clean no-op.
+    """
+    start = time.monotonic()
+    explicit = config_path or ctx.obj.get("config_path")
+    try:
+        path = discover_config_path(explicit=explicit, env=os.environ)
+        raw = path.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(raw) or {}
+    except ConfigError as err:
+        _emit_config_error("config.migrate", err, start)
+        raise SystemExit(2)
+    result = migrate_match_exprs(parsed)
+    base_result = {
+        "path": str(path),
+        "already_v2": result.already_v2,
+        "from_version": result.from_version,
+        "to_version": result.to_version,
+        "rewritten": result.rewrites,
+        "cli_flags_note": _CLI_FLAGS_NOTE,
+    }
+    # Write only when migrating for real (not already_v2, not --dry-run).
+    if not result.already_v2 and not dry_run:
+        backup = path.with_suffix(path.suffix + ".bak")
+        backup.write_text(raw, encoding="utf-8")
+        path.write_text(
+            yaml.safe_dump(result.config, sort_keys=False, default_flow_style=False),
+            encoding="utf-8",
+        )
+    emit(ok=True, command="config.migrate", result=base_result, duration_ms=_ms(start))

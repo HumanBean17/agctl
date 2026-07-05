@@ -16,6 +16,7 @@ import click
 from .commands.check_commands import check_ready
 from .commands.config_commands import (
     config_init,
+    config_migrate,
     config_show,
     config_validate,
     set_plugins_provider,
@@ -130,6 +131,7 @@ def mock_group() -> None:
 config_group.add_command(config_validate)
 config_group.add_command(config_show)
 config_group.add_command(config_init)
+config_group.add_command(config_migrate)
 
 # Register subcommands on the http group.
 http_group.add_command(http_call)
