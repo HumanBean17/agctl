@@ -657,6 +657,41 @@ def test_kafka_assert_no_match_is_assertion_error(install_fake):
     assert payload["error"]["detail"]["messages_scanned"] >= 1
 
 
+def test_kafka_assert_no_match_modes_echo_path_narrowing_contains(install_fake):
+    """When --path narrows --contains, the no-match detail must surface that path
+    (and that --contains still roots at the message value) so the agent can see
+    the exact target it AND-ed on."""
+    install_fake([_msg("t", {"payload": {"event": "Y"}}, "k1")])
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "kafka",
+            "assert",
+            "--topic",
+            "t",
+            "--contains",
+            '{"event": "X"}',
+            "--path",
+            ".payload",
+            "--lookback",
+            "10",
+            "--timeout",
+            "0.02",
+        ]
+    )
+    payload = _payload(result)
+    assert result.exit_code == 1
+    assert payload["error"]["detail"]["modes"] == [
+        {
+            "mode": "contains",
+            "root": "message value",
+            "needle": {"event": "X"},
+            "path": ".payload",
+        }
+    ]
+
+
 def test_kafka_assert_pattern_fills_placeholder_and_infers_topic(install_fake):
     # Pattern order-created: match on eventType==ORDER_CREATED and
     # .payload.orderId=="{orderId}" -> fill orderId=o9; topic orders.created.

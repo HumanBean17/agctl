@@ -579,8 +579,11 @@ payload field (`"body"`, `"row"`, `"rows"`, or `"modes"`) carries the actual
 data evaluated against. Root-per-mode mapping:
 
 - **HTTP** (`assertions.py::evaluate_http_assertions`):
-  - `--match` failures → `"root": "response envelope"` + `"body": <result["body"]>`
-  - `--contains` / `--jq-path` failures → `"root": "response body"` + `"body": <result["body"]>`
+  - `--match` failures → `"root": "response envelope"` + `"body": <response body snapshot>`
+  - `--contains` / `--jq-path` failures → `"root": "response body"` + `"body": <response body snapshot>`
+  - The `body` snapshot is size-capped via `_response_body_snapshot` (~4 KB; the
+    full body always remains at `detail.response.body`) so a multi-mode failure
+    can't duplicate a large body once per entry.
   - `--status` unchanged (no root label)
 
 - **DB** (`db_commands.py::_db_assert_core`):

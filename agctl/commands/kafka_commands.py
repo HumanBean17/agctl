@@ -278,11 +278,10 @@ _kafka_consume_envelope = envelope("kafka.consume")(_kafka_consume_core)
 
 def _build_assert_predicate(
     *,
-    contains: str | None,
+    needle: dict | list | None,
     match: str | None,
     path: str | None,
-    pattern_match: str | None,
-    params: dict[str, str],
+    filled_pattern_match: str | None,
 ) -> Callable[[dict], bool]:
     """Build a single predicate combining all supplied assertion modes.
 
@@ -290,12 +289,11 @@ def _build_assert_predicate(
     reference ``msg["value"]`` and degrade gracefully when the value is not a dict
     (jq/subset return False); ``--match``/``--pattern`` reference the whole ``msg``
     (always a dict).
-    """
-    needle = json.loads(contains) if contains is not None else None
-    filled_pattern_match = None
-    if pattern_match is not None:
-        filled_pattern_match = fill_placeholders(pattern_match, params)
 
+    Takes the already-parsed ``needle`` (``--contains``) and the already-filled
+    ``filled_pattern_match`` (``--pattern``) so the no-match failure detail can
+    echo the SAME values without re-parsing — see :func:`_kafka_assert_core`.
+    """
     def predicate(msg: dict) -> bool:
         value = msg.get("value")
         # --contains mode
@@ -404,12 +402,19 @@ def _kafka_assert_core(
         )
         return _run_kafka_custom_assertion(assertion, inferred_topic, messages, params)
 
+    # Parse --contains / fill --pattern ONCE here so the predicate and the
+    # no-match failure detail share one source of truth (no double json.loads,
+    # and the detail echoes the exact expr that was evaluated, params filled).
+    needle = json.loads(contains) if contains is not None else None
+    filled_pattern_match = (
+        fill_placeholders(pattern_match, params) if pattern_match is not None else None
+    )
+
     predicate = _build_assert_predicate(
-        contains=contains,
+        needle=needle,
         match=match,
         path=path,
-        pattern_match=pattern_match,
-        params=params,
+        filled_pattern_match=filled_pattern_match,
     )
 
     client = new_kafka_client(cfg.kafka, group_id=group)
@@ -424,20 +429,32 @@ def _kafka_assert_core(
     elapsed_ms = int((time.monotonic() - start) * 1000)
 
     if matched is None:
-        # Echo the active assertion modes with their jq roots so a "no match"
-        # is self-debugging: the agent sees which modes were AND-ed and that
+        # Echo the active modes with their jq roots so a "no match" is
+        # self-debugging: the agent sees which modes were AND-ed and that
         # --match/--pattern root at the message envelope while --contains/--path
-        # root at the message value (no need to drop the flag and re-run consume).
+        # root at the message value. A per-message ``value`` snapshot is
+        # deliberately OMITTED here — on a no-match there is no single
+        # representative message to show; the agent runs ``kafka consume`` to
+        # inspect the window. (Plan deviation from "value for kafka", confirmed
+        # intentional: the modes list is the actual diagnostic.)
         modes = []
-        if contains is not None:
-            entry = {"mode": "contains", "root": "message value", "needle": json.loads(contains)}
+        if needle is not None:
+            entry = {"mode": "contains", "root": "message value", "needle": needle}
             if path is not None:
                 entry["path"] = path
             modes.append(entry)
         if match is not None:
             modes.append({"mode": "match", "root": "message envelope", "expr": match})
         if pattern is not None:
-            modes.append({"mode": "pattern", "root": "message envelope", "pattern": pattern})
+            # name for discovery + the filled expr that was actually evaluated
+            modes.append(
+                {
+                    "mode": "pattern",
+                    "root": "message envelope",
+                    "pattern": pattern,
+                    "expr": filled_pattern_match,
+                }
+            )
         raise AssertionFailure(
             f"No matching message within {resolved_timeout}s window",
             {

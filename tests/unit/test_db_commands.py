@@ -264,6 +264,34 @@ def test_db_assert_expect_rows_fail(install_fake):
     assert payload["error"]["detail"]["actual"] == 0
 
 
+def test_db_assert_expect_rows_fail_echoes_capped_rows_sample(install_fake):
+    """A count mismatch with non-empty results echoes a CAPPED rows sample
+    (first 5) so the agent can see what the query returned; `actual` holds the
+    true count."""
+    rows = [{"id": i} for i in range(8)]  # 8 rows, expect 3 -> fail
+    install_fake(rows)
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "db",
+            "assert",
+            "--sql",
+            "SELECT id FROM t",
+            "--expect-rows",
+            "3",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 1
+    detail = payload["error"]["detail"]
+    assert detail["expected"] == 3
+    assert detail["actual"] == 8
+    # capped to the first 5 — NOT all 8
+    assert detail["rows"] == [{"id": i} for i in range(5)]
+
+
 # --------------------------------------------------------------------------- #
 # db assert — expect-value
 # --------------------------------------------------------------------------- #

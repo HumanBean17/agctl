@@ -717,3 +717,41 @@ def test_evaluate_match_wrong_root_self_documents_envelope_and_body():
     assert failure["result"] is False
     assert failure["root"] == "response envelope"
     assert failure["body"] == {"data": {"operator": "ACME"}}
+
+
+def test_evaluate_non_json_body_match_failure_echoes_string_body():
+    """A non-dict (string) response body is a real path (non-JSON 200). A failed
+    --match must still carry root + the body snapshot (the raw string) safely."""
+    from agctl.errors import AssertionFailure
+
+    body_string_result = {**RESULT, "body": "not-json"}
+    with pytest.raises(AssertionFailure) as exc_info:
+        evaluate_http_assertions(
+            body_string_result,
+            status=None,
+            contains=None,
+            match=".body.data.operator != null",
+            jq_path=None,
+            equals=None,
+        )
+    failure = exc_info.value.detail["failures"][0]
+    assert failure["mode"] == "match"
+    assert failure["root"] == "response envelope"
+    assert failure["body"] == "not-json"  # snapshot passes small values through
+
+
+def test_response_body_snapshot_truncates_large_payload():
+    """A large response body must not be duplicated verbatim into every failing
+    mode entry (context bloat). The snapshot collapses to a truncation marker
+    pointing at the full body in detail.response.body."""
+    from agctl.assertions import _response_body_snapshot, _DETAIL_SNAPSHOT_LIMIT
+
+    small = {"status": "PENDING"}
+    assert _response_body_snapshot(small) is small  # pass-through
+
+    # A body whose JSON form exceeds the limit collapses to a marker.
+    huge = {"blob": "x" * (_DETAIL_SNAPSHOT_LIMIT + 200)}
+    snap = _response_body_snapshot(huge)
+    assert snap["_truncated"] is True
+    assert snap["full_in"] == "error.detail.response.body"
+    assert len(snap["preview"]) == _DETAIL_SNAPSHOT_LIMIT
