@@ -220,3 +220,13 @@ def test_mock_run_help_exits_zero():
     assert "--http-listen" in result.output
     assert "--duration" in result.output
     assert "--until-stopped" in result.output
+
+
+def test_version_flag():
+    """--version prints 'agctl <version>' and exits 0 (DESIGN: CLI plumbing)."""
+    from agctl import __version__
+
+    result = CliRunner().invoke(cli, ["--version"])
+    assert result.exit_code == 0
+    assert __version__ in result.output
+    assert result.output.strip().startswith("agctl ")

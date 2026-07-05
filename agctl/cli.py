@@ -13,6 +13,7 @@ from typing import Any
 
 import click
 
+from . import __version__
 from .commands.check_commands import check_ready
 from .commands.config_commands import (
     config_init,
@@ -89,6 +90,7 @@ def _load_plugins(cli_group: click.Group) -> None:
 
 
 @click.group()
+@click.version_option(version=__version__, message="agctl %(version)s")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
 @click.pass_context
 def cli(ctx: click.Context, config_path: str | None) -> None:
