@@ -116,8 +116,9 @@ agctl/
 │   ├── http_commands.py        # http call / request / ping
 │   ├── kafka_commands.py       # kafka produce / consume / assert
 │   ├── db_commands.py          # db query / assert / execute / schema
+│   ├── logs_commands.py        # logs query / assert / tail
 │   ├── check_commands.py       # check ready
-│   ├── config_commands.py      # config validate / show / init
+│   ├── config_commands.py      # config validate / show / init / migrate
 │   ├── discover_commands.py    # discover summary / category / item / search
 │   └── mock_commands.py        # mock run / start / stop / status (HTTP mock + Kafka reactors)
 ├── mock/                       # mock server implementation (HTTP + Kafka)
@@ -136,7 +137,10 @@ agctl/
     ├── kafka_client.py         # confluent-kafka wrapper (lazy import)
     ├── db_client.py            # driver dispatch via agctl.db_drivers entry points
     ├── db_driver_protocol.py   # DBDriver Protocol
-    └── db_drivers/postgresql.py  # built-in psycopg driver (lazy import)
+    ├── db_drivers/postgresql.py  # built-in psycopg driver (lazy import)
+    ├── log_client.py           # log backend dispatch via agctl.logs_backends entry points
+    ├── log_backend_protocol.py # LogBackend Protocol + CanonicalEntry DTOs
+    └── log_backends/ndjson_file.py  # built-in NDJSON file backend (lazy import)
 ```
 
 > DESIGN §7's structure sketch predates several modules; §14 lists the deltas.
@@ -338,6 +342,14 @@ results as they happen, so it violates "one object per invocation":
 - Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary, http_hits, http_unmatched, http_body_parse_skipped, kafka_reactions, kafka_skipped, kafka_errors, duration_ms}` and exits `0` (clean, no runtime errors) or `1` (runtime errors occurred, or `--fail-fast` triggered).
 - Startup errors emit a single structured envelope **before** any event line.
 
+**The third streaming exception — `logs tail`.** Like `http ping`, the log tail command must stream entries as they appear:
+
+- Not wrapped by `@envelope`.
+- Emits one JSON object **per matching entry** (canonical entry model) directly as the loop runs.
+- Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary:true, total_emitted, duration_ms}` and exits `0`.
+- Supports `--duration` (daemon timer) and `--until-stopped` (signal-only) modes, mutually exclusive.
+- Startup errors emit a single structured envelope **before** any entry line.
+
 **The managed daemon commands — `mock start`/`stop`/`status`** are NOT streaming exceptions. Each is a normal `@envelope`-wrapped command that emits exactly one JSON object and exits 0/1/2:
 
 - `mock start` blocks until the daemon's `started` line appears in the log (or a startup error or timeout), then returns the `mock.start` envelope (`ok:true` with pid/listen/log_path/stubs/reactors/started_at).
@@ -469,6 +481,23 @@ command layer (`_kafka_ssl_conf`).
   argument validation (e.g. `subscribe` rejects an explicit `None` for
   `on_assign`/`on_revoke`; `store_offsets` — plural — is the only offset-store
   method). Keep the fakes honest against the real binding or regressions hide.
+
+### LogClient + backend (`clients/log_client.py`, `clients/log_backends/ndjson_file.py`)
+
+`LogClient` dispatches to a `LogBackend` selected by the source's `type`: discovery merges entry points (`agctl.logs_backends`, §10) over the always-present built-in `{"file": NdjsonFileBackend}`; broken third-party backends are skipped. The client delegates `scan`/`await_one`/`follow`/`sample_schema` and exposes DI seams (`backend`/`backends`).
+
+`NdjsonFileBackend` lazy-imports `jq` in `scan`/`await_one`/`follow` (missing → `ConfigError`, `logs` extra). The backend reads NDJSON files in logstash format (one JSON object per line), normalizes to the canonical entry model, and applies client-side filters (level, logger glob, message substring, jq predicate). It supports three operations:
+
+- **`scan`** — reads the last `tail_lines` from the file, applies time bounds and filters, returns up to `limit` matches with truncation flag.
+- **`await_one`** — blocks until a matching entry appears or timeout; supports one-shot mode (timeout ≤ 0) and poll mode (timeout > 0).
+- **`follow`** — streams matching entries indefinitely until stop event, handles file truncation/rollover by resetting offset to 0.
+- **`sample_schema`** — infers field presence patterns from a sample of entries (standard slots like `timestamp`/`level`/`logger`, conditional slots like `stack_trace`/`tags`, and observed custom `fields` keys).
+
+**File-tail implementation** (`_tail_lines`) — reads the last N lines without loading the entire file, using a loop-growing read window that handles long lines robustly. Starts with an estimate and doubles the window until either N lines are captured or the start of the file is reached. Discards partial leading fragment when seeking from a non-zero offset.
+
+**Lazy-jq rule** — `jq` is imported only when `--match` is used; a missing library surfaces as `ConfigError` (exit 2) pointing at `pip install 'agctl[logs]'`, not a crash. This keeps the zero-dep log query path working without `jq`.
+
+---
 
 ### DbClient + driver (`clients/db_client.py`, `clients/db_drivers/postgresql.py`)
 
@@ -663,6 +692,7 @@ and **skipped** — it never bricks the CLI, the registry, or driver discovery.
 | Group | Contract (file) | Loaded by | Adds |
 |---|---|---|---|
 | `agctl.db_drivers` | `DBDriver` Protocol (`clients/db_driver_protocol.py`) | `DbClient.load_drivers` | a new DB `type` |
+| `agctl.logs_backends` | `LogBackend` Protocol (`clients/log_backend_protocol.py`) | `LogClient.load_backends` | a new log source `type` |
 | `agctl.plugins` | `Plugin` Protocol (`plugin_protocol.py`) | `cli._load_plugins` (at import) | a new top-level command group |
 | `agctl.assertions` | `Assertion` base (`assertion_registry.py`) | `AssertionRegistry.load_entry_points` (lazy, cached) | a new `--assertion` mode |
 
@@ -677,6 +707,17 @@ and **skipped** — it never bricks the CLI, the registry, or driver discovery.
   ```toml
   [project.entry-points."agctl.db_drivers"]
   mysql = "agctl_mysql:MySQLDriver"
+  ```
+- **Log backends** — `LogClient` selects by `source["type"]`; unknown →
+  `ConfigError`. Built-in `file` always wins over a registration gap.
+  The `LogBackend` protocol requires `validate_config`/`scan`/`await_one`/
+  `follow`/`sample_schema`. All methods are mandatory. Built-in `file`
+  implements the protocol for NDJSON files in logstash format. Third-party
+  backends can add journald, syslog, ELasticsearch, etc. Register in another
+  package's `pyproject.toml`:
+  ```toml
+  [project.entry-points."agctl.logs_backends"]
+  journald = "agctl_logs_journald:JournaldBackend"
   ```
 - **Protocol plugins** — `cli._load_plugins` runs at CLI import, mounting each
   plugin's `command_group` onto the root `cli` group (name from `.name` →
@@ -702,21 +743,23 @@ extras, so a user installs only what they need and the package imports fast:
 | `jq` | `jq` | HTTP response assertions (`--match`/`--jq-path` on `http call`/`request`), mock HTTP `match.jq` (and mock startup pre-compile of stub `match.jq` / reactor `match`) |
 | `kafka` | `confluent-kafka`, `jq` | `kafka *` |
 | `db` | `psycopg[binary]`, `jq` | `db *` |
+| `logs` | `jq` | `logs *` (`--match` on logs query/assert/tail) |
 | `dev` | `pytest` | unit tests |
 | `integration` | `testcontainers`, `agctl[db,kafka,http]`, `pytest` | live integration tests |
 
-`jq` is bundled under `kafka`/`db` (which always needed it) **and** exposed as a
+`jq` is bundled under `kafka`/`db`/`logs` (which always needed it) **and** exposed as a
 dedicated `jq` extra for HTTP-only users (response assertions) and HTTP-only-mock
 users (`match.jq`) — `pip install 'agctl[jq]'`. A mock with no `match.jq` and no
 reactor `match` imports nothing, preserving the zero-dep HTTP-only mock. At
 runtime the lazy-import convention (§8) keeps the error category correct: a
-missing library → `ConfigError` (exit 2) pointing at `agctl[jq]`, not an opaque
-`ModuleNotFoundError`.
+missing library → `ConfigError` (exit 2) pointing at the right extra
+(`agctl[jq]` for http/mock, `agctl[logs]` for logs commands with `--match`),
+not an opaque `ModuleNotFoundError`.
 
 **Build & entry points:** hatchling backend, wheel target `agctl`; console
 scripts `agctl`/`agt` → `agctl.cli:cli`; entry-point groups `agctl.db_drivers`
-(registers built-in `postgresql`), `agctl.plugins`, `agctl.assertions` (§10);
-requires Python `>=3.11`.
+(registers built-in `postgresql`), `agctl.logs_backends` (registers built-in `file`),
+`agctl.plugins`, `agctl.assertions` (§10); requires Python `>=3.11`.
 
 ---
 
