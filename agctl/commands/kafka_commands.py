@@ -11,7 +11,8 @@
   match is an AssertionError (D10).
 
 Both ``consume`` and ``assert`` honor the D6 lookback window: partitions are
-seeked to ``now - lookback_seconds`` via ``offsets_for_times`` (or offset 0 with
+seeked to ``now - lookback_seconds`` via ``offsets_for_times`` (or to the
+partition beginning via the logical ``OFFSET_BEGINNING`` with
 ``--from-beginning``).
 """
 
@@ -23,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import click
 
-from ..assertions import jq_bool, jq_value, json_subset
+from ..assertions import compile_jq, jq_bool, jq_value, json_subset
 from ..command import envelope, load_config_or_raise
 
 if TYPE_CHECKING:
@@ -176,6 +177,13 @@ def _kafka_consume_core(
     match_expr = match if match is not None else filter_key
 
     resolved_timeout = _resolve_timeout(timeout, cfg.kafka.timeout_seconds)
+    if resolved_timeout <= 0:
+        # timeout <= 0 makes the poll deadline already-passed, so the loop never
+        # runs and consume returns ok:0 — a silent no-op masquerading as success.
+        raise ConfigError(
+            "kafka consume --timeout must be > 0",
+            {"timeout": resolved_timeout},
+        )
     # D6: default lookback = resolved timeout.
     resolved_lookback = float(lookback) if lookback is not None else resolved_timeout
     group = _resolve_group(consumer_group, cfg.kafka)
@@ -185,6 +193,12 @@ def _kafka_consume_core(
     # messages arrive (DESIGN §3.2 "whichever comes first").
     predicate = None
     if match_expr is not None:
+        # Validate syntax ONCE up front: jq_bool swallows compile/runtime errors
+        # per-message (returns False, DESIGN §3.2), so a typo'd --match would
+        # otherwise silently match nothing and report ok:0. compile_jq surfaces a
+        # malformed expression loudly as a ConfigError before any polling.
+        compile_jq(match_expr, label="kafka consume --match")
+
         def predicate(msg, _expr=match_expr):
             return jq_bool(msg, _expr)
 
@@ -388,6 +402,11 @@ def _kafka_assert_core(
         )
 
     resolved_timeout = float(timeout)
+    if resolved_timeout <= 0:
+        raise ConfigError(
+            "kafka assert --timeout must be > 0",
+            {"timeout": resolved_timeout},
+        )
     resolved_lookback = float(lookback) if lookback is not None else resolved_timeout
     group = _resolve_group(consumer_group, cfg.kafka)
 
@@ -409,6 +428,23 @@ def _kafka_assert_core(
     filled_pattern_match = (
         fill_placeholders(pattern_match, params) if pattern_match is not None else None
     )
+
+    # Validate jq expressions ONCE up front: the predicate swallows per-message jq
+    # errors (returns False, DESIGN §3.2), so a typo'd --match/--path/--pattern
+    # would otherwise silently never match and report "No matching message".
+    if match is not None:
+        compile_jq(match, label="kafka assert --match")
+    if path is not None:
+        compile_jq(path, label="kafka assert --path")
+    if filled_pattern_match is not None:
+        compile_jq(
+            filled_pattern_match,
+            label=(
+                f"kafka pattern {pattern!r}"
+                if pattern is not None
+                else "kafka assert --pattern"
+            ),
+        )
 
     predicate = _build_assert_predicate(
         needle=needle,
