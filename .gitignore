@@ -4,6 +4,9 @@
 # Claude Code local state (project agents/ and shared settings.json ARE tracked)
 .claude/settings.local.json
 
+# Local git worktrees (using-git-worktrees skill)
+.worktrees/
+
 # Python
 __pycache__/
 *.py[cod]
