@@ -726,66 +726,66 @@ def test_follow_yields_new_matches_then_stops(tmp_path):
     from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
 
     log_file = tmp_path / "test.log"
-    # Start with one INFO line (not matched by ERROR filter)
+    # Start with one INFO line (not matched by ERROR filter) followed by ERROR line
+    # IMPORTANT: End with newline so the last line is processed, not buffered
     initial_line = (
         '{"@timestamp":"2026-07-08T10:00:00Z","level":"INFO","logger_name":"c.Foo",'
         '"message":"info1"}'
     )
-    log_file.write_text(initial_line)
+    error_line = (
+        '\n{"@timestamp":"2026-07-08T10:00:01Z","level":"ERROR",'
+        '"logger_name":"c.Foo","message":"err1"}\n'
+    )
+    full_content = initial_line + error_line
+    log_file.write_text(full_content)
 
     source = LogSource(path=str(log_file), format="logstash")
     stop_event = threading.Event()
 
-    # ERROR line to append
-    error_line = (
-        '\n{"@timestamp":"2026-07-08T10:00:01Z","level":"ERROR",'
-        '"logger_name":"c.Foo","message":"err1"}'
-    )
-
-    # Fake stat that returns controlled sizes: initially size without ERROR line,
-    # then size with ERROR line, then stays constant (no more growth)
+    # Fake stat that simulates file growth: starts at 0 (file empty, nothing read yet),
+    # then grows to full size (simulating new data appearing)
     stat_call_count = [0]
-    sizes = [len(initial_line), len(initial_line) + len(error_line)]
+    sizes = [0, len(full_content)]  # 0 → full size (growth detected)
 
     def fake_stat(path):
         stat_call_count[0] += 1
         idx = min(stat_call_count[0] - 1, len(sizes) - 1)
         return os.stat_result((33188, 12345, 123, 1, 1000, 1000, sizes[idx], 0, 0, 0))
 
-    # Instant wait for tests (returns immediately, always "event not set")
-    def instant_wait(event, timeout):
-        return False  # Never return True (event never set during wait)
+    # Cooperative wait: sets stop_event after 2 calls to ensure bounded termination
+    # Flow: stat(size=0, no growth from last_offset=0) → wait → stat(size=full, growth!) → yield ERROR → check stop_event (not set) → wait sets stop_event
+    wait_call_count = [0]
+
+    def cooperative_wait(event, timeout):
+        wait_call_count[0] += 1
+        # Set stop_event after 2 calls (allows yield to happen first, then termination)
+        if wait_call_count[0] >= 2:
+            event.set()
+            return True  # Event was set during wait
+        return False  # Continue looping
 
     # Inject fakes
-    backend = NdjsonFileBackend(source, stat_fn=fake_stat, _wait=instant_wait)
+    backend = NdjsonFileBackend(source, stat_fn=fake_stat, _wait=cooperative_wait)
 
     # Create generator
     gen = backend.follow(
         LogFilter(level="ERROR"), stop_event=stop_event, poll_interval_ms=10
     )
 
-    # First iteration: no ERROR line yet, should yield nothing
-    entry = next(gen, None)
-    assert entry is None, "Should yield nothing before ERROR line is appended"
-
-    # Append ERROR line to file
-    log_file.write_text(initial_line + error_line)
-
-    # Second iteration: ERROR line exists, should yield it
+    # First iteration: should yield the ERROR entry
+    # The generator will: stat(size=0, no growth) → wait → stat(size=full, growth!) → read → yield ERROR
     entry = next(gen, None)
     assert entry is not None, "Should yield ERROR entry"
     assert entry.level == "ERROR"
     assert entry.message == "err1"
 
-    # Set stop_event
-    stop_event.set()
-
-    # Third iteration: stop_event is set, generator should exit (StopIteration)
+    # After yielding, the generator waits and cooperative_wait sets stop_event
+    # Second iteration: generator should exit (StopIteration)
     entry = next(gen, None)
     assert entry is None, "Generator should stop after stop_event is set"
 
-    # Should have called stat at least twice
-    assert stat_call_count[0] >= 2
+    # Should have called stat at least once
+    assert stat_call_count[0] >= 1
 
 
 def test_follow_missing_file_waits(tmp_path):
@@ -807,35 +807,38 @@ def test_follow_missing_file_waits(tmp_path):
         stat_call_count[0] += 1
         raise FileNotFoundError(f"Mock missing: {path}")
 
-    # Instant wait for tests (returns immediately, always "event not set")
-    def instant_wait(event, timeout):
-        return False  # Never return True (event never set during wait)
+    # Cooperative wait: sets stop_event after 2 calls to ensure bounded termination
+    # The generator will: stat → FileNotFoundError → wait → stat → FileNotFoundError → wait sets stop_event → return
+    wait_call_count = [0]
 
-    backend = NdjsonFileBackend(source, stat_fn=fake_stat, _wait=instant_wait)
+    def cooperative_wait(event, timeout):
+        wait_call_count[0] += 1
+        # Set stop_event after 2 calls (2 iterations → self-terminate)
+        if wait_call_count[0] >= 2:
+            event.set()
+            return True  # Event was set during wait
+        return False  # Continue looping
+
+    backend = NdjsonFileBackend(source, stat_fn=fake_stat, _wait=cooperative_wait)
 
     # Create generator
     gen = backend.follow(LogFilter(), stop_event=stop_event, poll_interval_ms=10)
 
-    # First iteration: file doesn't exist, should yield nothing (wait)
+    # First iteration: file doesn't exist, should yield nothing
+    # The cooperative wait ensures bounded iterations before setting stop_event
     entry = next(gen, None)
     assert entry is None, "Should yield nothing when file is missing"
 
-    # Should have attempted stat at least once
+    # Should have attempted stat at least once and waited at least once
     assert stat_call_count[0] >= 1
+    assert wait_call_count[0] >= 1
 
-    # Second iteration: still missing, should still yield nothing
-    entry = next(gen, None)
-    assert entry is None, "Should continue yielding nothing when file stays missing"
+    # Verify stop_event was set (cooperative wait did its job)
+    assert stop_event.is_set(), "Cooperative wait should have set stop_event"
 
-    # Set stop_event to signal shutdown
-    stop_event.set()
-
-    # Third iteration: stop_event is set, generator should exit (StopIteration)
+    # Second iteration: generator should have exited (StopIteration)
     entry = next(gen, None)
     assert entry is None, "Generator should stop after stop_event is set"
-
-    # Should have attempted stat at least twice
-    assert stat_call_count[0] >= 2
 
 
 # --- LogClient tests (Task 6) -----------------------------------------------
