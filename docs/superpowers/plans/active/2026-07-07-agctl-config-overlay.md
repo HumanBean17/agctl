@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - **No schema version bump, no `config migrate` work.** The overlay is load-time composition over the existing v2 schema; `version` stays `"2"`. `config init`/`migrate` gain no `--overlay`.
-- **Byte-unchanged invariants.** `agctl/data/sample-config.yaml` and `skills/agctl-write-test-runbook/reference/runbook-template.md` must not change — drift-guard tests `tests/unit/test_cli.py::test_sample_matches_readme_block` and `test_config_init_writes_sample` must stay green.
+- **Byte-unchanged invariants.** `agctl/data/sample-config.yaml` must not change — drift-guard tests `tests/unit/test_cli.py::test_sample_matches_readme_block` and `test_config_init_writes_sample` must stay green. *(Pre-flight resolution 2026-07-07: `runbook-template.md` is **not** pinned — nothing tests it, and Task 8 / spec §8 intend its Preconditions to gain the optional `Requires overlay:` line. The earlier "byte-unchanged" wording for the template is superseded; only `sample-config.yaml` is frozen.)*
 - **Exit codes unchanged.** `0` success; `2` config/tool/env error (overlay parse failure, version mismatch, type mismatch, dangling ref).
 - **Runbook stays pure markdown.** No YAML front-matter, no embedded config block (honors prior design §4 no-registry, §9 no-YAML-runbook). The runbook gains at most one `Preconditions` line naming the sidecar.
 - **Sidecar extension is exactly `.agctl.yaml`** (reserved, greppable); discovery by sibling convention `<runbook-base>.agctl.yaml`.

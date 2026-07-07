@@ -28,7 +28,7 @@ import click
 import yaml
 
 from ..config import ConfigError, load_config
-from ..config.loader import discover_config_path
+from ..config.loader import compose_config, discover_config_path
 from ..config.migrate import migrate_match_exprs
 from ..config.validator import validate_config
 from ..mock.capture_validate import collect_capture_placement_errors
@@ -176,21 +176,31 @@ def config_validate(ctx: click.Context, config_path: str | None) -> None:
 
 @click.command("show")
 @click.option("--config", "config_path", default=None)
+@click.option("--overlay", "overlay_paths", multiple=True, default=None)
 @click.option("--unmask", is_flag=True, default=False)
 @click.pass_context
-def config_show(ctx: click.Context, config_path: str | None, unmask: bool) -> None:
+def config_show(ctx: click.Context, config_path: str | None, overlay_paths: tuple[str, ...] | None, unmask: bool) -> None:
     """Dump the resolved config as JSON, secrets masked."""
     start = time.monotonic()
     path = config_path or ctx.obj.get("config_path")
+    # Resolve overlay paths: own option takes precedence over ctx.obj
+    ovs = tuple(overlay_paths) or ctx.obj.get("overlay_paths")
     try:
-        cfg = load_config(path)
+        composed = compose_config(path, list(ovs) if ovs else None)
     except ConfigError as err:
         _emit_config_error("config.show", err, start)
         raise SystemExit(2)
-    data = cfg.model_dump()
+    data = composed.config.model_dump()
     if not unmask:
         data = _mask(data)
-    emit(ok=True, command="config.show", result=data, duration_ms=_ms(start))
+    # Branch result shape based on whether overlays are active
+    if ovs:
+        # With --overlay: wrap in {"config": ..., "overrides": ...}
+        result = {"config": data, "overrides": composed.overrides}
+    else:
+        # Without --overlay: back-compat (config dict directly)
+        result = data
+    emit(ok=True, command="config.show", result=result, duration_ms=_ms(start))
 
 
 # --- config init -----------------------------------------------------------

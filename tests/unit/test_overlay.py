@@ -372,3 +372,133 @@ templates:
     # 2-arg form
     result2 = load_config(str(base), env={})
     assert result2.templates["create-order"].path == "/api/v1/orders"
+
+
+# Task 4: CLI --overlay flag and config show --overlay
+import json
+from click.testing import CliRunner
+from agctl.cli import cli
+
+
+def test_global_overlay_flag_threads_to_show(tmp_path):
+    """Scenario 1: Global --overlay flag threads to config show."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  create-order:
+    method: POST
+    service: orders
+    path: /api/v1/orders
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""templates:
+  extra:
+    method: GET
+    service: orders
+    path: /api/v1/orders/{id}
+""")
+    result = CliRunner().invoke(cli, ["--overlay", str(ov), "config", "show", "--config", str(base)])
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    # With --overlay, result should be wrapped: {"config": ..., "overrides": ...}
+    assert "config" in payload["result"]
+    assert "overrides" in payload["result"]
+    # Base template present
+    assert "create-order" in payload["result"]["config"]["templates"]
+    # Overlay template added
+    assert "extra" in payload["result"]["config"]["templates"]
+    assert payload["result"]["config"]["templates"]["extra"]["path"] == "/api/v1/orders/{id}"
+    # No overrides (addition only)
+    assert payload["result"]["overrides"] == []
+
+
+def test_override_surfaced_in_show(tmp_path):
+    """Scenario 2: Override surfaced in show result."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  create-order:
+    method: POST
+    service: orders
+    path: /api/v1/orders
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""templates:
+  create-order:
+    method: PUT
+    service: orders
+    path: /api/v1/orders/{id}
+""")
+    result = CliRunner().invoke(cli, ["--overlay", str(ov), "config", "show", "--config", str(base)])
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    assert "config" in payload["result"]
+    assert "overrides" in payload["result"]
+    # Overlay value wins
+    assert payload["result"]["config"]["templates"]["create-order"]["method"] == "PUT"
+    assert payload["result"]["config"]["templates"]["create-order"]["path"] == "/api/v1/orders/{id}"
+    # Override recorded (deep_merge records leaf overrides)
+    assert len(payload["result"]["overrides"]) > 0
+    # Check that some override under templates.create-order exists
+    assert any(o["path"].startswith("templates.create-order.") for o in payload["result"]["overrides"])
+    assert all(o["overlay"] == str(ov) for o in payload["result"]["overrides"])
+
+
+def test_no_overlay_shape_unchanged(tmp_path):
+    """Scenario 3: No --overlay shape unchanged (back-compat)."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  create-order:
+    method: POST
+    service: orders
+    path: /api/v1/orders
+""")
+    result = CliRunner().invoke(cli, ["config", "show", "--config", str(base)])
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    # Without --overlay, result is the config dict directly (no wrapper)
+    assert "templates" in payload["result"]
+    assert "config" not in payload["result"]
+    assert "overrides" not in payload["result"]
+    assert "create-order" in payload["result"]["templates"]
+
+
+def test_post_command_overlay_form(tmp_path):
+    """Scenario 4: Post-command --overlay form (own option precedence)."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  create-order:
+    method: POST
+    service: orders
+    path: /api/v1/orders
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""templates:
+  extra:
+    method: GET
+    service: orders
+    path: /api/v1/orders/{id}
+""")
+    result = CliRunner().invoke(cli, ["config", "show", "--config", str(base), "--overlay", str(ov)])
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    # Same behavior as global form
+    assert "config" in payload["result"]
+    assert "overrides" in payload["result"]
+    assert "extra" in payload["result"]["config"]["templates"]
+    assert payload["result"]["overrides"] == []
+
