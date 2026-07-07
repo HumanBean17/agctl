@@ -8,6 +8,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from agctl.assertions import _parse_iso_datetime, _to_utc, jq_bool
 from agctl.clients.log_backend_protocol import (
@@ -48,6 +49,7 @@ class NdjsonFileBackend:
         monotonic: callable = time.monotonic,
         sleep: callable = time.sleep,
         stat_fn: callable = os.stat,
+        _wait: Optional[callable] = None,
     ):
         """Store source config and injectable clock/sleep for testing.
 
@@ -56,12 +58,14 @@ class NdjsonFileBackend:
             monotonic: Injectable monotonic clock (default: time.monotonic)
             sleep: Injectable sleep function (default: time.sleep)
             stat_fn: Injectable stat function (default: os.stat)
+            _wait: Injectable wait function for stop_event (default: stop_event.wait)
         """
         self._path = source.path
         self._format = source.format
         self._monotonic = monotonic
         self._sleep = sleep
         self._stat_fn = stat_fn
+        self._wait = _wait or (lambda ev, timeout: ev.wait(timeout))
 
     def validate_config(self) -> None:
         """Raise ConfigError if path is None (file type requires path)."""
@@ -371,6 +375,7 @@ class NdjsonFileBackend:
         path = Path(self._path)
         last_offset = 0
         poll_interval = poll_interval_ms / 1000
+        _buffer = b""  # Buffer for partial lines across iterations
 
         while True:
             # Check if we should stop
@@ -382,13 +387,14 @@ class NdjsonFileBackend:
                 current_size = stat_result.st_size
             except (FileNotFoundError, OSError):
                 # File doesn't exist yet (service not started) - wait and retry
-                if stop_event.wait(poll_interval):
+                if self._wait(stop_event, poll_interval):
                     return  # Event was set during wait
                 continue
 
             # Check for rollover/truncation (file shrank)
             if current_size < last_offset:
                 last_offset = 0
+                _buffer = b""  # Clear buffer on rollover
 
             # Check if file grew
             if current_size > last_offset:
@@ -399,15 +405,34 @@ class NdjsonFileBackend:
                         new_bytes = f.read(current_size - last_offset)
                         last_offset = current_size
 
-                        # Decode and split into lines
+                        # No new data (shouldn't happen since size > offset, but be safe)
                         if not new_bytes:
-                            # No new data (shouldn't happen since size > offset, but be safe)
-                            if stop_event.wait(poll_interval):
+                            if self._wait(stop_event, poll_interval):
                                 return
                             continue
 
-                        decoded = new_bytes.decode("utf-8", errors="replace")
-                        lines = decoded.splitlines()
+                        # Combine buffered partial from previous iteration with new bytes
+                        combined = _buffer + new_bytes
+                        _buffer = b""  # Clear buffer after combining
+
+                        # Decode and split on newline
+                        try:
+                            decoded = combined.decode("utf-8", errors="replace")
+                        except UnicodeDecodeError:
+                            # If decode fails, skip this batch and keep buffer for next
+                            _buffer = combined
+                            if self._wait(stop_event, poll_interval):
+                                return
+                            continue
+
+                        # Split on newline and process complete lines
+                        lines = decoded.split("\n")
+
+                        # Keep the last fragment if it doesn't end with newline
+                        # (it's a partial line that will be completed in the next read)
+                        if not decoded.endswith("\n"):
+                            if lines:
+                                _buffer = lines.pop().encode("utf-8", errors="replace")
 
                         for line in lines:
                             if not line.strip():
@@ -454,12 +479,12 @@ class NdjsonFileBackend:
 
                 except (OSError, IOError):
                     # File read error - wait and retry
-                    if stop_event.wait(poll_interval):
+                    if self._wait(stop_event, poll_interval):
                         return
                     continue
 
             # No new data - wait before next poll
-            if stop_event.wait(poll_interval):
+            if self._wait(stop_event, poll_interval):
                 return  # Event was set during wait
 
     def sample_schema(self, *, sample_lines: int = 100) -> SchemaDescriptor:

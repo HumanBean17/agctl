@@ -736,60 +736,53 @@ def test_follow_yields_new_matches_then_stops(tmp_path):
     source = LogSource(path=str(log_file), format="logstash")
     stop_event = threading.Event()
 
-    # Fake stat that appends ERROR line on first call, then continues with grown size
-    initial_size = len(initial_line)
+    # ERROR line to append
     error_line = (
         '\n{"@timestamp":"2026-07-08T10:00:01Z","level":"ERROR",'
         '"logger_name":"c.Foo","message":"err1"}'
     )
-    grown_size = initial_size + len(error_line)
 
+    # Fake stat that returns controlled sizes: initially size without ERROR line,
+    # then size with ERROR line, then stays constant (no more growth)
     stat_call_count = [0]
-    appended = [False]
+    sizes = [len(initial_line), len(initial_line) + len(error_line)]
 
     def fake_stat(path):
-        """Return stat results; append ERROR line on first call."""
         stat_call_count[0] += 1
-        # Append ERROR line on first stat call
-        if not appended[0]:
-            existing = log_file.read_text()
-            log_file.write_text(existing + error_line)
-            appended[0] = True
-            return os.stat_result((33188, 12345, 123, 1, 1000, 1000, initial_size, 0, 0, 0))
-        # After appending, return grown size
-        return os.stat_result((33188, 12345, 123, 1, 1000, 1000, grown_size, 0, 0, 0))
+        idx = min(stat_call_count[0] - 1, len(sizes) - 1)
+        return os.stat_result((33188, 12345, 123, 1, 1000, 1000, sizes[idx], 0, 0, 0))
 
-    # Inject fake stat via __init__
-    backend = NdjsonFileBackend(source, stat_fn=fake_stat)
+    # Instant wait for tests (returns immediately, always "event not set")
+    def instant_wait(event, timeout):
+        return False  # Never return True (event never set during wait)
 
-    # Use a small poll interval and consume with a timeout
-    poll_interval = 10  # 10ms
+    # Inject fakes
+    backend = NdjsonFileBackend(source, stat_fn=fake_stat, _wait=instant_wait)
 
-    def stop_after_delay():
-        """Set stop_event after a short delay."""
-        import time
+    # Create generator
+    gen = backend.follow(
+        LogFilter(level="ERROR"), stop_event=stop_event, poll_interval_ms=10
+    )
 
-        time.sleep(0.1)  # Wait 100ms for generator to process
-        stop_event.set()
+    # First iteration: no ERROR line yet, should yield nothing
+    entry = next(gen, None)
+    assert entry is None, "Should yield nothing before ERROR line is appended"
 
-    stopper = threading.Thread(target=stop_after_delay, daemon=True)
-    stopper.start()
+    # Append ERROR line to file
+    log_file.write_text(initial_line + error_line)
 
-    # Consume the generator with a timeout
-    results = []
-    start = time.monotonic()
+    # Second iteration: ERROR line exists, should yield it
+    entry = next(gen, None)
+    assert entry is not None, "Should yield ERROR entry"
+    assert entry.level == "ERROR"
+    assert entry.message == "err1"
 
-    for entry in backend.follow(
-        LogFilter(level="ERROR"), stop_event=stop_event, poll_interval_ms=poll_interval
-    ):
-        results.append(entry)
-        if time.monotonic() - start > 1.0:  # Safety timeout
-            break
+    # Set stop_event
+    stop_event.set()
 
-    # Should yield exactly one ERROR entry
-    assert len(results) == 1
-    assert results[0].level == "ERROR"
-    assert results[0].message == "err1"
+    # Third iteration: stop_event is set, generator should exit (StopIteration)
+    entry = next(gen, None)
+    assert entry is None, "Generator should stop after stop_event is set"
 
     # Should have called stat at least twice
     assert stat_call_count[0] >= 2
@@ -797,7 +790,6 @@ def test_follow_yields_new_matches_then_stops(tmp_path):
 
 def test_follow_missing_file_waits(tmp_path):
     """follow waits for missing file, yields nothing, returns when stop_event set."""
-    import os
     import threading
 
     from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
@@ -815,32 +807,32 @@ def test_follow_missing_file_waits(tmp_path):
         stat_call_count[0] += 1
         raise FileNotFoundError(f"Mock missing: {path}")
 
-    backend = NdjsonFileBackend(source, stat_fn=fake_stat)
+    # Instant wait for tests (returns immediately, always "event not set")
+    def instant_wait(event, timeout):
+        return False  # Never return True (event never set during wait)
 
-    # Use a small poll interval and stop after a delay
-    poll_interval = 10  # 10ms
+    backend = NdjsonFileBackend(source, stat_fn=fake_stat, _wait=instant_wait)
 
-    def stop_after_delay():
-        """Set stop_event after a short delay."""
-        time.sleep(0.05)  # Wait 50ms
-        stop_event.set()
+    # Create generator
+    gen = backend.follow(LogFilter(), stop_event=stop_event, poll_interval_ms=10)
 
-    stopper = threading.Thread(target=stop_after_delay, daemon=True)
-    stopper.start()
-
-    # Consume the generator with a safety timeout
-    results = []
-    start = time.monotonic()
-
-    for entry in backend.follow(
-        LogFilter(), stop_event=stop_event, poll_interval_ms=poll_interval
-    ):
-        results.append(entry)
-        if time.monotonic() - start > 1.0:  # Safety timeout
-            break
-
-    # Should yield nothing (file never exists)
-    assert len(results) == 0
+    # First iteration: file doesn't exist, should yield nothing (wait)
+    entry = next(gen, None)
+    assert entry is None, "Should yield nothing when file is missing"
 
     # Should have attempted stat at least once
     assert stat_call_count[0] >= 1
+
+    # Second iteration: still missing, should still yield nothing
+    entry = next(gen, None)
+    assert entry is None, "Should continue yielding nothing when file stays missing"
+
+    # Set stop_event to signal shutdown
+    stop_event.set()
+
+    # Third iteration: stop_event is set, generator should exit (StopIteration)
+    entry = next(gen, None)
+    assert entry is None, "Generator should stop after stop_event is set"
+
+    # Should have attempted stat at least twice
+    assert stat_call_count[0] >= 2
