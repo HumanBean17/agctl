@@ -44,12 +44,13 @@ _VALID_CATEGORIES = (
     "db-templates",
     "mock-http-stubs",
     "mock-kafka-reactors",
+    "log-sources",
 )
 
 _SUMMARY_HINT = (
     "Run 'agctl discover --category <name>' to list items. "
     "Categories: services, http-templates, kafka-patterns, db-templates, "
-    "mock-http-stubs, mock-kafka-reactors"
+    "mock-http-stubs, mock-kafka-reactors, log-sources"
 )
 _CATEGORY_HINT = "Run 'agctl discover --category <c> --name <name>' for full detail"
 _SEARCH_HINT = (
@@ -199,6 +200,7 @@ def _summary_core(config_path: str | None, overlay_paths: list[str] | None = Non
         "db_templates": len(cfg.database.templates),
         "mock_http_stubs": len(_mock_http_stubs(cfg)),
         "mock_kafka_reactors": len(_mock_kafka_reactors(cfg)),
+        "log_sources": len(cfg.logs.sources),
         "hint": _SUMMARY_HINT,
     }
 
@@ -242,6 +244,14 @@ def _category_core(config_path: str | None, category: str, overlay_paths: list[s
                     "description": reactor.description,
                     "topic": reactor.topic,
                     "consumer_group": reactor.consumer_group,
+                }
+            )
+    elif category == "log-sources":
+        for name, src in cfg.logs.sources.items():
+            items.append(
+                {
+                    "name": name,
+                    "description": f"{src.type} logs for {name} ({src.path or '?'})",
                 }
             )
 
@@ -373,6 +383,32 @@ def _item_core(config_path: str | None, category: str, name: str, overlay_paths:
             }
         return item
 
+    if category == "log-sources":
+        # Local import to avoid module-load cycle (logs imports this file)
+        from ..clients.log_client import LogClient
+
+        if name not in cfg.logs.sources:
+            raise TemplateNotFound(
+                f"Unknown logs source: {name}",
+                {"path": f"logs.sources.{name}"},
+            )
+        src = cfg.logs.sources[name]
+        schema = LogClient(src).sample_schema(sample_lines=100)
+        return {
+            "category": "log-sources",
+            "name": name,
+            "description": f"{src.type} logs for {name}",
+            "path": src.path,
+            "type": src.type,
+            "format": src.format,
+            "schema_fields": {
+                "standard": schema.standard,
+                "conditional": schema.conditional,
+                "observed": schema.observed,
+            },
+            "example": f"agctl logs query --source {name} --level ERROR --since 5m",
+        }
+
     # category == "db-templates"
     if name not in cfg.database.templates:
         raise TemplateNotFound(
@@ -468,6 +504,16 @@ def _search_core(config_path: str | None, term: str, overlay_paths: list[str] | 
                     "category": "mock-kafka-reactors",
                     "name": name,
                     "description": reactor.description,
+                }
+            )
+
+    for name, src in cfg.logs.sources.items():
+        if needle in name.lower() or (src.path and needle in src.path.lower()):
+            matches.append(
+                {
+                    "category": "log-sources",
+                    "name": name,
+                    "description": f"{src.type} logs for {name} ({src.path or '?'})",
                 }
             )
 
