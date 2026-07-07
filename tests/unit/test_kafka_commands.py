@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
-from confluent_kafka import OFFSET_END, TopicPartition
+from confluent_kafka import OFFSET_BEGINNING, OFFSET_END, TopicPartition
 
 from agctl.cli import cli
 from agctl.clients.kafka_client import KafkaClient
@@ -213,20 +213,24 @@ class FakeConsumer:
     (an un-seeked partition likewise yields nothing).
     """
 
-    def __init__(self, conf, messages=None):
+    def __init__(self, conf, messages=None, empty_assignment=False):
         self.conf = conf
         self._messages = list(messages or [])
         self._messages.sort(key=lambda m: (m.partition(), m.offset()))
         self._seek_offsets = {}
-        self._from_beginning = set()  # partitions seeked via seek_to_beginning
         self._cursor = 0
         self._topics = []
         self.closed = False
+        # When True, assignment() returns [] — models a non-existent topic or an
+        # unreachable broker.
+        self.empty_assignment = empty_assignment
 
     def subscribe(self, topics):
         self._topics = list(topics)
 
     def assignment(self):
+        if self.empty_assignment:
+            return []
         t = self._topics[0]
         return [TopicPartition(t, 0), TopicPartition(t, 1)]
 
@@ -244,15 +248,16 @@ class FakeConsumer:
         return out
 
     def seek(self, tp):
-        # OFFSET_END means "nothing at/after here" — model it as +inf so poll's
-        # `offset >= seek_off` test yields nothing for that partition.
-        off = math.inf if tp.offset == OFFSET_END else tp.offset
+        # Model librdkafka logical offsets the real Consumer resolves:
+        #   OFFSET_BEGINNING -> partition start (0 here; fake has no retention)
+        #   OFFSET_END       -> +inf so poll's `offset >= seek_off` yields nothing
+        if tp.offset == OFFSET_BEGINNING:
+            off = 0
+        elif tp.offset == OFFSET_END:
+            off = math.inf
+        else:
+            off = tp.offset
         self._seek_offsets[(tp.topic, tp.partition)] = off
-
-    def seek_to_beginning(self, *tps):
-        for tp in tps:
-            self._seek_offsets[(tp.topic, tp.partition)] = 0
-            self._from_beginning.add((tp.topic, tp.partition))
 
     def poll(self, timeout):
         while self._cursor < len(self._messages):
@@ -261,11 +266,9 @@ class FakeConsumer:
             key = (m.topic(), m.partition())
             if key in self._seek_offsets:
                 seek_off = self._seek_offsets[key]
-            elif key in self._from_beginning:
-                seek_off = 0
             else:
-                # Un-seeked partition (e.g. offsets_for_times returned -1): the
-                # real consumer would have nothing in-window for it.
+                # Un-seeked partition: the real consumer would have nothing
+                # in-window for it.
                 continue
             if m.offset() >= seek_off:
                 return m
@@ -592,6 +595,77 @@ def test_kafka_consume_expect_count_stops_early(install_fake):
     assert elapsed < 1.0  # did NOT wait the full 2s window
 
 
+def test_kafka_consume_invalid_match_is_config_error(install_fake):
+    """Regression: a malformed --match jq expression must fail loudly (exit 2),
+    not silently match nothing and report ok:0. jq_bool swallows per-message
+    compile errors (returns False), so the expression is compiled once up front."""
+    install_fake([])
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "kafka",
+            "consume",
+            "--topic",
+            "t",
+            "--timeout",
+            "0.02",
+            "--match",
+            ".value.i ===",  # truncated/invalid jq
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+    assert "jq" in payload["error"]["message"].lower()
+
+
+def test_kafka_consume_nonpositive_timeout_is_config_error(install_fake):
+    """Regression: --timeout <= 0 makes the poll deadline already-passed, so the
+    loop never runs and consume would return ok:0 (a silent no-op). Reject it."""
+    install_fake([])
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "kafka",
+            "consume",
+            "--topic",
+            "t",
+            "--timeout",
+            "0",
+        ]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+    assert "timeout" in payload["error"]["message"].lower()
+
+
+def test_kafka_consume_nonexistent_topic_is_connection_error(monkeypatch):
+    """Regression: a topic that yields no partition assignment after the grace
+    window (non-existent topic with auto-create off, or unreachable broker) must
+    surface as a ConnectionError (exit 2) — not a silent ok:0 nor a cryptic
+    offsets_for_times([]) _INVALID_ARG."""
+    consumer = FakeConsumer({}, messages=[], empty_assignment=True)
+    client = KafkaClient(["host:9092"], consumer_factory=lambda conf: consumer)
+    monkeypatch.setattr(
+        kafka_commands, "new_kafka_client", lambda cfg_kafka, group_id=None: client
+    )
+
+    result = _run(
+        ["--config", str(FIXTURE), "kafka", "consume", "--topic", "nope", "--timeout", "1"]
+    )
+    payload = _payload(result)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConnectionError"
+    assert "nope" in payload["error"]["message"]
+
+
+
 # --------------------------------------------------------------------------- #
 # kafka assert
 # --------------------------------------------------------------------------- #
@@ -751,8 +825,12 @@ def test_kafka_assert_pattern_missing_raises_template_missing():
 
 
 def test_kafka_assert_match_predicate_errors_skips_message(install_fake):
-    # A bad jq expr must skip the message (not crash); only-bad-expr msgs ->
-    # no match -> AssertionError.
+    # A predicate that ERRORS AT RUNTIME on a message (valid syntax, but fails
+    # against this value) must skip that message (not crash); an all-skip window
+    # -> no match -> AssertionError. Note: a *compile* error (malformed syntax)
+    # is now caught up front as a ConfigError (see
+    # test_kafka_consume_invalid_match_is_config_error); only runtime errors
+    # against specific messages reach this per-message skip path (DESIGN §3.2).
     install_fake([_msg("t", {"a": 1}, "k1")])
     result = _run(
         [
@@ -763,7 +841,7 @@ def test_kafka_assert_match_predicate_errors_skips_message(install_fake):
             "--topic",
             "t",
             "--match",
-            ".a == ",  # malformed jq
+            ".value.a.b",  # valid syntax; .value.a==1 is a number -> runtime error
             "--lookback",
             "10",
             "--timeout",

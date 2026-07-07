@@ -43,13 +43,22 @@ def _import_kafka():
         from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 
         try:
-            from confluent_kafka import OFFSET_END, TopicPartition
+            from confluent_kafka import OFFSET_BEGINNING, OFFSET_END, TopicPartition
         except ImportError:  # pragma: no cover - always present in confluent_kafka
+            OFFSET_BEGINNING = -2
             OFFSET_END = -1
             TopicPartition = None
     except ImportError as exc:
         raise ConfigError(_KAFKA_EXTRA_MSG) from exc
-    return Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END
+    return (
+        Consumer,
+        Producer,
+        TopicPartition,
+        KafkaError,
+        KafkaException,
+        OFFSET_END,
+        OFFSET_BEGINNING,
+    )
 
 
 def _ms_to_iso8601z(ts_ms):
@@ -115,7 +124,7 @@ class KafkaClient:
         ``value`` is JSON-encoded; ``key`` and header values are encoded to
         bytes if they are strings.
         """
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END, OFFSET_BEGINNING = _import_kafka()
 
         producer_conf = {"bootstrap.servers": ",".join(self._brokers)}
         producer_conf.update(self._extra_conf)
@@ -209,11 +218,12 @@ class KafkaClient:
 
         Returns a list of normalized message dicts (DESIGN §4.2 message shape).
         """
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END, OFFSET_BEGINNING = _import_kafka()
 
         consumer = self._build_consumer()
 
         messages: list[dict] = []
+        poll_errors: list[str] = []
         try:
             self._setup_seek(consumer, topic, lookback_seconds, from_beginning)
 
@@ -223,7 +233,13 @@ class KafkaClient:
                 if msg is None:
                     continue
                 if msg.error():
-                    # Skip individual poll errors; a silent window yields [].
+                    # Transient per-message fetch errors (e.g. a brief leader
+                    # handover) are skipped; they typically resolve within the
+                    # window and a later poll succeeds. We record them so a window
+                    # that yielded ZERO messages ENTIRELY due to errors (broker
+                    # down / auth failure / topic deleted mid-consume) is surfaced
+                    # below as a ConnectionFailure rather than a silent ok:0.
+                    poll_errors.append(str(msg.error()))
                     continue
                 normalized = self._normalize_message(msg)
                 if predicate is not None:
@@ -239,6 +255,17 @@ class KafkaClient:
                 # timeout window elapses).
                 if expect_count is not None and len(messages) >= expect_count:
                     break
+
+            # No messages AND every poll errored: the window didn't fail to match
+            # — it failed to READ. A genuinely empty topic yields None polls (no
+            # errors), so this only fires when something is actually broken.
+            if not messages and poll_errors:
+                raise ConnectionFailure(
+                    message=(
+                        f"Consuming {topic!r} produced only fetch errors "
+                        f"({len(poll_errors)} poll(s), last: {poll_errors[-1]})"
+                    )
+                )
         finally:
             try:
                 consumer.close()
@@ -270,11 +297,12 @@ class KafkaClient:
         Returns a ``(message, scanned_count)`` tuple so callers can report
         ``messages_scanned``; if no match, returns ``(None, scanned_count)``.
         """
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END, OFFSET_BEGINNING = _import_kafka()
 
         consumer = self._build_consumer()
 
         scanned = 0
+        poll_errors: list[str] = []
         try:
             self._setup_seek(consumer, topic, lookback_seconds, from_beginning)
 
@@ -284,6 +312,10 @@ class KafkaClient:
                 if msg is None:
                     continue
                 if msg.error():
+                    # See consume_window: skip transient errors, but record them
+                    # so an all-error window is surfaced rather than reported as
+                    # a clean "no match".
+                    poll_errors.append(str(msg.error()))
                     continue
                 normalized = self._normalize_message(msg)
                 scanned += 1
@@ -293,6 +325,17 @@ class KafkaClient:
                     matched = False
                 if matched:
                     return normalized, scanned
+
+            # No message scanned AND every poll errored: not "no match" but
+            # "couldn't read". Surface it so `kafka assert` distinguishes a broken
+            # broker (ConnectionError, exit 2) from a legitimate no-match (exit 1).
+            if scanned == 0 and poll_errors:
+                raise ConnectionFailure(
+                    message=(
+                        f"Consuming {topic!r} for assert produced only fetch "
+                        f"errors ({len(poll_errors)} poll(s), last: {poll_errors[-1]})"
+                    )
+                )
         finally:
             try:
                 consumer.close()
@@ -349,7 +392,7 @@ class KafkaClient:
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
 
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END, OFFSET_BEGINNING = _import_kafka()
 
         consumer = self._build_consumer(group_id=group_id)
 
@@ -440,7 +483,7 @@ class KafkaClient:
             ConfigError: If ``kafka`` extra is not installed.
             ConnectionFailure: If broker is unreachable.
         """
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END, OFFSET_BEGINNING = _import_kafka()
 
         consumer = self._build_consumer(group_id=group_id)
 
@@ -472,7 +515,7 @@ class KafkaClient:
             group_id: Optional override for the consumer group id. If None, uses
                 self._group_id (or "agctl-consumer" if that's also None).
         """
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END, OFFSET_BEGINNING = _import_kafka()
 
         effective_group_id = group_id if group_id is not None else (self._group_id or "agctl-consumer")
         conf = {
@@ -494,10 +537,13 @@ class KafkaClient:
 
     def _setup_seek(self, consumer, topic, lookback_seconds, from_beginning):
         """Subscribe, wait for assignment, then seek partitions to the lookback
-        window (or offset 0 when ``from_beginning``). Shared by
-        :meth:`consume_window` and :meth:`find_in_window`.
+        window (or to the logical ``OFFSET_BEGINNING`` when ``from_beginning``).
+        Shared by :meth:`consume_window` and :meth:`find_in_window`.
+
+        Raises :class:`ConnectionFailure` if no partitions are assigned after
+        the grace window (non-existent topic / unreachable broker).
         """
-        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END = _import_kafka()
+        Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END, OFFSET_BEGINNING = _import_kafka()
 
         try:
             consumer.subscribe([topic])
@@ -513,15 +559,38 @@ class KafkaClient:
             assignment = consumer.assignment()
             attempts += 1
 
+        # No partitions assigned after the grace window means the topic does
+        # not exist (auto-create off / not yet complete) OR no broker is
+        # reachable. Failing loudly here prevents two silent-success modes:
+        #   - default mode would otherwise call offsets_for_times([]) and surface
+        #     a cryptic "_INVALID_ARG / Failed to get offsets: Invalid argument";
+        #   - --from-beginning would otherwise poll an empty assignment to the
+        #     timeout and return ok:true count:0 (false success on a dead/empty
+        #     topic), which for a testing tool is the worst outcome.
+        if not assignment:
+            raise ConnectionFailure(
+                message=(
+                    f"No partitions assigned for topic {topic!r} after "
+                    f"{attempts * 0.2:.1f}s — topic does not exist or broker(s) "
+                    f"{','.join(self._brokers)} unreachable"
+                )
+            )
+
         if from_beginning:
+            # confluent_kafka's Consumer has NO seek_to_beginning (that is a
+            # kafka-python API); seek to the logical OFFSET_BEGINNING so
+            # librdkafka resolves each partition's ACTUAL log-start offset.
+            # Seeking to an absolute offset (e.g. 0) is wrong once retention or
+            # compaction has advanced the start offset past 0: the broker returns
+            # "Offset out of range" and librdkafka logs
+            # "fetch failed due to requested offset not available on the broker".
             for tp in assignment:
-                if hasattr(consumer, "seek_to_beginning"):
-                    try:
-                        consumer.seek_to_beginning(tp)
-                    except KafkaException as exc:
-                        raise ConnectionFailure(message=str(exc)) from exc
-                else:  # pragma: no cover - real consumer always has it
-                    consumer.seek(TopicPartition(tp.topic, tp.partition, 0))
+                try:
+                    consumer.seek(
+                        TopicPartition(tp.topic, tp.partition, OFFSET_BEGINNING)
+                    )
+                except KafkaException as exc:
+                    raise ConnectionFailure(message=str(exc)) from exc
         else:
             target_ms = int((time.time() - lookback_seconds) * 1000)
             seek_tps = []

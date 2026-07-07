@@ -13,7 +13,7 @@ import threading
 import time
 
 import pytest
-from confluent_kafka import OFFSET_END, TopicPartition
+from confluent_kafka import OFFSET_BEGINNING, OFFSET_END, TopicPartition
 
 from agctl.clients.kafka_client import KafkaClient, ReactionResult
 from agctl.errors import ConfigError, ConnectionFailure
@@ -145,7 +145,7 @@ class FakeConsumer:
     offset, one per call, then returns None.
     """
 
-    def __init__(self, conf, messages=None, poll_error=False):
+    def __init__(self, conf, messages=None, poll_error=False, empty_assignment=False):
         self.conf = conf
         self._messages = list(messages or [])
         # sort by (partition, offset) so poll ordering is deterministic
@@ -155,6 +155,9 @@ class FakeConsumer:
         self._topics = []
         self.closed = False
         self.poll_error = poll_error
+        # When True, assignment() returns [] forever — models a non-existent
+        # topic or an unreachable broker (no partitions ever get assigned).
+        self.empty_assignment = empty_assignment
         # New for consume_loop/probe tests
         self.subscribe_calls = []
         self.store_offsets_calls = []
@@ -192,6 +195,8 @@ class FakeConsumer:
             on_assign([TopicPartition(t, 0), TopicPartition(t, 1)])
 
     def assignment(self):
+        if self.empty_assignment:
+            return []
         # Two partitions for the subscribed topic, mirroring tests' setup.
         t = self._topics[0]
         return [TopicPartition(t, 0), TopicPartition(t, 1)]
@@ -212,24 +217,26 @@ class FakeConsumer:
         return out
 
     def seek(self, tp):
-        # OFFSET_END means "nothing at/after here" — model it as +inf so poll's
-        # `offset >= seek_off` test yields nothing for that partition.
-        off = math.inf if tp.offset == OFFSET_END else tp.offset
+        # Model the librdkafka logical offsets the real Consumer resolves:
+        #   OFFSET_BEGINNING -> partition start (0 here; the fake has no retention)
+        #   OFFSET_END       -> +inf so poll's `offset >= seek_off` yields nothing
+        if tp.offset == OFFSET_BEGINNING:
+            off = 0
+        elif tp.offset == OFFSET_END:
+            off = math.inf
+        else:
+            off = tp.offset
         self._seek_offsets[(tp.topic, tp.partition)] = off
         self.seek_calls.append(tp)
         # Reset cursor to the earliest message that meets all seek offsets
         # (for retry scenarios and multi-partition seeks).
-        if tp.offset != OFFSET_END and tp.offset >= 0:
+        if off != math.inf and off >= 0:
             # Find the earliest message that meets ALL current seek offsets
             for i, m in enumerate(self._messages):
                 seek_off = self._seek_offsets.get((m.topic(), m.partition()), 0)
                 if m.offset() >= seek_off:
                     self._cursor = i
                     break
-
-    def seek_to_beginning(self, *tps):
-        for tp in tps:
-            self._seek_offsets[(tp.topic, tp.partition)] = 0
 
     def poll(self, timeout):
         self.poll_calls += 1
@@ -469,6 +476,68 @@ def test_consume_window_from_beginning_returns_all():
     assert consumer.closed is True
     keys = {m["key"] for m in result}
     assert keys == {"k0", "k1", "k2"}
+
+
+def test_consume_window_from_beginning_seeks_logical_offset_beginning():
+    """Regression: --from-beginning must seek the librdkafka logical
+    OFFSET_BEGINNING (so the broker resolves each partition's real start
+    offset), NOT an absolute offset 0. confluent_kafka's Consumer has no
+    seek_to_beginning (a kafka-python API); the old hasattr() fallback to
+    seek(0) produced "requested offset not available: Offset out of range" on
+    any topic whose start offset advanced past 0 via retention/compaction."""
+    topic = "orders"
+    consumer = FakeConsumer({}, messages=_canned(topic))
+
+    def factory(conf):
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+    client.consume_window(
+        topic, lookback_seconds=30, timeout_seconds=0.02, from_beginning=True
+    )
+
+    seeked_offsets = [tp.offset for tp in consumer.seek_calls]
+    assert seeked_offsets == [OFFSET_BEGINNING, OFFSET_BEGINNING]
+    # And no seek_to_beginning method should exist on the fake (mirrors real).
+    assert not hasattr(consumer, "seek_to_beginning")
+
+
+def test_consume_window_empty_assignment_raises_connection_error():
+    """Regression: a non-existent topic (or unreachable broker) yields an empty
+    assignment after the grace window. This must surface as a ConnectionFailure
+    rather than a silent ok:0 / cryptic offsets_for_times([]) _INVALID_ARG."""
+    topic = "missing"
+    consumer = FakeConsumer({}, messages=[], empty_assignment=True)
+
+    def factory(conf):
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+    with pytest.raises(ConnectionFailure) as exc_info:
+        client.consume_window(
+            topic, lookback_seconds=5, timeout_seconds=0.02, from_beginning=True
+        )
+    assert "missing" in str(exc_info.value)
+
+
+def test_consume_window_all_poll_errors_raise_connection_error():
+    """Regression: when every poll in the window returns an error (broker down /
+    auth failure / topic deleted mid-consume) and no message is ever read, the
+    window must surface a ConnectionFailure — not a silent ok:0. A genuinely
+    empty topic yields None polls (no errors) and still returns [] cleanly."""
+    topic = "orders"
+    consumer = FakeConsumer({}, messages=[], poll_error=True)
+
+    def factory(conf):
+        return consumer
+
+    client = KafkaClient(["host:9092"], consumer_factory=factory)
+    with pytest.raises(ConnectionFailure) as exc_info:
+        client.consume_window(
+            topic, lookback_seconds=5, timeout_seconds=0.02, from_beginning=True
+        )
+    assert "fetch errors" in str(exc_info.value)
+
 
 
 # ---------------------------------------------------------------------------

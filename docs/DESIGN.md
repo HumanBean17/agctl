@@ -506,7 +506,7 @@ agctl kafka consume
     [--consumer-group <name>]   # override default consumer group (default: agctl-consumer)
 ```
 
-`--match` is a jq boolean expression evaluated against each message **envelope** (`{key, value, partition, offset, timestamp, headers}`) — so `.value.eventType`, `.key`, `.headers.rqUID`. Header keys are case-sensitive (as-produced). Messages where the expression returns `false` or raises an error are silently skipped. This enables partial matching — you do not need to know the full message structure.
+`--match` is a jq boolean expression evaluated against each message **envelope** (`{key, value, partition, offset, timestamp, headers}`) — so `.value.eventType`, `.key`, `.headers.rqUID`. Header keys are case-sensitive (as-produced). A **malformed expression** (syntax error) raises `ConfigError` (exit 2) before any polling; messages where the expression evaluates to `false` or raises a **runtime error** against that specific message are silently skipped. This enables partial matching — you do not need to know the full message structure.
 
 **Examples:**
 

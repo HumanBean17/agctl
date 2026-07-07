@@ -439,9 +439,11 @@ command layer (`_kafka_ssl_conf`).
   `flush(timeout=30)`, returns the `kafka.produce` shape. A delivery error **or**
   non-zero remaining-flush count (undelivered) → `ConnectionFailure`.
 - **`consume_window`** — workhorse for `kafka consume` and custom assertions.
-  Seeks each partition to `now - lookback` (or offset 0 with `from_beginning`),
-  polls until the wall-clock deadline **or** `expect_count` matches ("whichever
-  comes first"). A predicate that raises → non-match (silently skipped).
+  Seeks each partition to `now - lookback` (or the librdkafka logical
+  `OFFSET_BEGINNING` with `from_beginning`, so the broker resolves each
+  partition's actual log-start offset), polls until the wall-clock deadline
+  **or** `expect_count` matches ("whichever comes first"). A predicate that
+  raises → non-match (silently skipped).
 - **`find_in_window`** — early-stop path for `kafka assert`. Same seek mechanics,
   returns the **first** matching message + a scanned-count; no match →
   `(None, scanned)` → the command raises `AssertionFailure`.
@@ -784,7 +786,7 @@ Terms used throughout, not already defined inline:
   `now - lookback` and read forward (not "subscribe at latest"), so an event
   published just before the command starts still falls in the window.
   `--lookback` defaults to the resolved `--timeout`; `--from-beginning`
-  overrides to offset 0.
+  seeks to the earliest offset.
 - **Send-then-assert** — the reliability property that follows: `produce` (or an
   HTTP call) then `kafka assert` works without subscribe-before-produce gymnastics.
 - **Three substitution syntaxes** (do not conflate): `${VAR}` — env, resolved at
