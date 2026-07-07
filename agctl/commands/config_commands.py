@@ -128,17 +128,26 @@ def _emit_config_error(command: str, err: ConfigError, start: float) -> None:
 
 @click.command("validate")
 @click.option("--config", "config_path", default=None)
+@click.option("--overlay", "overlay_paths", multiple=True, default=None)
 @click.pass_context
-def config_validate(ctx: click.Context, config_path: str | None) -> None:
+def config_validate(ctx: click.Context, config_path: str | None, overlay_paths: tuple[str, ...] | None) -> None:
     """Parse and validate agctl.yaml. Exit 2 on any error."""
     start = time.monotonic()
     path = config_path or ctx.obj.get("config_path")
+    # Resolve overlay paths: own option takes precedence over ctx.obj
+    ovs = tuple(overlay_paths) or ctx.obj.get("overlay_paths")
     try:
-        cfg = load_config(path)
+        composed = compose_config(path, list(ovs) if ovs else None)
     except ConfigError as err:
         _emit_config_error("config.validate", err, start)
         raise SystemExit(2)
+    cfg = composed.config
     errors, warnings = validate_config(cfg)
+    # Append override warnings from compose_config
+    for override in composed.overrides:
+        p = override["path"]
+        ov = override["overlay"]
+        warnings.append({"path": p, "message": f"overridden by overlay {Path(ov).name}"})
     # Let loaded plugins validate their own config sections (DESIGN §9.2).
     errors = errors + _plugin_validation_errors(_plugins_provider(), cfg.model_dump())
     # Surface malformed match.jq / reactor match as validation errors (D5,

@@ -136,3 +136,146 @@ def test_validate_no_mocks_section_exits_0(tmp_path):
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["result"]["valid"] is True
+
+
+# --- Task 5: config validate --overlay (override warnings) --------------------
+
+
+def test_validate_override_warning_emitted(tmp_path):
+    """Scenario 1: Override warning emitted when overlay overrides templates.create-order."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  create-order:
+    method: POST
+    service: orders
+    path: /api/v1/orders
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""templates:
+  create-order:
+    method: PUT
+    service: orders
+    path: /api/v1/orders/{id}
+""")
+    result = CliRunner().invoke(
+        cli,
+        ["config", "validate", "--config", str(base), "--overlay", str(ov)],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["result"]["valid"] is True
+    # Check that override warnings are present
+    warnings = payload["result"].get("warnings", [])
+    override_warnings = [w for w in warnings if "overridden by overlay" in w.get("message", "")]
+    assert len(override_warnings) > 0
+    # Check that at least one warning mentions templates.create-order path
+    override_warnings_templates = [w for w in override_warnings if "templates.create-order" in w.get("path", "")]
+    assert len(override_warnings_templates) > 0
+    # Check that the warning contains the overlay filename
+    assert any("overlay.yaml" in w.get("message", "") for w in override_warnings)
+
+
+def test_validate_no_override_no_warning(tmp_path):
+    """Scenario 2: No override warning when overlay only adds a new template."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  create-order:
+    method: POST
+    service: orders
+    path: /api/v1/orders
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""templates:
+  extra:
+    method: GET
+    service: orders
+    path: /api/v1/orders/{id}
+""")
+    result = CliRunner().invoke(
+        cli,
+        ["config", "validate", "--config", str(base), "--overlay", str(ov)],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["result"]["valid"] is True
+    # Check that no override warnings are present
+    warnings = payload["result"].get("warnings", [])
+    override_warnings = [w for w in warnings if "overridden by overlay" in w.get("message", "")]
+    assert len(override_warnings) == 0
+
+
+def test_validate_cross_file_dangling_ref_error(tmp_path):
+    """Scenario 3: Cross-file dangling ref is still an error."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  create-order:
+    method: POST
+    service: orders
+    path: /api/v1/orders
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""templates:
+  x:
+    method: GET
+    service: ghost
+    path: /x
+""")
+    result = CliRunner().invoke(
+        cli,
+        ["config", "validate", "--config", str(base), "--overlay", str(ov)],
+    )
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["result"]["valid"] is False
+    # Check that the error path is templates.x.service
+    errors = payload["result"].get("errors", [])
+    service_errors = [e for e in errors if e.get("path") == "templates.x.service"]
+    assert len(service_errors) > 0
+
+
+def test_validate_global_overlay_form_threads(tmp_path):
+    """Scenario 4: Global --overlay form threads to config validate (same as scenario 1)."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  create-order:
+    method: POST
+    service: orders
+    path: /api/v1/orders
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""templates:
+  create-order:
+    method: PUT
+    service: orders
+    path: /api/v1/orders/{id}
+""")
+    result = CliRunner().invoke(
+        cli,
+        ["--overlay", str(ov), "config", "validate", "--config", str(base)],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["result"]["valid"] is True
+    # Check that override warnings are present
+    warnings = payload["result"].get("warnings", [])
+    override_warnings = [w for w in warnings if "overridden by overlay" in w.get("message", "")]
+    assert len(override_warnings) > 0
+    # Check that at least one warning mentions templates.create-order path
+    override_warnings_templates = [w for w in override_warnings if "templates.create-order" in w.get("path", "")]
+    assert len(override_warnings_templates) > 0
