@@ -1,6 +1,7 @@
 """Tests for LogBackend protocol and canonical DTOs."""
 
 import threading
+import time
 from datetime import datetime
 
 from agctl.clients.log_backend_protocol import (
@@ -89,7 +90,7 @@ def test_log_backend_is_protocol():
             return AwaitResult(entry=None, scanned=0, elapsed_ms=0)
 
         def follow(
-            self, filt: LogFilter, *, stop_event: threading.Event
+            self, filt: LogFilter, *, stop_event: threading.Event, poll_interval_ms: int
         ):
             return
             yield  # pragma: no cover - make it a generator
@@ -710,3 +711,136 @@ def test_sample_schema_enumerates(tmp_path):
     # Well-known noise should be excluded
     assert "@version" not in result.observed
     assert "level_value" not in result.observed
+
+
+# ============================================================================
+# Task 5: NdjsonFileBackend - follow tests
+# ============================================================================
+
+
+def test_follow_yields_new_matches_then_stops(tmp_path):
+    """follow yields new matching entries as file grows, stops when stop_event set."""
+    import os
+    import threading
+
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    # Start with one INFO line (not matched by ERROR filter)
+    initial_line = (
+        '{"@timestamp":"2026-07-08T10:00:00Z","level":"INFO","logger_name":"c.Foo",'
+        '"message":"info1"}'
+    )
+    log_file.write_text(initial_line)
+
+    source = LogSource(path=str(log_file), format="logstash")
+    stop_event = threading.Event()
+
+    # Fake stat that appends ERROR line on first call, then continues with grown size
+    initial_size = len(initial_line)
+    error_line = (
+        '\n{"@timestamp":"2026-07-08T10:00:01Z","level":"ERROR",'
+        '"logger_name":"c.Foo","message":"err1"}'
+    )
+    grown_size = initial_size + len(error_line)
+
+    stat_call_count = [0]
+    appended = [False]
+
+    def fake_stat(path):
+        """Return stat results; append ERROR line on first call."""
+        stat_call_count[0] += 1
+        # Append ERROR line on first stat call
+        if not appended[0]:
+            existing = log_file.read_text()
+            log_file.write_text(existing + error_line)
+            appended[0] = True
+            return os.stat_result((33188, 12345, 123, 1, 1000, 1000, initial_size, 0, 0, 0))
+        # After appending, return grown size
+        return os.stat_result((33188, 12345, 123, 1, 1000, 1000, grown_size, 0, 0, 0))
+
+    # Inject fake stat via __init__
+    backend = NdjsonFileBackend(source, stat_fn=fake_stat)
+
+    # Use a small poll interval and consume with a timeout
+    poll_interval = 10  # 10ms
+
+    def stop_after_delay():
+        """Set stop_event after a short delay."""
+        import time
+
+        time.sleep(0.1)  # Wait 100ms for generator to process
+        stop_event.set()
+
+    stopper = threading.Thread(target=stop_after_delay, daemon=True)
+    stopper.start()
+
+    # Consume the generator with a timeout
+    results = []
+    start = time.monotonic()
+
+    for entry in backend.follow(
+        LogFilter(level="ERROR"), stop_event=stop_event, poll_interval_ms=poll_interval
+    ):
+        results.append(entry)
+        if time.monotonic() - start > 1.0:  # Safety timeout
+            break
+
+    # Should yield exactly one ERROR entry
+    assert len(results) == 1
+    assert results[0].level == "ERROR"
+    assert results[0].message == "err1"
+
+    # Should have called stat at least twice
+    assert stat_call_count[0] >= 2
+
+
+def test_follow_missing_file_waits(tmp_path):
+    """follow waits for missing file, yields nothing, returns when stop_event set."""
+    import os
+    import threading
+
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    # Non-existent file
+    log_file = tmp_path / "does_not_exist.log"
+
+    source = LogSource(path=str(log_file), format="logstash")
+    stop_event = threading.Event()
+
+    # Fake stat that always returns FileNotFoundError (file never appears)
+    stat_call_count = [0]
+
+    def fake_stat(path):
+        stat_call_count[0] += 1
+        raise FileNotFoundError(f"Mock missing: {path}")
+
+    backend = NdjsonFileBackend(source, stat_fn=fake_stat)
+
+    # Use a small poll interval and stop after a delay
+    poll_interval = 10  # 10ms
+
+    def stop_after_delay():
+        """Set stop_event after a short delay."""
+        time.sleep(0.05)  # Wait 50ms
+        stop_event.set()
+
+    stopper = threading.Thread(target=stop_after_delay, daemon=True)
+    stopper.start()
+
+    # Consume the generator with a safety timeout
+    results = []
+    start = time.monotonic()
+
+    for entry in backend.follow(
+        LogFilter(), stop_event=stop_event, poll_interval_ms=poll_interval
+    ):
+        results.append(entry)
+        if time.monotonic() - start > 1.0:  # Safety timeout
+            break
+
+    # Should yield nothing (file never exists)
+    assert len(results) == 0
+
+    # Should have attempted stat at least once
+    assert stat_call_count[0] >= 1

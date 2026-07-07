@@ -3,6 +3,7 @@
 import dataclasses
 import fnmatch
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -46,6 +47,7 @@ class NdjsonFileBackend:
         *,
         monotonic: callable = time.monotonic,
         sleep: callable = time.sleep,
+        stat_fn: callable = os.stat,
     ):
         """Store source config and injectable clock/sleep for testing.
 
@@ -53,11 +55,13 @@ class NdjsonFileBackend:
             source: LogSource configuration
             monotonic: Injectable monotonic clock (default: time.monotonic)
             sleep: Injectable sleep function (default: time.sleep)
+            stat_fn: Injectable stat function (default: os.stat)
         """
         self._path = source.path
         self._format = source.format
         self._monotonic = monotonic
         self._sleep = sleep
+        self._stat_fn = stat_fn
 
     def validate_config(self) -> None:
         """Raise ConfigError if path is None (file type requires path)."""
@@ -346,9 +350,117 @@ class NdjsonFileBackend:
             # Sleep before next poll
             self._sleep(poll_interval_ms / 1000)
 
-    def follow(self, filt: LogFilter, *, stop_event):
-        """Stream matching entries indefinitely (Task 5)."""
-        raise NotImplementedError("follow will be implemented in Task 5")
+    def follow(self, filt: LogFilter, *, stop_event, poll_interval_ms: int):
+        """Stream matching entries indefinitely until stop_event is set.
+
+        Polls the file for growth, yields new matching entries as they appear.
+        Handles file truncation/rollover by resetting offset to 0.
+        If file is missing, waits and retries (service not yet started).
+
+        Args:
+            filt: Filter criteria for entries
+            stop_event: Threading event to signal graceful shutdown
+            poll_interval_ms: Poll interval in milliseconds
+
+        Yields:
+            CanonicalEntry: New matching entries as they appear
+        """
+        if self._path is None:
+            return
+
+        path = Path(self._path)
+        last_offset = 0
+        poll_interval = poll_interval_ms / 1000
+
+        while True:
+            # Check if we should stop
+            if stop_event.is_set():
+                return
+
+            try:
+                stat_result = self._stat_fn(path)
+                current_size = stat_result.st_size
+            except (FileNotFoundError, OSError):
+                # File doesn't exist yet (service not started) - wait and retry
+                if stop_event.wait(poll_interval):
+                    return  # Event was set during wait
+                continue
+
+            # Check for rollover/truncation (file shrank)
+            if current_size < last_offset:
+                last_offset = 0
+
+            # Check if file grew
+            if current_size > last_offset:
+                # Open file, seek to last offset, read new bytes
+                try:
+                    with path.open("rb") as f:
+                        f.seek(last_offset)
+                        new_bytes = f.read(current_size - last_offset)
+                        last_offset = current_size
+
+                        # Decode and split into lines
+                        if not new_bytes:
+                            # No new data (shouldn't happen since size > offset, but be safe)
+                            if stop_event.wait(poll_interval):
+                                return
+                            continue
+
+                        decoded = new_bytes.decode("utf-8", errors="replace")
+                        lines = decoded.splitlines()
+
+                        for line in lines:
+                            if not line.strip():
+                                continue
+
+                            try:
+                                raw = json.loads(line)
+                            except json.JSONDecodeError:
+                                print(
+                                    "agctl: skipping non-JSON log line",
+                                    file=sys.stderr,
+                                )
+                                continue
+
+                            entry = self._normalize(raw)
+
+                            # Apply filters (AND logic)
+                            if filt.level is not None:
+                                if entry.level != filt.level.upper():
+                                    continue
+
+                            if filt.logger_glob is not None:
+                                if not fnmatch.fnmatch(
+                                    entry.logger or "", filt.logger_glob
+                                ):
+                                    continue
+
+                            if filt.message_substring is not None:
+                                if filt.message_substring not in (
+                                    entry.message or ""
+                                ):
+                                    continue
+
+                            if filt.match_jq is not None:
+                                if not jq_bool(dataclasses.asdict(entry), filt.match_jq):
+                                    continue
+
+                            # Yield the matching entry
+                            yield entry
+
+                            # Check stop_event immediately after yielding
+                            if stop_event.is_set():
+                                return
+
+                except (OSError, IOError):
+                    # File read error - wait and retry
+                    if stop_event.wait(poll_interval):
+                        return
+                    continue
+
+            # No new data - wait before next poll
+            if stop_event.wait(poll_interval):
+                return  # Event was set during wait
 
     def sample_schema(self, *, sample_lines: int = 100) -> SchemaDescriptor:
         """Infer field presence patterns from a sample of log entries.
