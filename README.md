@@ -336,6 +336,19 @@ templates:
 defaults:
   timeout_seconds: 10
   database_connection: main-db
+
+# --- logs: log file sources for tailing and searching ------------------------
+logs:
+  sources:
+    order-service:
+      path: "logs/order-service.log"
+      format: logstash
+      service: order-service
+  defaults:
+    tail_lines: 200
+    limit: 50
+    timeout_seconds: 10
+    poll_interval_ms: 100
 ```
 
 > **Note:** `charge-payment` uses the `${PAYMENT_SERVICE_TOKEN:-change-me}` form —
