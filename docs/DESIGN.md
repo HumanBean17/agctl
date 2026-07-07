@@ -2451,9 +2451,10 @@ mysql = "agctl_mysql:MySQLDriver"
 
 ```python
 # agctl/clients/log_backend_protocol.py
+import threading
 from typing import Protocol, Iterator
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class CanonicalEntry:
@@ -2466,7 +2467,7 @@ class CanonicalEntry:
     service: str | None = None
     stack_trace: str | None = None
     tags: list[str] | None = None
-    fields: dict = None
+    fields: dict = field(default_factory=dict)
 
 @dataclass
 class LogFilter:
@@ -2475,7 +2476,7 @@ class LogFilter:
     logger_glob: str | None = None
     message_substring: str | None = None
     match_jq: str | None = None
-    params: dict = None
+    params: dict = field(default_factory=dict)
 
 @dataclass
 class ScanResult:
@@ -2485,6 +2486,20 @@ class ScanResult:
     scanned: int
     truncated: bool
 
+@dataclass
+class AwaitResult:
+    """Result of an await_one operation."""
+    entry: CanonicalEntry | None
+    scanned: int
+    elapsed_ms: int
+
+@dataclass
+class SchemaDescriptor:
+    """Schema descriptor from sample_schema."""
+    standard: list[str]
+    conditional: list[str]
+    observed: list[str]
+
 class LogBackend(Protocol):
     """Structural contract for a log backend."""
 
@@ -2492,9 +2507,9 @@ class LogBackend(Protocol):
 
     def scan(self, filt: LogFilter, *, since: datetime | None, until: datetime | None, limit: int, tail_lines: int) -> ScanResult: ...
 
-    def await_one(self, filt: LogFilter, *, since: datetime | None, timeout_s: float, poll_interval_ms: int) -> AwaitResult: ...
+    def await_one(self, filt: LogFilter, *, since: datetime | None, timeout_s: float, poll_interval_ms: int, tail_lines: int) -> AwaitResult: ...
 
-    def follow(self, filt: LogFilter, *, stop_event, poll_interval_ms: int) -> Iterator[CanonicalEntry]: ...
+    def follow(self, filt: LogFilter, *, stop_event: threading.Event, poll_interval_ms: int) -> Iterator[CanonicalEntry]: ...
 
     def sample_schema(self, *, sample_lines: int = 100) -> SchemaDescriptor: ...
 ```

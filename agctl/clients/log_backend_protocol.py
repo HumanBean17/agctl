@@ -82,9 +82,10 @@ class AwaitResult:
 class SchemaDescriptor:
     """Schema descriptor from sample_schema.
 
-    ``standard`` lists fields present in all sampled entries. ``conditional``
-    lists fields present in some entries. ``observed`` lists all unique field
-    names seen across the sample.
+    ``standard`` lists standard-slot fields present in any sampled entry
+    (union, not intersection). ``conditional`` lists optional fields
+    (stack_trace, tags) present in any sampled entry. ``observed`` lists all
+    unique field names seen across the sample.
     """
 
     standard: list[str]
@@ -124,6 +125,7 @@ class LogBackend(Protocol):
         since: datetime | None,
         timeout_s: float,
         poll_interval_ms: int,
+        tail_lines: int,
     ) -> AwaitResult: ...
 
     def follow(

@@ -288,6 +288,7 @@ def _logs_assert_core(
         since=since_dt,
         timeout_s=timeout_s,
         poll_interval_ms=cfg.logs.defaults.poll_interval_ms,
+        tail_lines=cfg.logs.defaults.tail_lines,
     )
 
     matched = res.entry is not None
@@ -338,7 +339,7 @@ def _logs_assert_core(
     help="jq predicate against canonical entry fields",
 )
 @click.option("--param", "param", multiple=True, help="k=v placeholder for --match")
-@click.option("--since", "since", default=None, required=True, help="Start time (ISO-8601 or duration)")
+@click.option("--since", "since", default=None, help="Start time (ISO-8601 or duration)")
 @click.option("--not", "not_", is_flag=True, default=False, help="Invert: fail if a match IS found")
 @click.option("--timeout", "timeout", type=float, default=None, help="Poll timeout (seconds); omit for one-shot")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")

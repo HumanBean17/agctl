@@ -86,6 +86,7 @@ def test_log_backend_is_protocol():
             since: datetime | None,
             timeout_s: float,
             poll_interval_ms: int,
+            tail_lines: int,
         ) -> AwaitResult:
             return AwaitResult(entry=None, scanned=0, elapsed_ms=0)
 
@@ -503,7 +504,11 @@ def test_await_one_shot_match(tmp_path):
     backend = NdjsonFileBackend(source)
 
     result = backend.await_one(
-        LogFilter(level="ERROR"), since=None, timeout_s=0, poll_interval_ms=100
+        LogFilter(level="ERROR"),
+        since=None,
+        timeout_s=0,
+        poll_interval_ms=100,
+        tail_lines=200,
     )
 
     assert result.entry is not None
@@ -527,7 +532,11 @@ def test_await_one_shot_no_match(tmp_path):
     backend = NdjsonFileBackend(source)
 
     result = backend.await_one(
-        LogFilter(level="ERROR"), since=None, timeout_s=0, poll_interval_ms=100
+        LogFilter(level="ERROR"),
+        since=None,
+        timeout_s=0,
+        poll_interval_ms=100,
+        tail_lines=200,
     )
 
     assert result.entry is None
@@ -557,19 +566,24 @@ def test_await_one_poll_finds_after_delay(tmp_path):
 
     def fake_sleep(seconds):
         sleep_calls.append(seconds)
-        # After first sleep, append matching line
+        # After first sleep, append matching line (terminated by \n, as real
+        # NDJSON writers do; the incremental tail buffers unterminated partials).
         if len(sleep_calls) == 1:
             existing = log_file.read_text()
             log_file.write_text(
                 existing
-                + '\n{"@timestamp":"2026-07-07T10:00:01Z","level":"ERROR","logger_name":"c.Foo","message":"err1"}'
+                + '\n{"@timestamp":"2026-07-07T10:00:01Z","level":"ERROR","logger_name":"c.Foo","message":"err1"}\n'
             )
 
     # Inject fakes via __init__ kwargs
     backend = NdjsonFileBackend(source, monotonic=fake_monotonic, sleep=fake_sleep)
 
     result = backend.await_one(
-        LogFilter(level="ERROR"), since=None, timeout_s=0.2, poll_interval_ms=100
+        LogFilter(level="ERROR"),
+        since=None,
+        timeout_s=0.2,
+        poll_interval_ms=100,
+        tail_lines=200,
     )
 
     # Should have found the entry after the second poll
@@ -582,7 +596,13 @@ def test_await_one_poll_finds_after_delay(tmp_path):
 
 
 def test_await_one_poll_times_out(tmp_path):
-    """await_one polling mode times out when no match appears."""
+    """await_one polling mode times out when no match appears.
+
+    Incremental poll: the high-water offset is seeded to the file's current
+    size at poll start, so the pre-existing INFO line is NOT re-scanned each
+    iteration. Since the file never grows during the poll window, the final
+    scanned count is 0 (not N x polls).
+    """
     from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
 
     log_file = tmp_path / "test.log"
@@ -597,12 +617,57 @@ def test_await_one_poll_times_out(tmp_path):
     backend = NdjsonFileBackend(source)
 
     result = backend.await_one(
-        LogFilter(level="ERROR"), since=None, timeout_s=0.1, poll_interval_ms=50
+        LogFilter(level="ERROR"),
+        since=None,
+        timeout_s=0.1,
+        poll_interval_ms=50,
+        tail_lines=200,
     )
 
     assert result.entry is None
-    assert result.scanned > 0
+    # Historical window read once at poll start (1 line scanned); the file never
+    # grows during the poll window so no further lines are scanned. The single
+    # INFO line is counted exactly once (not once per poll).
+    assert result.scanned == 1
     assert result.elapsed_ms >= 100  # ~100ms elapsed
+
+
+def test_await_one_poll_no_inflate_across_iterations(tmp_path):
+    """await_one poll scanned count is NOT inflated across iterations.
+
+    A static (non-growing) file with 3 non-matching historical lines: poll mode
+    reads the historical window ONCE (3 lines scanned), then seeds a high-water
+    byte offset and reads only growth on subsequent iterations. Since the file
+    never grows, the cumulative scanned stays 3 — exactly the historical line
+    count, NOT 3 x (number of polls) as the old re-read-the-tail code did.
+    """
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    # Several non-matching historical lines
+    lines = [
+        '{"@timestamp":"2026-07-07T10:00:00Z","level":"INFO","logger_name":"c.Foo","message":"info1"}',
+        '{"@timestamp":"2026-07-07T10:00:01Z","level":"INFO","logger_name":"c.Foo","message":"info2"}',
+        '{"@timestamp":"2026-07-07T10:00:02Z","level":"INFO","logger_name":"c.Foo","message":"info3"}',
+    ]
+    log_file.write_text("\n".join(lines))
+
+    source = LogSource(path=str(log_file), format="logstash")
+    backend = NdjsonFileBackend(source)
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"),
+        since=None,
+        timeout_s=0.15,
+        poll_interval_ms=40,
+        tail_lines=200,
+    )
+
+    assert result.entry is None
+    # Historical window counted exactly once (3 lines); no growth means no
+    # further lines scanned. Old buggy code re-read the tail each poll, which
+    # would have produced 3 x (~4 polls) = ~12.
+    assert result.scanned == 3
 
 
 def test_await_one_cumulative_scanned(tmp_path):
@@ -633,24 +698,33 @@ def test_await_one_cumulative_scanned(tmp_path):
     def fake_sleep(seconds):
         sleep_calls.append(seconds)
         if len(sleep_calls) == 1:
-            # Append more non-matching + matching line
+            # Append more non-matching + matching line (each \n-terminated, as
+            # real NDJSON writers do; the incremental tail buffers partials).
             existing = log_file.read_text()
             log_file.write_text(
                 existing
                 + '\n{"@timestamp":"2026-07-07T10:00:03Z","level":"INFO","logger_name":"c.Foo","message":"info4"}'
-                + '\n{"@timestamp":"2026-07-07T10:00:04Z","level":"ERROR","logger_name":"c.Foo","message":"err1"}'
+                + '\n{"@timestamp":"2026-07-07T10:00:04Z","level":"ERROR","logger_name":"c.Foo","message":"err1"}\n'
             )
 
     backend = NdjsonFileBackend(source, monotonic=fake_monotonic, sleep=fake_sleep)
 
     result = backend.await_one(
-        LogFilter(level="ERROR"), since=None, timeout_s=0.2, poll_interval_ms=100
+        LogFilter(level="ERROR"),
+        since=None,
+        timeout_s=0.2,
+        poll_interval_ms=100,
+        tail_lines=200,
     )
 
     assert result.entry is not None
     assert result.entry.level == "ERROR"
-    # First poll scanned 3, second poll scanned 2 = total 5
-    assert result.scanned >= 5
+    # Two-phase poll: the 3 pre-existing historical lines are read ONCE in
+    # phase 1 (scanned=3), then the high-water offset is seeded to the file
+    # size. After the append, phase 2 reads only the 2 NEW lines (scanned=5).
+    # Each physical line is counted exactly once (once-only semantics), not
+    # re-counted by re-reading the tail each poll.
+    assert result.scanned == 5
 
 
 # ============================================================================
@@ -711,6 +785,38 @@ def test_sample_schema_enumerates(tmp_path):
     # Well-known noise should be excluded
     assert "@version" not in result.observed
     assert "level_value" not in result.observed
+
+
+def test_sample_schema_standard_is_union(tmp_path):
+    """sample_schema ``standard`` is a UNION (present in any entry), not intersection.
+
+    Two entries differ in standard-slot presence: entry 1 has ``service`` but
+    no ``thread``; entry 2 has ``thread`` but no ``service``. Under union
+    semantics both ``service`` and ``thread`` appear in ``standard``; under
+    intersection they would both be absent. This locks the union behavior
+    implemented by ``sample_schema``.
+    """
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    lines = [
+        # Entry 1: has service, no thread
+        '{"@timestamp":"2026-07-07T10:00:00Z","level":"INFO","logger_name":"c.Foo","message":"m1","service":"svc-a"}',
+        # Entry 2: has thread, no service
+        '{"@timestamp":"2026-07-07T10:00:01Z","level":"ERROR","logger_name":"c.Bar","message":"m2","thread_name":"t1"}',
+    ]
+    log_file.write_text("\n".join(lines))
+
+    source = LogSource(path=str(log_file), format="logstash")
+    backend = NdjsonFileBackend(source)
+
+    result = backend.sample_schema(sample_lines=100)
+
+    # Union: each field present in ANY sampled entry appears in standard.
+    assert "service" in result.standard
+    assert "thread" in result.standard
+    # Intersection would have excluded both; union keeps both.
+    assert set(result.standard) >= {"timestamp", "level", "logger", "message", "service", "thread"}
 
 
 # ============================================================================
@@ -785,6 +891,66 @@ def test_follow_yields_new_matches_then_stops(tmp_path):
     assert entry is None, "Generator should stop after stop_event is set"
 
     # Should have called stat at least once
+    assert stat_call_count[0] >= 1
+
+
+def test_follow_starts_at_eof_not_replay(tmp_path):
+    """follow seeds the offset to EOF on first stat — does NOT replay history.
+
+    A pre-existing log with 2 historical matching (ERROR) lines: follow must
+    stream only NEW growth after connect. With no appends during the test, the
+    generator yields ZERO entries (the historical matches are not replayed).
+    Spec §6.4/§8.1 require "new" entries only.
+    """
+    import os
+    import threading
+
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    # Pre-write 2 historical ERROR lines that WOULD match the filter if replayed.
+    historical = (
+        '{"@timestamp":"2026-07-08T10:00:00Z","level":"ERROR","logger_name":"c.Foo","message":"old1"}\n'
+        '{"@timestamp":"2026-07-08T10:00:01Z","level":"ERROR","logger_name":"c.Foo","message":"old2"}\n'
+    )
+    log_file.write_text(historical)
+    file_size = len(historical)
+
+    source = LogSource(path=str(log_file), format="logstash")
+    stop_event = threading.Event()
+
+    # Real-sized stat that always reports the static file size (no growth).
+    stat_call_count = [0]
+
+    def fake_stat(path):
+        stat_call_count[0] += 1
+        return os.stat_result(
+            (33188, 12345, 123, 1, 1000, 1000, file_size, 0, 0, 0)
+        )
+
+    # Cooperative wait: seed wait (1) + a no-growth poll (2), then on the 3rd
+    # wait set stop_event to terminate the generator deterministically WITHOUT
+    # appending anything new.
+    wait_call_count = [0]
+
+    def cooperative_wait(event, timeout):
+        wait_call_count[0] += 1
+        if wait_call_count[0] >= 3:
+            event.set()
+            return True
+        return False
+
+    backend = NdjsonFileBackend(source, stat_fn=fake_stat, _wait=cooperative_wait)
+    gen = backend.follow(
+        LogFilter(level="ERROR"), stop_event=stop_event, poll_interval_ms=10
+    )
+
+    # Drive the generator to exhaustion WITHOUT appending anything new.
+    yielded = list(gen)
+
+    # Historical matching entries must NOT be replayed (EOF-seed).
+    assert yielded == [], f"expected no replay of history, got {len(yielded)} entries"
+    assert stop_event.is_set()
     assert stat_call_count[0] >= 1
 
 
@@ -925,7 +1091,7 @@ def test_log_client_injected_backend_skips_lookup():
                 truncated=False
             )
 
-        def await_one(self, filt, *, since, timeout_s, poll_interval_ms):
+        def await_one(self, filt, *, since, timeout_s, poll_interval_ms, tail_lines):
             raise NotImplementedError()
 
         def follow(self, filt, *, stop_event, poll_interval_ms):

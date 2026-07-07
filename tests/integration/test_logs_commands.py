@@ -348,7 +348,7 @@ def test_discover_item_real_schema(tmp_path):
 
     # Check schema_fields
     schema = res["schema_fields"]
-    # Standard fields present in ALL entries
+    # Standard fields present in any sampled entry (union)
     assert set(schema["standard"]) == {"timestamp", "level", "logger", "message"}
     # Conditional fields present in SOME entries
     assert "stack_trace" in schema["conditional"]

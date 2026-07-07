@@ -489,8 +489,8 @@ command layer (`_kafka_ssl_conf`).
 `NdjsonFileBackend` lazy-imports `jq` in `scan`/`await_one`/`follow` (missing → `ConfigError`, `logs` extra). The backend reads NDJSON files in logstash format (one JSON object per line), normalizes to the canonical entry model, and applies client-side filters (level, logger glob, message substring, jq predicate). It supports three operations:
 
 - **`scan`** — reads the last `tail_lines` from the file, applies time bounds and filters, returns up to `limit` matches with truncation flag.
-- **`await_one`** — blocks until a matching entry appears or timeout; supports one-shot mode (timeout ≤ 0) and poll mode (timeout > 0).
-- **`follow`** — streams matching entries indefinitely until stop event, handles file truncation/rollover by resetting offset to 0.
+- **`await_one`** — blocks until a matching entry appears or timeout; supports one-shot mode (timeout ≤ 0, single read of the last `tail_lines`) and poll mode (timeout > 0, two-phase: the historical window is read ONCE then a high-water byte offset tracks only NEW growth so each physical line is counted exactly once — no re-count across polls).
+- **`follow`** — streams matching entries indefinitely until stop event; on the first successful stat of an existing file the read offset is seeded to that file's current size (EOF), so only NEW growth after connect is streamed (historical entries are not replayed); handles file truncation/rollover by resetting offset to 0.
 - **`sample_schema`** — infers field presence patterns from a sample of entries (standard slots like `timestamp`/`level`/`logger`, conditional slots like `stack_trace`/`tags`, and observed custom `fields` keys).
 
 **File-tail implementation** (`_tail_lines`) — reads the last N lines without loading the entire file, using a loop-growing read window that handles long lines robustly. Starts with an estimate and doubles the window until either N lines are captured or the start of the file is reached. Discards partial leading fragment when seeking from a non-zero offset.

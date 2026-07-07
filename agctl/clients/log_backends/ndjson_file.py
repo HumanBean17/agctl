@@ -5,7 +5,9 @@ import fnmatch
 import json
 import os
 import sys
+import threading
 import time
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -276,6 +278,25 @@ class NdjsonFileBackend:
                     # Window would cover entire file, just read it all
                     estimate = file_size
 
+    def _drain_complete_lines(
+        self, buffer: bytes, new_bytes: bytes
+    ) -> tuple[list[str], bytes]:
+        """Combine buffer + new bytes, decode, split on newline.
+
+        Returns ``(complete_lines, remaining_buffer)`` where ``remaining_buffer``
+        holds the trailing partial-line fragment (no terminating newline yet) to
+        be prepended on the next read. Shared by :meth:`follow` and poll-mode
+        :meth:`await_one` so a line split across reads is never mis-counted.
+        """
+        combined = buffer + new_bytes
+        decoded = combined.decode("utf-8", errors="replace")
+        lines = decoded.split("\n")
+        remaining = b""
+        if not decoded.endswith("\n"):
+            if lines:
+                remaining = lines.pop().encode("utf-8", errors="replace")
+        return lines, remaining
+
     def await_one(
         self,
         filt: LogFilter,
@@ -283,67 +304,80 @@ class NdjsonFileBackend:
         since: datetime | None,
         timeout_s: float,
         poll_interval_ms: int,
+        tail_lines: int,
     ) -> AwaitResult:
         """Block until a matching entry appears or timeout.
 
-        One-shot mode (timeout_s <= 0): single read attempt.
-        Poll mode (timeout_s > 0): loop with deadline, re-reading file each iteration.
+        One-shot mode (timeout_s <= 0): single read of the last ``tail_lines``
+        (historical window); return first match or None.
+
+        Poll mode (timeout_s > 0): **two-phase incremental** tail.
+        Phase 1 reads the historical window (last ``tail_lines``) ONCE and
+        counts each line exactly once. Phase 2 then tracks a high-water byte
+        offset (seeded to the file's size after the historical read) so every
+        subsequent iteration reads only NEW growth — physical lines are never
+        re-counted across polls. Rollover / truncation (file shrank) resets the
+        offset to 0.
 
         Args:
             filt: Filter criteria
             since: Time window start (None = unbounded)
             timeout_s: Timeout in seconds (<= 0 for one-shot, > 0 for poll mode)
             poll_interval_ms: Poll interval in milliseconds (poll mode only)
+            tail_lines: Historical window (number of trailing lines) read once
+                at the start of both one-shot and poll mode
 
         Returns:
-            AwaitResult with first matching entry (or None), cumulative scanned count,
-            and elapsed wall-clock time in milliseconds.
+            AwaitResult with first matching entry (or None), cumulative scanned
+            count, and elapsed wall-clock time in milliseconds.
         """
         start_time = self._monotonic()
         scanned_total = 0
+        until_now = datetime.now(timezone.utc)
 
-        if timeout_s <= 0:
-            # One-shot mode: single read attempt
-            entries, matched, scanned = self._read_window(
-                filt=filt,
-                since=since,
-                until=datetime.now(timezone.utc),
-                limit=1,
-                tail_lines=1000,  # Reasonable tail for await_one
-            )
+        # Phase 1 (one-shot mode is just this phase): read the historical window
+        # once and count each line exactly once.
+        entries, _matched, scanned = self._read_window(
+            filt=filt,
+            since=since,
+            until=until_now,
+            limit=1,
+            tail_lines=tail_lines,
+        )
+        scanned_total += scanned
+
+        if timeout_s <= 0 or entries:
             elapsed_ms = int((self._monotonic() - start_time) * 1000)
             return AwaitResult(
                 entry=entries[0] if entries else None,
-                scanned=scanned,
+                scanned=scanned_total,
                 elapsed_ms=elapsed_ms,
             )
 
-        # Poll mode: loop until deadline or match found
+        # Phase 2 (poll mode): seed high-water offset to current file size, then
+        # read only NEW growth each iteration (no re-count of historical bytes).
         deadline = start_time + timeout_s
+        offset, _buffer = self._seed_offset()
 
         while True:
-            entries, matched, scanned = self._read_window(
+            new_entries, scanned, offset, _buffer = self._read_increment(
                 filt=filt,
                 since=since,
-                until=datetime.now(timezone.utc),
-                limit=1,
-                tail_lines=1000,
+                offset=offset,
+                buffer=_buffer,
             )
             scanned_total += scanned
 
-            if entries:
-                # Found a match - return immediately
+            if new_entries:
                 elapsed_ms = int((self._monotonic() - start_time) * 1000)
                 return AwaitResult(
-                    entry=entries[0],
+                    entry=new_entries[0],
                     scanned=scanned_total,
                     elapsed_ms=elapsed_ms,
                 )
 
-            # No match - check if we should continue polling
             now = self._monotonic()
             if now >= deadline:
-                # Timeout reached
                 elapsed_ms = int((now - start_time) * 1000)
                 return AwaitResult(
                     entry=None,
@@ -351,15 +385,138 @@ class NdjsonFileBackend:
                     elapsed_ms=elapsed_ms,
                 )
 
-            # Sleep before next poll
             self._sleep(poll_interval_ms / 1000)
 
-    def follow(self, filt: LogFilter, *, stop_event, poll_interval_ms: int):
+    def _seed_offset(self) -> tuple[int, bytes]:
+        """Seed the poll-mode high-water offset to the file's current size.
+
+        Returns ``(offset, buffer)``. If the file is missing, offset is 0
+        (when it later appears, growth is read from the start). Buffer always
+        starts empty.
+        """
+        if self._path is None:
+            return 0, b""
+        path = Path(self._path)
+        try:
+            return self._stat_fn(path).st_size, b""
+        except (FileNotFoundError, OSError):
+            return 0, b""
+
+    def _read_increment(
+        self,
+        filt: LogFilter,
+        since: datetime | None,
+        offset: int,
+        buffer: bytes,
+    ) -> tuple[list[CanonicalEntry], int, int, bytes]:
+        """Read NEW bytes since ``offset``, returning up to one match.
+
+        Returns ``(entries, scanned, new_offset, new_buffer)``. Each physical
+        line is counted in ``scanned`` exactly once. Rollover/truncation
+        (size < offset) resets the offset to 0 and clears the buffer.
+
+        No upper time bound is applied: bytes read here are, by construction,
+        freshly appended (they did not exist when the offset was last
+        advanced), so an upper ``until`` bound would only wrongly exclude
+        them. The ``since`` lower bound is still honored.
+        """
+        entries: list[CanonicalEntry] = []
+        scanned = 0
+        if self._path is None:
+            return entries, scanned, offset, buffer
+        path = Path(self._path)
+
+        try:
+            current_size = self._stat_fn(path).st_size
+        except (FileNotFoundError, OSError):
+            return entries, scanned, offset, buffer
+
+        # Rollover/truncation: file shrank -> reset offset to 0, clear buffer
+        if current_size < offset:
+            offset = 0
+            buffer = b""
+
+        if current_size <= offset:
+            return entries, scanned, offset, buffer
+
+        try:
+            with path.open("rb") as f:
+                f.seek(offset)
+                new_bytes = f.read(current_size - offset)
+            new_offset = current_size
+        except (OSError, IOError):
+            return entries, scanned, offset, buffer
+
+        if not new_bytes:
+            return entries, scanned, new_offset, buffer
+
+        lines, remaining = self._drain_complete_lines(buffer, new_bytes)
+
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                print("agctl: skipping non-JSON log line", file=sys.stderr)
+                continue
+
+            entry = self._normalize(raw)
+
+            # Window check: only the `since` lower bound. Fresh bytes are, by
+            # construction, recent, so no upper `until` bound is applied (an
+            # upper bound computed at poll start would wrongly exclude entries
+            # appended later in the poll window).
+            if since is not None:
+                entry_ts = _parse_iso_datetime(entry.timestamp)
+                if entry_ts is None:
+                    continue
+                entry_ts_utc = _to_utc(entry_ts)
+                if entry_ts_utc < since:
+                    continue
+
+            scanned += 1
+
+            # Apply filters (AND logic)
+            if filt.level is not None and entry.level != filt.level.upper():
+                continue
+
+            if filt.logger_glob is not None and not fnmatch.fnmatch(
+                entry.logger or "", filt.logger_glob
+            ):
+                continue
+
+            if filt.message_substring is not None and (
+                filt.message_substring not in (entry.message or "")
+            ):
+                continue
+
+            if filt.match_jq is not None and not jq_bool(
+                dataclasses.asdict(entry), filt.match_jq
+            ):
+                continue
+
+            entries.append(entry)
+            break  # limit == 1 for await_one
+
+        return entries, scanned, new_offset, remaining
+
+    def follow(
+        self,
+        filt: LogFilter,
+        *,
+        stop_event: threading.Event,
+        poll_interval_ms: int,
+    ) -> Iterator[CanonicalEntry]:
         """Stream matching entries indefinitely until stop_event is set.
 
         Polls the file for growth, yields new matching entries as they appear.
+        On the first successful stat of an existing file, the read offset is
+        seeded to that file's current size (EOF), so only growth AFTER connect
+        is streamed — historical entries are not replayed (spec §6.4/§8.1:
+        "new" entries only). If the file is missing, it waits and retries;
+        when the file appears, the offset is seeded to its then-current size.
         Handles file truncation/rollover by resetting offset to 0.
-        If file is missing, waits and retries (service not yet started).
 
         Args:
             filt: Filter criteria for entries
@@ -373,7 +530,9 @@ class NdjsonFileBackend:
             return
 
         path = Path(self._path)
-        last_offset = 0
+        # None sentinel: not yet seeded. On first successful stat we seed to the
+        # file's current size (EOF) so only post-connect growth is streamed.
+        last_offset: int | None = None
         poll_interval = poll_interval_ms / 1000
         _buffer = b""  # Buffer for partial lines across iterations
 
@@ -389,6 +548,15 @@ class NdjsonFileBackend:
                 # File doesn't exist yet (service not started) - wait and retry
                 if self._wait(stop_event, poll_interval):
                     return  # Event was set during wait
+                continue
+
+            # First successful stat: seed offset to current size (EOF) so we
+            # stream only NEW growth after connect (no history replay).
+            if last_offset is None:
+                last_offset = current_size
+                _buffer = b""
+                if self._wait(stop_event, poll_interval):
+                    return
                 continue
 
             # Check for rollover/truncation (file shrank)
@@ -411,28 +579,8 @@ class NdjsonFileBackend:
                                 return
                             continue
 
-                        # Combine buffered partial from previous iteration with new bytes
-                        combined = _buffer + new_bytes
-                        _buffer = b""  # Clear buffer after combining
-
-                        # Decode and split on newline
-                        try:
-                            decoded = combined.decode("utf-8", errors="replace")
-                        except UnicodeDecodeError:
-                            # If decode fails, skip this batch and keep buffer for next
-                            _buffer = combined
-                            if self._wait(stop_event, poll_interval):
-                                return
-                            continue
-
-                        # Split on newline and process complete lines
-                        lines = decoded.split("\n")
-
-                        # Keep the last fragment if it doesn't end with newline
-                        # (it's a partial line that will be completed in the next read)
-                        if not decoded.endswith("\n"):
-                            if lines:
-                                _buffer = lines.pop().encode("utf-8", errors="replace")
+                        # Decode + split, carrying any partial line across reads.
+                        lines, _buffer = self._drain_complete_lines(_buffer, new_bytes)
 
                         for line in lines:
                             if not line.strip():

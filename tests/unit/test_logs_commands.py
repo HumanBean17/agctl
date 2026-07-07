@@ -84,6 +84,7 @@ class _FakeLogsClient:
         since: datetime.datetime | None,
         timeout_s: float,
         poll_interval_ms: int,
+        tail_lines: int,
     ) -> AwaitResult:
         self.await_one_calls.append(
             {
@@ -91,6 +92,7 @@ class _FakeLogsClient:
                 "since": since,
                 "timeout_s": timeout_s,
                 "poll_interval_ms": poll_interval_ms,
+                "tail_lines": tail_lines,
             }
         )
         return self._await_one_result

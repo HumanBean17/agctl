@@ -123,6 +123,7 @@ class LogClient:
         since: datetime | None,
         timeout_s: float,
         poll_interval_ms: int,
+        tail_lines: int,
     ) -> AwaitResult:
         """Delegate to backend's await_one."""
         return self._backend.await_one(
@@ -130,6 +131,7 @@ class LogClient:
             since=since,
             timeout_s=timeout_s,
             poll_interval_ms=poll_interval_ms,
+            tail_lines=tail_lines,
         )
 
     def follow(self, filt: LogFilter, *, stop_event, poll_interval_ms: int):
