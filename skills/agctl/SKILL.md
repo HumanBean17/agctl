@@ -63,7 +63,7 @@ Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`, `moc
 
 ## Command forms
 
-Only `--config <path>` is global. `--timeout` is **not** global (see gotchas).
+`--config <path>` and `--overlay <path>` (repeatable) are global. `--timeout` is **not** global (see gotchas).
 `[brackets]` = optional; trailing `…` = repeatable; `<mode>` = one of
 `--contains '{…}' | --match '<jq>' | --pattern <name>`.
 
