@@ -26,7 +26,7 @@ from .commands.db_commands import db_assert, db_execute, db_query, db_schema
 from .commands.discover_commands import discover
 from .commands.http_commands import http_call, http_ping, http_request
 from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
-from .commands.logs_commands import logs_assert, logs_query
+from .commands.logs_commands import logs_assert, logs_query, logs_tail
 from .commands.mock_commands import mock_run, mock_start, mock_stop, mock_status
 
 #: Entry-point group for third-party protocol plugins (DESIGN §9.2).
@@ -183,6 +183,7 @@ kafka_group.add_command(kafka_assert)
 # Register subcommands on the logs group.
 logs_group.add_command(logs_query)
 logs_group.add_command(logs_assert)
+logs_group.add_command(logs_tail)
 
 
 # Register subcommands on the check group.

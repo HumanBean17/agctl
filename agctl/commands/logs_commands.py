@@ -1,24 +1,32 @@
-"""`logs query/assert` commands (DESIGN §6.2, §6.3).
+"""`logs query/assert/tail` commands (DESIGN §6.2, §6.3, §6.4).
 
 - ``logs query`` scans logs within a time window, optionally filtering by
   level/logger/message, and returns a paginated result set.
 - ``logs assert`` polls for a matching entry and raises an AssertionError if
   no match appears within the timeout (or if ``--not`` is set and a match
   does appear).
+- ``logs tail`` streams log entries in real-time until stopped (NDJSON,
+  signal-driven, summary line) — the streaming exception (D9), mirroring
+  ``http ping``.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import datetime
+import json
 import re
-from typing import TYPE_CHECKING
+import signal
+import threading
+import time
+from typing import TYPE_CHECKING, Any, Callable
 
 import click
 
 from ..assertions import _parse_iso_datetime, _to_utc, compile_jq
 from ..command import envelope, load_config_or_raise
-from ..errors import AssertionFailure, ConfigError
+from ..errors import AgctlError, AssertionFailure, ConfigError
+from ..output import emit
 from ..params import parse_params
 from ..resolution import fill_placeholders
 
@@ -28,6 +36,7 @@ if TYPE_CHECKING:
 __all__ = [
     "logs_query",
     "logs_assert",
+    "logs_tail",
     "new_logs_client",
 ]
 
@@ -367,3 +376,178 @@ def logs_assert(
 
 
 _logs_assert_envelope = envelope("logs.assert")(_logs_assert_core)
+
+
+# --------------------------------------------------------------------------- #
+# logs tail (DESIGN §6.4, D9 streaming exception)
+# --------------------------------------------------------------------------- #
+
+
+def _emit_stdout_line(line: dict) -> None:
+    """Write one NDJSON line directly to stdout (NOT via emit)."""
+    import sys
+
+    sys.stdout.write(json.dumps(line, ensure_ascii=False))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _tail_run(
+    client,
+    filt,
+    *,
+    stop_event: threading.Event,
+    emit_line: Callable[[dict], None],
+    poll_interval_ms: int,
+) -> tuple[int, int]:
+    """Drive the tail streaming loop.
+
+    Calls ``client.follow(filt, stop_event=stop_event)`` and yields each
+    entry via ``emit_line`` (as ``dataclasses.asdict(entry)``). Returns
+    ``(emitted_count, duration_ms)``. Factored out so the streaming loop
+    is testable separately from signal plumbing (mirrors ``_run_pings``).
+    """
+    start = time.monotonic()
+    emitted = 0
+
+    for entry in client.follow(filt, stop_event=stop_event, poll_interval_ms=poll_interval_ms):
+        emit_line(dataclasses.asdict(entry))
+        emitted += 1
+
+    duration_ms = int((time.monotonic() - start) * 1000)
+    return emitted, duration_ms
+
+
+@click.command("tail")
+@click.option("--source", "source", required=True, help="Log source name")
+@click.option("--level", "level", default=None, help="Log level (case-insensitive)")
+@click.option("--logger", "logger", default=None, help="Logger name glob")
+@click.option(
+    "--match",
+    "match",
+    default=None,
+    help="jq predicate against canonical entry fields",
+)
+@click.option("--param", "param", multiple=True, help="k=v placeholder for --match")
+@click.option("--duration", "duration", type=float, default=None, help="Stop after N seconds")
+@click.option("--until-stopped", "until_stopped", is_flag=True, default=False)
+@click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
+@click.pass_context
+def logs_tail(
+    ctx: click.Context,
+    source: str,
+    level: str | None,
+    logger: str | None,
+    match: str | None,
+    param: tuple[str, ...],
+    duration: float | None,
+    until_stopped: bool,
+    config_path: str | None,
+) -> None:
+    """Stream log entries in real-time (NDJSON, signal-driven stop, summary line)."""
+    # Resolve config_path from click context
+    config_path_resolved = config_path
+    if ctx.obj and ctx.obj.get("config_path"):
+        config_path_resolved = ctx.obj.get("config_path")
+
+    start = time.monotonic()
+
+    if duration is not None and until_stopped:
+        # Mutex check (mirrors http_ping)
+        emit(
+            ok=False,
+            command="logs.tail",
+            error={
+                "type": "ConfigError",
+                "message": "--duration and --until-stopped are mutually exclusive",
+                "detail": {},
+            },
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        raise SystemExit(2)
+
+    try:
+        cfg = load_config_or_raise(config_path_resolved)
+        src = _resolve_source(cfg, source)
+        params = parse_params(param)
+        filt = _build_log_filter(
+            level=level,
+            logger=logger,
+            message=None,  # Tail takes no --message per spec §6.4
+            match=match,
+            params=params,
+        )
+    except AgctlError as err:
+        # Startup config errors -> structured envelope + exit code (mirrors http_ping)
+        emit(
+            ok=False,
+            command="logs.tail",
+            error=err.to_dict(),
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        raise SystemExit(err.exit_code)
+    except Exception as exc:
+        # Non-agctl startup errors -> InternalError envelope + exit 2
+        emit(
+            ok=False,
+            command="logs.tail",
+            error={"type": "InternalError", "message": str(exc), "detail": {}},
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        raise SystemExit(2)
+
+    client = new_logs_client(src)
+
+    # Signal handling: install SIGTERM/SIGINT handlers that set a stop event.
+    # Guard for non-main-thread contexts (degrades gracefully).
+    stop_event = threading.Event()
+    prev_term = None
+    prev_int = None
+
+    def _handler(signum, frame):
+        stop_event.set()
+
+    try:
+        prev_term = signal.getsignal(signal.SIGTERM)
+        prev_int = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGTERM, _handler)
+        signal.signal(signal.SIGINT, _handler)
+    except (ValueError, OSError):
+        pass
+
+    # If --duration is set, start a daemon timer that sets stop_event after N seconds.
+    duration_timer: threading.Timer | None = None
+    if duration is not None:
+        duration_timer = threading.Timer(duration, stop_event.set)
+        duration_timer.daemon = True
+        duration_timer.start()
+
+    try:
+        emitted, total_ms = _tail_run(
+            client,
+            filt,
+            stop_event=stop_event,
+            emit_line=_emit_stdout_line,
+            poll_interval_ms=cfg.logs.defaults.poll_interval_ms,
+        )
+    finally:
+        # Restore previous signal handlers (mirrors http_ping).
+        try:
+            if prev_term is not None:
+                signal.signal(signal.SIGTERM, prev_term)
+            if prev_int is not None:
+                signal.signal(signal.SIGINT, prev_int)
+        except (ValueError, OSError):
+            pass
+        # Clean up duration timer if it was started.
+        if duration_timer is not None:
+            duration_timer.cancel()
+
+    summary = {
+        "summary": True,
+        "total_emitted": emitted,
+        "duration_ms": total_ms,
+    }
+    _emit_stdout_line(summary)
+
+    raise SystemExit(0)

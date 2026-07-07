@@ -42,17 +42,20 @@ ENV = {
 
 
 class _FakeLogsClient:
-    """Fake LogClient with canned scan/await_one results."""
+    """Fake LogClient with canned scan/await_one/follow results."""
 
     def __init__(
         self,
         scan: ScanResult | None = None,
         await_one: AwaitResult | None = None,
+        follow_entries: list[CanonicalEntry] | None = None,
     ):
         self._scan_result = scan
         self._await_one_result = await_one
+        self._follow_entries = follow_entries or []
         self.scan_calls = []
         self.await_one_calls = []
+        self.follow_calls = []
 
     def scan(
         self,
@@ -96,7 +99,21 @@ class _FakeLogsClient:
         pass
 
     def follow(self, filt, *, stop_event, poll_interval_ms: int):
-        pass
+        """Yield canned entries, then check stop_event (never blocks)."""
+        self.follow_calls.append(
+            {
+                "filter": filt,
+                "stop_event": stop_event,
+                "poll_interval_ms": poll_interval_ms,
+            }
+        )
+        # Yield each entry, then check stop_event and return (never hangs).
+        for entry in self._follow_entries:
+            yield entry
+            # Check stop_event after each yield; if set, return immediately.
+            if stop_event.is_set():
+                return
+        # After all entries yielded, return (no real polling loop).
 
     def validate_config(self):
         pass
@@ -104,12 +121,16 @@ class _FakeLogsClient:
 
 @pytest.fixture
 def install_fake(monkeypatch):
-    """Install a _FakeLogsClient that captures scan/await_one calls."""
+    """Install a _FakeLogsClient that captures scan/await_one/follow calls."""
 
     captured = {}
 
-    def _install(scan: ScanResult | None = None, await_one: AwaitResult | None = None):
-        fake = _FakeLogsClient(scan=scan, await_one=await_one)
+    def _install(
+        scan: ScanResult | None = None,
+        await_one: AwaitResult | None = None,
+        follow_entries: list[CanonicalEntry] | None = None,
+    ):
+        fake = _FakeLogsClient(scan=scan, await_one=await_one, follow_entries=follow_entries)
         captured["fake"] = fake
 
         def factory(src):
@@ -534,3 +555,131 @@ def test_logs_match_missing_jq_extra(monkeypatch):
     # Should NOT contain the original db/kafka hint
     assert "[db]" not in payload["error"]["message"]
     assert "[kafka]" not in payload["error"]["message"]
+
+
+# --------------------------------------------------------------------------- #
+# logs tail
+# --------------------------------------------------------------------------- #
+
+
+def test_logs_tail_streams_entries_and_summary(install_fake):
+    """Tail streams 2 entries then summary (via fake client follow)."""
+    entries = [
+        CanonicalEntry(
+            timestamp="2026-07-08T12:00:00Z",
+            level="INFO",
+            logger="order-service",
+            message="Order created",
+        ),
+        CanonicalEntry(
+            timestamp="2026-07-08T12:00:01Z",
+            level="INFO",
+            logger="order-service",
+            message="Payment processed",
+        ),
+    ]
+    install_fake(follow_entries=entries)
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "logs",
+            "tail",
+            "--source",
+            "order-service",
+            "--until-stopped",
+        ]
+    )
+
+    assert result.exit_code == 0
+    lines = result.output.strip().split("\n")
+    assert len(lines) == 3
+
+    # First two lines are entry JSON
+    import json
+
+    entry1 = json.loads(lines[0])
+    entry2 = json.loads(lines[1])
+    assert entry1["message"] == "Order created"
+    assert entry2["message"] == "Payment processed"
+
+    # Third line is summary
+    summary = json.loads(lines[2])
+    assert summary["summary"] is True
+    assert summary["total_emitted"] == 2
+    assert "duration_ms" in summary
+
+
+def test_logs_tail_mutex_duration_until_stopped(install_fake):
+    """--duration and --until-stopped are mutually exclusive."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "logs",
+            "tail",
+            "--source",
+            "order-service",
+            "--duration",
+            "5",
+            "--until-stopped",
+        ]
+    )
+
+    assert result.exit_code == 2
+    import json
+
+    payload = json.loads(result.output.strip())
+    assert payload["ok"] is False
+    assert payload["command"] == "logs.tail"
+    assert payload["error"]["type"] == "ConfigError"
+    assert "--duration and --until-stopped are mutually exclusive" in payload["error"]["message"]
+
+
+def test_logs_tail_unknown_source_startup_error(install_fake):
+    """Unknown --source -> ConfigError envelope at startup (no streaming)."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "logs",
+            "tail",
+            "--source",
+            "does-not-exist",
+        ]
+    )
+
+    assert result.exit_code == 2
+    import json
+
+    payload = json.loads(result.output.strip())
+    assert payload["ok"] is False
+    assert payload["command"] == "logs.tail"
+    assert payload["error"]["type"] == "ConfigError"
+    assert "does-not-exist" in payload["error"]["message"]
+
+
+def test_logs_tail_match_compile_loud_fail(install_fake):
+    """Malformed --match surfaces as ConfigError envelope at startup."""
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "logs",
+            "tail",
+            "--source",
+            "order-service",
+            "--match",
+            ".fields.x ==",  # truncated expression
+        ]
+    )
+
+    assert result.exit_code == 2
+    import json
+
+    payload = json.loads(result.output.strip())
+    assert payload["ok"] is False
+    assert payload["command"] == "logs.tail"
+    assert payload["error"]["type"] == "ConfigError"
+    assert "jq" in payload["error"]["message"].lower()
