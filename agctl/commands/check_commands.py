@@ -75,8 +75,9 @@ def _check_ready_core(
     service: str | None,
     all_services: bool,
     timeout: float | None,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
     return _check_ready_with_config(cfg, service, all_services, timeout)
 
 
@@ -109,7 +110,8 @@ def check_ready(
 ) -> None:
     """Probe configured service health endpoints."""
     path = config_path or (ctx.obj.get("config_path") if ctx.obj else None)
-    _check_ready_envelope(path, service, all_services, timeout)
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    _check_ready_envelope(path, service, all_services, timeout, overlay_paths=list(ovs) if ovs else None)
 
 
 _check_ready_envelope = envelope("check.ready")(_check_ready_core)

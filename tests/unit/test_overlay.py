@@ -502,3 +502,233 @@ templates:
     assert "extra" in payload["result"]["config"]["templates"]
     assert payload["result"]["overrides"] == []
 
+
+# Task 7: Thread --overlay into runtime commands
+from pathlib import Path
+from agctl.config.models import Config, ServiceConfig
+
+
+def test_http_call_forwards_overlay(tmp_path, monkeypatch):
+    """http call forwards overlay_paths from ctx.obj to load_config_or_raise."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  get-order:
+    method: GET
+    service: orders
+    path: /api/v1/orders
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""templates:
+  extra:
+    method: GET
+    service: orders
+    path: /extra
+""")
+
+    # Track what overlay_paths was passed to load_config_or_raise
+    captured_overlays = []
+
+    def fake_load_config(config_path, overlay_paths=None):
+        captured_overlays.append(overlay_paths)
+        from agctl.config.models import HttpTemplate
+        return Config(
+            version="2",
+            services={"orders": ServiceConfig(base_url="http://localhost:8081")},
+            templates={
+                "get-order": HttpTemplate(
+                    method="GET",
+                    service="orders",
+                    path="/api/v1/orders"
+                )
+            }
+        )
+
+    # Patch at the module level where it's imported
+    monkeypatch.setattr("agctl.commands.http_commands.load_config_or_raise", fake_load_config)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--overlay", str(ov), "--config", str(base), "http", "call", "get-order"]
+    )
+
+    # Debug output
+    if len(captured_overlays) != 1:
+        print(f"\nExit code: {result.exit_code}")
+        print(f"Output: {result.output}")
+        if result.exception:
+            import traceback
+            print(f"Exception: {''.join(traceback.format_exception(type(result.exception), result.exception, result.exception.__traceback__))}")
+
+    # Should have attempted to load config with overlay
+    assert len(captured_overlays) == 1
+    assert captured_overlays[0] == [str(ov)]
+
+
+def test_db_query_forwards_overlay(tmp_path, monkeypatch):
+    """db query forwards overlay_paths from ctx.obj to load_config_or_raise."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+database:
+  connections:
+    main:
+      type: sqlite
+      path: /tmp/db.sqlite
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""database:
+  templates:
+    extra:
+      sql: SELECT 1
+""")
+
+    captured_overlays = []
+
+    def fake_load_config(config_path, overlay_paths=None):
+        captured_overlays.append(overlay_paths)
+        from agctl.config.models import DatabaseConfig, ConnectionConfig
+        return Config(
+            version="2",
+            services={"orders": ServiceConfig(base_url="http://localhost:8081")},
+            database=DatabaseConfig(
+                connections={"main": ConnectionConfig(type="sqlite", path="/tmp/db.sqlite")}
+            )
+        )
+
+    monkeypatch.setattr("agctl.commands.db_commands.load_config_or_raise", fake_load_config)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--overlay", str(ov), "--config", str(base), "db", "query", "--sql", "SELECT 1"]
+    )
+
+    assert len(captured_overlays) == 1
+    assert captured_overlays[0] == [str(ov)]
+
+
+def test_kafka_produce_forwards_overlay(tmp_path, monkeypatch):
+    """kafka produce forwards overlay_paths from ctx.obj to load_config_or_raise."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+kafka:
+  brokers:
+    - localhost:9092
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""kafka:
+  patterns:
+    extra:
+      topic: test
+      match: .event == "test"
+""")
+
+    captured_overlays = []
+
+    def fake_load_config(config_path, overlay_paths=None):
+        captured_overlays.append(overlay_paths)
+        from agctl.config.models import KafkaConfig
+        return Config(
+            version="2",
+            services={"orders": ServiceConfig(base_url="http://localhost:8081")},
+            kafka=KafkaConfig(brokers=["localhost:9092"])
+        )
+
+    monkeypatch.setattr("agctl.commands.kafka_commands.load_config_or_raise", fake_load_config)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--overlay", str(ov), "--config", str(base), "kafka", "produce", "--topic", "test", "--message", "{}"]
+    )
+
+    assert len(captured_overlays) == 1
+    assert captured_overlays[0] == [str(ov)]
+
+
+def test_check_ready_forwards_overlay(tmp_path, monkeypatch):
+    """check ready forwards overlay_paths from ctx.obj to load_config_or_raise."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+    health_path: /health
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""services:
+  orders:
+    health_path: /health2
+""")
+
+    captured_overlays = []
+
+    def fake_load_config(config_path, overlay_paths=None):
+        captured_overlays.append(overlay_paths)
+        return Config(
+            version="2",
+            services={"orders": ServiceConfig(base_url="http://localhost:8081", health_path="/health")}
+        )
+
+    monkeypatch.setattr("agctl.commands.check_commands.load_config_or_raise", fake_load_config)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--overlay", str(ov), "--config", str(base), "check", "ready"]
+    )
+
+    assert len(captured_overlays) == 1
+    assert captured_overlays[0] == [str(ov)]
+
+
+def test_mock_run_forwards_overlay(tmp_path, monkeypatch):
+    """mock run forwards overlay_paths from ctx.obj to load_config_or_raise."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""mocks:
+  http:
+    listen: "0.0.0.0:18080"
+""")
+
+    captured_overlays = []
+
+    def fake_load_config(config_path, overlay_paths=None):
+        captured_overlays.append(overlay_paths)
+        # Return minimal valid config (no mocks needed for this test)
+        return Config(
+            version="2",
+            services={"orders": ServiceConfig(base_url="http://localhost:8081")}
+        )
+
+    # For mock run we need to patch at the command level since it's not @envelope-wrapped
+    monkeypatch.setattr("agctl.commands.mock_commands.load_config_or_raise", fake_load_config)
+
+    # Also need to patch new_mock_engine to prevent actual engine startup
+    from unittest.mock import MagicMock
+    fake_engine = MagicMock()
+    fake_engine.start = MagicMock()
+    fake_engine.run = MagicMock(return_value=0)
+    fake_engine.shutdown = MagicMock()
+    monkeypatch.setattr("agctl.commands.mock_commands.new_mock_engine", lambda **kwargs: fake_engine)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--overlay", str(ov), "--config", str(base), "mock", "run"],
+        catch_exceptions=False
+    )
+
+    assert len(captured_overlays) == 1
+    assert captured_overlays[0] == [str(ov)]
+

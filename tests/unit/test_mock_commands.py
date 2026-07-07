@@ -1,6 +1,7 @@
 """Tests for agctl mock run command (Task 8)."""
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -471,3 +472,76 @@ mocks:
             )
 
             assert result.exit_code == 1
+
+
+# Task 7: mock start daemon argv forwards --overlay
+def test_mock_start_includes_overlay_in_daemon_argv(tmp_path, monkeypatch):
+    """mock start includes --overlay in the daemon argv so the spawned daemon loads the overlay."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub2:
+        method: POST
+        path: /test2
+        response:
+          status: 201
+          body: '{"created": true}'
+""")
+
+    # Track the daemon argv that would be passed to spawn_daemon
+    captured_argv = []
+
+    def fake_spawn_daemon(argv, log_path, env=None):
+        captured_argv.append(argv)
+        return 12345  # Fake PID
+
+    monkeypatch.setattr("agctl.commands.mock_commands.spawn_daemon", fake_spawn_daemon)
+
+    # Also patch is_alive to make the daemon appear running
+    def fake_is_alive(pid):
+        return True
+
+    monkeypatch.setattr("agctl.commands.mock_commands.is_alive", fake_is_alive)
+
+    # Patch parse_log to return a started event
+    from unittest.mock import MagicMock
+    fake_parsed = MagicMock()
+    fake_parsed.started = {"http": {"listen": "0.0.0.0:18080", "stubs": 1}}
+    fake_parsed.startup_error = None
+    monkeypatch.setattr("agctl.commands.mock_commands.parse_log", lambda log_path: fake_parsed)
+
+    # Also need to patch read_pidfile to return None (no existing daemon)
+    monkeypatch.setattr("agctl.commands.mock_commands.read_pidfile", lambda pidfile: None)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--overlay", str(ov), "--config", str(base), "mock", "start"],
+    )
+
+    # Verify spawn_daemon was called
+    assert len(captured_argv) == 1
+
+    # Verify the daemon argv includes --overlay with absolute path
+    daemon_argv = captured_argv[0]
+    assert "--overlay" in daemon_argv
+    overlay_idx = daemon_argv.index("--overlay")
+    # Next item should be the absolute path to the overlay
+    assert daemon_argv[overlay_idx + 1] == str(Path(ov).absolute())
