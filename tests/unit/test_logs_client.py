@@ -479,3 +479,234 @@ def test_scan_tail_lines_long_lines(tmp_path):
     assert all(len(msg) == 300 for msg in messages)  # All 300-char messages
     assert all(msg == "x" * 300 for msg in messages)  # All are the long message
     assert len(messages) == 3
+
+
+# ============================================================================
+# Task 4: NdjsonFileBackend - await_one tests
+# ============================================================================
+
+
+def test_await_one_shot_match(tmp_path):
+    """await_one in one-shot mode (timeout_s=0) returns matching entry."""
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    lines = [
+        '{"@timestamp":"2026-07-07T10:00:00Z","level":"INFO","logger_name":"c.Foo","message":"info"}',
+        '{"@timestamp":"2026-07-07T10:00:01Z","level":"ERROR","logger_name":"c.Foo","message":"err1"}',
+        '{"@timestamp":"2026-07-07T10:00:02Z","level":"ERROR","logger_name":"c.Foo","message":"err2"}',
+    ]
+    log_file.write_text("\n".join(lines))
+
+    source = LogSource(path=str(log_file), format="logstash")
+    backend = NdjsonFileBackend(source)
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"), since=None, timeout_s=0, poll_interval_ms=100
+    )
+
+    assert result.entry is not None
+    assert result.entry.level == "ERROR"
+    assert result.scanned > 0
+    assert result.elapsed_ms >= 0
+
+
+def test_await_one_shot_no_match(tmp_path):
+    """await_one in one-shot mode returns None when no match."""
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    lines = [
+        '{"@timestamp":"2026-07-07T10:00:00Z","level":"INFO","logger_name":"c.Foo","message":"info"}',
+        '{"@timestamp":"2026-07-07T10:00:01Z","level":"INFO","logger_name":"c.Foo","message":"info2"}',
+    ]
+    log_file.write_text("\n".join(lines))
+
+    source = LogSource(path=str(log_file), format="logstash")
+    backend = NdjsonFileBackend(source)
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"), since=None, timeout_s=0, poll_interval_ms=100
+    )
+
+    assert result.entry is None
+    assert result.scanned > 0
+    assert result.elapsed_ms >= 0
+
+
+def test_await_one_poll_finds_after_delay(tmp_path):
+    """await_one polling mode finds entry that appears after initial read."""
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+
+    # Start with empty file
+    log_file.write_text("")
+
+    source = LogSource(path=str(log_file), format="logstash")
+
+    # Fake monotonic that advances: start=0.0 -> first check=0.05 -> sleep -> second check=0.15 (timeout at 0.2)
+    monotonic_calls = [0.0, 0.05, 0.15]
+
+    def fake_monotonic():
+        return monotonic_calls.pop(0)
+
+    # Fake sleep that appends a line after first poll
+    sleep_calls = []
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        # After first sleep, append matching line
+        if len(sleep_calls) == 1:
+            existing = log_file.read_text()
+            log_file.write_text(
+                existing
+                + '\n{"@timestamp":"2026-07-07T10:00:01Z","level":"ERROR","logger_name":"c.Foo","message":"err1"}'
+            )
+
+    # Inject fakes via __init__ kwargs
+    backend = NdjsonFileBackend(source, monotonic=fake_monotonic, sleep=fake_sleep)
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"), since=None, timeout_s=0.2, poll_interval_ms=100
+    )
+
+    # Should have found the entry after the second poll
+    assert result.entry is not None
+    assert result.entry.level == "ERROR"
+    assert result.entry.message == "err1"
+    assert result.scanned > 0
+    assert result.elapsed_ms >= 50  # At least one sleep cycle
+    assert len(sleep_calls) >= 1  # Slept at least once
+
+
+def test_await_one_poll_times_out(tmp_path):
+    """await_one polling mode times out when no match appears."""
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    lines = [
+        '{"@timestamp":"2026-07-07T10:00:00Z","level":"INFO","logger_name":"c.Foo","message":"info"}',
+    ]
+    log_file.write_text("\n".join(lines))
+
+    source = LogSource(path=str(log_file), format="logstash")
+
+    # Use real time but short timeout
+    backend = NdjsonFileBackend(source)
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"), since=None, timeout_s=0.1, poll_interval_ms=50
+    )
+
+    assert result.entry is None
+    assert result.scanned > 0
+    assert result.elapsed_ms >= 100  # ~100ms elapsed
+
+
+def test_await_one_cumulative_scanned(tmp_path):
+    """await_one accumulates scanned count across poll iterations."""
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+
+    # Start with non-matching lines
+    lines = [
+        '{"@timestamp":"2026-07-07T10:00:00Z","level":"INFO","logger_name":"c.Foo","message":"info1"}',
+        '{"@timestamp":"2026-07-07T10:00:01Z","level":"INFO","logger_name":"c.Foo","message":"info2"}',
+        '{"@timestamp":"2026-07-07T10:00:02Z","level":"INFO","logger_name":"c.Foo","message":"info3"}',
+    ]
+    log_file.write_text("\n".join(lines))
+
+    source = LogSource(path=str(log_file), format="logstash")
+
+    # Fake monotonic: start=0.0 -> first check=0.05 -> sleep -> second check=0.15 (timeout at 0.2)
+    monotonic_calls = [0.0, 0.05, 0.15]
+
+    def fake_monotonic():
+        return monotonic_calls.pop(0)
+
+    # Fake sleep that appends matching line after first sleep
+    sleep_calls = []
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) == 1:
+            # Append more non-matching + matching line
+            existing = log_file.read_text()
+            log_file.write_text(
+                existing
+                + '\n{"@timestamp":"2026-07-07T10:00:03Z","level":"INFO","logger_name":"c.Foo","message":"info4"}'
+                + '\n{"@timestamp":"2026-07-07T10:00:04Z","level":"ERROR","logger_name":"c.Foo","message":"err1"}'
+            )
+
+    backend = NdjsonFileBackend(source, monotonic=fake_monotonic, sleep=fake_sleep)
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"), since=None, timeout_s=0.2, poll_interval_ms=100
+    )
+
+    assert result.entry is not None
+    assert result.entry.level == "ERROR"
+    # First poll scanned 3, second poll scanned 2 = total 5
+    assert result.scanned >= 5
+
+
+# ============================================================================
+# Task 4: NdjsonFileBackend - sample_schema tests
+# ============================================================================
+
+
+def test_sample_schema_missing_file_empty(tmp_path):
+    """sample_schema returns empty lists when file is missing."""
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    # Non-existent file
+    source = LogSource(path=str(tmp_path / "nope.log"), format="logstash")
+    backend = NdjsonFileBackend(source)
+
+    result = backend.sample_schema(sample_lines=100)
+
+    assert result.standard == []
+    assert result.conditional == []
+    assert result.observed == []
+
+
+def test_sample_schema_enumerates(tmp_path):
+    """sample_schema enumerates standard/conditional/observed fields correctly."""
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    lines = [
+        # Line with standard fields + orderId + @version
+        '{"@timestamp":"2026-07-07T10:00:00Z","level":"INFO","logger_name":"c.Foo","message":"msg1","orderId":"ord-1","@version":"1"}',
+        # Line with standard fields + status + level_value + stack_trace
+        '{"@timestamp":"2026-07-07T10:00:01Z","level":"ERROR","logger_name":"c.Foo","message":"msg2","status":"failed","level_value":40000,"stack_trace":"err"}',
+        # Line with standard fields + tags
+        '{"@timestamp":"2026-07-07T10:00:02Z","level":"INFO","logger_name":"c.Bar","message":"msg3","tags":["tag1"]}',
+    ]
+    log_file.write_text("\n".join(lines))
+
+    source = LogSource(path=str(log_file), format="logstash")
+    backend = NdjsonFileBackend(source)
+
+    result = backend.sample_schema(sample_lines=100)
+
+    # standard: from predefined set, non-None/non-empty, sorted
+    # Should include timestamp, level, logger, message (always present if parsed)
+    assert "timestamp" in result.standard
+    assert "level" in result.standard
+    assert "logger" in result.standard
+    assert "message" in result.standard
+    # thread, service not present in any entry -> not in standard
+
+    # conditional: subset of stack_trace, tags seen non-None, sorted
+    assert "stack_trace" in result.conditional
+    assert "tags" in result.conditional
+
+    # observed: union of all keys in fields, EXCLUDING @version and level_value
+    assert "orderId" in result.observed
+    assert "status" in result.observed
+    # Well-known noise should be excluded
+    assert "@version" not in result.observed
+    assert "level_value" not in result.observed

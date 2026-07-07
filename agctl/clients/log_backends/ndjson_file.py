@@ -4,7 +4,8 @@ import dataclasses
 import fnmatch
 import json
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agctl.assertions import _parse_iso_datetime, _to_utc, jq_bool
@@ -39,10 +40,24 @@ class NdjsonFileBackend:
     jq predicate).
     """
 
-    def __init__(self, source: LogSource):
-        """Store source config (no I/O at construction)."""
+    def __init__(
+        self,
+        source: LogSource,
+        *,
+        monotonic: callable = time.monotonic,
+        sleep: callable = time.sleep,
+    ):
+        """Store source config and injectable clock/sleep for testing.
+
+        Args:
+            source: LogSource configuration
+            monotonic: Injectable monotonic clock (default: time.monotonic)
+            sleep: Injectable sleep function (default: time.sleep)
+        """
         self._path = source.path
         self._format = source.format
+        self._monotonic = monotonic
+        self._sleep = sleep
 
     def validate_config(self) -> None:
         """Raise ConfigError if path is None (file type requires path)."""
@@ -85,29 +100,27 @@ class NdjsonFileBackend:
             fields=fields,
         )
 
-    def scan(
+    def _read_window(
         self,
         filt: LogFilter,
-        *,
         since: datetime | None,
         until: datetime | None,
         limit: int,
         tail_lines: int,
-    ) -> ScanResult:
-        """Scan last N lines of the file, applying window and filters.
+    ) -> tuple[list[CanonicalEntry], int, int]:
+        """Read and filter a time window, returning (entries, matched, scanned).
 
-        If the file does not exist, returns empty ScanResult (no error).
-        Reads only the last ``tail_lines`` newline-terminated lines.
-        Non-JSON lines are skipped (stderr message, no exception).
-        Window bounds (since/until) are applied via _parse_iso_datetime.
-        Filters are applied in AND order (level, logger glob, message substring,
-        jq predicate). Returns up to ``limit`` matches with truncation flag.
+        Shared helper for scan and await_one. Reads up to tail_lines from file,
+        applies time bounds and filters, returns up to limit matches.
+
+        Returns:
+            (entries, matched, scanned) tuple
         """
         if self._path is None:
-            return ScanResult(entries=[], matched=0, scanned=0, truncated=False)
+            return [], 0, 0
         path = Path(self._path)
         if not path.exists():
-            return ScanResult(entries=[], matched=0, scanned=0, truncated=False)
+            return [], 0, 0
 
         # Read last tail_lines from file (backward read without loading all)
         lines = self._tail_lines(path, tail_lines)
@@ -163,6 +176,30 @@ class NdjsonFileBackend:
             matched += 1
             if len(entries) < limit:
                 entries.append(entry)
+
+        return entries, matched, scanned
+
+    def scan(
+        self,
+        filt: LogFilter,
+        *,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int,
+        tail_lines: int,
+    ) -> ScanResult:
+        """Scan last N lines of the file, applying window and filters.
+
+        If the file does not exist, returns empty ScanResult (no error).
+        Reads only the last ``tail_lines`` newline-terminated lines.
+        Non-JSON lines are skipped (stderr message, no exception).
+        Window bounds (since/until) are applied via _parse_iso_datetime.
+        Filters are applied in AND order (level, logger glob, message substring,
+        jq predicate). Returns up to ``limit`` matches with truncation flag.
+        """
+        entries, matched, scanned = self._read_window(
+            filt, since, until, limit, tail_lines
+        )
 
         return ScanResult(
             entries=entries,
@@ -239,13 +276,158 @@ class NdjsonFileBackend:
         timeout_s: float,
         poll_interval_ms: int,
     ) -> AwaitResult:
-        """Block until a matching entry appears or timeout (Task 4)."""
-        raise NotImplementedError("await_one will be implemented in Task 4")
+        """Block until a matching entry appears or timeout.
+
+        One-shot mode (timeout_s <= 0): single read attempt.
+        Poll mode (timeout_s > 0): loop with deadline, re-reading file each iteration.
+
+        Args:
+            filt: Filter criteria
+            since: Time window start (None = unbounded)
+            timeout_s: Timeout in seconds (<= 0 for one-shot, > 0 for poll mode)
+            poll_interval_ms: Poll interval in milliseconds (poll mode only)
+
+        Returns:
+            AwaitResult with first matching entry (or None), cumulative scanned count,
+            and elapsed wall-clock time in milliseconds.
+        """
+        start_time = self._monotonic()
+        scanned_total = 0
+
+        if timeout_s <= 0:
+            # One-shot mode: single read attempt
+            entries, matched, scanned = self._read_window(
+                filt=filt,
+                since=since,
+                until=datetime.now(timezone.utc),
+                limit=1,
+                tail_lines=1000,  # Reasonable tail for await_one
+            )
+            elapsed_ms = int((self._monotonic() - start_time) * 1000)
+            return AwaitResult(
+                entry=entries[0] if entries else None,
+                scanned=scanned,
+                elapsed_ms=elapsed_ms,
+            )
+
+        # Poll mode: loop until deadline or match found
+        deadline = start_time + timeout_s
+
+        while True:
+            entries, matched, scanned = self._read_window(
+                filt=filt,
+                since=since,
+                until=datetime.now(timezone.utc),
+                limit=1,
+                tail_lines=1000,
+            )
+            scanned_total += scanned
+
+            if entries:
+                # Found a match - return immediately
+                elapsed_ms = int((self._monotonic() - start_time) * 1000)
+                return AwaitResult(
+                    entry=entries[0],
+                    scanned=scanned_total,
+                    elapsed_ms=elapsed_ms,
+                )
+
+            # No match - check if we should continue polling
+            now = self._monotonic()
+            if now >= deadline:
+                # Timeout reached
+                elapsed_ms = int((now - start_time) * 1000)
+                return AwaitResult(
+                    entry=None,
+                    scanned=scanned_total,
+                    elapsed_ms=elapsed_ms,
+                )
+
+            # Sleep before next poll
+            self._sleep(poll_interval_ms / 1000)
 
     def follow(self, filt: LogFilter, *, stop_event):
         """Stream matching entries indefinitely (Task 5)."""
         raise NotImplementedError("follow will be implemented in Task 5")
 
     def sample_schema(self, *, sample_lines: int = 100) -> SchemaDescriptor:
-        """Infer field presence patterns from a sample (Task 4)."""
-        raise NotImplementedError("sample_schema will be implemented in Task 4")
+        """Infer field presence patterns from a sample of log entries.
+
+        Args:
+            sample_lines: Number of trailing lines to sample (default 100)
+
+        Returns:
+            SchemaDescriptor with:
+            - standard: Fields from predefined set present in sample
+            - conditional: Optional fields (stack_trace, tags) present in sample
+            - observed: All keys from fields dict, excluding logstash noise
+        """
+        if self._path is None:
+            return SchemaDescriptor(standard=[], conditional=[], observed=[])
+        path = Path(self._path)
+        if not path.exists():
+            return SchemaDescriptor(standard=[], conditional=[], observed=[])
+
+        # Read last sample_lines from file
+        lines = self._tail_lines(path, sample_lines)
+
+        # Standard slot field set (from brief)
+        standard_slots = {
+            "timestamp",
+            "level",
+            "logger",
+            "message",
+            "thread",
+            "service",
+        }
+
+        # Conditional slot field set (from brief)
+        conditional_slots = {"stack_trace", "tags"}
+
+        # Track presence across entries
+        standard_seen = set()
+        conditional_seen = set()
+        observed_keys = set()
+
+        for line in lines:
+            if not line.strip():
+                continue
+
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                # Skip non-JSON lines silently for schema inference
+                continue
+
+            entry = self._normalize(raw)
+
+            # Check standard slots (non-None/non-empty)
+            if entry.timestamp is not None and entry.timestamp != "":
+                standard_seen.add("timestamp")
+            if entry.level is not None and entry.level != "":
+                standard_seen.add("level")
+            if entry.logger is not None and entry.logger != "":
+                standard_seen.add("logger")
+            if entry.message is not None and entry.message != "":
+                standard_seen.add("message")
+            if entry.thread is not None and entry.thread != "":
+                standard_seen.add("thread")
+            if entry.service is not None and entry.service != "":
+                standard_seen.add("service")
+
+            # Check conditional slots (non-None)
+            if entry.stack_trace is not None:
+                conditional_seen.add("stack_trace")
+            if entry.tags is not None:
+                conditional_seen.add("tags")
+
+            # Collect all observed keys from fields (excluding logstash noise)
+            for key in entry.fields.keys():
+                if key not in {"@version", "level_value"}:
+                    observed_keys.add(key)
+
+        return SchemaDescriptor(
+            standard=sorted(standard_seen),
+            conditional=sorted(conditional_seen),
+            observed=sorted(observed_keys),
+        )
