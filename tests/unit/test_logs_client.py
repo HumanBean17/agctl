@@ -836,3 +836,234 @@ def test_follow_missing_file_waits(tmp_path):
 
     # Should have attempted stat at least twice
     assert stat_call_count[0] >= 2
+
+
+# --- LogClient tests (Task 6) -----------------------------------------------
+
+
+def test_log_client_selects_file_backend(tmp_path):
+    """LogClient selects NdjsonFileBackend for type='file' and validates config."""
+    from agctl.clients.log_client import LogClient
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    log_file.write_text('{"@timestamp":"2024-01-01T00:00:00Z","level":"INFO","message":"test"}\n')
+
+    source = LogSource(type="file", path=str(log_file), format="logstash")
+    client = LogClient(source)
+
+    # Should have selected the file backend
+    assert isinstance(client._backend, NdjsonFileBackend)
+
+    # validate_config should return None (no error)
+    assert client.validate_config() is None
+
+
+def test_log_client_unknown_type_raises():
+    """LogClient raises ConfigError for unknown backend type."""
+    from agctl.clients.log_client import LogClient
+    from agctl.errors import ConfigError
+
+    source = LogSource(type="victoria", path=None)
+    try:
+        LogClient(source)
+        assert False, "Should have raised ConfigError"
+    except ConfigError as e:
+        # Message should mention unknown type
+        assert "Unknown logs backend type" in str(e)
+        assert "victoria" in str(e)
+        # Detail should include the type
+        assert e.detail.get("type") == "victoria"
+
+
+def test_log_client_missing_path_raises():
+    """LogClient raises ConfigError when file backend missing path."""
+    from agctl.clients.log_client import LogClient
+    from agctl.errors import ConfigError
+
+    # File type requires path
+    source = LogSource(type="file", path=None)
+    try:
+        LogClient(source)
+        assert False, "Should have raised ConfigError"
+    except ConfigError as e:
+        # Error should mention path requirement
+        assert "path" in str(e).lower()
+
+
+def test_log_client_injected_backend_skips_lookup():
+    """LogClient uses injected backend directly, skipping load_backends."""
+    from agctl.clients.log_client import LogClient
+    from agctl.clients.log_backend_protocol import (
+        LogBackend,
+        ScanResult,
+        CanonicalEntry,
+    )
+
+    # Create a fake backend
+    class FakeBackend(LogBackend):
+        def __init__(self, source):
+            self.source = source
+
+        def validate_config(self):
+            return None
+
+        def scan(self, filt, *, since, until, limit, tail_lines):
+            # Return a sentinel ScanResult
+            return ScanResult(
+                entries=[CanonicalEntry(
+                    timestamp="2024-01-01T00:00:00Z",
+                    level="INFO",
+                    logger="test",
+                    message="sentinel"
+                )],
+                matched=1,
+                scanned=1,
+                truncated=False
+            )
+
+        def await_one(self, filt, *, since, timeout_s, poll_interval_ms):
+            raise NotImplementedError()
+
+        def follow(self, filt, *, stop_event, poll_interval_ms):
+            raise NotImplementedError()
+
+        def sample_schema(self, *, sample_lines=100):
+            raise NotImplementedError()
+
+    fake = FakeBackend(None)
+    source = LogSource(type="file", path="/tmp/test.log")
+
+    # Inject the backend
+    client = LogClient(source, backend=fake)
+
+    # Should use the injected backend, not load_backends
+    assert client._backend is fake
+
+    # Methods should delegate to the fake backend
+    result = client.scan(
+        filt=LogFilter(),
+        since=None,
+        until=None,
+        limit=10,
+        tail_lines=100
+    )
+    assert result.matched == 1
+    assert result.entries[0].message == "sentinel"
+
+
+def test_load_backends_includes_file_and_skips_broken():
+    """LogClient.load_backends() includes 'file' and skips broken entry points."""
+    from agctl.clients.log_client import LogClient
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+    import importlib.metadata
+
+    # Monkeypatch entry_points to return a broken entry point
+    original_entry_points = importlib.metadata.entry_points
+
+    def broken_entry_points():
+        # Return a fake entry point that raises on load
+        class BrokenEntryPoint:
+            name = "broken_backend"
+            def load(self):
+                raise RuntimeError("Broken backend")
+
+        # Mock the select/get interface
+        class MockGroup:
+            def __iter__(self):
+                return iter([BrokenEntryPoint()])
+
+        class MockEPS:
+            def select(self, group=None):
+                return MockGroup()
+
+        return MockEPS()
+
+    importlib.metadata.entry_points = broken_entry_points
+
+    try:
+        # load_backends should not crash, should skip broken
+        backends = LogClient.load_backends()
+
+        # Should include the built-in 'file' backend
+        assert "file" in backends
+        assert backends["file"] is NdjsonFileBackend
+
+        # Should not include the broken backend
+        assert "broken_backend" not in backends
+    finally:
+        # Restore original
+        importlib.metadata.entry_points = original_entry_points
+
+
+def test_validates_logs_sources_in_config():
+    """validate_config() checks logs.sources and surfaces missing-path errors."""
+    from agctl.config.models import (
+        Config,
+        DatabaseConfig,
+        Defaults,
+        KafkaConfig,
+        LogSource,
+        LogsConfig,
+    )
+    from agctl.config.validator import validate_config
+
+    # Build a config with a malformed logs source (missing path)
+    cfg = Config.model_validate(
+        dict(
+            version="1",
+            services={},
+            kafka=KafkaConfig(),
+            database=DatabaseConfig(),
+            templates={},
+            defaults=Defaults(),
+            logs=LogsConfig(
+                sources={
+                    "svc": LogSource(type="file", path=None, format="logstash")
+                }
+            ),
+        )
+    )
+
+    errors, warnings = validate_config(cfg)
+
+    # Should have an error for logs.sources.svc
+    log_errors = [e for e in errors if e["path"] == "logs.sources.svc"]
+    assert len(log_errors) == 1, f"Expected 1 error for logs.sources.svc, got {len(log_errors)}"
+    assert "path" in log_errors[0]["message"].lower()
+
+
+def test_validates_logs_sources_with_wellformed_source():
+    """validate_config() passes for well-formed logs sources."""
+    from agctl.config.models import (
+        Config,
+        DatabaseConfig,
+        Defaults,
+        KafkaConfig,
+        LogSource,
+        LogsConfig,
+    )
+    from agctl.config.validator import validate_config
+
+    # Build a config with a well-formed logs source
+    cfg = Config.model_validate(
+        dict(
+            version="1",
+            services={},
+            kafka=KafkaConfig(),
+            database=DatabaseConfig(),
+            templates={},
+            defaults=Defaults(),
+            logs=LogsConfig(
+                sources={
+                    "svc": LogSource(type="file", path="/tmp/x.log", format="logstash")
+                }
+            ),
+        )
+    )
+
+    errors, warnings = validate_config(cfg)
+
+    # Should have no error for logs.sources.svc
+    log_errors = [e for e in errors if e["path"] == "logs.sources.svc"]
+    assert len(log_errors) == 0, f"Expected no error for logs.sources.svc, got {log_errors}"
