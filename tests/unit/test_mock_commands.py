@@ -557,3 +557,21 @@ mocks:
     if "--config" in daemon_argv:
         config_idx = daemon_argv.index("--config")
         assert config_idx < mock_idx, "--config must appear before the 'mock' subcommand"
+
+    # Fix 3: Re-invoke cli with the captured daemon_argv to verify it's parseable and loads config
+    # We need to stub the engine to prevent mock run from hanging (it streams NDJSON)
+    def fake_new_mock_engine(**kwargs):
+        engine = MagicMock()
+        engine.start = MagicMock()
+        engine.run = MagicMock(return_value=0)
+        engine.shutdown = MagicMock()
+        return engine
+
+    monkeypatch.setattr("agctl.commands.mock_commands.new_mock_engine", fake_new_mock_engine)
+
+    # Re-invoke cli with the exact daemon_argv that was captured
+    # This verifies the built argv is parseable AND loads config in the daemon child
+    reinvoke_result = CliRunner().invoke(cli, daemon_argv)
+
+    # Assert the re-invoke succeeds (exit_code == 0)
+    assert reinvoke_result.exit_code == 0, f"Re-invoke failed with exit code {reinvoke_result.exit_code}, output: {reinvoke_result.output}"

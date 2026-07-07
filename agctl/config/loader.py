@@ -290,7 +290,16 @@ def compose_config(
                     {"overlay": ov, "found": ov_major},
                 )
 
+        # Drop version from overlay before merge to prevent spurious override warning
+        raw_ov.pop("version", None)
+
         deep_merge(base_raw, raw_ov, ov, overrides)
+
+    # Dedupe overrides by path, keeping last occurrence (last writer wins)
+    deduped_overrides: list[dict] = {}
+    for override in overrides:
+        deduped_overrides[override["path"]] = override
+    overrides = list(deduped_overrides.values())
 
     with_env = apply_env_overrides(base_raw, env)
     try:

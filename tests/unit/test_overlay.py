@@ -503,6 +503,71 @@ templates:
     assert payload["result"]["overrides"] == []
 
 
+# Fix 1: overlay version-only test
+def test_compose_config_overlay_version_only_no_override_recorded(tmp_path):
+    """Overlay with only version: '2' on v2 base → no override recorded, version inherited."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  create-order:
+    method: POST
+    service: orders
+    path: /api/v1/orders
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""version: "2"
+""")
+    result = compose_config(str(base), [str(ov)])
+    # No overrides should be recorded for version
+    assert result.overrides == []
+    # Version should be inherited from base
+    assert result.config.version == "2"
+
+
+# Fix 2: multiple overlays later wins test
+def test_compose_config_multiple_overlays_later_wins(tmp_path):
+    """Two overlays both setting templates.x.path → later wins, single override record per path."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  x:
+    method: GET
+    service: orders
+    path: /original
+""")
+    ov1 = tmp_path / "overlay1.yaml"
+    ov1.write_text("""templates:
+  x:
+    method: GET
+    service: orders
+    path: /a
+""")
+    ov2 = tmp_path / "overlay2.yaml"
+    ov2.write_text("""templates:
+  x:
+    method: GET
+    service: orders
+    path: /b
+""")
+    result = compose_config(str(base), [str(ov1), str(ov2)])
+    # Later overlay wins for the value
+    assert result.config.templates["x"].path == "/b"
+    # All three fields have overrides (method, service, path), but all should be from ov2 (deduped)
+    assert len(result.overrides) == 3
+    # Verify no override references ov1 - all should be from ov2 (last writer wins)
+    assert all(o["overlay"] == str(ov2) for o in result.overrides)
+    # Verify the specific path override is from ov2
+    path_override = [o for o in result.overrides if o["path"] == "templates.x.path"]
+    assert len(path_override) == 1
+    assert path_override[0]["overlay"] == str(ov2)
+
+
 # Task 7: Thread --overlay into runtime commands
 from pathlib import Path
 from agctl.config.models import Config, ServiceConfig
