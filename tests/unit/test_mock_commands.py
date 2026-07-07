@@ -1,6 +1,7 @@
 """Tests for agctl mock run command (Task 8)."""
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -471,3 +472,106 @@ mocks:
             )
 
             assert result.exit_code == 1
+
+
+# Task 7: mock start daemon argv forwards --overlay
+def test_mock_start_includes_overlay_in_daemon_argv(tmp_path, monkeypatch):
+    """mock start includes --overlay in the daemon argv so the spawned daemon loads the overlay."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub2:
+        method: POST
+        path: /test2
+        response:
+          status: 201
+          body: '{"created": true}'
+""")
+
+    # Track the daemon argv that would be passed to spawn_daemon
+    captured_argv = []
+
+    def fake_spawn_daemon(argv, log_path, env=None):
+        captured_argv.append(argv)
+        return 12345  # Fake PID
+
+    monkeypatch.setattr("agctl.commands.mock_commands.spawn_daemon", fake_spawn_daemon)
+
+    # Also patch is_alive to make the daemon appear running
+    def fake_is_alive(pid):
+        return True
+
+    monkeypatch.setattr("agctl.commands.mock_commands.is_alive", fake_is_alive)
+
+    # Patch parse_log to return a started event
+    from unittest.mock import MagicMock
+    fake_parsed = MagicMock()
+    fake_parsed.started = {"http": {"listen": "0.0.0.0:18080", "stubs": 1}}
+    fake_parsed.startup_error = None
+    monkeypatch.setattr("agctl.commands.mock_commands.parse_log", lambda log_path: fake_parsed)
+
+    # Also need to patch read_pidfile to return None (no existing daemon)
+    monkeypatch.setattr("agctl.commands.mock_commands.read_pidfile", lambda pidfile: None)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--overlay", str(ov), "--config", str(base), "mock", "start"],
+    )
+
+    # Verify spawn_daemon was called
+    assert len(captured_argv) == 1
+
+    # Verify the daemon argv structure
+    daemon_argv = captured_argv[0]
+
+    # Global flags (--config, --overlay) must appear BEFORE the "mock" subcommand
+    # because they are root-level Click options, not mock-run options
+    mock_idx = daemon_argv.index("mock")
+
+    # Verify --overlay is in the argv and appears BEFORE the "mock" subcommand
+    assert "--overlay" in daemon_argv
+    overlay_idx = daemon_argv.index("--overlay")
+    assert overlay_idx < mock_idx, "--overlay must appear before the 'mock' subcommand"
+    # Next item should be the absolute path to the overlay
+    assert daemon_argv[overlay_idx + 1] == str(Path(ov).absolute())
+
+    # Verify --config also appears BEFORE the "mock" subcommand (if provided)
+    if "--config" in daemon_argv:
+        config_idx = daemon_argv.index("--config")
+        assert config_idx < mock_idx, "--config must appear before the 'mock' subcommand"
+
+    # Fix 3: Re-invoke cli with the captured daemon_argv to verify it's parseable and loads config
+    # We need to stub the engine to prevent mock run from hanging (it streams NDJSON)
+    def fake_new_mock_engine(**kwargs):
+        engine = MagicMock()
+        engine.start = MagicMock()
+        engine.run = MagicMock(return_value=0)
+        engine.shutdown = MagicMock()
+        return engine
+
+    monkeypatch.setattr("agctl.commands.mock_commands.new_mock_engine", fake_new_mock_engine)
+
+    # Re-invoke cli with the exact daemon_argv that was captured
+    # This verifies the built argv is parseable AND loads config in the daemon child
+    reinvoke_result = CliRunner().invoke(cli, daemon_argv)
+
+    # Assert the re-invoke succeeds (exit_code == 0)
+    assert reinvoke_result.exit_code == 0, f"Re-invoke failed with exit code {reinvoke_result.exit_code}, output: {reinvoke_result.output}"

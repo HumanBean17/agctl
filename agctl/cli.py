@@ -109,12 +109,14 @@ def _ensure_utf8_streams() -> None:
 @click.group()
 @click.version_option(version=__version__, message="agctl %(version)s")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
+@click.option("--overlay", "overlay_paths", multiple=True, help="Overlay config fragment (repeatable; later wins)")
 @click.pass_context
-def cli(ctx: click.Context, config_path: str | None) -> None:
+def cli(ctx: click.Context, config_path: str | None, overlay_paths: tuple[str, ...]) -> None:
     """agctl — agent-facing CLI harness for testing distributed systems."""
     _ensure_utf8_streams()
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
+    ctx.obj["overlay_paths"] = tuple(overlay_paths) or None
 
 
 @cli.group(name="config")

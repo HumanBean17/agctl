@@ -19,6 +19,7 @@
 
 - `agctl check ready --all` → all services ready
 - <env assumptions, e.g. `DB_WRITE_USER` set>
+- `Requires overlay: <runbook-base>.agctl.yaml` *(optional)* — present when the runbook uses fixtures/overrides defined in a sidecar config sibling to the runbook
 
 ## Fixtures
 

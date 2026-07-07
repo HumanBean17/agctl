@@ -42,6 +42,8 @@ Before running anything, check the runbook:
 - Every `$VAR` used in a Command resolves to a prior **Capture**.
 - Assertion steps use `Expected: exit 0`.
 
+**Sidecar discovery:** Look for a sibling `<runbook-base>.agctl.yaml` file next to the runbook. If present, run `agctl config validate --overlay <sidecar>` and surface any `overridden by overlay` warnings into the report. Treat the sidecar as active for the entire run if validation succeeds (ok: true). If validation fails, treat as a validation error and do not execute.
+
 On any violation: stop with a validation error. Do not execute — no partial runs.
 
 ### 2. Setup
@@ -57,6 +59,8 @@ On any violation: stop with a validation error. Do not execute — no partial ru
   - Mock: `agctl mock run > mock.log 2>&1 &`, then poll `mock.log` for `started` (see `fixtures-mock.md`).
   - Heartbeat: `agctl http ping … --until-stopped &`.
 
+**Overlay injection:** When a sidecar is active (per Validate), prefix every `agctl` invocation with the global `--overlay <sidecar>` form: `agctl --overlay <sidecar> <group> <cmd> …`. This applies to `check ready`, `db execute` (seed), `mock run`, `http ping` (heartbeat), and all step commands. If no sidecar exists, run commands exactly as today.
+
 Record each in the report's `## Setup` block.
 
 ### 3. Execute
@@ -64,6 +68,7 @@ Record each in the report's `## Setup` block.
 For each step, in order:
 
 - Substitute `$VAR` from prior Captures into the Command.
+- **Overlay injection:** When a sidecar is active (per Validate), prefix the command with the global `--overlay <sidecar>` form: `agctl --overlay <sidecar> <group> <cmd> …`. If no sidecar exists, run the command as-is.
 - Run the verbatim command.
 - From the JSON envelope `agctl` emits on stdout, capture the exit code, `ok`, `error.type` (if any), and a curated excerpt (e.g. `result.status_code`, a DB row, the matched Kafka message).
 

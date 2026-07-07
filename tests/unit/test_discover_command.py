@@ -580,3 +580,154 @@ def test_item_mock_http_stub_ipv6_wildcard_normalized(tmp_path, monkeypatch):
     assert result.exit_code == 0
     res = _payload(result)["result"]
     assert res["example"] == "curl -i -X GET http://localhost:19090/ping"
+
+
+# --------------------------------------------------------------------------- #
+# Task 6: overlay support
+# --------------------------------------------------------------------------- #
+
+
+_BASE_CONFIG = (
+    'version: "2"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+    "templates:\n"
+    "  base-template:\n"
+    '    description: "Base template"\n'
+    "    method: GET\n"
+    "    service: demo\n"
+    "    path: /base\n"
+    "mocks:\n"
+    "  http:\n"
+    "    listen: \"0.0.0.0:18080\"\n"
+    "    stubs:\n"
+    "      base-stub:\n"
+    "        description: \"Base stub\"\n"
+    "        method: GET\n"
+    "        path: /base\n"
+    "        response:\n"
+    "          status: 200\n"
+)
+
+
+_OVERLAY_CONFIG = (
+    'version: "2"\n'
+    "templates:\n"
+    "  overlay-template:\n"
+    '    description: "Overlay template"\n'
+    "    method: POST\n"
+    "    service: demo\n"
+    "    path: /overlay\n"
+    "    body:\n"
+    "      foo: bar\n"
+    "mocks:\n"
+    "  http:\n"
+    "    listen: \"0.0.0.0:18080\"\n"
+    "    stubs:\n"
+    "      overlay-stub:\n"
+    "        description: \"Overlay stub\"\n"
+    "        method: POST\n"
+    "        path: /overlay\n"
+    "        response:\n"
+    "          status: 201\n"
+    "          body:\n"
+    "            created: true\n"
+)
+
+
+def _run_with_overlay(args, base_config_yaml, overlay_config_yaml, tmp_path, monkeypatch):
+    """Run discover against a base config + overlay config written to ``tmp_path``."""
+    base_file = tmp_path / "base.yaml"
+    base_file.write_text(base_config_yaml)
+
+    overlay_file = tmp_path / "overlay.yaml"
+    overlay_file.write_text(overlay_config_yaml)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--config", str(base_file), "--overlay", str(overlay_file), "discover", *args],
+        env=ENV,
+        standalone_mode=False,
+    )
+    return result
+
+
+def test_discover_overlay_composed_category_listing(tmp_path, monkeypatch):
+    """Task 6 Test 1: discover --category http-templates with --overlay shows both base and overlay items."""
+    result = _run_with_overlay(
+        ["--category", "http-templates"],
+        _BASE_CONFIG,
+        _OVERLAY_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+
+    # The test should fail initially since --overlay is not implemented
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["category"] == "http-templates"
+    assert res["count"] == 2
+    names = {item["name"] for item in res["items"]}
+    assert names == {"base-template", "overlay-template"}
+
+
+def test_discover_overlay_mock_stubs_visible(tmp_path, monkeypatch):
+    """Task 6 Test 2: discover --category mock-http-stubs with --overlay includes overlay-added stub."""
+    result = _run_with_overlay(
+        ["--category", "mock-http-stubs"],
+        _BASE_CONFIG,
+        _OVERLAY_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["category"] == "mock-http-stubs"
+    assert res["count"] == 2
+    names = {item["name"] for item in res["items"]}
+    assert names == {"base-stub", "overlay-stub"}
+
+
+def test_discover_overlay_name_resolves_overlay_only_item(tmp_path, monkeypatch):
+    """Task 6 Test 3: discover --category http-templates --name overlay-template with --overlay returns full detail."""
+    result = _run_with_overlay(
+        ["--category", "http-templates", "--name", "overlay-template"],
+        _BASE_CONFIG,
+        _OVERLAY_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["category"] == "http-templates"
+    assert res["name"] == "overlay-template"
+    assert res["method"] == "POST"
+    assert res["path"] == "/overlay"
+    assert res["service"] == "demo"
+    assert "params" in res
+    assert "example" in res
+
+
+def test_discover_without_overlay_base_only(tmp_path, monkeypatch):
+    """Task 6 Test 4: discover --category http-templates without --overlay shows only base items."""
+    result = _run_with(
+        ["--category", "http-templates"],
+        _BASE_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["category"] == "http-templates"
+    assert res["count"] == 1
+    names = {item["name"] for item in res["items"]}
+    assert names == {"base-template"}

@@ -328,6 +328,25 @@ The `${...}` syntax is only supported in string scalar values, not in keys.
 
 HTTP template `path` and `body` values use `{placeholder}` (single braces) for runtime substitution via `--param key=value`. SQL (templates and free-form) uses `:paramName` (JDBC-style) instead — `{...}` is avoided in SQL to prevent collisions with JSON literals. Both are distinct from env var interpolation (`${...}`), which is resolved at config load time.
 
+### 2.4 Overlay Fragments
+
+An overlay is a partial config file layered on top of the base `agctl.yaml` to provide runbook-specific fixtures or test-time overrides without cluttering the shared config. Overlays are merged with the base config before validation; the final result is a complete, valid `Config` object.
+
+**Overlay syntax:** An overlay file is any YAML file that matches the `agctl.yaml` schema but with the `version` field optional (inherited from the base). All other fields follow the same rules as the base config.
+
+**Usage:** Pass `--overlay <path>` one or more times to any `agctl` command. Overlays are applied in flag order (later overlays win on conflict).
+
+**Runbook sidecar convention:** A runbook can carry its own fixtures as a co-located overlay fragment `<runbook-base>.agctl.yaml` (sibling to the runbook markdown file). The runbook stays pure markdown and gains one `Preconditions` line `Requires overlay: <file>`.
+
+**Merge behavior (sidecar-wins):**
+- Nested dicts are merged key-by-key (recursive).
+- Scalar values and lists are replaced by the overlay (no array merge).
+- Type clashes (e.g. overlay provides a string where base expects a list) raise `ConfigError`.
+
+**Override tracking:** `config validate --overlay` surfaces each overridden leaf as a warning: `{"path": "<dotted-path>", "message": "overridden by overlay <file>"}`. Cross-file dangling references remain hard errors (exit 2).
+
+**Precedence:** Base config < overlays (in flag order) < `AGCTL_*` environment variable overrides. This is not a schema version change — overlays load over v2 and do not bump the dialect.
+
 ---
 
 ## 3. CLI Command Design
@@ -337,6 +356,7 @@ All commands share these global flags:
 | Flag | Default | Description |
 |---|---|---|
 | `--config <path>` | auto-discovered | Explicit path to `agctl.yaml` |
+| `--overlay <path>` | — | Overlay config fragment (repeatable; later wins); layered on base config |
 | `--timeout <seconds>` | from config `defaults` | Override request/operation timeout |
 | `--version` | — | Print version and exit |
 
@@ -814,6 +834,7 @@ Run an HTTP mock server and/or Kafka reactors, streaming NDJSON events to stdout
 ```
 agctl mock run
     [--config <path>]            # auto-discovered by default
+    [--overlay <path>]           # repeatable; overlay config fragments to compose
     [--http-listen <host:port>]  # literal string (NO ${} interpolation); overrides mocks.http.listen
     [--only http|kafka]          # run a single engine (HTTP-only needs no kafka extra)
     [--fail-fast]                # exit non-zero on the FIRST runtime error (default: continue + summarize)
@@ -884,6 +905,7 @@ Start the mock server as a detached daemon with automatic pidfile management and
 ```
 agctl mock start
     [--config <path>]            # auto-discovered by default
+    [--overlay <path>]           # repeatable; forwarded to the daemon
     [--http-listen <host:port>]  # literal (NO ${} interpolation); overrides mocks.http.listen
     [--only http|kafka]          # run a single engine
     [--fail-fast]                # forwarded to the daemon
@@ -1056,7 +1078,10 @@ Parse and validate `agctl.yaml`. Reports schema errors, unresolvable required en
 ```
 agctl config validate
     [--config <path>]
+    [--overlay <path>]         # repeatable; overlay config fragments to validate
 ```
+
+When `--overlay` is used, warnings include one entry per overridden leaf: `{"path": "<dotted-path>", "message": "overridden by overlay <filename>"}`.
 
 #### `agctl config show`
 
@@ -1065,8 +1090,11 @@ Dump the fully resolved configuration as JSON. All secret-looking values (passwo
 ```
 agctl config show
     [--config <path>]
+    [--overlay <path>]         # repeatable; overlay config fragments to compose
     [--unmask]                  # disable masking (use only in secured environments)
 ```
+
+When `--overlay` is used, emits `{"config": <masked dump>, "overrides": [...]}`; without overlays, returns the back-compat form (direct config dict).
 
 #### `agctl config init`
 
@@ -1127,6 +1155,8 @@ Then bumps `version` to `"2"`. `capture.*.from` and `match.body` are **not** vis
 
 The discovery subsystem lets an agent understand what is available in the system **without loading everything into context at once**. It is structured as three progressive levels: a summary, a category listing, and a single-item detail. The agent fetches only what the current task requires.
 
+All `discover` commands accept `--overlay <path>` (repeatable) to list composed entries from overlay fragments.
+
 > **Design principle:** discovery is a map, not a dump. The agent navigates to the detail it needs rather than receiving everything upfront.
 
 #### Level 0 — System summary
@@ -1135,6 +1165,7 @@ Run once at the start of a session to understand system shape. Returns only coun
 
 ```bash
 agctl discover
+    [--overlay <path>]         # repeatable; overlay config fragments to compose
 ```
 
 ```json
@@ -1157,7 +1188,7 @@ agctl discover
 Returns names and one-line descriptions for all items in a category. No params, no examples, no SQL.
 
 ```bash
-agctl discover --category <name>
+agctl discover --category <name> [--overlay <path>]
 # <name>: services | http-templates | kafka-patterns | db-templates | mock-http-stubs | mock-kafka-reactors
 ```
 
@@ -1186,7 +1217,7 @@ agctl discover --category <name>
 Returns the full schema for one named item: method, path, required params, and a ready-to-use example command with placeholder values. The agent fetches this immediately before using a template it has not seen before.
 
 ```bash
-agctl discover --category <name> --name <item-name>
+agctl discover --category <name> --name <item-name> [--overlay <path>]
 ```
 
 **Example — `agctl discover --category http-templates --name create-order`:**
@@ -1251,7 +1282,7 @@ agctl discover --category <name> --name <item-name>
 When the agent does not know which category to look in, it searches across all categories by name and description. Returns a flat list of matching items at the name+description level only (no detail). The agent follows up with a Level 2 call for the item it wants to use.
 
 ```bash
-agctl discover --search <term>
+agctl discover --search <term> [--overlay <path>]
 ```
 
 **Example — `agctl discover --search payment`:**
@@ -1595,13 +1626,21 @@ Shape varies by category. All items share `name`, `description`, `params[]`, and
       "path": "services.order-service.base_url",
       "message": "Unresolved environment variable: ORDER_SERVICE_URL"
     }
+  ],
+  "warnings": [
+    {
+      "path": "templates.create-order.path",
+      "message": "overridden by overlay sidecar.yaml"
+    }
   ]
 }
 ```
 
+When `--overlay` is used, warnings include one entry per overridden leaf: `{"path": "<dotted-path>", "message": "overridden by overlay <filename>"}`. Cross-file dangling references remain hard errors (exit 2).
+
 #### `config.show`
 
-Returns the fully resolved config as a JSON object with secrets masked. Structure mirrors the YAML schema.
+Returns the fully resolved config as a JSON object with secrets masked. Structure mirrors the YAML schema. When `--overlay` is used, the result shape changes to `{"config": <masked dump>, "overrides": [...]}`; without overlays, the back-compat form (direct config dict) is unchanged.
 
 #### `config.init`
 
@@ -1675,7 +1714,8 @@ Refused to overwrite (without `--force`):
 2. **`AGCTL_CONFIG` environment variable** — if set, used as the config file path. Ignored when `--config` is explicitly passed.
 3. **Auto-discovery** — search for `agctl.yaml` starting in the current working directory, walking up parent directories until the filesystem root or a `.git` directory is found (whichever is first). The first `agctl.yaml` found wins.
 4. **`${ENV_VAR}` interpolation within YAML values** — after the file is located and parsed, all `${VAR}` references in string values are resolved from the process environment.
-5. **`AGCTL_<SECTION>_<KEY>` environment variable overrides** — after file loading and `${}` interpolation, specific values can be overridden by structured env vars (see §8 for the exact convention).
+5. **`--overlay <path>` CLI flags (repeatable)** — after base interpolation, each overlay file is loaded, interpolated, and deep-merged into the base config in flag order (later overlays win on conflict). Overlay version (if present) must match the base config's major version.
+6. **`AGCTL_<SECTION>_<KEY>` environment variable overrides** — after overlays are merged, specific values can be overridden by structured env vars (see §8 for the exact convention). These have the highest precedence and win over both base and overlay values.
 
 **If no config file is found and no `--config` or `AGCTL_CONFIG` is set**, the tool exits with code 2 and a `ConfigError` JSON object.
 

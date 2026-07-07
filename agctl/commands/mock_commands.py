@@ -219,6 +219,7 @@ def _mock_start_core(
     fail_fast: bool,
     duration: float | None,
     state_dir: str,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
     """Core logic for `mock start` (Task 4).
 
@@ -231,7 +232,7 @@ def _mock_start_core(
         ConfigError: If already running, startup error, or timeout.
     """
     # Step 1: Load config
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
 
     # Step 2: Resolve which engines to run
     run_http, run_kafka = _resolve_engines(only, cfg.mocks)
@@ -287,9 +288,16 @@ def _mock_start_core(
                 )
 
     # Step 6: Build daemon argv
-    daemon_argv = ["mock", "run"]
+    daemon_argv = []
+    # Global flags (parsed by root cli group) must come BEFORE the subcommand
     if config_path is not None:
         daemon_argv.extend(["--config", str(Path(config_path).absolute())])
+    # Forward overlay paths to the daemon
+    if overlay_paths is not None:
+        for ov in overlay_paths:
+            daemon_argv.extend(["--overlay", str(Path(ov).absolute())])
+    # Subcommand and mock-run-specific options
+    daemon_argv.extend(["mock", "run"])
     if run_http:
         daemon_argv.extend(["--http-listen", http_listen])
     if only is not None:
@@ -401,8 +409,9 @@ def mock_start(
     # Fall back to ctx.obj["config_path"] if --config not provided
     if config_path is None:
         config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
 
-    _mock_start_envelope(config_path, http_listen, only, fail_fast, duration, state_dir)
+    _mock_start_envelope(config_path, http_listen, only, fail_fast, duration, state_dir, overlay_paths=list(ovs) if ovs else None)
 
 
 _mock_start_envelope = envelope("mock.start")(_mock_start_core)
@@ -435,6 +444,7 @@ def mock_run(
     # Fall back to ctx.obj["config_path"] if --config not provided
     if config_path is None:
         config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
 
     start = time.monotonic()
 
@@ -454,7 +464,7 @@ def mock_run(
 
     try:
         # Guard 1: Load config (ConfigError → envelope + exit 2)
-        cfg = load_config_or_raise(config_path)
+        cfg = load_config_or_raise(config_path, overlay_paths=list(ovs) if ovs else None)
 
         # Guard 2+3: Resolve engines to run
         run_http, run_kafka = _resolve_engines(only, cfg.mocks)

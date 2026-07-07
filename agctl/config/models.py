@@ -285,3 +285,9 @@ class Config(BaseModel):
     templates: dict[str, HttpTemplate] = Field(default_factory=dict)
     defaults: Defaults = Field(default_factory=Defaults)
     mocks: MocksConfig | None = None
+
+
+class PartialConfig(Config):
+    """Overlay fragment — Config with version optional; version is inherited from the base at merge time (spec D5)."""
+
+    version: str | None = None

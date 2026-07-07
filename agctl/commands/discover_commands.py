@@ -190,8 +190,8 @@ def _mock_kafka_example(reactor) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _summary_core(config_path: str | None) -> dict:
-    cfg = load_config_or_raise(config_path)
+def _summary_core(config_path: str | None, overlay_paths: list[str] | None = None) -> dict:
+    cfg = load_config_or_raise(config_path, overlay_paths)
     return {
         "services": len(cfg.services),
         "http_templates": len(cfg.templates),
@@ -206,8 +206,8 @@ def _summary_core(config_path: str | None) -> dict:
 _summary_envelope = envelope("discover.summary")(_summary_core)
 
 
-def _category_core(config_path: str | None, category: str) -> dict:
-    cfg = load_config_or_raise(config_path)
+def _category_core(config_path: str | None, category: str, overlay_paths: list[str] | None = None) -> dict:
+    cfg = load_config_or_raise(config_path, overlay_paths)
     if category not in _VALID_CATEGORIES:
         raise ConfigError(f"Unknown category: {category}", {"category": category})
 
@@ -256,8 +256,8 @@ def _category_core(config_path: str | None, category: str) -> dict:
 _category_envelope = envelope("discover.category")(_category_core)
 
 
-def _item_core(config_path: str | None, category: str, name: str) -> dict:
-    cfg = load_config_or_raise(config_path)
+def _item_core(config_path: str | None, category: str, name: str, overlay_paths: list[str] | None = None) -> dict:
+    cfg = load_config_or_raise(config_path, overlay_paths)
     if category not in _VALID_CATEGORIES:
         raise ConfigError(f"Unknown category: {category}", {"category": category})
 
@@ -398,8 +398,8 @@ def _item_core(config_path: str | None, category: str, name: str) -> dict:
 _item_envelope = envelope("discover.item")(_item_core)
 
 
-def _search_core(config_path: str | None, term: str) -> dict:
-    cfg = load_config_or_raise(config_path)
+def _search_core(config_path: str | None, term: str, overlay_paths: list[str] | None = None) -> dict:
+    cfg = load_config_or_raise(config_path, overlay_paths)
     needle = term.lower()
 
     def _matches(haystack: str | None) -> bool:
@@ -510,6 +510,7 @@ def _emit_argument_error(message: str) -> None:
 @click.option("--name", "name", default=None, help="Item name within a category")
 @click.option("--search", "search", default=None, help="Substring to search for")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
+@click.option("--overlay", "overlay_paths", multiple=True, default=None, help="Overlay config paths")
 @click.pass_context
 def discover(
     ctx: click.Context,
@@ -517,9 +518,12 @@ def discover(
     name: str | None,
     search: str | None,
     config_path: str | None,
+    overlay_paths: tuple[str, ...] | None,
 ) -> None:
     """Discover configured services, templates, patterns."""
     resolved_config = config_path or (ctx.obj.get("config_path") if ctx.obj else None)
+    ovs = tuple(overlay_paths) or (ctx.obj.get("overlay_paths") if ctx.obj else None)
+    resolved_overlay = list(ovs) if ovs else None
 
     # Mutual exclusion: --category + --search together is an error.
     if category is not None and search is not None:
@@ -531,16 +535,16 @@ def discover(
         return
 
     if search is not None:
-        _search_envelope(resolved_config, search)
+        _search_envelope(resolved_config, search, resolved_overlay)
         return
 
     if category is not None and name is None:
-        _category_envelope(resolved_config, category)
+        _category_envelope(resolved_config, category, resolved_overlay)
         return
 
     if category is not None and name is not None:
-        _item_envelope(resolved_config, category, name)
+        _item_envelope(resolved_config, category, name, resolved_overlay)
         return
 
     # No flags — summary.
-    _summary_envelope(resolved_config)
+    _summary_envelope(resolved_config, resolved_overlay)

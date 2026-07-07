@@ -167,8 +167,9 @@ def _db_query_core(
     sql: str | None,
     param: tuple[str, ...],
     connection: str | None,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
     sql_text, params, conn_name = resolve_db_request(
         cfg,
         template=template,
@@ -196,7 +197,8 @@ def db_query(
 ) -> None:
     """Run a DB query and return the rows."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
-    _db_query_envelope(config_path, template, sql, param, connection)
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    _db_query_envelope(config_path, template, sql, param, connection, overlay_paths=list(ovs) if ovs else None)
 
 
 _db_query_envelope = envelope("db.query")(_db_query_core)
@@ -243,8 +245,9 @@ def _db_assert_core(
     path: str | None,
     equals: str | None,
     assertion: str | None,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
     sql_text, params, conn_name = resolve_db_request(
         cfg,
         template=template,
@@ -368,6 +371,7 @@ def db_assert(
 ) -> None:
     """Run a DB query and assert on its result."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     _db_assert_envelope(
         config_path,
         template,
@@ -379,6 +383,7 @@ def db_assert(
         path,
         equals,
         assertion,
+        overlay_paths=list(ovs) if ovs else None,
     )
 
 
@@ -397,9 +402,10 @@ def _db_execute_core(
     param: tuple[str, ...],
     connection: str | None,
     write: bool,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
     # Step 1: Load config
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
 
     # Step 2: Resolve SQL, params, and connection (enforces template XOR sql,
     # neither-given, unknown template, unknown connection)
@@ -464,7 +470,8 @@ def db_execute(
 ) -> None:
     """Execute a write SQL statement and return affected row count."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
-    _db_execute_envelope(config_path, template, sql, param, connection, write)
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    _db_execute_envelope(config_path, template, sql, param, connection, write, overlay_paths=list(ovs) if ovs else None)
 
 
 _db_execute_envelope = envelope("db.execute")(_db_execute_core)
@@ -523,9 +530,10 @@ def _db_schema_tables_core(
     config_path: str | None,
     connection: str | None,
     schema: str | None,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
     """Level 1: list relations (tables/views) visible in the connection."""
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
     # Schema has no template, so resolve inline with no template_connection.
     conn_name = resolve_connection_name(cfg, connection_name=connection)
     raw = _probe_and_describe(
@@ -546,9 +554,10 @@ def _db_schema_table_core(
     connection: str | None,
     schema: str | None,
     table: str,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
     """Level 2: return one relation's columns + keys, disambiguating matches."""
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
     conn_name = resolve_connection_name(cfg, connection_name=connection)
     raw = _probe_and_describe(
         cfg.database.connections[conn_name], table=table, schema=schema
@@ -609,10 +618,12 @@ def db_schema(
 ) -> None:
     """Discover live DB schema: list relations, then columns/keys for one."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    overlay_paths = list(ovs) if ovs else None
     if table is None:
-        _db_schema_tables_envelope(config_path, connection, schema)
+        _db_schema_tables_envelope(config_path, connection, schema, overlay_paths=overlay_paths)
     else:
-        _db_schema_table_envelope(config_path, connection, schema, table)
+        _db_schema_table_envelope(config_path, connection, schema, table, overlay_paths=overlay_paths)
 
 
 _db_schema_tables_envelope = envelope("db.schema.tables")(_db_schema_tables_core)

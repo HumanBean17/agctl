@@ -213,13 +213,20 @@ discovers, parses, and validates `agctl.yaml` from scratch. This is what makes
 
 ## 5. Configuration Pipeline
 
-`config/loader.py::load_config`, fixed order; any stage may fail the load with a
-`ConfigError`:
+`config/loader.py::load_config` → `compose_config`, fixed order; any stage may fail the load with a `ConfigError`:
 
 ```
-discover_config_path → yaml.safe_load → interpolate → apply_env_overrides
-                                                → _check_version (major == "2")
-                                                → Config.model_validate (Pydantic v2)
+discover_config_path → yaml.safe_load → interpolate → _check_version (base must be v2)
+                                                ↓
+                              for each overlay (in flag order):
+                                discover_config_path (explicit only) → yaml.safe_load → interpolate
+                                → PartialConfig.model_validate (attributes type errors to the overlay)
+                                → version-major-match check (if overlay has version)
+                                → deep_merge (sidecar-wins, record overrides at leaves)
+                                                ↓
+                              apply_env_overrides (on MERGED dict; AGCTL_* wins over overlays)
+                                                ↓
+                              Config.model_validate (Pydantic v2, final)
    (caller then runs validate_config → cross-refs)
 ```
 
@@ -262,6 +269,10 @@ deep-merged with highest precedence. Two refinements beyond the spec:
 `HttpTemplate`, `Defaults`). Notable: `KafkaSSL.security_protocol` is
 upper-cased and restricted to `PLAINTEXT|SSL|SASL_SSL|SASL_PLAINTEXT` at load,
 so an invalid protocol fails fast rather than surfacing as an opaque broker error.
+
+**Overlay types** — `PartialConfig` (a `Config` subclass with `version: str | None = None`) represents a fragment; version is inherited from the base at merge time. `ComposedConfig` is a `NamedTuple(config: Config, overrides: list[dict])`, where each override record is `{"path": "<dotted>", "overlay": "<file>"}` surfacing which overlay won which leaf.
+
+**Deep merge** (`deep_merge`, `loader.py`) — sidecar-wins dict merge: for each key in the overlay, if the key is absent in the base, add it; if both base and overlay values are dicts, recurse; otherwise, record an override and replace with the overlay value. Scalar/list leaves are replaced wholesale, not merged. Overrides are recorded only at leaf level (e.g., `templates.create-order.path`), not at intermediate dicts.
 
 **Cross-reference validation** (`validator.py`) — returns `(errors, warnings)`,
 catching what Pydantic cannot:

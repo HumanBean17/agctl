@@ -119,8 +119,9 @@ def _kafka_produce_core(
     message: str,
     key: str | None,
     header: tuple[str, ...],
+    overlay_paths: list[str] | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
     value = json.loads(message)
     headers = parse_params(header) if header else None
 
@@ -143,7 +144,8 @@ def kafka_produce(
 ) -> None:
     """Produce one message to a Kafka topic."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
-    _kafka_produce_envelope(config_path, topic, message, key, header)
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    _kafka_produce_envelope(config_path, topic, message, key, header, overlay_paths=list(ovs) if ovs else None)
 
 
 _kafka_produce_envelope = envelope("kafka.produce")(_kafka_produce_core)
@@ -164,8 +166,9 @@ def _kafka_consume_core(
     expect_count: int | None,
     from_beginning: bool,
     consumer_group: str | None,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
 
     # --filter-key is a deprecated alias of --match; both given -> error.
     if match is not None and filter_key is not None:
@@ -269,6 +272,7 @@ def kafka_consume(
 ) -> None:
     """Consume messages from a Kafka topic window."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     _kafka_consume_envelope(
         config_path,
         topic,
@@ -279,6 +283,7 @@ def kafka_consume(
         expect_count,
         from_beginning,
         consumer_group,
+        overlay_paths=list(ovs) if ovs else None,
     )
 
 
@@ -368,8 +373,9 @@ def _kafka_assert_core(
     from_beginning: bool,
     consumer_group: str | None,
     assertion: str | None,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
     params = parse_params(param)
 
     # DESIGN §9.3: a custom assertion mode is mutually exclusive with the
@@ -554,6 +560,7 @@ def kafka_assert(
 ) -> None:
     """Assert a matching message exists in a Kafka window."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     _kafka_assert_envelope(
         config_path,
         topic,
@@ -567,6 +574,7 @@ def kafka_assert(
         from_beginning,
         consumer_group,
         assertion,
+        overlay_paths=list(ovs) if ovs else None,
     )
 
 

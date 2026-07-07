@@ -116,8 +116,9 @@ def _http_call_core(
     match: str | None = None,
     jq_path: str | None = None,
     equals: str | None = None,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
 
     if template_name not in cfg.templates:
         raise TemplateNotFound(
@@ -181,6 +182,9 @@ def _http_call_core(
     return result
 
 
+_http_call_envelope = envelope("http.call")(_http_call_core)
+
+
 @click.command("call")
 @click.argument("template_name")
 @click.option("--param", "param", multiple=True, help="k=v path/body placeholder")
@@ -228,6 +232,7 @@ def http_call(
 ) -> None:
     """Resolve and send a named HTTP template."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     _http_call_envelope(
         config_path,
         template_name,
@@ -240,10 +245,8 @@ def http_call(
         match,
         jq_path,
         equals,
+        overlay_paths=list(ovs) if ovs else None,
     )
-
-
-_http_call_envelope = envelope("http.call")(_http_call_core)
 
 
 # --------------------------------------------------------------------------- #
@@ -265,8 +268,9 @@ def _http_request_core(
     match: str | None = None,
     jq_path: str | None = None,
     equals: str | None = None,
+    overlay_paths: list[str] | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
 
     if url is not None:
         # URL mode: a full request URL, no configured service required. This is
@@ -390,6 +394,7 @@ def http_request(
 ) -> None:
     """Send a free-form HTTP request against a configured service or a full URL."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     _http_request_envelope(
         config_path,
         service,
@@ -404,6 +409,7 @@ def http_request(
         match,
         jq_path,
         equals,
+        overlay_paths=list(ovs) if ovs else None,
     )
 
 
@@ -491,12 +497,13 @@ def _resolve_ping_request(
     param: tuple[str, ...],
     timeout: float | None,
     url: str | None = None,
+    overlay_paths: list[str] | None = None,
 ):
     """Resolve the request components for a ping (template, URL, or free-form).
 
     Returns ``(client, method, path, headers, body_dict_or_None)``.
     """
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
 
     # --url is mutually exclusive with the template positional and --service/--path.
     if url is not None and (
@@ -630,6 +637,7 @@ def http_ping(
 ) -> None:
     """Repeatedly send an HTTP request, streaming NDJSON ping lines."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     start = time.monotonic()
 
     if duration is not None and until_stopped:
@@ -658,6 +666,7 @@ def http_ping(
             param,
             timeout,
             url=url,
+            overlay_paths=list(ovs) if ovs else None,
         )
     except AgctlError as err:
         # Startup config/template errors (ConfigError, TemplateNotFound) -> structured
