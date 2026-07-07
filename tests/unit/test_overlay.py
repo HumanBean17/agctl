@@ -732,3 +732,55 @@ services:
     assert len(captured_overlays) == 1
     assert captured_overlays[0] == [str(ov)]
 
+
+def test_http_ping_forwards_overlay(tmp_path, monkeypatch):
+    """http ping forwards overlay_paths from ctx.obj to load_config_or_raise."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "2"
+services:
+  orders:
+    base_url: http://localhost:8081
+templates:
+  health-check:
+    method: GET
+    service: orders
+    path: /health
+""")
+    ov = tmp_path / "overlay.yaml"
+    ov.write_text("""templates:
+  extra:
+    method: GET
+    service: orders
+    path: /extra
+""")
+
+    captured_overlays = []
+
+    def fake_load_config(config_path, overlay_paths=None):
+        captured_overlays.append(overlay_paths)
+        from agctl.config.models import HttpTemplate
+        return Config(
+            version="2",
+            services={"orders": ServiceConfig(base_url="http://localhost:8081")},
+            templates={
+                "health-check": HttpTemplate(
+                    method="GET",
+                    service="orders",
+                    path="/health"
+                )
+            }
+        )
+
+    # Patch at the module level where it's imported
+    monkeypatch.setattr("agctl.commands.http_commands.load_config_or_raise", fake_load_config)
+
+    # Use --url mode to avoid template resolution complexity (the monkeypatch short-circuits config load)
+    result = CliRunner().invoke(
+        cli,
+        ["--overlay", str(ov), "--config", str(base), "http", "ping", "--url", "http://localhost:8081/health", "--interval", "1", "--duration", "0.1"]
+    )
+
+    # Should have attempted to load config with overlay
+    assert len(captured_overlays) == 1
+    assert captured_overlays[0] == [str(ov)]
+

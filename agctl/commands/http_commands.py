@@ -497,12 +497,13 @@ def _resolve_ping_request(
     param: tuple[str, ...],
     timeout: float | None,
     url: str | None = None,
+    overlay_paths: list[str] | None = None,
 ):
     """Resolve the request components for a ping (template, URL, or free-form).
 
     Returns ``(client, method, path, headers, body_dict_or_None)``.
     """
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
 
     # --url is mutually exclusive with the template positional and --service/--path.
     if url is not None and (
@@ -636,6 +637,7 @@ def http_ping(
 ) -> None:
     """Repeatedly send an HTTP request, streaming NDJSON ping lines."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     start = time.monotonic()
 
     if duration is not None and until_stopped:
@@ -664,6 +666,7 @@ def http_ping(
             param,
             timeout,
             url=url,
+            overlay_paths=list(ovs) if ovs else None,
         )
     except AgctlError as err:
         # Startup config/template errors (ConfigError, TemplateNotFound) -> structured
