@@ -27,6 +27,42 @@ _VAR_INNER_RE = re.compile(r"^([A-Z_][A-Z0-9_]*)(:-(.*))?$", re.DOTALL)
 _MAX_INTERP_PASSES = 25
 
 
+def deep_merge(base: dict, overlay: dict, overlay_name: str, overrides: list[dict], path: str = "") -> dict:
+    """Merge overlay dict into base dict, with overlay winning in conflicts.
+
+    For each key in overlay:
+      - If key absent from base: base[key] = overlay[key] (addition, no record).
+      - If key in base and both base[key] and overlay[key] are dict: recurse.
+      - Else: record override and base[key] = overlay[key] (overlay wins).
+
+    Args:
+        base: Base dict to merge into (mutated in place).
+        overlay: Overlay dict to merge from.
+        overlay_name: Name of overlay source (e.g., "sidecar.yaml").
+        overrides: List to append override records to.
+        path: Current dotted path (used internally for recursion).
+
+    Returns:
+        The mutated base dict.
+    """
+    for key, overlay_value in overlay.items():
+        # Build the dotted path for this key
+        key_path = f"{path}.{key}" if path else key
+
+        if key not in base:
+            # Addition: key not in base, just add it
+            base[key] = overlay_value
+        elif isinstance(base[key], dict) and isinstance(overlay_value, dict):
+            # Both are dicts: recurse
+            deep_merge(base[key], overlay_value, overlay_name, overrides, key_path)
+        else:
+            # Scalar/list leaf or type clash: record override and replace
+            overrides.append({"path": key_path, "overlay": overlay_name})
+            base[key] = overlay_value
+
+    return base
+
+
 def interpolate(obj: Any, env: dict[str, str]) -> Any:
     """Resolve ${VAR}, ${VAR:-default}, ${VAR:-} in all string scalars.
 

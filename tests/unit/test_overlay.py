@@ -47,3 +47,74 @@ def test_base_config_requires_version():
     # Verify the error is about the missing version field
     errors = exc_info.value.errors()
     assert any(err["loc"] == ("version",) for err in errors)
+
+
+# Task 2: deep_merge tests
+from agctl.config.loader import deep_merge
+
+
+def test_deep_merge_addition():
+    """Overlay key absent in base → merged has it; overrides empty."""
+    base = {"a": 1}
+    overlay = {"b": 2}
+    overrides = []
+    result = deep_merge(base, overlay, "sidecar.yaml", overrides)
+    assert result == {"a": 1, "b": 2}
+    assert base == {"a": 1, "b": 2}  # mutated in place
+    assert overrides == []
+
+
+def test_deep_merge_scalar_override():
+    """Both have scalar at same key → overlay wins; override recorded."""
+    base = {"a": 1}
+    overlay = {"a": 2}
+    overrides = []
+    result = deep_merge(base, overlay, "sidecar.yaml", overrides)
+    assert result == {"a": 2}
+    assert overrides == [{"path": "a", "overlay": "sidecar.yaml"}]
+
+
+def test_deep_merge_list_replace():
+    """Lists replace (not extend); override recorded."""
+    base = {"brokers": ["x"]}
+    overlay = {"brokers": ["y", "z"]}
+    overrides = []
+    result = deep_merge(base, overlay, "sidecar.yaml", overrides)
+    assert result == {"brokers": ["y", "z"]}
+    assert overrides == [{"path": "brokers", "overlay": "sidecar.yaml"}]
+
+
+def test_deep_merge_nested_dict_merge():
+    """Nested dicts merge key-by-key; only leaf override recorded."""
+    base = {"templates": {"keep": 1, "shared": {"m": "GET"}}}
+    overlay = {"templates": {"new": 2, "shared": {"m": "POST"}}}
+    overrides = []
+    result = deep_merge(base, overlay, "sidecar.yaml", overrides)
+    assert result == {
+        "templates": {
+            "keep": 1,
+            "new": 2,
+            "shared": {"m": "POST"}
+        }
+    }
+    assert overrides == [{"path": "templates.shared.m", "overlay": "sidecar.yaml"}]
+
+
+def test_deep_merge_type_clash():
+    """Dict vs scalar at same key → override wins and is recorded."""
+    base = {"x": {"a": 1}}
+    overlay = {"x": "scalar"}
+    overrides = []
+    result = deep_merge(base, overlay, "sidecar.yaml", overrides)
+    assert result == {"x": "scalar"}
+    assert overrides == [{"path": "x", "overlay": "sidecar.yaml"}]
+
+
+def test_deep_merge_dotted_path_nesting():
+    """Dotted path builds correctly across multiple levels."""
+    base = {"kafka": {"patterns": {"foo": {"match": "old"}}}}
+    overlay = {"kafka": {"patterns": {"foo": {"match": "new"}}}}
+    overrides = []
+    result = deep_merge(base, overlay, "sidecar.yaml", overrides)
+    assert result == {"kafka": {"patterns": {"foo": {"match": "new"}}}}
+    assert overrides == [{"path": "kafka.patterns.foo.match", "overlay": "sidecar.yaml"}]
