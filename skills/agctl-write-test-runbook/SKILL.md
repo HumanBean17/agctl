@@ -70,6 +70,8 @@ If none apply, omit the Fixtures section entirely. Background commands
 (`mock run`, `http ping`) go under Fixtures, never as Steps — they stream NDJSON,
 not a single envelope.
 
+**Config placement rule:** Ground every template, mock, seed-template, and pattern via `agctl discover` against the main config. When a needed definition is **not** present, place it in a sidecar `<runbook-base>.agctl.yaml` (sibling to the runbook) rather than editing the main `agctl.yaml`. Shared infrastructure stays in the main config; runbook-specific fixtures (one-off seed templates, ad-hoc mocks, scratch HTTP templates) and per-runbook overrides belong in the sidecar.
+
 ### 4. Emit
 
 Instantiate `reference/runbook-template.md`, prune the fixture subsections you
@@ -78,6 +80,8 @@ don't need, and fill in goal, source, preconditions, steps, and cleanup. For a
 sections entirely. Write the file as `runbook.md` wherever you prefer (a
 `runbooks/` directory at the repo root is common). It is committable — a test
 plan; the `*.results.md` report produced at execution is gitignored.
+
+**Sidecar emission:** When any template, mock, seed-template, or pattern definition was placed in a sidecar (per the Design rule), also write `<runbook-base>.agctl.yaml` next to the runbook, and add a `Preconditions` line to the runbook: `Requires overlay: <runbook-base>.agctl.yaml`. The runbook stays pure markdown — no YAML front-matter, no embedded config block. The companion `agctl-run-test-runbook` skill looks for this sibling sidecar and activates the overlay at run-time.
 
 ## Reference
 
