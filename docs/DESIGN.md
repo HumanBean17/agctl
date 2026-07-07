@@ -1945,7 +1945,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agctl"
-version = "0.1.0"
+version = "1.1.1"
 description = "Agent-facing CLI harness for testing distributed systems"
 requires-python = ">=3.11"
 dependencies = [
