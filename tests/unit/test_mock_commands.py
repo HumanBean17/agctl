@@ -539,9 +539,21 @@ mocks:
     # Verify spawn_daemon was called
     assert len(captured_argv) == 1
 
-    # Verify the daemon argv includes --overlay with absolute path
+    # Verify the daemon argv structure
     daemon_argv = captured_argv[0]
+
+    # Global flags (--config, --overlay) must appear BEFORE the "mock" subcommand
+    # because they are root-level Click options, not mock-run options
+    mock_idx = daemon_argv.index("mock")
+
+    # Verify --overlay is in the argv and appears BEFORE the "mock" subcommand
     assert "--overlay" in daemon_argv
     overlay_idx = daemon_argv.index("--overlay")
+    assert overlay_idx < mock_idx, "--overlay must appear before the 'mock' subcommand"
     # Next item should be the absolute path to the overlay
     assert daemon_argv[overlay_idx + 1] == str(Path(ov).absolute())
+
+    # Verify --config also appears BEFORE the "mock" subcommand (if provided)
+    if "--config" in daemon_argv:
+        config_idx = daemon_argv.index("--config")
+        assert config_idx < mock_idx, "--config must appear before the 'mock' subcommand"

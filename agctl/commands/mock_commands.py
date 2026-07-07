@@ -288,13 +288,16 @@ def _mock_start_core(
                 )
 
     # Step 6: Build daemon argv
-    daemon_argv = ["mock", "run"]
+    daemon_argv = []
+    # Global flags (parsed by root cli group) must come BEFORE the subcommand
     if config_path is not None:
         daemon_argv.extend(["--config", str(Path(config_path).absolute())])
     # Forward overlay paths to the daemon
     if overlay_paths is not None:
         for ov in overlay_paths:
             daemon_argv.extend(["--overlay", str(Path(ov).absolute())])
+    # Subcommand and mock-run-specific options
+    daemon_argv.extend(["mock", "run"])
     if run_http:
         daemon_argv.extend(["--http-listen", http_listen])
     if only is not None:
