@@ -11,6 +11,11 @@ config **and a source artifact** — a REST controller, a Kafka producer, a SQL 
 and it produces the right block, in the right section, in valid form, then verifies.
 It asks only when something is genuinely ambiguous.
 
+**Infra vs. fixtures boundary:** Shared infrastructure (services, connections, core patterns)
+belongs in the main `agctl.yaml`; runbook-specific fixtures live in sidecars (`<runbook>.agctl.yaml`)
+layered via `--overlay`. This skill enforces that boundary when authoring — don't put
+runbook-only data in the shared config.
+
 This is the **authoring** counterpart to the `agctl` skill, which covers *running*
 commands. Don't conflate them: `agctl` drives the CLI; `agctl-config` writes its config.
 
@@ -39,7 +44,7 @@ Mirror agctl's own discovery, highest precedence first:
 
 If none is found, **ask** — don't invent one. This skill edits the **consuming repo's
 `agctl.yaml`** — never the packaged `agctl/data/sample-config.yaml` (a drift-guard test
-pins it byte-identical to the README).
+pins it byte-identical to the README). The sidecar feature adds no sample; never edit it.
 
 ## The contract — every block you write obeys this
 
@@ -96,6 +101,13 @@ Every edit ends with these two commands (the config must stay valid):
 agctl config validate                                                       # ok:true, exit 0 (warnings fine; errors are not)
 agctl discover --category <http-templates|kafka-patterns|db-templates|mock-http-stubs|mock-kafka-reactors> --name <new-key>   # must list expected params
 ```
+
+**When editing a sidecar** (`.agctl.yaml` layered via `--overlay`), verify with:
+```bash
+agctl config validate --config <base-config> --overlay <sidecar>            # validates the merged result
+agctl discover --overlay <sidecar> --name <new-key>                        # must list expected params from the sidecar
+```
+The base-only close-out above is the default for main `agctl.yaml` edits.
 
 **Mocks are discoverable** via `agctl discover --category <mock-http-stubs|mock-kafka-reactors>`
 (and `--name <stub-or-reactor>` for full detail). For a `mock` edit, confirm the new/changed
