@@ -1,7 +1,14 @@
 import pytest
 from pydantic import ValidationError
 
-from agctl.config.models import Config, DatabaseConnection, DatabaseTemplate
+from agctl.config.models import (
+    Config,
+    DatabaseConnection,
+    DatabaseTemplate,
+    LogSource,
+    LogsConfig,
+    LogsDefaults,
+)
 
 
 def _full_config_dict():
@@ -119,3 +126,50 @@ def test_database_template_roundtrip():
     tmpl = DatabaseTemplate(sql="x", mode="write")
     dumped = tmpl.model_dump()
     assert dumped["mode"] == "write"
+
+
+def test_log_source_defaults():
+    """LogSource() has type=='file', path is None, format=='logstash', service is None."""
+    source = LogSource()
+    assert source.type == "file"
+    assert source.path is None
+    assert source.format == "logstash"
+    assert source.service is None
+
+
+def test_logs_defaults_defaults():
+    """LogsDefaults() has tail_lines==200, limit==50, timeout_seconds==10, poll_interval_ms==100."""
+    defaults = LogsDefaults()
+    assert defaults.tail_lines == 200
+    assert defaults.limit == 50
+    assert defaults.timeout_seconds == 10
+    assert defaults.poll_interval_ms == 100
+
+
+def test_logs_config_empty_default():
+    """LogsConfig() has sources=={} and a LogsDefaults instance."""
+    cfg = LogsConfig()
+    assert cfg.sources == {}
+    assert isinstance(cfg.defaults, LogsDefaults)
+    assert cfg.defaults.tail_lines == 200
+    assert cfg.defaults.limit == 50
+    assert cfg.defaults.timeout_seconds == 10
+    assert cfg.defaults.poll_interval_ms == 100
+
+
+def test_config_has_logs_field():
+    """Config(version='2') has .logs being a LogsConfig (empty sources)."""
+    cfg = Config(version="2")
+    assert isinstance(cfg.logs, LogsConfig)
+    assert cfg.logs.sources == {}
+    assert isinstance(cfg.logs.defaults, LogsDefaults)
+
+    # Also test constructing with a dict via model_validate
+    cfg2 = Config.model_validate(
+        {
+            "version": "2",
+            "logs": {"sources": {"svc": {"path": "/tmp/x.log"}}},
+        }
+    )
+    assert cfg2.logs.sources["svc"].path == "/tmp/x.log"
+    assert cfg2.logs.sources["svc"].type == "file"  # default applied
