@@ -248,10 +248,9 @@ def test_scan_reads_tail_and_filters_level(tmp_path):
     assert result.entries[1].message == "err2"
 
 
-def test_scan_skips_non_json_lines(tmp_path):
+def test_scan_skips_non_json_lines(tmp_path, capsys):
     """scan skips non-JSON lines with stderr message (no exception)."""
     from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
-    import sys
 
     log_file = tmp_path / "test.log"
     lines = [
@@ -264,22 +263,14 @@ def test_scan_skips_non_json_lines(tmp_path):
     source = LogSource(path=str(log_file), format="logstash")
     backend = NdjsonFileBackend(source)
 
-    # Capture stderr to check for skip message
-    import io
-    old_stderr = sys.stderr
-    sys.stderr = io.StringIO()
-
-    try:
-        result = backend.scan(
-            LogFilter(), since=None, until=None, limit=50, tail_lines=200
-        )
-    finally:
-        stderr_output = sys.stderr.getvalue()
-        sys.stderr = old_stderr
+    result = backend.scan(
+        LogFilter(), since=None, until=None, limit=50, tail_lines=200
+    )
 
     assert result.scanned == 2  # Only the 2 valid JSON lines
     assert result.matched == 2
-    assert "skipping non-JSON log line" in stderr_output
+    captured = capsys.readouterr()
+    assert "skipping non-JSON log line" in captured.err
 
 
 def test_scan_logger_glob_and_message(tmp_path):
@@ -438,3 +429,53 @@ def test_scan_tail_lines_bounds_read(tmp_path):
     # Only the last 3 lines should be considered
     assert result.scanned <= 3
     assert result.matched <= 3
+
+
+def test_scan_tail_lines_long_lines(tmp_path):
+    """scan handles long lines (300-800 bytes) via loop-growing read window."""
+    import json
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+
+    # Generate 5 NDJSON lines, each ~400 bytes (pad message + add fields)
+    lines = []
+    for i in range(5):
+        # Create a proper long message (300 characters)
+        long_message = "x" * 300
+        # Build valid JSON object with multiple fields to reach ~400 bytes
+        line_obj = {
+            "@timestamp": f"2026-07-08T10:00:0{i}Z",
+            "level": "INFO",
+            "logger_name": f"com.example.service.Service{i}",
+            "message": long_message,
+            "field1": "value1",
+            "field2": "value2",
+            "field3": "value3",
+            "orderId": f"ord-{i}",
+            "userId": f"user-{i}",
+            "requestId": f"req-{i}",
+            "sessionId": f"sess-{i}",
+        }
+        line = json.dumps(line_obj)
+        lines.append(line)
+
+    log_file.write_text("\n".join(lines))
+
+    source = LogSource(path=str(log_file), format="logstash")
+    backend = NdjsonFileBackend(source)
+
+    # Request last 3 lines - should correctly capture them despite long lines
+    result = backend.scan(
+        LogFilter(), since=None, until=None, limit=50, tail_lines=3
+    )
+
+    # Should scan at most 3 lines (the last 3)
+    assert result.scanned == 3
+    assert result.matched == 3
+
+    # The last 3 lines (indices 2, 3, 4) should be in the results
+    messages = [e.message for e in result.entries]
+    assert all(len(msg) == 300 for msg in messages)  # All 300-char messages
+    assert all(msg == "x" * 300 for msg in messages)  # All are the long message
+    assert len(messages) == 3

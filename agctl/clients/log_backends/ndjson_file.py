@@ -1,11 +1,11 @@
 """NDJSON file backend for logstash-formatted logs (DESIGN §9.2)."""
 
 import dataclasses
+import fnmatch
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
-
-import fnmatch
 
 from agctl.assertions import _parse_iso_datetime, _to_utc, jq_bool
 from agctl.clients.log_backend_protocol import (
@@ -103,6 +103,8 @@ class NdjsonFileBackend:
         Filters are applied in AND order (level, logger glob, message substring,
         jq predicate). Returns up to ``limit`` matches with truncation flag.
         """
+        if self._path is None:
+            return ScanResult(entries=[], matched=0, scanned=0, truncated=False)
         path = Path(self._path)
         if not path.exists():
             return ScanResult(entries=[], matched=0, scanned=0, truncated=False)
@@ -121,8 +123,6 @@ class NdjsonFileBackend:
             try:
                 raw = json.loads(line)
             except json.JSONDecodeError:
-                import sys
-
                 print("agctl: skipping non-JSON log line", file=sys.stderr)
                 continue
 
@@ -133,8 +133,7 @@ class NdjsonFileBackend:
                 entry_ts = _parse_iso_datetime(entry.timestamp)
                 if entry_ts is None:
                     # Unparseable timestamp: only keep if no bounds
-                    if since is not None or until is not None:
-                        continue
+                    continue
                 else:
                     entry_ts_utc = _to_utc(entry_ts)
                     if since is not None and entry_ts_utc < since:
@@ -175,7 +174,10 @@ class NdjsonFileBackend:
     def _tail_lines(self, path: Path, n: int) -> list[str]:
         """Read the last n lines from a file without loading it all.
 
-        Seeks near the end and collects up to n newline-terminated fragments.
+        Uses loop-growing read window to handle long lines robustly.
+        Starts with an estimate and doubles the window until either n lines
+        are captured or the start of the file is reached. Discards partial
+        leading fragment when seeking from a non-zero offset.
         Robust to files smaller than the estimate and final lines without
         trailing newline.
         """
@@ -184,19 +186,50 @@ class NdjsonFileBackend:
             f.seek(0, 2)
             file_size = f.tell()
 
-            # Estimate bytes needed (rough estimate: assume avg 100 bytes per line)
-            estimate = min(n * 100, file_size)
-            f.seek(max(0, file_size - estimate))
+            # Start with initial estimate
+            estimate = n * 100  # Conservative initial estimate
 
-            # Read chunks and collect lines
-            raw = f.read()
-            lines = raw.decode("utf-8", errors="replace").splitlines()
+            while True:
+                # Calculate seek offset
+                seek_offset = max(0, file_size - estimate)
+                f.seek(seek_offset)
 
-            # Keep only the last n lines
-            if len(lines) > n:
-                lines = lines[-n:]
+                # Read and decode
+                raw = f.read()
+                decoded = raw.decode("utf-8", errors="replace")
 
-            return lines
+                # If seeking from middle of file, discard partial leading fragment
+                if seek_offset > 0:
+                    first_newline_idx = decoded.find("\n")
+                    if first_newline_idx != -1:
+                        # Slice off everything before and including first newline
+                        decoded = decoded[first_newline_idx + 1:]
+                    else:
+                        # No newline in read - entire content is partial fragment
+                        # Grow window and retry
+                        estimate *= 2
+                        if estimate >= file_size:
+                            estimate = file_size
+                        continue
+
+                # Split into lines
+                all_lines = decoded.splitlines()
+
+                # Check if we got enough lines
+                if len(all_lines) >= n:
+                    # We have enough (or more), return last n
+                    return all_lines[-n:]
+
+                # Not enough lines - check if we've reached the start
+                if seek_offset == 0:
+                    # At file start, return whatever we have
+                    return all_lines
+
+                # Not at start and not enough lines - grow the window and retry
+                estimate *= 2
+                if estimate >= file_size:
+                    # Window would cover entire file, just read it all
+                    estimate = file_size
 
     def await_one(
         self,
