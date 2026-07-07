@@ -67,8 +67,10 @@ def envelope(command: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]
     return decorator
 
 
-def load_config_or_raise(config_path: str | None = None):
+def load_config_or_raise(
+    config_path: str | None = None, overlay_paths: list[str] | None = None
+):
     """Load config, letting ConfigError propagate to the envelope wrapper (exit 2)."""
     from .config import load_config
 
-    return load_config(config_path)
+    return load_config(config_path, overlays=overlay_paths)

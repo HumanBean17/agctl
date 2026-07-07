@@ -3,13 +3,13 @@
 import os
 import pathlib
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 import yaml
 from pydantic import ValidationError
 
 from ..errors import ConfigError
-from .models import Config
+from .models import Config, PartialConfig
 from .resolver import apply_env_overrides
 
 # Matches the *inner* text of a ${...} expression: VAR, VAR:-default, or VAR:-.
@@ -215,18 +215,111 @@ def discover_config_path(explicit: str | None = None, env: dict[str, str] | None
 TOOL_MAJOR_VERSION = "2"
 
 
-def load_config(path: str | None = None, env: dict[str, str] | None = None):
-    """Full pipeline: discover -> parse -> interpolate -> override -> validate."""
+class ComposedConfig(NamedTuple):
+    """Result of composing a base config with overlay fragments.
+
+    Attributes:
+        config: The final merged and validated Config.
+        overrides: List of override records, each with "path" (dotted path) and
+            "overlay" (overlay file path).
+    """
+    config: Config
+    overrides: list[dict]
+
+
+def compose_config(
+    path: str | None = None,
+    overlays: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> ComposedConfig:
+    """Compose base config with overlay fragments.
+
+    Pipeline:
+      1. Resolve env (defaults to os.environ).
+      2. Discover base config path.
+      3. Load and interpolate base YAML.
+      4. Check base version (must be v2).
+      5. For each overlay (in order):
+         - Verify file exists.
+         - Load and interpolate overlay YAML.
+         - Validate fragment with PartialConfig.
+         - Check overlay version major matches TOOL_MAJOR_VERSION if present.
+         - Deep merge into base, recording overrides.
+      6. Apply environment variable overrides to merged dict.
+      7. Validate final Config.
+      8. Return ComposedConfig(config, overrides).
+
+    Args:
+        path: Explicit base config path (discovery if None).
+        overlays: List of overlay file paths to apply in order.
+        env: Environment dict (defaults to os.environ).
+
+    Returns:
+        ComposedConfig with final Config and override records.
+
+    Raises:
+        ConfigError: On discovery, validation, or version mismatch errors.
+    """
     env = env if env is not None else os.environ
-    config_path = discover_config_path(explicit=path, env=env)
-    raw = yaml.safe_load(config_path.read_text()) or {}
-    interpolated = interpolate(raw, env)
-    with_overrides = apply_env_overrides(interpolated, env)
-    _check_version(with_overrides)
+    base_path = discover_config_path(explicit=path, env=env)
+    base_raw = interpolate(yaml.safe_load(base_path.read_text()) or {}, env)
+    _check_version(base_raw)
+
+    overrides: list[dict] = []
+    for ov in overlays or []:
+        ov_path = pathlib.Path(ov)
+        if not ov_path.is_file():
+            raise ConfigError(f"Overlay file not found: {ov}", {"path": ov})
+
+        raw_ov = interpolate(yaml.safe_load(ov_path.read_text()) or {}, env)
+
+        try:
+            PartialConfig.model_validate(raw_ov)
+        except ValidationError as exc:
+            raise ConfigError(
+                f"Invalid overlay: {ov}",
+                {"overlay": ov, "validation_errors": exc.errors()},
+            ) from exc
+
+        ov_version = raw_ov.get("version")
+        if ov_version is not None:
+            ov_major = str(ov_version).split(".")[0]
+            if ov_major != TOOL_MAJOR_VERSION:
+                raise ConfigError(
+                    f"Overlay version mismatch in {ov}: major must be {TOOL_MAJOR_VERSION}",
+                    {"overlay": ov, "found": ov_major},
+                )
+
+        deep_merge(base_raw, raw_ov, ov, overrides)
+
+    with_env = apply_env_overrides(base_raw, env)
     try:
-        return Config.model_validate(with_overrides)
+        config = Config.model_validate(with_env)
     except ValidationError as exc:
         raise ConfigError("Invalid configuration", {"validation_errors": exc.errors()}) from exc
+
+    return ComposedConfig(config, overrides)
+
+
+def load_config(
+    path: str | None = None,
+    env: dict[str, str] | None = None,
+    overlays: list[str] | None = None,
+) -> Config:
+    """Full pipeline: discover -> parse -> interpolate -> merge overlays -> override -> validate.
+
+    Args:
+        path: Explicit config path (discovery if None).
+        env: Environment dict (defaults to os.environ).
+        overlays: Optional list of overlay file paths to compose.
+
+    Returns:
+        Validated Config object.
+
+    Raises:
+        ConfigError: On any pipeline error.
+    """
+    return compose_config(path, overlays, env).config
 
 
 def _check_version(data: dict) -> None:
