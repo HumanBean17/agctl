@@ -14,6 +14,9 @@ This skill writes runbooks; it does not run them. Point at a spec (or a one-line
 testing request) plus the repo's `agctl.yaml`, and produce a well-formed
 `runbook.md` grounded in the system's real templates — not invented commands.
 
+**Stop after emitting the runbook.** Never invoke `agctl-run-test-runbook` (or
+run any step) on your own — execution is a separate, user-initiated action.
+
 ## Procedure
 
 ### 1. Ingest
