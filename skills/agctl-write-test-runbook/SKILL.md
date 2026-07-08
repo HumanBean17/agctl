@@ -23,6 +23,9 @@ Accept either input and scale planning depth to it:
 - **One-line testing request** → produce a **Steps-only** runbook (omit the Fixtures and Cleanup sections entirely). Keep it to the assertions that answer the request.
 - **Spec link / design doc** → produce the full structure: Goal + Preconditions + Fixtures + Steps + Cleanup.
 
+**Scope:** one runbook per independent scenario. If the spec spans multiple
+flows, flag it and author one runbook each — don't merge them into one.
+
 Record the source in the runbook's `**Source:**` line.
 
 ### 2. Discover
@@ -47,7 +50,16 @@ To ground a mock fixture, run `agctl discover --category mock-http-stubs` /
 `mock-kafka-reactors` (and `--name <Y>` for full detail) — the same way you ground
 templates. Do not invent stubs.
 
-### 3. Design
+### 3. Clarify (only when ambiguous)
+
+If the input already pins down the target scenario and its expected outcomes,
+skip this step and go straight to Design. Only when something is genuinely
+ambiguous ask the user — one question at a time, multiple-choice where possible.
+Scope each question to what would change the runbook: which scenario or branch
+(happy-path vs. error), what to assert, or which downstream to mock vs. let
+through. Don't interrogate a clear spec.
+
+### 4. Design
 
 Sequence the steps. For each step decide:
 
@@ -72,7 +84,7 @@ not a single envelope.
 
 **Config placement rule:** Ground every template, mock, seed-template, and pattern via `agctl discover` against the main config. When a needed definition is **not** present, place it in a sidecar `<runbook-base>.agctl.yaml` (sibling to the runbook) rather than editing the main `agctl.yaml`. Shared infrastructure stays in the main config; runbook-specific fixtures (one-off seed templates, ad-hoc mocks, scratch HTTP templates) and per-runbook overrides belong in the sidecar.
 
-### 4. Emit
+### 5. Emit
 
 Instantiate `reference/runbook-template.md`, prune the fixture subsections you
 don't need, and fill in goal, source, preconditions, steps, and cleanup. For a
@@ -82,6 +94,18 @@ sections entirely. Write the file as `runbook.md` wherever you prefer (a
 plan; the `*.results.md` report produced at execution is gitignored.
 
 **Sidecar emission:** When any template, mock, seed-template, or pattern definition was placed in a sidecar (per the Design rule), also write `<runbook-base>.agctl.yaml` next to the runbook, and add a `Preconditions` line to the runbook: `Requires overlay: <runbook-base>.agctl.yaml`. The runbook stays pure markdown — no YAML front-matter, no embedded config block. The companion `agctl-run-test-runbook` skill looks for this sibling sidecar and activates the overlay at run-time.
+
+### 6. Self-review
+
+Before declaring the runbook done, scan it and fix inline:
+
+- No leftover `<...>` / TBD placeholders.
+- Every `$CAPTURE` is defined by an earlier step before any later step uses it.
+- Cleanup reverses every fixture — one teardown line per fixture (mock PID,
+  heartbeat PID, seed reset).
+- Each `Expected` asserts the field that actually answers the Goal.
+- Every template, mock, seed-template, and pattern resolves in `agctl discover`
+  against the main config or the sidecar — nothing invented.
 
 ## Reference
 
