@@ -4,6 +4,7 @@ Operates on a schema-validated Config instance and reports cross-reference
 errors that pydantic cannot catch, plus missing-description warnings.
 """
 
+from ..errors import ConfigError
 from .models import Config
 
 
@@ -175,6 +176,20 @@ def validate_config(cfg: Config) -> tuple[list[dict], list[dict]]:
                         }
                     )
                     break  # Only warn once per later stub
+
+    # --- logs sources validation -----------------------------------------------
+
+    # Validate each log source (backend discovery + config validation)
+    for name, source in cfg.logs.sources.items():
+        try:
+            # Local import to avoid module-load cycle
+            from ..clients.log_client import LogClient
+
+            LogClient(source)  # Construction runs validate_config()
+        except ConfigError as err:
+            errors.append(
+                {"path": f"logs.sources.{name}", "message": str(err)}
+            )
 
     return errors, warnings
 

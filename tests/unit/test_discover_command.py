@@ -731,3 +731,111 @@ def test_discover_without_overlay_base_only(tmp_path, monkeypatch):
     assert res["count"] == 1
     names = {item["name"] for item in res["items"]}
     assert names == {"base-template"}
+
+
+# --------------------------------------------------------------------------- #
+# Task 9: log-sources category
+# --------------------------------------------------------------------------- #
+
+
+def test_discover_summary_includes_log_sources(monkeypatch):
+    """Task 9 Test 1: discover summary includes log_sources count and log-sources in hint."""
+    result = _run([], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["ok"] is True
+    counts = payload["result"]
+    # The fixture has 2 logs sources (order-service, payment-service)
+    assert counts["log_sources"] == 2
+    # Hint should mention log-sources category
+    assert "log-sources" in counts["hint"]
+
+
+def test_discover_category_log_sources(monkeypatch):
+    """Task 9 Test 2: discover --category log-sources lists all log sources."""
+    result = _run(["--category", "log-sources"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.category"
+    res = payload["result"]
+    assert res["category"] == "log-sources"
+    assert res["count"] == 2
+    by_name = {item["name"]: item for item in res["items"]}
+    assert set(by_name) == {"order-service", "payment-service"}
+    # Each item has name and description
+    # Description format: "{src.type} logs for {name} ({src.path or '?'})"
+    assert "file" in by_name["order-service"]["description"]
+    assert "order-service" in by_name["order-service"]["description"]
+    assert "logs/order-service.log" in by_name["order-service"]["description"]
+
+
+def test_discover_item_log_sources_with_schema(tmp_path, monkeypatch):
+    """Task 9 Test 3: discover --category log-sources --name returns schema_fields sampled from the log file."""
+    # Create a temp log file with 2 NDJSON lines
+    log_file = tmp_path / "test.log"
+    # Line 1: standard fields + orderId (note: logger_name not logger)
+    # Line 2: standard fields + stack_trace
+    # IMPORTANT: write both lines in a single write_text() call, not two separate calls
+    log_file.write_text(
+        '{"@timestamp":"2026-07-08T12:00:00Z","@version":"1","level":"ERROR","logger_name":"order.service","message":"Order failed","orderId":"o1"}\n'
+        '{"@timestamp":"2026-07-08T12:01:00Z","@version":"1","level":"ERROR","logger_name":"order.service","message":"Order crashed","stack_trace":"java.lang.Exception"}'
+    )
+
+    # Create a temp config with a logs source pointing at the temp file
+    config_yaml = (
+        'version: "2"\n'
+        "services:\n"
+        '  demo:\n'
+        '    base_url: "http://localhost:9999"\n'
+        "logs:\n"
+        "  sources:\n"
+        "    svc:\n"
+        f"      path: \"{log_file}\"\n"
+        '      type: "file"\n'
+        '      format: "logstash"\n'
+    )
+
+    result = _run_with(["--category", "log-sources", "--name", "svc"], config_yaml, tmp_path, monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.item"
+    res = payload["result"]
+    assert res["category"] == "log-sources"
+    assert res["name"] == "svc"
+    assert res["type"] == "file"
+    assert res["format"] == "logstash"
+    assert res["path"] == str(log_file)
+    # schema_fields should have standard/conditional/observed
+    schema = res["schema_fields"]
+    # standard fields are present in any sampled entry (union): timestamp, level, logger, message
+    assert set(schema["standard"]) == {"timestamp", "level", "logger", "message"}
+    # conditional fields are present in SOME entries: stack_trace
+    assert "stack_trace" in schema["conditional"]
+    # observed includes all unique fields: orderId (not @version - it's excluded)
+    assert "orderId" in schema["observed"]
+    assert "@version" not in schema["observed"]
+    # example command starts with "agctl logs query --source"
+    assert res["example"].startswith("agctl logs query --source svc")
+
+
+def test_discover_search_finds_log_source(monkeypatch):
+    """Task 9 Test 4: discover --search order finds order-service log source."""
+    result = _run(["--search", "order"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.search"
+    res = payload["result"]
+    matches = res["matches"]
+    by_key = {(m["category"], m["name"]) for m in matches}
+    # Should find order-service log source
+    assert ("log-sources", "order-service") in by_key
+
+
+def test_discover_item_unknown_log_source(monkeypatch):
+    """Task 9 Test 5: discover --category log-sources --name nope returns TemplateNotFound."""
+    result = _run(["--category", "log-sources", "--name", "nope"], monkeypatch)
+    assert result.exit_code == 2
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "TemplateNotFound"
+    assert "Unknown logs source: nope" in payload["error"]["message"]

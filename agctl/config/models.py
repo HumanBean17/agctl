@@ -277,6 +277,31 @@ class MocksConfig(BaseModel):
     kafka: KafkaMockConfig | None = None
 
 
+class LogSource(BaseModel):
+    """Log source configuration (file or journald)."""
+
+    type: str = "file"
+    path: str | None = None
+    format: str = "logstash"
+    service: str | None = None
+
+
+class LogsDefaults(BaseModel):
+    """Default parameters for logs commands."""
+
+    tail_lines: int = 200
+    limit: int = 50
+    timeout_seconds: int = 10
+    poll_interval_ms: int = 100
+
+
+class LogsConfig(BaseModel):
+    """Logs configuration: sources and defaults."""
+
+    sources: dict[str, LogSource] = Field(default_factory=dict)
+    defaults: LogsDefaults = Field(default_factory=LogsDefaults)
+
+
 class Config(BaseModel):
     version: str
     services: dict[str, ServiceConfig] = Field(default_factory=dict)
@@ -285,6 +310,7 @@ class Config(BaseModel):
     templates: dict[str, HttpTemplate] = Field(default_factory=dict)
     defaults: Defaults = Field(default_factory=Defaults)
     mocks: MocksConfig | None = None
+    logs: LogsConfig = Field(default_factory=LogsConfig)
 
 
 class PartialConfig(Config):

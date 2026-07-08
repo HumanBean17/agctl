@@ -66,7 +66,9 @@ pip install -e ".[http]"            # http call / request / ping / check ready
 pip install -e ".[jq]"             # jq flags: http --match/--jq-path, mock match.jq
 pip install -e ".[kafka]"           # kafka produce / consume / assert
 pip install -e ".[db]"              # db query / assert
-pip install -e ".[http,kafka,db]"   # everything (typical — bundles jq)
+pip install -e ".[logs]"            # logs query / assert / tail (includes jq)
+pip install -e ".[http,kafka,db]"   # everything except logs (typical — bundles jq)
+pip install -e ".[http,kafka,db,logs]"   # everything
 ```
 
 Verify the install — both binary names work:
@@ -109,6 +111,9 @@ auto-discovered from the current directory upward).
 | | `assert` | Fail (exit 1) unless a matching message arrives within `--timeout`. Modes: `--contains`, `--match <jq>`, `--pattern <name>` (combinable) |
 | **`db`** | `query` | Run `--template` or free-form `--sql`; return all rows |
 | | `assert` | Assert `--expect-rows N`, or `--expect-value --path <jq> --equals <v>` on the first row |
+| **`logs`** | `query` | Scan log sources; filter by `--since`, `--match` (jq), `--level` |
+| | `assert` | Assert logs match/nmatch a condition within `--timeout` (one-shot or poll) |
+| | `tail` | Stream log entries as NDJSON (with `--duration` or `--until-stopped`) |
 | **`check`** | `ready` | Hit `health_path` for one (`--service`) or all services; 2xx = ready |
 | **`config`** | `validate` | Validate schema, env vars, cross-references, version |
 | | `show` | Dump fully-resolved config as JSON (secrets masked) |
@@ -331,6 +336,19 @@ templates:
 defaults:
   timeout_seconds: 10
   database_connection: main-db
+
+# --- logs: log file sources for tailing and searching ------------------------
+logs:
+  sources:
+    order-service:
+      path: "logs/order-service.log"
+      format: logstash
+      service: order-service
+  defaults:
+    tail_lines: 200
+    limit: 50
+    timeout_seconds: 10
+    poll_interval_ms: 100
 ```
 
 > **Note:** `charge-payment` uses the `${PAYMENT_SERVICE_TOKEN:-change-me}` form —

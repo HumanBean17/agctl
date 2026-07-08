@@ -260,6 +260,39 @@ database:
       sql: "INSERT INTO orders (id, customer_id, status) VALUES (:orderId, :customerId, 'PENDING') ON CONFLICT (id) DO NOTHING RETURNING *"
 
 # ---------------------------------------------------------------------------
+# logs — log source configuration for log query/assert/tail.
+#   sources.<name>: named log source definitions
+#     type: backend type (default "file"; extensible via agctl.logs_backends entry point)
+#     path: file path (required for type "file")
+#     format: log format (default "logstash"; "logstash" = NDJSON with @timestamp)
+#     service: optional service name override (defaults to source name)
+#   defaults: fallback values for logs commands
+#     tail_lines: number of trailing lines to read (default 200)
+#     limit: max entries to return from query (default 50)
+#     timeout_seconds: default timeout for logs assert (default 10)
+#     poll_interval_ms: poll interval for tail/assert (default 100)
+# ---------------------------------------------------------------------------
+logs:
+  sources:
+    order-service:
+      type: file
+      path: "/var/log/order-service/app.log"
+      format: logstash
+      service: order-service
+
+    payment-service:
+      type: file
+      path: "/var/log/payment-service/app.log"
+      format: logstash
+      service: payment-service
+
+  defaults:
+    tail_lines: 200
+    limit: 50
+    timeout_seconds: 10
+    poll_interval_ms: 100
+
+# ---------------------------------------------------------------------------
 # templates — named HTTP request templates.
 # method:   HTTP verb (GET, POST, PUT, PATCH, DELETE)
 # service:  must match a key under `services`
@@ -799,7 +832,223 @@ agctl db schema
 
 ---
 
-### 3.4 `agctl check` — Service Health
+### 3.4 `agctl logs` — Log Query, Assert, and Tail
+
+The `agctl logs` command group provides three modes for interrogating service logs: query (scan and filter), assert (poll for a match), and tail (stream live entries). All commands operate on a **canonical log entry model** regardless of the underlying log format, enabling uniform queries across different log sources.
+
+#### Canonical entry model
+
+All backends normalize to this structure. Optional fields default to `null`:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `timestamp` | string (ISO 8601) | Yes | Event timestamp (e.g. `"2026-07-08T12:34:56.789Z"`) |
+| `level` | string (UPPERCASE) | Yes | Log level (`INFO`, `WARN`, `ERROR`, etc.) |
+| `logger` | string | Yes | Logger name (e.g. `"com.example.OrderService"`) |
+| `message` | string | Yes | Log message |
+| `thread` | string | No | Thread name |
+| `service` | string | No | Service name (from config source or inferred) |
+| `stack_trace` | string | No | Exception stack trace (when present) |
+| `tags` | array[string] | No | Log tags |
+| `fields` | object | No | Custom/MDC fields (backend-specific extras) |
+
+Flags operate on the canonical fields; custom values live under `.fields.*`.
+
+#### `agctl logs query`
+
+Scan logs within a time window, applying level/logger/message/jq filters, returning a paginated result set.
+
+```
+agctl logs query
+    --source <name>              # required; log source name from logs.sources
+    [--level <INFO|WARN|ERROR>]  # case-insensitive level match
+    [--logger <glob>]             # logger name glob pattern (e.g. "com.example.*")
+    [--message <substring>]       # message substring match
+    [--match <jq-expr>]          # jq predicate over canonical entry; supports {placeholder}
+    [--param key=value]           # repeatable; fills placeholders in --match
+    [--since <spec>]              # start time: ISO-8601 or duration (30s, 5m, 1h)
+    [--until <spec>]              # end time: ISO-8601 or duration (defaults to now)
+    [--limit <n>]                 # max entries to return (default: logs.defaults.limit)
+    [--timeout <seconds>]         # operation timeout
+    [--config <path>]
+```
+
+**Result shape (`logs.query`):**
+
+```json
+{
+  "ok": true,
+  "command": "logs.query",
+  "result": {
+    "source": "order-service",
+    "matched": 3,
+    "scanned": 200,
+    "truncated": false,
+    "entries": [
+      {
+        "timestamp": "2026-07-08T12:34:56.789Z",
+        "level": "ERROR",
+        "logger": "com.example.OrderService",
+        "message": "Order processing failed",
+        "thread": "http-nio-8081-exec-1",
+        "service": "order-service",
+        "stack_trace": "java.lang.IllegalArgumentException: ...",
+        "fields": { "orderId": "ord-789", "customerId": "cust-42" }
+      }
+    ]
+  },
+  "duration_ms": 45
+}
+```
+
+**Time window parsing:** `--since` and `--until` accept either ISO-8601 strings (`"2026-07-08T12:00:00Z"`) or relative durations (`30s`, `5m`, `1h`). Duration forms compute `now(UTC) - duration`.
+
+**`--match` predicate:** Evaluated against the full canonical entry (all top-level fields plus `.fields.*`). True on **any** truthy output (`.fields.orderId == "ord-789"` means "≥1 entry qualifies," not "all"). Use `{placeholder}` syntax for runtime values filled via `--param`. A malformed expression raises `ConfigError` (exit 2); missing `jq` library surfaces as `ConfigError` pointing at `pip install 'agctl[logs]'`.
+
+#### `agctl logs assert`
+
+Poll for a matching log entry and raise `AssertionError` (exit 1) if no match appears within the timeout. Supports `--not` for negative assertions (fail if a match **is** found).
+
+```
+agctl logs assert
+    --source <name>              # required
+    [--level <INFO|WARN|ERROR>]
+    [--logger <glob>]
+    [--message <substring>]
+    [--match <jq-expr>]
+    [--param key=value]
+    --since <spec>               # required; start of search window
+    [--not]                       # invert: fail if a match IS found (exit 1)
+    [--timeout <seconds>]        # poll timeout; omit/0 for one-shot mode (single read)
+    [--config <path>]
+```
+
+**Execution modes:**
+
+- **One-shot mode** (`--timeout` omitted or `0`): Single read attempt. Returns immediately with `matched: true/false` and `scanned` count.
+- **Poll mode** (`--timeout N>0`): Loop with deadline, re-reading the log source each iteration. Returns the first matching entry or timeout.
+
+**Result shape — success (`logs.assert`):**
+
+```json
+{
+  "ok": true,
+  "command": "logs.assert",
+  "result": {
+    "source": "order-service",
+    "matched": true,
+    "matching_entry": { /* canonical entry */ },
+    "entries_scanned": 15,
+    "elapsed_ms": 234
+  },
+  "duration_ms": 234
+}
+```
+
+**Failure shape — negative assertion (`--not`):**
+
+When `--not` is set and a match IS found, raises `AssertionError` (exit 1):
+
+```json
+{
+  "ok": false,
+  "command": "logs.assert",
+  "error": {
+    "type": "AssertionError",
+    "message": "Matching log entry found",
+    "detail": {
+      "source": "order-service",
+      "not": true,
+      "filter": { "level": "ERROR", "logger_glob": null, "message_substring": null, "match_jq": null },
+      "since": "2026-07-08T12:34:00Z",
+      "entries_scanned": 8,
+      "elapsed_ms": 12,
+      "matching_entry": { /* the offending entry */ }
+    }
+  },
+  "duration_ms": 12
+}
+```
+
+**Failure shape — timeout (positive assertion):**
+
+When `--not` is omitted and no match appears within the timeout:
+
+```json
+{
+  "ok": false,
+  "command": "logs.assert",
+  "error": {
+    "type": "AssertionError",
+    "message": "No matching log entry found within 10s",
+    "detail": {
+      "source": "order-service",
+      "not": false,
+      "filter": { "level": "ERROR", ... },
+      "since": "2026-07-08T12:34:00Z",
+      "entries_scanned": 200,
+      "elapsed_ms": 10000
+    }
+  },
+  "duration_ms": 10000
+}
+```
+
+**`--since` requirement:** The flag is mandatory to guard against runaway scans. Explicit bounds make the search window deterministic and prevent accidental full-file reads on large logs.
+
+#### `agctl logs tail`
+
+Stream log entries in real-time until stopped. Emits one NDJSON line per entry (newline-delimited), followed by a final `summary` line. The third streaming exception after `http ping` and `mock run`.
+
+```
+agctl logs tail
+    --source <name>              # required
+    [--level <INFO|WARN|ERROR>]
+    [--logger <glob>]
+    [--match <jq-expr>]
+    [--param key=value]
+    [--duration <seconds>]        # stop after N seconds; mutually exclusive with --until-stopped
+    [--until-stopped]            # run until SIGTERM/SIGINT (default if --duration omitted)
+    [--config <path>]
+```
+
+**NDJSON event stream (one canonical entry per line):**
+
+```json
+{"timestamp":"2026-07-08T12:34:56.789Z","level":"INFO","logger":"com.example.OrderService","message":"Processing order","thread":"http-nio-8081-exec-1","service":"order-service","fields":{"orderId":"ord-789"}}
+{"timestamp":"2026-07-08T12:34:57.123Z","level":"ERROR","logger":"com.example.OrderService","message":"Order processing failed","thread":"http-nio-8081-exec-2","service":"order-service","stack_trace":"java.lang.IllegalArgumentException: ...","fields":{"orderId":"ord-790"}}
+```
+
+**Final `summary` line (on SIGTERM/SIGINT or `--duration` expiry):**
+
+```json
+{"summary":true,"total_emitted":2,"duration_ms":1500}
+```
+
+**Signal handling:** Installs `SIGTERM`/`SIGINT` handlers that flush the summary line and exit `0`. Startup errors emit a structured envelope **before** any entry line (same pattern as `http ping` and `mock run`).
+
+**Examples:**
+
+```bash
+# Stream all ERROR entries from order-service logs
+agctl logs tail --source order-service --level ERROR
+
+# Stream entries matching a specific order ID, stop after 30 seconds
+agctl logs tail --source order-service --match '.fields.orderId == "ord-789"' --duration 30
+
+# Stream in background for a test scenario
+agctl logs tail --source payment-service --until-stopped &
+TAIL_PID=$!
+
+# ... run test scenario ...
+
+kill $TAIL_PID
+wait $TAIL_PID
+```
+
+---
+
+### 3.5 `agctl check` — Service Health
 
 #### `agctl check ready`
 
@@ -823,7 +1072,7 @@ agctl check ready --all
 
 ---
 
-### 3.5 `agctl mock` — Mock Server (HTTP & Kafka)
+### 3.6 `agctl mock` — Mock Server (HTTP & Kafka)
 
 The `agctl mock` command group provides two ways to run mock servers: foreground streaming (`mock run`) and managed daemon lifecycle (`mock start`/`stop`/`status`). Both share the same engine and configuration; choose the mode that fits your testing workflow.
 
@@ -1069,7 +1318,7 @@ The old protocol (redirect log → poll `started` → SIGTERM+wait → grep log)
 
 ---
 
-### 3.6 `agctl config` — Config Introspection
+### 3.7 `agctl config` — Config Introspection
 
 #### `agctl config validate`
 
@@ -1151,7 +1400,7 @@ Then bumps `version` to `"2"`. `capture.*.from` and `match.body` are **not** vis
 
 ---
 
-### 3.7 `agctl discover` — Lazy Scoped Discovery
+### 3.8 `agctl discover` — Lazy Scoped Discovery
 
 The discovery subsystem lets an agent understand what is available in the system **without loading everything into context at once**. It is structured as three progressive levels: a summary, a category listing, and a single-item detail. The agent fetches only what the current task requires.
 
@@ -1177,7 +1426,8 @@ agctl discover
     "http_templates": 12,
     "kafka_patterns": 5,
     "db_templates": 8,
-    "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates, mock-http-stubs, mock-kafka-reactors"
+    "log_sources": 2,
+    "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates, mock-http-stubs, mock-kafka-reactors, log-sources"
   },
   "duration_ms": 1
 }
@@ -1189,7 +1439,7 @@ Returns names and one-line descriptions for all items in a category. No params, 
 
 ```bash
 agctl discover --category <name> [--overlay <path>]
-# <name>: services | http-templates | kafka-patterns | db-templates | mock-http-stubs | mock-kafka-reactors
+# <name>: services | http-templates | kafka-patterns | db-templates | mock-http-stubs | mock-kafka-reactors | log-sources
 ```
 
 **Example — `agctl discover --category http-templates`:**
@@ -1546,6 +1796,60 @@ Every invocation writes exactly one JSON object to stdout (the sole exception is
 ```
 
 The `db` group is now **mixed**: the `schema.*` tags carry a `hint` string (like `discover`) to chain the agent's next call, while `db.query`/`db.assert`/`db.execute` do not.
+
+#### `logs.query`
+
+```json
+{
+  "source": "order-service",
+  "matched": 3,
+  "scanned": 200,
+  "truncated": false,
+  "entries": [
+    {
+      "timestamp": "2026-07-08T12:34:56.789Z",
+      "level": "ERROR",
+      "logger": "com.example.OrderService",
+      "message": "Order processing failed",
+      "thread": "http-nio-8081-exec-1",
+      "service": "order-service",
+      "stack_trace": "java.lang.IllegalArgumentException: ...",
+      "fields": { "orderId": "ord-789", "customerId": "cust-42" }
+    }
+  ]
+}
+```
+
+#### `logs.assert` (success)
+
+```json
+{
+  "source": "order-service",
+  "matched": true,
+  "matching_entry": {
+    "timestamp": "2026-07-08T12:34:56.789Z",
+    "level": "ERROR",
+    "logger": "com.example.OrderService",
+    "message": "Order processing failed",
+    "thread": "http-nio-8081-exec-1",
+    "service": "order-service",
+    "stack_trace": "java.lang.IllegalArgumentException: ...",
+    "fields": { "orderId": "ord-789" }
+  },
+  "entries_scanned": 15,
+  "elapsed_ms": 234
+}
+```
+
+#### `logs.tail` (NDJSON stream)
+
+The `logs tail` command is the third streaming exception (after `http ping` and `mock run`). Each line is a complete JSON object representing a canonical entry, followed by a final summary line:
+
+```json
+{"timestamp":"2026-07-08T12:34:56.789Z","level":"INFO","logger":"com.example.OrderService","message":"Processing order","thread":"http-nio-8081-exec-1","service":"order-service","fields":{"orderId":"ord-789"}}
+{"timestamp":"2026-07-08T12:34:57.123Z","level":"ERROR","logger":"com.example.OrderService","message":"Order processing failed","thread":"http-nio-8081-exec-2","service":"order-service","stack_trace":"java.lang.IllegalArgumentException: ...","fields":{"orderId":"ord-790"}}
+{"summary":true,"total_emitted":2,"duration_ms":1500}
+```
 
 #### `check.ready`
 
@@ -2141,7 +2445,86 @@ mysql = "agctl_mysql:MySQLDriver"
 
 `agctl` loads all registered drivers at startup and selects the correct one based on the `type` field in a `database` connection config.
 
-### 9.2 Protocol Plugins
+### 9.2 Log Backend Plugins
+
+`agctl` discovers log backends via the `agctl.logs_backends` entry point group. Each backend must implement the `LogBackend` protocol:
+
+```python
+# agctl/clients/log_backend_protocol.py
+import threading
+from typing import Protocol, Iterator
+from datetime import datetime
+from dataclasses import dataclass, field
+
+@dataclass
+class CanonicalEntry:
+    """Canonical log entry representation."""
+    timestamp: str
+    level: str
+    logger: str
+    message: str
+    thread: str | None = None
+    service: str | None = None
+    stack_trace: str | None = None
+    tags: list[str] | None = None
+    fields: dict = field(default_factory=dict)
+
+@dataclass
+class LogFilter:
+    """Filter criteria for log queries."""
+    level: str | None = None
+    logger_glob: str | None = None
+    message_substring: str | None = None
+    match_jq: str | None = None
+    params: dict = field(default_factory=dict)
+
+@dataclass
+class ScanResult:
+    """Result of a scan operation."""
+    entries: list[CanonicalEntry]
+    matched: int
+    scanned: int
+    truncated: bool
+
+@dataclass
+class AwaitResult:
+    """Result of an await_one operation."""
+    entry: CanonicalEntry | None
+    scanned: int
+    elapsed_ms: int
+
+@dataclass
+class SchemaDescriptor:
+    """Schema descriptor from sample_schema."""
+    standard: list[str]
+    conditional: list[str]
+    observed: list[str]
+
+class LogBackend(Protocol):
+    """Structural contract for a log backend."""
+
+    def validate_config(self) -> None: ...
+
+    def scan(self, filt: LogFilter, *, since: datetime | None, until: datetime | None, limit: int, tail_lines: int) -> ScanResult: ...
+
+    def await_one(self, filt: LogFilter, *, since: datetime | None, timeout_s: float, poll_interval_ms: int, tail_lines: int) -> AwaitResult: ...
+
+    def follow(self, filt: LogFilter, *, stop_event: threading.Event, poll_interval_ms: int) -> Iterator[CanonicalEntry]: ...
+
+    def sample_schema(self, *, sample_lines: int = 100) -> SchemaDescriptor: ...
+```
+
+The built-in `file` backend (type `"file"`) reads NDJSON files in logstash format. Third-party backends can add support for journald, syslog, ELasticsearch, etc. To add a journald backend:
+
+```toml
+# In agctl-logs-journald/pyproject.toml
+[project.entry-points."agctl.logs_backends"]
+journald = "agctl_logs_journald:JournaldBackend"
+```
+
+`agctl` loads all registered backends at startup and selects the correct one based on the `type` field in a `logs.sources` config. A broken third-party backend is skipped (logged to stderr) rather than crashing the CLI.
+
+### 9.3 Protocol Plugins
 
 New top-level command groups (e.g., gRPC, GraphQL, WebSocket) are registered via the `agctl.plugins` entry point group. Each plugin must implement the `Plugin` protocol:
 
@@ -2159,7 +2542,7 @@ class Plugin(Protocol):
 
 `cli.py` iterates `entry_points(group="agctl.plugins")` and registers each `command_group` onto the root `cli` group (using `.name` as the subcommand, falling back to `command_group.name`). During `agctl config validate`, each loaded plugin's `validate_config(config)` is invoked with the fully-resolved config dict; any error strings it returns are folded into the validation result (exit 2). No changes to core code are needed.
 
-### 9.3 Custom Assertion Types
+### 9.4 Custom Assertion Types
 
 For `agctl db assert` and `agctl kafka assert`, new assertion modes are added by subclassing `Assertion` and registering via `agctl.assertions`:
 
