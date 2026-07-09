@@ -286,7 +286,12 @@ catching what Pydantic cannot:
 - `defaults.database_connection` → unknown connection → **error**.
 - Any template/pattern/stub/reactor missing `description` → **warning**
   (discovery degrades).
-- `mocks.kafka` with reactors but no top-level `kafka.brokers` → **error**.
+- Each `mocks.kafka.reactors.<name>` must resolve a cluster
+  (`reactor.cluster` → `kafka.default_cluster` → single-cluster auto-default,
+  mirroring `resolve_cluster_name`); a dangling `reactor.cluster` → **error** at
+  `…reactors.<name>.cluster`, and a resolved cluster with empty `brokers` →
+  **error** at `…reactors.<name>`. (Inlined in the validator so `config/` stays
+  free of a `commands/` import.)
 - Path-template shadowing: a `{name}` segment ahead of a literal at the same
   position (`/orders/{id}` before `/orders/bulk`) → **warning** (first-match-wins;
   the literal stub silently never fires). Method-agnostic — known limitation.
