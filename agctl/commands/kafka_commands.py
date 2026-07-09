@@ -158,16 +158,17 @@ def _kafka_produce_core(
     message: str,
     key: str | None,
     header: tuple[str, ...],
+    cluster: str | None = None,
     overlay_paths: list[str] | None = None,
 ) -> dict:
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
     value = json.loads(message)
     headers = parse_params(header) if header else None
 
-    # Resolve the cluster (Task 1: no flag/binding yet -> default/single-cluster).
-    name = resolve_cluster_name(cfg.kafka, None)
-    cluster = cfg.kafka.clusters[name]
-    client = new_kafka_client(cluster)
+    # Resolve the cluster: --cluster (explicit) > default > single-cluster.
+    name = resolve_cluster_name(cfg.kafka, explicit=cluster)
+    resolved = cfg.kafka.clusters[name]
+    client = new_kafka_client(resolved)
     return client.produce(topic, value, key=key, headers=headers or None)
 
 
@@ -176,6 +177,7 @@ def _kafka_produce_core(
 @click.option("--message", "message", required=True, help="JSON message body")
 @click.option("--key", "key", default=None, help="Message key")
 @click.option("--header", "header", multiple=True, help="k=v message header")
+@click.option("--cluster", "cluster", default=None, help="Named kafka cluster (default: kafka.default_cluster)")
 @click.pass_context
 def kafka_produce(
     ctx: click.Context,
@@ -183,11 +185,12 @@ def kafka_produce(
     message: str,
     key: str | None,
     header: tuple[str, ...],
+    cluster: str | None,
 ) -> None:
     """Produce one message to a Kafka topic."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
-    _kafka_produce_envelope(config_path, topic, message, key, header, overlay_paths=list(ovs) if ovs else None)
+    _kafka_produce_envelope(config_path, topic, message, key, header, cluster, overlay_paths=list(ovs) if ovs else None)
 
 
 _kafka_produce_envelope = envelope("kafka.produce")(_kafka_produce_core)
@@ -208,6 +211,7 @@ def _kafka_consume_core(
     expect_count: int | None,
     from_beginning: bool,
     consumer_group: str | None,
+    cluster: str | None = None,
     overlay_paths: list[str] | None = None,
 ) -> dict:
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
@@ -221,11 +225,12 @@ def _kafka_consume_core(
         )
     match_expr = match if match is not None else filter_key
 
-    # Resolve the cluster (Task 1: no flag/binding yet -> default/single-cluster).
-    name = resolve_cluster_name(cfg.kafka, None)
-    cluster = cfg.kafka.clusters[name]
+    # Resolve the cluster: --cluster (explicit) > default > single-cluster.
+    # No pattern binding on consume (no --pattern option) -> binding_cluster None.
+    name = resolve_cluster_name(cfg.kafka, explicit=cluster)
+    resolved = cfg.kafka.clusters[name]
 
-    resolved_timeout = _resolve_timeout(timeout, cluster.timeout_seconds)
+    resolved_timeout = _resolve_timeout(timeout, resolved.timeout_seconds)
     if resolved_timeout <= 0:
         # timeout <= 0 makes the poll deadline already-passed, so the loop never
         # runs and consume returns ok:0 — a silent no-op masquerading as success.
@@ -235,7 +240,7 @@ def _kafka_consume_core(
         )
     # D6: default lookback = resolved timeout.
     resolved_lookback = float(lookback) if lookback is not None else resolved_timeout
-    group = _resolve_group(consumer_group, cluster)
+    group = _resolve_group(consumer_group, resolved)
 
     # Build the optional jq filter as an inline predicate so consume_window can
     # apply it incrementally AND short-circuit as soon as --expect-count matching
@@ -251,7 +256,7 @@ def _kafka_consume_core(
         def predicate(msg, _expr=match_expr):
             return jq_bool(msg, _expr)
 
-    client = new_kafka_client(cluster, group_id=group)
+    client = new_kafka_client(resolved, group_id=group)
     matched = client.consume_window(
         topic,
         lookback_seconds=resolved_lookback,
@@ -304,6 +309,7 @@ def _kafka_consume_core(
 @click.option("--expect-count", "expect_count", type=int, default=None, help="Min expected count")
 @click.option("--from-beginning", "from_beginning", is_flag=True, default=False)
 @click.option("--consumer-group", "consumer_group", default=None, help="Consumer group override")
+@click.option("--cluster", "cluster", default=None, help="Named kafka cluster (default: kafka.default_cluster)")
 @click.pass_context
 def kafka_consume(
     ctx: click.Context,
@@ -315,6 +321,7 @@ def kafka_consume(
     expect_count: int | None,
     from_beginning: bool,
     consumer_group: str | None,
+    cluster: str | None,
 ) -> None:
     """Consume messages from a Kafka topic window."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
@@ -329,6 +336,7 @@ def kafka_consume(
         expect_count,
         from_beginning,
         consumer_group,
+        cluster,
         overlay_paths=list(ovs) if ovs else None,
     )
 
@@ -419,6 +427,7 @@ def _kafka_assert_core(
     from_beginning: bool,
     consumer_group: str | None,
     assertion: str | None,
+    cluster: str | None = None,
     overlay_paths: list[str] | None = None,
 ) -> dict:
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
@@ -436,6 +445,9 @@ def _kafka_assert_core(
 
     pattern_match: str | None = None
     inferred_topic: str | None = topic
+    # The pattern's cluster is the binding value for cluster resolution
+    # (explicit --cluster, if given, wins — see resolve_cluster_name).
+    binding_cluster: str | None = None
     if pattern is not None:
         if pattern not in cfg.kafka.patterns:
             raise TemplateNotFound(
@@ -444,6 +456,7 @@ def _kafka_assert_core(
             )
         pat = cfg.kafka.patterns[pattern]
         pattern_match = pat.match
+        binding_cluster = pat.cluster
         # Topic inferred from the pattern when --topic is omitted.
         if inferred_topic is None:
             inferred_topic = pat.topic
@@ -460,15 +473,17 @@ def _kafka_assert_core(
             {"timeout": resolved_timeout},
         )
     resolved_lookback = float(lookback) if lookback is not None else resolved_timeout
-    # Resolve the cluster (Task 1: no flag/binding yet -> default/single-cluster;
-    # Task 2 passes the pattern's cluster as binding_cluster).
-    name = resolve_cluster_name(cfg.kafka, None)
-    cluster = cfg.kafka.clusters[name]
-    group = _resolve_group(consumer_group, cluster)
+    # Resolve the cluster: --cluster (explicit) > pattern.cluster (binding) >
+    # default > single-cluster.
+    name = resolve_cluster_name(
+        cfg.kafka, explicit=cluster, binding_cluster=binding_cluster
+    )
+    resolved = cfg.kafka.clusters[name]
+    group = _resolve_group(consumer_group, resolved)
 
     # DESIGN §9.3: a custom assertion mode evaluates the full consumed window.
     if assertion is not None:
-        client = new_kafka_client(cluster, group_id=group)
+        client = new_kafka_client(resolved, group_id=group)
         messages = client.consume_window(
             inferred_topic,
             lookback_seconds=resolved_lookback,
@@ -509,7 +524,7 @@ def _kafka_assert_core(
         filled_pattern_match=filled_pattern_match,
     )
 
-    client = new_kafka_client(cluster, group_id=group)
+    client = new_kafka_client(resolved, group_id=group)
     start = time.monotonic()
     matched, scanned = client.find_in_window(
         inferred_topic,
@@ -593,6 +608,7 @@ def _kafka_assert_core(
     default=None,
     help="Named custom assertion mode",
 )
+@click.option("--cluster", "cluster", default=None, help="Named kafka cluster (default: kafka.default_cluster)")
 @click.pass_context
 def kafka_assert(
     ctx: click.Context,
@@ -607,6 +623,7 @@ def kafka_assert(
     from_beginning: bool,
     consumer_group: str | None,
     assertion: str | None,
+    cluster: str | None,
 ) -> None:
     """Assert a matching message exists in a Kafka window."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
@@ -624,6 +641,7 @@ def kafka_assert(
         from_beginning,
         consumer_group,
         assertion,
+        cluster,
         overlay_paths=list(ovs) if ovs else None,
     )
 

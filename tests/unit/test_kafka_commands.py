@@ -321,6 +321,9 @@ def install_fake(monkeypatch):
         def factory(cluster, group_id=None):
             # Preserve the test's canned messages; honor a caller group_id by
             # simply returning the same client (group has no effect on fakes).
+            # Capture the resolved cluster so multi-cluster tests can assert
+            # which named cluster the flag/binding resolved to.
+            captured["cluster"] = cluster
             return client
 
         monkeypatch.setattr(kafka_commands, "new_kafka_client", factory)
@@ -1199,3 +1202,131 @@ def test_resolve_cluster_name_no_cluster_specified_errors():
         kafka_commands.resolve_cluster_name(k, None)
     assert exc.value.message == "No kafka cluster specified"
     assert exc.value.detail == {}
+
+
+# --------------------------------------------------------------------------- #
+# Task 2: --cluster flag + per-pattern cluster binding
+# Two-cluster configs: main (broker-a, default) + analytics (broker-b). The
+# `install_fake` seam captures the resolved KafkaCluster passed to
+# new_kafka_client, so tests assert which cluster was selected by inspecting
+# ``captured["cluster"].brokers``.
+# --------------------------------------------------------------------------- #
+
+
+def _write_two_cluster_cfg(tmp_path, *, pattern_cluster=None):
+    """Write a two-cluster v3 config: main (broker-a, default) + analytics
+    (broker-b). When ``pattern_cluster`` is given, add a pattern ``ord``
+    (topic=orders, match=.value.x) bound to that cluster."""
+    lines = [
+        'version: "3"',
+        "kafka:",
+        "  clusters:",
+        "    main:",
+        "      brokers: [broker-a:9092]",
+        "    analytics:",
+        "      brokers: [broker-b:9092]",
+        "  default_cluster: main",
+    ]
+    if pattern_cluster is not None:
+        lines += [
+            "  patterns:",
+            "    ord:",
+            "      topic: orders",
+            "      match: '.value.x'",
+            f"      cluster: {pattern_cluster}",
+        ]
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text("\n".join(lines) + "\n")
+    return cfg
+
+
+def test_kafka_produce_explicit_cluster(install_fake, tmp_path):
+    """`--cluster analytics` selects the analytics cluster: the fake client is
+    built from analytics's brokers (broker-b), not the default main (broker-a)."""
+    cap = install_fake([])
+    cfg = _write_two_cluster_cfg(tmp_path)
+    result = _run(
+        [
+            "--config", str(cfg),
+            "kafka", "produce",
+            "--topic", "t",
+            "--message", '{"a":1}',
+            "--cluster", "analytics",
+        ]
+    )
+    payload = _payload(result)
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    # The factory received the analytics cluster (broker-b), not main (broker-a).
+    assert cap["cluster"].brokers == ["broker-b:9092"]
+
+
+def test_kafka_assert_pattern_resolves_cluster(install_fake, tmp_path):
+    """`assert --pattern ord` (no --cluster, no --topic) resolves BOTH the topic
+    and the cluster from the pattern binding (analytics). The fake client is
+    built from analytics and consumes the pattern's topic `orders`."""
+    cap = install_fake([_msg("orders", {"x": 1}, "k1")])
+    cfg = _write_two_cluster_cfg(tmp_path, pattern_cluster="analytics")
+    result = _run(
+        [
+            "--config", str(cfg),
+            "kafka", "assert",
+            "--pattern", "ord",
+            "--timeout", "2",
+        ]
+    )
+    payload = _payload(result)
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    # Topic inferred from the pattern.
+    assert payload["result"]["topic"] == "orders"
+    # Cluster resolved from the pattern's binding (analytics / broker-b).
+    assert cap["cluster"].brokers == ["broker-b:9092"]
+
+
+def test_kafka_assert_cluster_flag_overrides_pattern(install_fake, tmp_path):
+    """Precedence: `--cluster main` (explicit) beats the pattern's
+    `cluster: analytics` (binding). Captured cluster is main (broker-a).
+
+    Note: override of a pattern binding is only exercisable on `kafka assert`,
+    the sole command that carries a pattern binding (produce/consume have no
+    --pattern, so binding_cluster is always None there per the Task 2 spec)."""
+    cap = install_fake([_msg("orders", {"x": 1}, "k1")])
+    cfg = _write_two_cluster_cfg(tmp_path, pattern_cluster="analytics")
+    result = _run(
+        [
+            "--config", str(cfg),
+            "kafka", "assert",
+            "--pattern", "ord",
+            "--cluster", "main",
+            "--timeout", "2",
+        ]
+    )
+    payload = _payload(result)
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    # Explicit --cluster main wins over the pattern's analytics binding.
+    assert cap["cluster"].brokers == ["broker-a:9092"]
+
+
+def test_kafka_assert_unknown_cluster_flag_error(install_fake, tmp_path):
+    """`--cluster ghost` surfaces as a ConfigError at the CLI (flag path). The
+    helper-level contract is covered by test_resolve_cluster_name_unknown_cluster_errors;
+    this adds the flag-path coverage Task 1 deferred."""
+    install_fake([])
+    cfg = _write_two_cluster_cfg(tmp_path)
+    result = _run(
+        [
+            "--config", str(cfg),
+            "kafka", "assert",
+            "--topic", "t",
+            "--contains", '{"a":1}',
+            "--timeout", "2",
+            "--cluster", "ghost",
+        ]
+    )
+    payload = _payload(result)
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+    assert "Unknown kafka cluster: ghost" in payload["error"]["message"]
+    assert payload["error"]["detail"]["cluster"] == "ghost"
