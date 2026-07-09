@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 __all__ = ["mock_run", "new_mock_engine", "mock_start", "mock_stop", "mock_status"]
 
 # Import from kafka_commands to avoid duplication (no circular import)
-from .kafka_commands import new_kafka_client
+from .kafka_commands import new_kafka_client, resolve_cluster_name
 
 # Import daemon lifecycle helpers (Task 2: pidfile, liveness; Task 3: log parser)
 from ..mock.daemon import (
@@ -469,13 +469,20 @@ def mock_run(
         # Guard 2+3: Resolve engines to run
         run_http, run_kafka = _resolve_engines(only, cfg.mocks)
 
-        # Guard 5: If run_kafka, require non-empty kafka.brokers
+        # Guard 5: If run_kafka, resolve a default cluster and require its brokers.
+        # (Task 1: all reactors share the single default client; per-reactor
+        # cluster selection lands in Task 3.)
         kafka_client = None
         if run_kafka:
-            if not cfg.kafka.brokers:
-                raise ConfigError("kafka.brokers is required when running Kafka reactors", {})
+            cluster_name = resolve_cluster_name(cfg.kafka, None)
+            cluster = cfg.kafka.clusters[cluster_name]
+            if not cluster.brokers:
+                raise ConfigError(
+                    "kafka.clusters.<name>.brokers is required when running Kafka reactors",
+                    {"cluster": cluster_name},
+                )
             # Build KafkaClient (may raise ConfigError if kafka extra missing)
-            kafka_client = new_kafka_client(cfg.kafka)
+            kafka_client = new_kafka_client(cluster)
 
         # Guard 6: Resolve http_listen
         if http_listen is not None:

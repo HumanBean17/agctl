@@ -477,7 +477,7 @@ def test_search_finds_mock_kafka_reactor(monkeypatch):
 
 
 _NO_MOCKS_CONFIG = (
-    'version: "2"\n'
+    'version: "3"\n'
     "services:\n"
     "  demo:\n"
     '    base_url: "http://localhost:9999"\n'
@@ -501,7 +501,7 @@ def test_category_mock_http_stubs_absent_is_empty(tmp_path, monkeypatch):
 
 
 _CAPTURE_CONFIG = (
-    'version: "2"\n'
+    'version: "3"\n'
     "services:\n"
     "  demo:\n"
     '    base_url: "http://localhost:9999"\n'
@@ -539,7 +539,7 @@ def test_item_mock_http_stub_with_capture(tmp_path, monkeypatch):
 
 
 _IPV6_CONFIG = (
-    'version: "2"\n'
+    'version: "3"\n'
     "services:\n"
     "  demo:\n"
     '    base_url: "http://localhost:9999"\n'
@@ -588,7 +588,7 @@ def test_item_mock_http_stub_ipv6_wildcard_normalized(tmp_path, monkeypatch):
 
 
 _BASE_CONFIG = (
-    'version: "2"\n'
+    'version: "3"\n'
     "services:\n"
     "  demo:\n"
     '    base_url: "http://localhost:9999"\n'
@@ -612,7 +612,7 @@ _BASE_CONFIG = (
 
 
 _OVERLAY_CONFIG = (
-    'version: "2"\n'
+    'version: "3"\n'
     "templates:\n"
     "  overlay-template:\n"
     '    description: "Overlay template"\n'
@@ -783,7 +783,7 @@ def test_discover_item_log_sources_with_schema(tmp_path, monkeypatch):
 
     # Create a temp config with a logs source pointing at the temp file
     config_yaml = (
-        'version: "2"\n'
+        'version: "3"\n'
         "services:\n"
         '  demo:\n'
         '    base_url: "http://localhost:9999"\n'

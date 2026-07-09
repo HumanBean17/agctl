@@ -1,4 +1,4 @@
-version: "2"
+version: "3"
 
 services:
   order-service:
@@ -12,21 +12,26 @@ services:
     timeout_seconds: 15
 
 kafka:
-  brokers:
-    - "${KAFKA_BROKER}"
-  default_consumer_group: "agctl-consumer"
-  schema_registry_url: "${SCHEMA_REGISTRY_URL:-}"
-  timeout_seconds: 30
-  # Optional TLS/mTLS — uncomment for brokers that require SSL. Setting any
-  # field enables TLS (security.protocol defaults to "SSL"). Env override:
-  # AGCTL_KAFKA__SSL__CA_LOCATION, ...__CERTIFICATE_LOCATION, etc.
-  # ssl:
-  #   ca_location: "${KAFKA_SSL_CA:-}"
-  #   certificate_location: "${KAFKA_SSL_CERT:-}"
-  #   key_location: "${KAFKA_SSL_KEY:-}"
-  #   key_password: "${KAFKA_SSL_KEY_PASSWORD:-}"
-  #   # endpoint_identification_algorithm: "none"   # disable hostname verification
-  #   # security_protocol: "SSL"                    # default SSL; SASL_SSL when adding SASL
+  clusters:
+    default:
+      brokers:
+        - "${KAFKA_BROKER}"
+      default_consumer_group: "agctl-consumer"
+      schema_registry_url: "${SCHEMA_REGISTRY_URL:-}"
+      timeout_seconds: 30
+      # Optional TLS/mTLS — uncomment for brokers that require SSL. Setting any
+      # field enables TLS (security.protocol defaults to "SSL"). Env override:
+      # AGCTL_KAFKA__CLUSTERS__DEFAULT__SSL__CA_LOCATION, etc.
+      # ssl:
+      #   ca_location: "${KAFKA_SSL_CA:-}"
+      #   certificate_location: "${KAFKA_SSL_CERT:-}"
+      #   key_location: "${KAFKA_SSL_KEY:-}"
+      #   key_password: "${KAFKA_SSL_KEY_PASSWORD:-}"
+      #   # endpoint_identification_algorithm: "none"   # disable hostname verification
+      #   # security_protocol: "SSL"                    # default SSL; SASL_SSL when adding SASL
+
+  default_cluster: default
+
   patterns:
     order-created:
       description: "An ORDER_CREATED event for a specific order"

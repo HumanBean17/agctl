@@ -11,6 +11,7 @@ from agctl.config.models import (
     HttpResponse,
     HttpStub,
     HttpTemplate,
+    KafkaCluster,
     KafkaConfig,
     KafkaMockConfig,
     KafkaPattern,
@@ -275,8 +276,9 @@ def test_read_mode_template_with_read_only_connection_no_error():
 # --- mock server validation ---------------------------------------------------
 
 
-def test_mock_kafka_requires_kafka_brokers_error():
-    """mocks.kafka.reactors non-empty but no kafka.brokers → error."""
+def test_mock_kafka_requires_resolvable_default_cluster_error():
+    """mocks.kafka.reactors non-empty but no resolvable cluster -> error at
+    mocks.kafka (no default/single cluster resolves)."""
     cfg = _cfg(
         mocks=MocksConfig(
             kafka=KafkaMockConfig(
@@ -290,16 +292,16 @@ def test_mock_kafka_requires_kafka_brokers_error():
                 }
             )
         ),
-        kafka=KafkaConfig(brokers=[]),  # Empty brokers list
+        kafka=KafkaConfig(),  # no clusters at all
     )
     errors, warnings = validate_config(cfg)
     assert len(errors) == 1
     assert errors[0]["path"] == "mocks.kafka"
-    assert errors[0]["message"] == "kafka mocks require top-level kafka.brokers"
+    assert errors[0]["message"] == "reactors require a resolvable default cluster"
 
 
-def test_mock_kafka_with_brokers_no_error():
-    """mocks.kafka.reactors with kafka.brokers present → no error."""
+def test_mock_kafka_with_cluster_no_error():
+    """mocks.kafka.reactors with a single resolvable cluster -> no error."""
     cfg = _cfg(
         mocks=MocksConfig(
             kafka=KafkaMockConfig(
@@ -313,11 +315,66 @@ def test_mock_kafka_with_brokers_no_error():
                 }
             )
         ),
-        kafka=KafkaConfig(brokers=["localhost:9092"]),
+        kafka=KafkaConfig(
+            clusters={"default": KafkaCluster(brokers=["localhost:9092"])}
+        ),
     )
     errors, warnings = validate_config(cfg)
-    # Should not have the kafka.brokers error
+    # Should not have the mocks.kafka error
     assert not any(e["path"] == "mocks.kafka" for e in errors)
+
+
+# --- v3 cluster cross-ref validation ----------------------------------------
+
+
+def test_reactor_default_cluster_missing_brokers_errors():
+    """A reactor whose resolved default cluster exists but has empty brokers ->
+    error at mocks.kafka naming the cluster."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            kafka=KafkaMockConfig(
+                reactors={
+                    "r": KafkaReactor(
+                        topic="t",
+                        reaction=KafkaReaction(topic="out", value={}),
+                    )
+                }
+            )
+        ),
+        kafka=KafkaConfig(
+            clusters={"default": KafkaCluster(brokers=[])},
+            default_cluster="default",
+        ),
+    )
+    errors, warnings = validate_config(cfg)
+    mocks_errors = [e for e in errors if e["path"] == "mocks.kafka"]
+    assert len(mocks_errors) == 1
+    assert "kafka.clusters.default.brokers" in mocks_errors[0]["message"]
+
+
+def test_default_cluster_dangling_ref_errors():
+    """cfg.kafka.default_cluster names a cluster absent from clusters -> error
+    at kafka.default_cluster."""
+    cfg = _cfg(
+        kafka=KafkaConfig(clusters={}, default_cluster="ghost"),
+    )
+    errors, warnings = validate_config(cfg)
+    paths = [e["path"] for e in errors]
+    assert "kafka.default_cluster" in paths
+
+
+def test_pattern_cluster_dangling_ref_errors():
+    """A KafkaPattern whose cluster names an unknown cluster -> error at
+    kafka.patterns.<name>.cluster."""
+    cfg = _cfg(
+        kafka=KafkaConfig(
+            clusters={"main": KafkaCluster(brokers=["h:9092"])},
+            patterns={"p": KafkaPattern(topic="t", cluster="ghost")},
+        ),
+    )
+    errors, warnings = validate_config(cfg)
+    paths = [e["path"] for e in errors]
+    assert "kafka.patterns.p.cluster" in paths
 
 
 def test_mock_http_stub_missing_description_warns():
@@ -357,7 +414,9 @@ def test_mock_kafka_reactor_missing_description_warns():
                 }
             )
         ),
-        kafka=KafkaConfig(brokers=["localhost:9092"]),
+        kafka=KafkaConfig(
+            clusters={"default": KafkaCluster(brokers=["localhost:9092"])}
+        ),
     )
     errors, warnings = validate_config(cfg)
     assert errors == []

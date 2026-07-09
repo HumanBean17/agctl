@@ -74,6 +74,9 @@ class KafkaPattern(BaseModel):
     description: str | None = None
     topic: str
     match: str | None = None
+    # Named cluster this pattern binds to (DESIGN §6, consumed in Tasks 2-3).
+    # None -> resolved via default_cluster / single-cluster auto-default.
+    cluster: str | None = None
 
 
 class KafkaSSL(BaseModel):
@@ -110,13 +113,34 @@ class KafkaSSL(BaseModel):
         return upper
 
 
-class KafkaConfig(BaseModel):
+class KafkaCluster(BaseModel):
+    """A named Kafka cluster's broker configuration (DESIGN §6, v3 schema).
+
+    Holds the per-cluster knobs formerly on ``KafkaConfig`` (brokers / TLS /
+    timeout / consumer group / schema registry). Mirrors
+    :class:`DatabaseConnection`: a named entry in ``kafka.clusters.<name>``,
+    selected by name via ``resolve_cluster_name``.
+    """
+
     brokers: list[str] = Field(default_factory=list)
+    ssl: KafkaSSL | None = None
+    timeout_seconds: int | None = None
     default_consumer_group: str | None = None
     schema_registry_url: str | None = None
-    timeout_seconds: int | None = None
+
+
+class KafkaConfig(BaseModel):
+    """Top-level Kafka config (v3 schema).
+
+    ``clusters`` is a named map (mirroring ``database.connections``);
+    ``default_cluster`` names the cluster used when no flag/binding selects one
+    (required only when >1 cluster is defined, per single-cluster auto-default);
+    ``patterns`` is a global cluster-aware map.
+    """
+
+    clusters: dict[str, KafkaCluster] = Field(default_factory=dict)
+    default_cluster: str | None = None
     patterns: dict[str, KafkaPattern] = Field(default_factory=dict)
-    ssl: KafkaSSL | None = None
 
 
 class DatabaseConnection(BaseModel):
@@ -262,6 +286,9 @@ class KafkaReactor(BaseModel):
     match: str | None = None
     capture: dict[str, CaptureSpec] | None = None
     reaction: KafkaReaction
+    # Named cluster this reactor binds to (DESIGN §7, consumed in Task 3).
+    # None -> resolved via default_cluster / single-cluster auto-default.
+    cluster: str | None = None
 
 
 class KafkaMockConfig(BaseModel):

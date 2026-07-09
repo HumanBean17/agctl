@@ -212,7 +212,7 @@ def discover_config_path(explicit: str | None = None, env: dict[str, str] | None
     raise ConfigError("No agctl.yaml found (use --config or AGCTL_CONFIG, or add agctl.yaml)", {})
 
 
-TOOL_MAJOR_VERSION = "2"
+TOOL_MAJOR_VERSION = "3"
 
 
 class ComposedConfig(NamedTuple):
@@ -238,7 +238,7 @@ def compose_config(
       1. Resolve env (defaults to os.environ).
       2. Discover base config path.
       3. Load and interpolate base YAML.
-      4. Check base version (must be v2).
+      4. Check base version (must be v3).
       5. For each overlay (in order):
          - Verify file exists.
          - Load and interpolate overlay YAML.
@@ -349,10 +349,7 @@ def _check_version(data: dict) -> None:
         else:
             message = (
                 f"Config dialect v{major} is no longer supported by agctl v{TOOL_MAJOR_VERSION} "
-                f"(config_version='{version}'). Run `agctl config migrate` to upgrade, "
-                f"or manually bump `version: \"{TOOL_MAJOR_VERSION}\"` and prefix each HTTP "
-                f"`match` expression with `.body | ` and each Kafka `match` expression with "
-                f"`.value | `."
+                f"(config_version='{version}'). Run `agctl config migrate` to upgrade."
             )
         raise ConfigError(
             message,

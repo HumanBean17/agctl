@@ -16,9 +16,9 @@ def test_partial_config_accepts_empty_dict():
 
 
 def test_partial_config_accepts_version():
-    """PartialConfig.model_validate({"version": "2"}) returns version="2"."""
-    result = PartialConfig.model_validate({"version": "2"})
-    assert result.version == "2"
+    """PartialConfig.model_validate({"version": "3"}) returns version="3"."""
+    result = PartialConfig.model_validate({"version": "3"})
+    assert result.version == "3"
 
 
 def test_partial_config_validates_sections_without_version():
@@ -130,7 +130,7 @@ from agctl.errors import ConfigError
 def test_compose_config_overlay_adds_template(tmp_path):
     """Overlay adds a template → config has both; overrides empty."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -157,7 +157,7 @@ templates:
 def test_compose_config_override_recorded(tmp_path):
     """Base and overlay both define templates.create-order → overlay wins; override recorded."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -183,9 +183,9 @@ templates:
 
 
 def test_compose_config_version_inherited(tmp_path):
-    """Overlay has no version → no error; config.version == '2'."""
+    """Overlay has no version → no error; config.version == '3'."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -203,13 +203,14 @@ templates:
     path: /api/v1/orders/{id}
 """)
     result = compose_config(str(base), [str(ov)])
-    assert result.config.version == "2"
+    assert result.config.version == "3"
 
 
 def test_compose_config_overlay_version_mismatch(tmp_path):
-    """Overlay has version: '3' → ConfigError with detail['overlay'] set."""
+    """Overlay has a stale version ('2' under the v3 tool) → ConfigError with
+    detail['overlay'] set."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -220,7 +221,7 @@ templates:
     path: /api/v1/orders
 """)
     ov = tmp_path / "overlay.yaml"
-    ov.write_text("""version: "3"
+    ov.write_text("""version: "2"
 templates:
   extra:
     method: GET
@@ -231,13 +232,13 @@ templates:
         compose_config(str(base), [str(ov)])
     assert "version mismatch" in exc_info.value.message.lower()
     assert exc_info.value.detail["overlay"] == str(ov)
-    assert exc_info.value.detail["found"] == "3"
+    assert exc_info.value.detail["found"] == "2"
 
 
 def test_compose_config_bad_overlay_fragment(tmp_path):
     """Overlay has templates.bad missing required method → ConfigError with detail['overlay'] set."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -263,7 +264,7 @@ templates:
 def test_compose_config_type_clash_final_validate(tmp_path):
     """Base templates.x is valid; overlay replaces with scalar → caught at PartialConfig validation."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -287,7 +288,7 @@ templates:
 def test_compose_config_env_wins_over_overlay(tmp_path):
     """Base sets path=/a, overlay sets /b, env sets /env → final value is /env."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -311,7 +312,7 @@ templates:
 def test_compose_config_missing_overlay_file(tmp_path):
     """Overlay file not found → ConfigError with detail['path'] set."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -330,7 +331,7 @@ templates:
 def test_load_config_forwards_overlays(tmp_path):
     """load_config(path, overlays=[...]) returns Config with overlay's added template."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -356,7 +357,7 @@ templates:
 def test_load_config_no_overlay_back_compat(tmp_path):
     """load_config(path) and load_config(path, env={}) work as before (back-compat)."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -383,7 +384,7 @@ from agctl.cli import cli
 def test_global_overlay_flag_threads_to_show(tmp_path):
     """Scenario 1: Global --overlay flag threads to config show."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -418,7 +419,7 @@ templates:
 def test_override_surfaced_in_show(tmp_path):
     """Scenario 2: Override surfaced in show result."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -453,7 +454,7 @@ templates:
 def test_no_overlay_shape_unchanged(tmp_path):
     """Scenario 3: No --overlay shape unchanged (back-compat)."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -476,7 +477,7 @@ templates:
 def test_post_command_overlay_form(tmp_path):
     """Scenario 4: Post-command --overlay form (own option precedence)."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -507,7 +508,7 @@ templates:
 def test_compose_config_overlay_version_only_no_override_recorded(tmp_path):
     """Overlay with only version: '2' on v2 base → no override recorded, version inherited."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -518,20 +519,20 @@ templates:
     path: /api/v1/orders
 """)
     ov = tmp_path / "overlay.yaml"
-    ov.write_text("""version: "2"
+    ov.write_text("""version: "3"
 """)
     result = compose_config(str(base), [str(ov)])
     # No overrides should be recorded for version
     assert result.overrides == []
     # Version should be inherited from base
-    assert result.config.version == "2"
+    assert result.config.version == "3"
 
 
 # Fix 2: multiple overlays later wins test
 def test_compose_config_multiple_overlays_later_wins(tmp_path):
     """Two overlays both setting templates.x.path → later wins, single override record per path."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -576,7 +577,7 @@ from agctl.config.models import Config, ServiceConfig
 def test_http_call_forwards_overlay(tmp_path, monkeypatch):
     """http call forwards overlay_paths from ctx.obj to load_config_or_raise."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -636,7 +637,7 @@ templates:
 def test_db_query_forwards_overlay(tmp_path, monkeypatch):
     """db query forwards overlay_paths from ctx.obj to load_config_or_raise."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -680,7 +681,7 @@ database:
 def test_kafka_produce_forwards_overlay(tmp_path, monkeypatch):
     """kafka produce forwards overlay_paths from ctx.obj to load_config_or_raise."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -700,11 +701,13 @@ kafka:
 
     def fake_load_config(config_path, overlay_paths=None):
         captured_overlays.append(overlay_paths)
-        from agctl.config.models import KafkaConfig
+        from agctl.config.models import KafkaCluster, KafkaConfig
         return Config(
-            version="2",
+            version="3",
             services={"orders": ServiceConfig(base_url="http://localhost:8081")},
-            kafka=KafkaConfig(brokers=["localhost:9092"])
+            kafka=KafkaConfig(
+                clusters={"default": KafkaCluster(brokers=["localhost:9092"])}
+            ),
         )
 
     monkeypatch.setattr("agctl.commands.kafka_commands.load_config_or_raise", fake_load_config)
@@ -721,7 +724,7 @@ kafka:
 def test_check_ready_forwards_overlay(tmp_path, monkeypatch):
     """check ready forwards overlay_paths from ctx.obj to load_config_or_raise."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -756,7 +759,7 @@ services:
 def test_mock_run_forwards_overlay(tmp_path, monkeypatch):
     """mock run forwards overlay_paths from ctx.obj to load_config_or_raise."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -801,7 +804,7 @@ services:
 def test_http_ping_forwards_overlay(tmp_path, monkeypatch):
     """http ping forwards overlay_paths from ctx.obj to load_config_or_raise."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081

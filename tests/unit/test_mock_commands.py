@@ -34,7 +34,7 @@ class TestMockRunCommand:
     def test_only_http_with_stubs(self, temp_config, fake_engine):
         """--only http with 2-stub mocks.http -> run_http=True, run_kafka=False, kafka_client=None."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -82,10 +82,12 @@ mocks:
         pytest.importorskip("confluent_kafka")
 
         config_content = """
-version: "2.0"
+version: "3"
 kafka:
-  brokers:
-    - "localhost:9092"
+  clusters:
+    default:
+      brokers:
+        - "localhost:9092"
 mocks:
   kafka:
     reactors:
@@ -120,7 +122,7 @@ mocks:
     def test_only_http_without_mocks_http(self, temp_config):
         """--only http with no mocks.http -> exit 2, ConfigError envelope."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   kafka:
     reactors:
@@ -151,7 +153,7 @@ mocks:
     def test_no_mocks_section_no_only(self, temp_config, fake_engine):
         """No mocks section, no --only -> exit 0, no-op engine (run_http=False, run_kafka=False)."""
         config_content = """
-version: "2.0"
+version: "3"
 kafka:
   brokers:
     - "localhost:9092"
@@ -179,11 +181,15 @@ kafka:
             fake_engine.shutdown.assert_called_once()
 
     def test_kafka_reactors_without_brokers(self, temp_config):
-        """mocks.kafka reactors present but no kafka.brokers -> exit 2, ConfigError envelope."""
+        """mocks.kafka reactors present but resolved cluster has empty brokers ->
+        exit 2, ConfigError envelope."""
         config_content = """
-version: "2.0"
+version: "3"
 kafka:
-  brokers: []
+  clusters:
+    default:
+      brokers: []
+  default_cluster: default
 mocks:
   kafka:
     reactors:
@@ -209,12 +215,12 @@ mocks:
         assert envelope["ok"] is False
         assert envelope["command"] == "mock.run"
         assert envelope["error"]["type"] == "ConfigError"
-        assert "kafka.brokers" in envelope["error"]["message"]
+        assert "brokers" in envelope["error"]["message"]
 
     def test_duration_and_until_stopped_mutually_exclusive(self, temp_config):
         """--duration and --until-stopped together -> exit 2, ConfigError envelope."""
         config_content = """
-version: "2.0"
+version: "3"
 """
         temp_config.write_text(config_content)
 
@@ -237,7 +243,7 @@ version: "2.0"
     def test_engine_start_raises_connection_failure(self, temp_config):
         """Engine start() raises ConnectionFailure -> mock.run envelope with ConnectionError, exit 2."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -278,7 +284,7 @@ mocks:
     def test_http_listen_override(self, temp_config, fake_engine):
         """--http-listen 127.0.0.1:9999 overrides config listen -> engine called with http_listen."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -309,7 +315,7 @@ mocks:
     def test_http_listen_bad_value(self, temp_config):
         """--http-listen 'bad:no-port' -> exit 2 (parse_listen fails)."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -341,7 +347,7 @@ mocks:
     def test_started_line_emitted(self, temp_config, fake_engine):
         """Config with mocks.http, --only http -> stdout's first line is the engine's started."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -385,7 +391,7 @@ mocks:
     def test_fail_fast_flag_passed(self, temp_config, fake_engine):
         """--fail-fast flag is passed to the engine."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -416,7 +422,7 @@ mocks:
     def test_duration_flag_passed(self, temp_config, fake_engine):
         """--duration flag is passed to the engine."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -447,7 +453,7 @@ mocks:
     def test_exit_code_from_engine(self, temp_config):
         """Engine returns non-zero exit code -> process exits with that code."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -478,7 +484,7 @@ mocks:
 def test_mock_start_includes_overlay_in_daemon_argv(tmp_path, monkeypatch):
     """mock start includes --overlay in the daemon argv so the spawned daemon loads the overlay."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081

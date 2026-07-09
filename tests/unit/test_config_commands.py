@@ -37,7 +37,7 @@ def test_validate_malformed_http_stub_jq_exits_2(tmp_path):
     ``mocks.http.stubs.<name>.match.jq`` (the jq-compile error surfaced by
     collect_jq_compile_errors)."""
     yaml_text = """
-version: "2"
+version: "3"
 mocks:
   http:
     stubs:
@@ -65,10 +65,13 @@ def test_validate_malformed_kafka_reactor_match_exits_2(tmp_path):
     """A Kafka reactor whose match is malformed -> exit 2 and an error whose
     path is ``mocks.kafka.reactors.<name>.match``."""
     yaml_text = """
-version: "2"
+version: "3"
 kafka:
-  brokers:
-    - localhost:9092
+  clusters:
+    default:
+      brokers:
+        - localhost:9092
+  default_cluster: default
 mocks:
   kafka:
     reactors:
@@ -95,10 +98,13 @@ def test_validate_fully_valid_config_exits_0(tmp_path):
     """A config with a well-formed match.jq and reactor match -> exit 0,
     ``valid: true`` (no jq-compile errors)."""
     yaml_text = """
-version: "2"
+version: "3"
 kafka:
-  brokers:
-    - localhost:9092
+  clusters:
+    default:
+      brokers:
+        - localhost:9092
+  default_cluster: default
 mocks:
   http:
     stubs:
@@ -132,7 +138,7 @@ mocks:
 
 def test_validate_no_mocks_section_exits_0(tmp_path):
     """A config with no ``mocks`` section -> exit 0 (collector returns [])."""
-    result = _validate(tmp_path, 'version: "2"\n')
+    result = _validate(tmp_path, 'version: "3"\n')
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["result"]["valid"] is True
@@ -144,7 +150,7 @@ def test_validate_no_mocks_section_exits_0(tmp_path):
 def test_validate_override_warning_emitted(tmp_path):
     """Scenario 1: Override warning emitted when overlay overrides templates.create-order."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -182,7 +188,7 @@ templates:
 def test_validate_no_override_no_warning(tmp_path):
     """Scenario 2: No override warning when overlay only adds a new template."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -215,7 +221,7 @@ templates:
 def test_validate_cross_file_dangling_ref_error(tmp_path):
     """Scenario 3: Cross-file dangling ref is still an error."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081
@@ -248,7 +254,7 @@ templates:
 def test_validate_global_overlay_form_threads(tmp_path):
     """Scenario 4: Global --overlay form threads to config validate (same as scenario 1)."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081

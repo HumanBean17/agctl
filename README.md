@@ -203,8 +203,8 @@ version is the same file with secrets/hosts moved into `${...}` and sourced from
 
 ```yaml
 # agctl.yaml
-# Version tracks the agctl MAJOR version only (currently "2").
-version: "2"
+# Version tracks the agctl MAJOR version only (currently "3").
+version: "3"
 
 # --- services: named HTTP base URLs for services under test -----------------
 services:
@@ -218,31 +218,39 @@ services:
     health_path: "/health"
     timeout_seconds: 15
 
-# --- kafka: broker config --------------------------------------------------
+# --- kafka: named clusters + patterns --------------------------------------
+# Mirrors database.connections: a named map of clusters, a default_cluster,
+# and a global patterns map. A single cluster needs no default_cluster
+# (auto-defaulted), but it is set here for clarity.
 kafka:
-  brokers:
-    - "localhost:9092"
-  default_consumer_group: "agctl-consumer"
-  schema_registry_url: ""              # optional; omit/leave empty if unused
-  timeout_seconds: 30                  # default consume/assert timeout
+  clusters:
+    default:
+      brokers:
+        - "localhost:9092"
+      default_consumer_group: "agctl-consumer"
+      schema_registry_url: ""           # optional; omit/leave empty if unused
+      timeout_seconds: 30               # default consume/assert timeout
 
-  # Optional TLS/mTLS — uncomment for brokers that require SSL. Setting ANY
-  # field to a non-empty value enables TLS (security.protocol defaults to "SSL").
-  # ca_location is optional: unset → librdkafka uses the system trust store
-  # (fine for publicly-trusted brokers; pin a CA for private-PKI brokers).
-  # Hostname verification stays ON unless endpoint_identification_algorithm: "none".
-  # ssl:
-  #   ca_location: ""
-  #   certificate_location: ""          # path to client cert (mTLS)
-  #   key_location: ""                  # path to client private key (mTLS)
-  #   key_password: ""                  # optional private-key password
-  #   # endpoint_identification_algorithm: "none"   # disable hostname verification
-  #   # security_protocol: "SSL"                     # default; set SASL_SSL when adding SASL
+      # Optional TLS/mTLS — uncomment for brokers that require SSL. Setting ANY
+      # field to a non-empty value enables TLS (security.protocol defaults to "SSL").
+      # ca_location is optional: unset → librdkafka uses the system trust store
+      # (fine for publicly-trusted brokers; pin a CA for private-PKI brokers).
+      # Hostname verification stays ON unless endpoint_identification_algorithm: "none".
+      # ssl:
+      #   ca_location: ""
+      #   certificate_location: ""          # path to client cert (mTLS)
+      #   key_location: ""                  # path to client private key (mTLS)
+      #   key_password: ""                  # optional private-key password
+      #   # endpoint_identification_algorithm: "none"   # disable hostname verification
+      #   # security_protocol: "SSL"                     # default; set SASL_SSL when adding SASL
+
+  default_cluster: default
 
   # patterns: named Kafka filters, analogous to HTTP templates.
   #   topic: Kafka topic
   #   match: jq boolean predicate over each message envelope;
   #          supports {placeholder} substitution via --param at assert time
+  #   cluster: optional named cluster this pattern binds to (default = default_cluster)
   patterns:
     order-created:
       description: "An ORDER_CREATED event for a specific order"

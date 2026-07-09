@@ -17,9 +17,10 @@ from confluent_kafka import OFFSET_BEGINNING, OFFSET_END, TopicPartition
 
 from agctl.cli import cli
 from agctl.clients.kafka_client import KafkaClient
-from agctl.config.models import KafkaConfig, KafkaSSL
+from agctl.config.models import KafkaCluster, KafkaConfig, KafkaSSL
 from agctl.assertion_registry import Assertion
 from agctl.commands import kafka_commands
+from agctl.errors import ConfigError
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "agctl.yaml"
 
@@ -44,19 +45,20 @@ ENV = {
 # ---------------------------------------------------------------------------
 
 
-def _kcfg(**ssl_kwargs):
-    return KafkaConfig(ssl=KafkaSSL(**ssl_kwargs)) if ssl_kwargs else KafkaConfig()
+def _cluster(**ssl_kwargs):
+    """Build a KafkaCluster carrying the given ssl knobs (or none)."""
+    return KafkaCluster(ssl=KafkaSSL(**ssl_kwargs)) if ssl_kwargs else KafkaCluster()
 
 
 def test_ssl_conf_none_when_no_ssl():
-    assert kafka_commands._kafka_ssl_conf(KafkaConfig()) == {}
+    assert kafka_commands._kafka_ssl_conf(KafkaCluster()) == {}
     # An empty ssl block also yields nothing (no knobs -> no protocol inferred).
-    assert kafka_commands._kafka_ssl_conf(_kcfg()) == {}
+    assert kafka_commands._kafka_ssl_conf(_cluster()) == {}
 
 
 def test_ssl_conf_full_emits_all_keys_with_inferred_protocol():
     conf = kafka_commands._kafka_ssl_conf(
-        _kcfg(
+        _cluster(
             ca_location="/ca.pem",
             certificate_location="/client.crt",
             key_location="/client.key",
@@ -77,13 +79,13 @@ def test_ssl_conf_full_emits_all_keys_with_inferred_protocol():
 
 def test_ssl_conf_explicit_security_protocol_honored():
     conf = kafka_commands._kafka_ssl_conf(
-        _kcfg(ca_location="/ca.pem", security_protocol="SASL_SSL")
+        _cluster(ca_location="/ca.pem", security_protocol="SASL_SSL")
     )
     assert conf["security.protocol"] == "SASL_SSL"
 
 
 def test_ssl_conf_partial_emits_only_set_keys():
-    conf = kafka_commands._kafka_ssl_conf(_kcfg(ca_location="/ca.pem"))
+    conf = kafka_commands._kafka_ssl_conf(_cluster(ca_location="/ca.pem"))
     # Only the CA knob plus the inferred protocol.
     assert conf == {"ssl.ca.location": "/ca.pem", "security.protocol": "SSL"}
 
@@ -93,7 +95,7 @@ def test_ssl_conf_skips_empty_string_values():
     emit bogus ssl.*.location paths nor disable hostname verification via an
     empty endpoint_identification_algorithm (librdkafka treats "" == "none")."""
     conf = kafka_commands._kafka_ssl_conf(
-        _kcfg(
+        _cluster(
             ca_location="/ca.pem",
             certificate_location="",
             key_location="",
@@ -109,7 +111,7 @@ def test_ssl_conf_all_empty_strings_is_noop():
     """A fully-unresolved ssl block (every field "") enables no TLS at all —
     no empty paths, no inferred security.protocol."""
     conf = kafka_commands._kafka_ssl_conf(
-        _kcfg(
+        _cluster(
             ca_location="",
             certificate_location="",
             key_location="",
@@ -316,7 +318,7 @@ def install_fake(monkeypatch):
         captured["producer"] = producer
         captured["consumer"] = consumer
 
-        def factory(cfg_kafka, group_id=None):
+        def factory(cluster, group_id=None):
             # Preserve the test's canned messages; honor a caller group_id by
             # simply returning the same client (group has no effect on fakes).
             return client
@@ -652,7 +654,7 @@ def test_kafka_consume_nonexistent_topic_is_connection_error(monkeypatch):
     consumer = FakeConsumer({}, messages=[], empty_assignment=True)
     client = KafkaClient(["host:9092"], consumer_factory=lambda conf: consumer)
     monkeypatch.setattr(
-        kafka_commands, "new_kafka_client", lambda cfg_kafka, group_id=None: client
+        kafka_commands, "new_kafka_client", lambda cluster, group_id=None: client
     )
 
     result = _run(
@@ -1097,3 +1099,103 @@ def test_kafka_assert_custom_mode_mutually_exclusive_with_match(install_fake):
 
     assert result.exit_code == 2
     assert payload["error"]["type"] == "ConfigError"
+
+
+# --------------------------------------------------------------------------- #
+# v3 cluster resolution (Task 1: default / single-cluster path)
+# --cluster flag and per-pattern bindings land in Task 2; here the resolution
+# helper (the Task 1 contract) is exercised directly for the error cases that
+# need an explicit name, and via the CLI for the no-flag paths.
+# --------------------------------------------------------------------------- #
+
+
+def test_kafka_produce_single_cluster_no_flag(install_fake):
+    """A config with one cluster and no --cluster flag produces successfully —
+    proving default/single-cluster resolution keeps the common case flagless."""
+    cap = install_fake([])
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "kafka", "produce",
+            "--topic", "t",
+            "--message", '{"a":1}',
+        ]
+    )
+    payload = _payload(result)
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    # The fake producer received the produce call.
+    assert cap["producer"].calls[0]["topic"] == "t"
+
+
+def test_kafka_consume_no_default_multi_cluster_error(install_fake, tmp_path):
+    """A config with two clusters, no default_cluster, and no --cluster flag
+    cannot resolve a cluster -> ConfigError (exit 2), message names the gap."""
+    install_fake([])
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "3"\n'
+        "kafka:\n"
+        "  clusters:\n"
+        "    a:\n"
+        "      brokers: [ha:9092]\n"
+        "    b:\n"
+        "      brokers: [hb:9092]\n"
+    )
+    result = _run(
+        ["--config", str(cfg), "kafka", "consume", "--topic", "t", "--timeout", "0.02"],
+        env={},
+    )
+    payload = _payload(result)
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+    assert "No kafka cluster specified" in payload["error"]["message"]
+
+
+def test_resolve_cluster_name_explicit_wins():
+    """Precedence: explicit > binding > default > single-cluster."""
+    k = KafkaConfig(
+        clusters={
+            "a": KafkaCluster(brokers=["ha:9092"]),
+            "b": KafkaCluster(brokers=["hb:9092"]),
+        },
+        default_cluster="a",
+    )
+    assert kafka_commands.resolve_cluster_name(k, "b") == "b"
+    # binding_cluster beats default
+    assert kafka_commands.resolve_cluster_name(k, None, "b") == "b"
+    # default when no explicit/binding
+    assert kafka_commands.resolve_cluster_name(k, None) == "a"
+
+
+def test_resolve_cluster_name_single_cluster_auto_default():
+    """One cluster defined, no default_cluster -> that cluster auto-resolves."""
+    k = KafkaConfig(clusters={"only": KafkaCluster(brokers=["h:9092"])})
+    assert kafka_commands.resolve_cluster_name(k, None) == "only"
+
+
+def test_resolve_cluster_name_unknown_cluster_errors():
+    """A resolved name absent from clusters -> ConfigError with detail.cluster
+    (the Task 1 contract; the CLI --cluster wiring lands in Task 2)."""
+    k = KafkaConfig(
+        clusters={"a": KafkaCluster(brokers=["ha:9092"])},
+        default_cluster="a",
+    )
+    with pytest.raises(ConfigError) as exc:
+        kafka_commands.resolve_cluster_name(k, "ghost")
+    assert "Unknown kafka cluster: ghost" in exc.value.message
+    assert exc.value.detail["cluster"] == "ghost"
+
+
+def test_resolve_cluster_name_no_cluster_specified_errors():
+    """No explicit/binding/default and >1 cluster -> ConfigError."""
+    k = KafkaConfig(
+        clusters={
+            "a": KafkaCluster(brokers=["ha:9092"]),
+            "b": KafkaCluster(brokers=["hb:9092"]),
+        }
+    )
+    with pytest.raises(ConfigError) as exc:
+        kafka_commands.resolve_cluster_name(k, None)
+    assert exc.value.message == "No kafka cluster specified"
+    assert exc.value.detail == {}

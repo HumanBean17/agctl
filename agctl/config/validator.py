@@ -85,7 +85,7 @@ def validate_config(cfg: Config) -> tuple[list[dict], list[dict]]:
             }
         )
 
-    # §3.6 — Kafka pattern missing-description warnings.
+    # §3.6 — Kafka pattern missing-description warnings + cluster dangling refs.
     for name, pattern in cfg.kafka.patterns.items():
         if _missing_description(pattern.description):
             warnings.append(
@@ -94,22 +94,63 @@ def validate_config(cfg: Config) -> tuple[list[dict], list[dict]]:
                     "message": "missing description (discovery degrades without it)",
                 }
             )
+        # KafkaPattern.cluster dangling ref (Task 2 consumes the field).
+        if pattern.cluster is not None and pattern.cluster not in cfg.kafka.clusters:
+            errors.append(
+                {
+                    "path": f"kafka.patterns.{name}.cluster",
+                    "message": (
+                        f"Pattern references unknown cluster '{pattern.cluster}'"
+                    ),
+                }
+            )
+
+    # kafka.default_cluster dangling ref (DESIGN §3.5 dangling refs, v3).
+    if (
+        cfg.kafka.default_cluster is not None
+        and cfg.kafka.default_cluster not in cfg.kafka.clusters
+    ):
+        errors.append(
+            {
+                "path": "kafka.default_cluster",
+                "message": (
+                    f"Default references unknown cluster "
+                    f"'{cfg.kafka.default_cluster}'"
+                ),
+            }
+        )
 
     # --- mock server validation -----------------------------------------------
 
-    # Check 1: mocks.kafka requires kafka.brokers
+    # Check 1: mocks.kafka reactors require a resolvable default cluster with
+    # non-empty brokers. Resolution mirrors resolve_cluster_name (default_cluster
+    # -> single-cluster auto-default) but is inlined here so config/ stays free
+    # of a commands/ import. (Reactor.cluster dangling-ref is deferred to Task 3
+    # where it is consumed.)
     if (
         cfg.mocks is not None
         and cfg.mocks.kafka is not None
         and cfg.mocks.kafka.reactors
-        and not cfg.kafka.brokers
     ):
-        errors.append(
-            {
-                "path": "mocks.kafka",
-                "message": "kafka mocks require top-level kafka.brokers",
-            }
-        )
+        reactor_cluster = cfg.kafka.default_cluster
+        if reactor_cluster is None and len(cfg.kafka.clusters) == 1:
+            reactor_cluster = next(iter(cfg.kafka.clusters))
+        if reactor_cluster is None or reactor_cluster not in cfg.kafka.clusters:
+            errors.append(
+                {
+                    "path": "mocks.kafka",
+                    "message": "reactors require a resolvable default cluster",
+                }
+            )
+        elif not cfg.kafka.clusters[reactor_cluster].brokers:
+            errors.append(
+                {
+                    "path": "mocks.kafka",
+                    "message": (
+                        f"kafka mocks require kafka.clusters.{reactor_cluster}.brokers"
+                    ),
+                }
+            )
 
     # Check 2: Missing description warnings for stubs and reactors
     if cfg.mocks is not None:

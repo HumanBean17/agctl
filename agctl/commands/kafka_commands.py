@@ -28,7 +28,7 @@ from ..assertions import compile_jq, jq_bool, jq_value, json_subset
 from ..command import envelope, load_config_or_raise
 
 if TYPE_CHECKING:
-    from ..config.models import KafkaConfig
+    from ..config.models import KafkaCluster, KafkaConfig
 from ..errors import AssertionFailure, ConfigError, TemplateNotFound
 from ..params import parse_params
 from ..resolution import fill_placeholders
@@ -38,11 +38,48 @@ __all__ = [
     "kafka_consume",
     "kafka_assert",
     "new_kafka_client",
+    "resolve_cluster_name",
 ]
 
 
-def _kafka_ssl_conf(cfg_kafka: "KafkaConfig") -> dict[str, str]:
-    """Translate ``cfg.kafka.ssl`` into librdkafka conf keys.
+def resolve_cluster_name(
+    cfg_kafka: "KafkaConfig",
+    explicit: str | None,
+    binding_cluster: str | None = None,
+) -> str:
+    """Resolve the Kafka cluster **name** to use (DESIGN §6, D2/D3).
+
+    Precedence (mirrors :func:`resolve_connection_name` in ``db_commands``,
+    plus single-cluster auto-default):
+
+    * ``explicit`` (the ``--cluster`` flag — wired in Task 2)
+    * ``binding_cluster`` (a pattern/reactor ``.cluster`` — Tasks 2-3)
+    * ``cfg_kafka.default_cluster``
+    * the single cluster when exactly one is defined
+
+    Raises :class:`ConfigError` if none resolves (>1 cluster / no default), or
+    if the resolved name is absent from ``cfg_kafka.clusters``. Returns the
+    cluster NAME; callers index ``cfg_kafka.clusters[name]``.
+    """
+    name = explicit
+    if name is None:
+        name = binding_cluster
+    if name is None:
+        name = cfg_kafka.default_cluster
+    if name is None:
+        # Single-cluster auto-default (D3): the overwhelmingly common config.
+        cluster_names = list(cfg_kafka.clusters.keys())
+        if len(cluster_names) == 1:
+            name = cluster_names[0]
+    if name is None:
+        raise ConfigError("No kafka cluster specified", {})
+    if name not in cfg_kafka.clusters:
+        raise ConfigError(f"Unknown kafka cluster: {name}", {"cluster": name})
+    return name
+
+
+def _kafka_ssl_conf(cluster: "KafkaCluster") -> dict[str, str]:
+    """Translate a cluster's ``ssl`` block into librdkafka conf keys.
 
     Returns an empty dict when no TLS knobs are configured. When any knob is
     set, ``security.protocol`` defaults to ``"SSL"`` (mTLS) unless
@@ -55,7 +92,7 @@ def _kafka_ssl_conf(cfg_kafka: "KafkaConfig") -> dict[str, str]:
     absent env var to ``""``, and an empty ``ssl.endpoint.identification.algorithm``
     must NOT flip verification off the way librdkafka treats ``""`` == ``"none"``.
     """
-    ssl = cfg_kafka.ssl
+    ssl = cluster.ssl
     if ssl is None:
         return {}
     conf: dict[str, str] = {}
@@ -74,37 +111,39 @@ def _kafka_ssl_conf(cfg_kafka: "KafkaConfig") -> dict[str, str]:
     return conf
 
 
-def new_kafka_client(cfg_kafka, group_id=None):
-    """Build a real :class:`KafkaClient` from ``cfg.kafka``.
+def new_kafka_client(cluster, group_id=None):
+    """Build a real :class:`KafkaClient` from a resolved :class:`KafkaCluster`.
 
     Test seam: tests monkeypatch this attribute
     (``monkeypatch.setattr(kafka_commands, "new_kafka_client", factory)``) to
     return a KafkaClient built with FakeConsumer/FakeProducer, avoiding any real
-    broker connection.
+    broker connection. The factory signature takes the resolved ``cluster``
+    (not ``cfg.kafka``) so multi-cluster selection (Tasks 2-3) is decoupled
+    from client construction.
     """
     from ..clients.kafka_client import KafkaClient
 
     return KafkaClient(
-        cfg_kafka.brokers,
+        cluster.brokers,
         group_id=group_id,
-        extra_conf=_kafka_ssl_conf(cfg_kafka),
+        extra_conf=_kafka_ssl_conf(cluster),
     )
 
 
-def _resolve_timeout(cli_timeout, cfg_kafka_timeout, fallback=30):
-    """First non-None of (cli, cfg.kafka.timeout_seconds, 30); coerced to float."""
-    for candidate in (cli_timeout, cfg_kafka_timeout, fallback):
+def _resolve_timeout(cli_timeout, cluster_timeout, fallback=30):
+    """First non-None of (cli, cluster.timeout_seconds, 30); coerced to float."""
+    for candidate in (cli_timeout, cluster_timeout, fallback):
         if candidate is not None:
             return float(candidate)
     return float(fallback)
 
 
-def _resolve_group(cli_group, cfg_kafka):
-    """``--consumer-group`` > ``cfg.kafka.default_consumer_group`` > default."""
+def _resolve_group(cli_group, cluster):
+    """``--consumer-group`` > ``cluster.default_consumer_group`` > default."""
     if cli_group is not None:
         return cli_group
-    if cfg_kafka.default_consumer_group is not None:
-        return cfg_kafka.default_consumer_group
+    if cluster.default_consumer_group is not None:
+        return cluster.default_consumer_group
     return "agctl-consumer"
 
 
@@ -125,7 +164,10 @@ def _kafka_produce_core(
     value = json.loads(message)
     headers = parse_params(header) if header else None
 
-    client = new_kafka_client(cfg.kafka)
+    # Resolve the cluster (Task 1: no flag/binding yet -> default/single-cluster).
+    name = resolve_cluster_name(cfg.kafka, None)
+    cluster = cfg.kafka.clusters[name]
+    client = new_kafka_client(cluster)
     return client.produce(topic, value, key=key, headers=headers or None)
 
 
@@ -179,7 +221,11 @@ def _kafka_consume_core(
         )
     match_expr = match if match is not None else filter_key
 
-    resolved_timeout = _resolve_timeout(timeout, cfg.kafka.timeout_seconds)
+    # Resolve the cluster (Task 1: no flag/binding yet -> default/single-cluster).
+    name = resolve_cluster_name(cfg.kafka, None)
+    cluster = cfg.kafka.clusters[name]
+
+    resolved_timeout = _resolve_timeout(timeout, cluster.timeout_seconds)
     if resolved_timeout <= 0:
         # timeout <= 0 makes the poll deadline already-passed, so the loop never
         # runs and consume returns ok:0 — a silent no-op masquerading as success.
@@ -189,7 +235,7 @@ def _kafka_consume_core(
         )
     # D6: default lookback = resolved timeout.
     resolved_lookback = float(lookback) if lookback is not None else resolved_timeout
-    group = _resolve_group(consumer_group, cfg.kafka)
+    group = _resolve_group(consumer_group, cluster)
 
     # Build the optional jq filter as an inline predicate so consume_window can
     # apply it incrementally AND short-circuit as soon as --expect-count matching
@@ -205,7 +251,7 @@ def _kafka_consume_core(
         def predicate(msg, _expr=match_expr):
             return jq_bool(msg, _expr)
 
-    client = new_kafka_client(cfg.kafka, group_id=group)
+    client = new_kafka_client(cluster, group_id=group)
     matched = client.consume_window(
         topic,
         lookback_seconds=resolved_lookback,
@@ -414,11 +460,15 @@ def _kafka_assert_core(
             {"timeout": resolved_timeout},
         )
     resolved_lookback = float(lookback) if lookback is not None else resolved_timeout
-    group = _resolve_group(consumer_group, cfg.kafka)
+    # Resolve the cluster (Task 1: no flag/binding yet -> default/single-cluster;
+    # Task 2 passes the pattern's cluster as binding_cluster).
+    name = resolve_cluster_name(cfg.kafka, None)
+    cluster = cfg.kafka.clusters[name]
+    group = _resolve_group(consumer_group, cluster)
 
     # DESIGN §9.3: a custom assertion mode evaluates the full consumed window.
     if assertion is not None:
-        client = new_kafka_client(cfg.kafka, group_id=group)
+        client = new_kafka_client(cluster, group_id=group)
         messages = client.consume_window(
             inferred_topic,
             lookback_seconds=resolved_lookback,
@@ -459,7 +509,7 @@ def _kafka_assert_core(
         filled_pattern_match=filled_pattern_match,
     )
 
-    client = new_kafka_client(cfg.kafka, group_id=group)
+    client = new_kafka_client(cluster, group_id=group)
     start = time.monotonic()
     matched, scanned = client.find_in_window(
         inferred_topic,
