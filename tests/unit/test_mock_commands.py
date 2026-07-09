@@ -77,7 +77,9 @@ mocks:
             fake_engine.shutdown.assert_called_once()
 
     def test_only_kafka_with_reactors(self, temp_config, fake_engine):
-        """--only kafka with reactors + kafka.brokers -> run_kafka=True, kafka_client is KafkaClient."""
+        """--only kafka with reactors resolved to the default v3 cluster
+        (kafka.clusters.default.brokers) -> run_kafka=True, kafka_clients maps
+        the reactor name to a KafkaClient built for that resolved cluster."""
         # Skip if confluent_kafka is not installed
         pytest.importorskip("confluent_kafka")
 
@@ -288,8 +290,11 @@ mocks:
         config_content = """
 version: "3"
 kafka:
-  brokers:
-    - "localhost:9092"
+  clusters:
+    default:
+      brokers:
+        - "localhost:9092"
+  default_cluster: default
 """
         temp_config.write_text(config_content)
 

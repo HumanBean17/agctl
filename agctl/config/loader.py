@@ -343,8 +343,7 @@ def _check_version(data: dict) -> None:
         if not version:
             message = (
                 f"Config is missing a `version`. agctl speaks dialect v{TOOL_MAJOR_VERSION}; "
-                f"add `version: \"{TOOL_MAJOR_VERSION}\"` (or run `agctl config migrate` "
-                f"on a v1 config)."
+                f"add `version: \"{TOOL_MAJOR_VERSION}\"` (or run `agctl config migrate`)."
             )
         else:
             message = (

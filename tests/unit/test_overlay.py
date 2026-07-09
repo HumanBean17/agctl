@@ -686,8 +686,11 @@ services:
   orders:
     base_url: http://localhost:8081
 kafka:
-  brokers:
-    - localhost:9092
+  clusters:
+    default:
+      brokers:
+        - localhost:9092
+  default_cluster: default
 """)
     ov = tmp_path / "overlay.yaml"
     ov.write_text("""kafka:

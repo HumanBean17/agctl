@@ -1129,6 +1129,9 @@ def test_kafka_produce_single_cluster_no_flag(install_fake):
     assert payload["ok"] is True
     # The fake producer received the produce call.
     assert cap["producer"].calls[0]["topic"] == "t"
+    # The fixture's single default cluster was selected (broker resolved from
+    # KAFKA_BROKER=localhost) — genuinely exercising single-cluster resolution.
+    assert cap["cluster"].brokers == ["localhost"]
 
 
 def test_kafka_consume_no_default_multi_cluster_error(install_fake, tmp_path):

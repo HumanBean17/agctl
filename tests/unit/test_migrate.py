@@ -511,6 +511,60 @@ def test_config_migrate_result_carries_cli_flags_note(tmp_path):
     assert "--match" in note
 
 
+def test_config_migrate_cli_flags_note_v1_includes_prefix_instruction(tmp_path):
+    """A v1->v3 migration DID jq-prefix the config's match expressions, so the
+    ``cli_flags_note`` must carry the manual ``.body |`` / ``.value |`` prefix
+    guidance for the CLI flags it cannot reach."""
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "1"\n'
+        "mocks:\n"
+        "  http:\n"
+        "    stubs:\n"
+        "      s:\n"
+        "        match:\n"
+        '          jq: ".amount > 1000"\n'
+    )
+
+    result = _migrate(tmp_path, ["--config", str(cfg), "--dry-run"])
+
+    assert result.exit_code == 0
+    note = json.loads(result.output)["result"]["cli_flags_note"]
+    assert "--match" in note
+    assert ".body | " in note
+    assert ".value | " in note
+
+
+def test_config_migrate_cli_flags_note_v2_omits_prefix_instruction(tmp_path):
+    """A v2->v3 migration does NOT jq-prefix (v2 exprs are already
+    envelope-rooted), so the ``cli_flags_note`` must NOT tell the operator to
+    prefix — that would steer them into double-prefixing working scripts. The
+    base reminder (flags live in scripts/prompts, not rewritten) is still
+    present. Uses a flat-kafka v2 config so a real structural lift runs (i.e.
+    this is a genuine migration, not already_current)."""
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "2"\n'
+        "kafka:\n"
+        "  brokers:\n"
+        "    - host:9092\n"
+    )
+
+    result = _migrate(tmp_path, ["--config", str(cfg), "--dry-run"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["result"]["already_current"] is False
+    # A structural rewrite ran -> this was a real v2->v3 migration.
+    assert payload["result"]["rewritten"]
+    note = payload["result"]["cli_flags_note"]
+    # Base reminder present.
+    assert "--match" in note
+    # Prefix instruction MUST be absent for v2->v3.
+    assert ".body | " not in note
+    assert ".value | " not in note
+
+
 def test_config_migrate_round_trip_proves_behavior(tmp_path):
     """After migrating a v1 config and loading the result, the rewritten HTTP
     stub ``match.jq`` actually matches an envelope with a qualifying body and
