@@ -189,6 +189,69 @@ mocks:
             # has its own cluster, so the two client objects differ.
             assert kafka_clients["rA"] is not kafka_clients["rB"]
 
+    def test_mock_run_reuses_client_for_shared_cluster(self, temp_config, fake_engine):
+        """Two reactors bound to the SAME cluster -> new_kafka_client called
+        exactly once, and both reactors share the same client instance.
+
+        Pins the DRY/reuse path that ``test_mock_run_builds_per_cluster_clients``
+        (2 reactors / 2 clusters) does not cover.
+        """
+        config_content = """
+version: "3"
+kafka:
+  clusters:
+    shared:
+      brokers:
+        - "shared:9092"
+  default_cluster: shared
+mocks:
+  kafka:
+    reactors:
+      rA:
+        topic: topicA
+        cluster: shared
+        reaction:
+          topic: out
+          value: {}
+      rB:
+        topic: topicB
+        cluster: shared
+        reaction:
+          topic: out
+          value: {}
+"""
+        temp_config.write_text(config_content)
+
+        call_count = {"n": 0}
+
+        def fake_client_factory(cluster, group_id=None):
+            call_count["n"] += 1
+            return MagicMock()  # fake client; engine is also faked
+
+        with patch(
+            "agctl.commands.mock_commands.new_kafka_client",
+            side_effect=fake_client_factory,
+        ), patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "kafka"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+
+            # The factory is called exactly once for the single shared cluster.
+            assert call_count["n"] == 1
+
+            # Both reactors map to the SAME client instance.
+            call_kwargs = mock_factory.call_args.kwargs
+            kafka_clients = call_kwargs["kafka_clients"]
+            assert set(kafka_clients.keys()) == {"rA", "rB"}
+            assert kafka_clients["rA"] is kafka_clients["rB"]
+
     def test_only_http_without_mocks_http(self, temp_config):
         """--only http with no mocks.http -> exit 2, ConfigError envelope."""
         config_content = """
@@ -251,15 +314,12 @@ kafka:
             fake_engine.shutdown.assert_called_once()
 
     def test_kafka_reactors_without_brokers(self, temp_config):
-        """mocks.kafka reactors whose resolved cluster has empty brokers -> exit 2.
+        """mocks.kafka reactors whose resolved cluster has empty brokers ->
+        exit 2 with a clear ConfigError naming the reactor + cluster.
 
-        The runtime brokers guard was dropped in Task 3 (per-reactor resolution
-        replaced it); empty-brokers validation now lives in the validator's
-        per-reactor check. At ``mock run`` time the empty broker list surfaces as
-        a probe failure (ConnectionError when confluent_kafka is installed, or a
-        ConfigError for the missing extra when it is not). Either way the run
-        fails fast with exit 2 and a single error envelope — the contract this
-        test pins.
+        The per-reactor brokers guard in ``mock_run`` (spec §11) fires BEFORE
+        any confluent_kafka import/probe, so this guarantee holds regardless of
+        whether the extra is installed.
         """
         config_content = """
 version: "3"
@@ -292,6 +352,14 @@ mocks:
         envelope = json.loads(output_lines[0])
         assert envelope["ok"] is False
         assert envelope["command"] == "mock.run"
+
+        # Clear ConfigError naming the offending reactor + cluster (spec §11).
+        error = envelope["error"]
+        assert error["type"] == "ConfigError"
+        assert "brokers" in error["message"]
+        detail = error["detail"]
+        assert detail["reactor"] == "reactor1"
+        assert detail["cluster"] == "default"
 
     def test_duration_and_until_stopped_mutually_exclusive(self, temp_config):
         """--duration and --until-stopped together -> exit 2, ConfigError envelope."""

@@ -480,8 +480,19 @@ def mock_run(
                 cluster_name = resolve_cluster_name(
                     cfg.kafka, None, binding_cluster=reactor.cluster
                 )
+                cluster = cfg.kafka.clusters[cluster_name]
+                # Per-reactor brokers guard (spec §11): a reactor whose resolved
+                # cluster has empty brokers must fail fast with a clear
+                # ConfigError at mock run, BEFORE any client build/probe. This
+                # restores the runtime guarantee dropped in Task 3 — but per
+                # reactor (honoring the brief's per-reactor resolution), not via
+                # the old single-cluster guard.
+                if not cluster.brokers:
+                    raise ConfigError(
+                        f"kafka.clusters.{cluster_name}.brokers is required when running Kafka reactors",
+                        {"reactor": reactor_name, "cluster": cluster_name},
+                    )
                 if cluster_name not in clients_by_cluster:
-                    cluster = cfg.kafka.clusters[cluster_name]
                     clients_by_cluster[cluster_name] = new_kafka_client(cluster)
                 kafka_clients[reactor_name] = clients_by_cluster[cluster_name]
 
