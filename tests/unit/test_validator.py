@@ -296,8 +296,8 @@ def test_mock_kafka_requires_resolvable_default_cluster_error():
     )
     errors, warnings = validate_config(cfg)
     assert len(errors) == 1
-    assert errors[0]["path"] == "mocks.kafka"
-    assert errors[0]["message"] == "reactors require a resolvable default cluster"
+    assert errors[0]["path"] == "mocks.kafka.reactors.r"
+    assert "cluster" in errors[0]["message"]
 
 
 def test_mock_kafka_with_cluster_no_error():
@@ -320,8 +320,8 @@ def test_mock_kafka_with_cluster_no_error():
         ),
     )
     errors, warnings = validate_config(cfg)
-    # Should not have the mocks.kafka error
-    assert not any(e["path"] == "mocks.kafka" for e in errors)
+    # Should not have the mocks.kafka.reactors error
+    assert not any(e["path"].startswith("mocks.kafka.reactors") for e in errors)
 
 
 # --- v3 cluster cross-ref validation ----------------------------------------
@@ -347,9 +347,60 @@ def test_reactor_default_cluster_missing_brokers_errors():
         ),
     )
     errors, warnings = validate_config(cfg)
-    mocks_errors = [e for e in errors if e["path"] == "mocks.kafka"]
+    mocks_errors = [e for e in errors if e["path"] == "mocks.kafka.reactors.r"]
     assert len(mocks_errors) == 1
     assert "kafka.clusters.default.brokers" in mocks_errors[0]["message"]
+
+
+def test_reactor_cluster_dangling_ref_errors():
+    """A KafkaReactor whose ``cluster`` names an unknown cluster -> error at
+    mocks.kafka.reactors.<name>.cluster."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            kafka=KafkaMockConfig(
+                reactors={
+                    "r": KafkaReactor(
+                        topic="t",
+                        cluster="ghost",
+                        reaction=KafkaReaction(topic="out", value={}),
+                    )
+                }
+            )
+        ),
+        kafka=KafkaConfig(
+            clusters={"main": KafkaCluster(brokers=["h:9092"])},
+            default_cluster="main",
+        ),
+    )
+    errors, warnings = validate_config(cfg)
+    paths = [e["path"] for e in errors]
+    assert "mocks.kafka.reactors.r.cluster" in paths
+
+
+def test_reactor_resolved_cluster_missing_brokers_errors():
+    """A reactor binding ``cluster="main"`` where main.brokers is empty -> error
+    at mocks.kafka.reactors.<name>, message names the cluster."""
+    cfg = _cfg(
+        mocks=MocksConfig(
+            kafka=KafkaMockConfig(
+                reactors={
+                    "r": KafkaReactor(
+                        topic="t",
+                        cluster="main",
+                        reaction=KafkaReaction(topic="out", value={}),
+                    )
+                }
+            )
+        ),
+        kafka=KafkaConfig(
+            clusters={"main": KafkaCluster(brokers=[])},
+            default_cluster="main",
+        ),
+    )
+    errors, warnings = validate_config(cfg)
+    reactor_errors = [e for e in errors if e["path"] == "mocks.kafka.reactors.r"]
+    assert len(reactor_errors) == 1
+    assert "kafka.clusters.main.brokers" in reactor_errors[0]["message"]
 
 
 def test_default_cluster_dangling_ref_errors():

@@ -117,7 +117,7 @@ def new_mock_engine(
     run_http: bool,
     run_kafka: bool,
     http_listen: str,
-    kafka_client: KafkaClient | None,
+    kafka_clients: dict[str, "KafkaClient"] | None = None,
     fail_fast: bool = False,
     duration: float | None = None,
     until_stopped: bool = True,
@@ -130,7 +130,7 @@ def new_mock_engine(
         run_http=run_http,
         run_kafka=run_kafka,
         http_listen=http_listen,
-        kafka_client=kafka_client,
+        kafka_clients=kafka_clients,
         fail_fast=fail_fast,
         duration=duration,
         until_stopped=until_stopped,
@@ -469,20 +469,21 @@ def mock_run(
         # Guard 2+3: Resolve engines to run
         run_http, run_kafka = _resolve_engines(only, cfg.mocks)
 
-        # Guard 5: If run_kafka, resolve a default cluster and require its brokers.
-        # (Task 1: all reactors share the single default client; per-reactor
-        # cluster selection lands in Task 3.)
-        kafka_client = None
+        # Guard 5: If run_kafka, resolve each reactor's cluster and build one
+        # KafkaClient per DISTINCT cluster (reactors sharing a cluster reuse the
+        # same client). The per-reactor client map is keyed by reactor name.
+        kafka_clients: dict[str, KafkaClient] | None = None
         if run_kafka:
-            cluster_name = resolve_cluster_name(cfg.kafka, None)
-            cluster = cfg.kafka.clusters[cluster_name]
-            if not cluster.brokers:
-                raise ConfigError(
-                    "kafka.clusters.<name>.brokers is required when running Kafka reactors",
-                    {"cluster": cluster_name},
+            kafka_clients = {}
+            clients_by_cluster: dict[str, KafkaClient] = {}
+            for reactor_name, reactor in cfg.mocks.kafka.reactors.items():
+                cluster_name = resolve_cluster_name(
+                    cfg.kafka, None, binding_cluster=reactor.cluster
                 )
-            # Build KafkaClient (may raise ConfigError if kafka extra missing)
-            kafka_client = new_kafka_client(cluster)
+                if cluster_name not in clients_by_cluster:
+                    cluster = cfg.kafka.clusters[cluster_name]
+                    clients_by_cluster[cluster_name] = new_kafka_client(cluster)
+                kafka_clients[reactor_name] = clients_by_cluster[cluster_name]
 
         # Guard 6: Resolve http_listen
         if http_listen is not None:
@@ -503,7 +504,7 @@ def mock_run(
             run_http=run_http,
             run_kafka=run_kafka,
             http_listen=http_listen,
-            kafka_client=kafka_client,
+            kafka_clients=kafka_clients,
             fail_fast=fail_fast,
             duration=duration,
             until_stopped=until_stopped,

@@ -122,35 +122,56 @@ def validate_config(cfg: Config) -> tuple[list[dict], list[dict]]:
 
     # --- mock server validation -----------------------------------------------
 
-    # Check 1: mocks.kafka reactors require a resolvable default cluster with
-    # non-empty brokers. Resolution mirrors resolve_cluster_name (default_cluster
-    # -> single-cluster auto-default) but is inlined here so config/ stays free
-    # of a commands/ import. (Reactor.cluster dangling-ref is deferred to Task 3
-    # where it is consumed.)
+    # Check 1: each mocks.kafka reactor must bind a resolvable cluster with
+    # non-empty brokers. Resolution mirrors resolve_cluster_name
+    # (reactor.cluster -> default_cluster -> single-cluster auto-default) but is
+    # inlined here so config/ stays free of a commands/ import.
     if (
         cfg.mocks is not None
         and cfg.mocks.kafka is not None
         and cfg.mocks.kafka.reactors
     ):
-        reactor_cluster = cfg.kafka.default_cluster
-        if reactor_cluster is None and len(cfg.kafka.clusters) == 1:
-            reactor_cluster = next(iter(cfg.kafka.clusters))
-        if reactor_cluster is None or reactor_cluster not in cfg.kafka.clusters:
-            errors.append(
-                {
-                    "path": "mocks.kafka",
-                    "message": "reactors require a resolvable default cluster",
-                }
-            )
-        elif not cfg.kafka.clusters[reactor_cluster].brokers:
-            errors.append(
-                {
-                    "path": "mocks.kafka",
-                    "message": (
-                        f"kafka mocks require kafka.clusters.{reactor_cluster}.brokers"
-                    ),
-                }
-            )
+        for reactor_name, reactor in cfg.mocks.kafka.reactors.items():
+            # (a) reactor.cluster dangling ref -> error at the .cluster field.
+            if (
+                reactor.cluster is not None
+                and reactor.cluster not in cfg.kafka.clusters
+            ):
+                errors.append(
+                    {
+                        "path": f"mocks.kafka.reactors.{reactor_name}.cluster",
+                        "message": (
+                            f"Reactor references unknown cluster "
+                            f"'{reactor.cluster}'"
+                        ),
+                    }
+                )
+                continue  # cannot check brokers for an unknown cluster
+
+            # (b) resolve cluster name: reactor.cluster -> default -> single.
+            resolved = reactor.cluster
+            if resolved is None:
+                resolved = cfg.kafka.default_cluster
+            if resolved is None and len(cfg.kafka.clusters) == 1:
+                resolved = next(iter(cfg.kafka.clusters))
+
+            # (c) resolvable + non-empty brokers.
+            if resolved is None or resolved not in cfg.kafka.clusters:
+                errors.append(
+                    {
+                        "path": f"mocks.kafka.reactors.{reactor_name}",
+                        "message": "reactor requires a resolvable cluster",
+                    }
+                )
+            elif not cfg.kafka.clusters[resolved].brokers:
+                errors.append(
+                    {
+                        "path": f"mocks.kafka.reactors.{reactor_name}",
+                        "message": (
+                            f"reactor requires kafka.clusters.{resolved}.brokers"
+                        ),
+                    }
+                )
 
     # Check 2: Missing description warnings for stubs and reactors
     if cfg.mocks is not None:
