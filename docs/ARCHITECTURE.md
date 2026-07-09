@@ -220,7 +220,7 @@ discovers, parses, and validates `agctl.yaml` from scratch. This is what makes
 `config/loader.py::load_config` → `compose_config`, fixed order; any stage may fail the load with a `ConfigError`:
 
 ```
-discover_config_path → yaml.safe_load → interpolate → _check_version (base must be v2)
+discover_config_path → yaml.safe_load → interpolate → _check_version (base must be v3)
                                                 ↓
                               for each overlay (in flag order):
                                 discover_config_path (explicit only) → yaml.safe_load → interpolate
@@ -266,13 +266,17 @@ deep-merged with highest precedence. Two refinements beyond the spec:
 - `database.connections.*.writable` — write safety gate must be set explicitly in config
 - `database.templates.*.mode` — read/write mode is a template authoring intent, not runtime config
 
-**Version guard** — major only; `_check_version` (`loader.py`) rejects `major != TOOL_MAJOR_VERSION` (`"2"`) with a `ConfigError` whose message points at `agctl config migrate`. The version is the jq-dialect switch: `"2"` = envelope-rooted `match` (`.body.x` for HTTP, `.value.x` for Kafka); `"1"` (the legacy payload-rooted dialect) is rejected, not silently re-interpreted. `agctl config migrate` performs the file-level rewrite (`.body | ` / `.value | ` prefix on the three `match`-site families — see `config/migrate.py::migrate_match_exprs`); CLI `--match` flags in scripts/prompts are out of its scope and must be prefixed manually.
+**Version guard** — major only; `_check_version` (`loader.py`) rejects `major != TOOL_MAJOR_VERSION` (`"3"`) with a `ConfigError` whose message points at `agctl config migrate`. The version is the **config schema version**: `"3"` restructured `Config.kafka` from a single flat object into a named map `kafka.clusters.<name>` (mirroring `database.connections`) plus `default_cluster`. The `match` envelope-rooting introduced under `"2"` (`.body.x` for HTTP, `.value.x` for Kafka) is unchanged in v3; `"1"` and `"2"` (the legacy flat-`kafka:` schemas, `"1"` additionally payload-rooted) are rejected, not silently re-interpreted. `agctl config migrate` performs a STRUCTURAL lift (v1/v2 → v3: a flat `kafka:` block moves into `kafka.clusters.default` + `default_cluster: default` — see `config/migrate.py::migrate_config`/`_lift_kafka_clusters`); v1 sources additionally get the `.body | ` / `.value | ` prefix on the three `match`-site families (v2 exprs are already envelope-rooted and are not re-prefixed). CLI `--match` flags in scripts/prompts are out of its scope and must be prefixed manually (v1 inputs only).
 
 **Typed validation** (`Config.model_validate`, `models.py`) — Pydantic v2 tree
-(`Config` → `ServiceConfig`, `KafkaConfig`/`KafkaSSL`, `DatabaseConfig`/…,
-`HttpTemplate`, `Defaults`). Notable: `KafkaSSL.security_protocol` is
+(`Config` → `ServiceConfig`, `KafkaConfig`/`KafkaCluster`/`KafkaSSL`,
+`DatabaseConfig`/…, `HttpTemplate`, `Defaults`). Notable: `KafkaSSL.security_protocol` is
 upper-cased and restricted to `PLAINTEXT|SSL|SASL_SSL|SASL_PLAINTEXT` at load,
 so an invalid protocol fails fast rather than surfacing as an opaque broker error.
+Under v3 `KafkaConfig` is a named map (`clusters: dict[str, KafkaCluster]`,
+`default_cluster`, `patterns`), mirroring `DatabaseConfig.connections`;
+`KafkaCluster` owns the per-cluster knobs formerly on `KafkaConfig` (brokers / ssl /
+timeout / consumer group / schema registry).
 
 **Overlay types** — `PartialConfig` (a `Config` subclass with `version: str | None = None`) represents a fragment; version is inherited from the base at merge time. `ComposedConfig` is a `NamedTuple(config: Config, overrides: list[dict])`, where each override record is `{"path": "<dotted>", "overlay": "<file>"}` surfacing which overlay won which leaf.
 
@@ -461,7 +465,21 @@ Exception mapping: `ConnectError`/`ConnectTimeout` → `ConnectionFailure`;
 
 confluent-kafka wrapper, transport-agnostic — it takes an `extra_conf` dict
 (`security.protocol`/`ssl.*`); the typed→librdkafka translation is owned by the
-command layer (`_kafka_ssl_conf`).
+command layer (`_kafka_ssl_conf`, which now takes the resolved `KafkaCluster`).
+
+**Cluster resolution + client seam (v3).** Multi-cluster selection is decoupled
+from client construction: `kafka_commands.resolve_cluster_name(cfg.kafka,
+explicit, binding_cluster)` returns the cluster **name** to use (precedence:
+`--cluster` flag > a pattern/reactor `.cluster` binding > `kafka.default_cluster`
+> the single defined cluster when exactly one exists), mirroring
+`db_commands.resolve_connection_name`. It raises `ConfigError` (exit 2) when no
+name resolves (>1 cluster, no default) or the resolved name is absent from
+`kafka.clusters`. Callers then index `cfg.kafka.clusters[name]` and build the
+client via `new_kafka_client(cluster, group_id=None)` (test seam — tests
+monkeypatch it). `_kafka_ssl_conf(cluster)` and `_resolve_timeout`/`_resolve_group`
+read the resolved cluster's knobs. The mock engine receives one pre-built
+`KafkaClient` per reactor (`kafka_clients: dict[reactor_name → KafkaClient]`;
+reactors sharing a cluster reuse a single client built via `clients_by_cluster`).
 
 - **`produce`** — JSON-encodes the value, registers a delivery-report callback,
   `flush(timeout=30)`, returns the `kafka.produce` shape. A delivery error **or**
@@ -905,6 +923,6 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
 - **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** — cannot intercept HTTPS → integration untested → false green.
 - **Cross-transport sagas** (Kafka trigger → HTTP callback) — no causal linkage → false green.
 - **Non-JSON Kafka values** (Avro/Protobuf/schema-registry) — emitted as `kafka.skipped` → false green.
-- **`match` is envelope-rooted under dialect `"2"`** (was: payload-rooted under `"1"`). The five `match` eval sites (HTTP stub `match.jq`, Kafka reactor `match`, `kafka.patterns[].match`, `kafka assert/consume --match`, `http call`/`request --match`) feed the whole envelope; `capture.*.from` shares the same root. `match.body` / `--contains` / `--path` / `--jq-path`+`--equals` / `--status` remain payload-rooted. A v1 config is rejected by `_check_version`; rewrite with `agctl config migrate`.
+- **`match` is envelope-rooted under dialect `"2"`+ (was: payload-rooted under `"1"`; unchanged by the v3 named-cluster schema lift). The five `match` eval sites (HTTP stub `match.jq`, Kafka reactor `match`, `kafka.patterns[].match`, `kafka assert/consume --match`, `http call`/`request --match`) feed the whole envelope; `capture.*.from` shares the same root. `match.body` / `--contains` / `--path` / `--jq-path`+`--equals` / `--status` remain payload-rooted. A v1/v2 config is rejected by `_check_version`; rewrite with `agctl config migrate`.
 - **Containerized SUT topology** — operator must target `host.docker.internal` / host LAN IP and avoid SUT that swallows connection errors → false green.
 - **Shared broker + pinned `consumer_group` reused across runs/devs** — partition split or resume-past-messages → silently missing/old reactions → false green (mitigated by unique-per-run default).

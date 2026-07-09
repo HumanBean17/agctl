@@ -51,10 +51,13 @@
 ```yaml
 # agctl.yaml
 # ---------------
-# Version is the jq-dialect switch: "2" = envelope-rooted `match` (`.body.x`
-# for HTTP, `.value.x` for Kafka). A major-version mismatch is a ConfigError
-# (exit 2) pointing at `agctl config migrate`; minor/patch are not tracked.
-version: "2"
+# Version is the config schema version. "3" = named `kafka.clusters` (the flat
+# `kafka:` block was lifted into `kafka.clusters.<name>` + `default_cluster`).
+# The `match` envelope-rooting introduced under "2" (`.body.x` for HTTP,
+# `.value.x` for Kafka) is unchanged in v3. A major-version mismatch is a
+# ConfigError (exit 2) pointing at `agctl config migrate`; minor/patch are not
+# tracked.
+version: "3"
 
 # ---------------------------------------------------------------------------
 # services — named HTTP base URLs for services under test.
@@ -72,30 +75,46 @@ services:
     timeout_seconds: 15
 
 # ---------------------------------------------------------------------------
-# kafka — broker configuration.
+# kafka — named clusters + patterns (v3). Mirrors database.connections:
+#   clusters.<name>: a named broker profile (brokers, TLS, timeout, group, schema registry)
+#   default_cluster: cluster used when no --cluster flag / pattern.cluster selects one
+#                    (required only when >1 cluster is defined; a single cluster auto-defaults)
+# Each cluster's fields support ${ENV_VAR} interpolation (see §2.2).
 # ---------------------------------------------------------------------------
 kafka:
-  brokers:
-    - "${KAFKA_BROKER_HOST}:9092"
-  default_consumer_group: "agctl-consumer"  # optional
-  schema_registry_url: "${SCHEMA_REGISTRY_URL}" # optional; omit if not used
-  timeout_seconds: 30                            # default consume/assert timeout
+  clusters:
+    default:
+      brokers:
+        - "${KAFKA_BROKER_HOST}:9092"
+      default_consumer_group: "agctl-consumer"  # optional
+      schema_registry_url: "${SCHEMA_REGISTRY_URL}" # optional; omit if not used
+      timeout_seconds: 30                            # default consume/assert timeout
 
-  # kafka.ssl — optional TLS/mTLS settings for brokers that require SSL.
-  #   Setting any field (to a non-empty value) enables TLS; security.protocol
-  #   defaults to "SSL" unless overridden. Hostname verification stays on
-  #   unless endpoint_identification_algorithm is set to "none" (self-signed/dev).
-  #   ca_location is optional: when unset, librdkafka falls back to the system
-  #   trust store (use it for publicly-trusted brokers like Confluent Cloud; pin
-  #   a CA for private-PKI brokers). All values support ${ENV_VAR} interpolation
-  #   and AGCTL_KAFKA__SSL__* overrides; an empty string counts as unset.
-  ssl:
-    ca_location: "${KAFKA_SSL_CA:-}"               # path to CA certificate (PEM); optional
-    certificate_location: "${KAFKA_SSL_CERT:-}"    # path to client certificate (mTLS)
-    key_location: "${KAFKA_SSL_KEY:-}"             # path to client private key (mTLS)
-    key_password: "${KAFKA_SSL_KEY_PASSWORD:-}"    # optional private-key password
-    # endpoint_identification_algorithm: "none"    # uncomment to disable hostname verification
-    # security_protocol: "SSL"                     # defaults to SSL; set SASL_SSL when adding SASL later
+      # kafka.clusters.<name>.ssl — optional TLS/mTLS settings, per cluster.
+      #   Setting any field (to a non-empty value) enables TLS; security.protocol
+      #   defaults to "SSL" unless overridden. Hostname verification stays on
+      #   unless endpoint_identification_algorithm is set to "none" (self-signed/dev).
+      #   ca_location is optional: when unset, librdkafka falls back to the system
+      #   trust store (use it for publicly-trusted brokers like Confluent Cloud; pin
+      #   a CA for private-PKI brokers). All values support ${ENV_VAR} interpolation
+      #   and AGCTL_KAFKA__CLUSTERS__<NAME>__SSL__* overrides; an empty string counts as unset.
+      ssl:
+        ca_location: "${KAFKA_SSL_CA:-}"               # path to CA certificate (PEM); optional
+        certificate_location: "${KAFKA_SSL_CERT:-}"    # path to client certificate (mTLS)
+        key_location: "${KAFKA_SSL_KEY:-}"             # path to client private key (mTLS)
+        key_password: "${KAFKA_SSL_KEY_PASSWORD:-}"    # optional private-key password
+        # endpoint_identification_algorithm: "none"    # uncomment to disable hostname verification
+        # security_protocol: "SSL"                     # defaults to SSL; set SASL_SSL when adding SASL later
+
+    # A second named cluster (optional). Patterns and reactors bind a cluster by name;
+    # the CLI `--cluster` flag overrides any binding. Omit `default_cluster` only when
+    # exactly one cluster is defined (it auto-defaults); with >1 cluster, `default_cluster`
+    # is required.
+    # analytics:
+    #   brokers:
+    #     - "${ANALYTICS_KAFKA_BROKER_HOST}:9092"
+
+  default_cluster: default
 
 # ---------------------------------------------------------------------------
 # kafka.patterns — named Kafka filter patterns, analogous to HTTP templates.
@@ -104,6 +123,8 @@ kafka:
 #          ({key, value, partition, offset, timestamp, headers}); so .value.eventType,
 #          .value.payload.orderId, .key, .headers.<name>. Supports {placeholder}
 #          substitution via --param at assert time.
+# cluster: optional named cluster this pattern binds to (default: default_cluster,
+#          or the single defined cluster). The CLI `--cluster` flag overrides it.
 # ---------------------------------------------------------------------------
   patterns:
     order-created:
@@ -172,6 +193,8 @@ mocks:
         description: "Mock the service that consumes order commands"
         topic: orders.commands
         consumer_group: agctl-mock-order-handler   # OPTIONAL; omit → unique per-run group
+        # cluster: analytics                          # OPTIONAL named cluster this reactor binds to
+                                                      # (default: kafka.default_cluster / single-cluster auto-default)
         match: '.value.command == "CREATE_ORDER"'    # envelope-rooted (whole Kafka message)
         # capture: same CaptureSpec shape as HTTP stubs; `from` shares the `match`
         # root — the Kafka message envelope ({key, value, partition, offset,
@@ -547,7 +570,7 @@ Consume messages from a topic. Returns as soon as `--expect-count` matching mess
 ```
 agctl kafka consume
     --topic <name>
-    [--timeout <seconds>]       # default: kafka.timeout_seconds from config
+    [--timeout <seconds>]       # default: resolved cluster's timeout_seconds from config
     [--lookback <seconds>]      # seek to now - lookback before reading; default: = --timeout
     [--match <jq-expr>]         # jq boolean predicate over the message envelope
                                 #   ({key, value, partition, offset, timestamp, headers}); only
@@ -557,6 +580,7 @@ agctl kafka consume
                                 #   messages are received within the window
     [--from-beginning]          # seek to earliest offset (default: seek to now - lookback)
     [--consumer-group <name>]   # override default consumer group (default: agctl-consumer)
+    [--cluster <name>]          # named kafka cluster (default: kafka.default_cluster / single-cluster)
 ```
 
 `--match` is a jq boolean expression evaluated against each message **envelope** (`{key, value, partition, offset, timestamp, headers}`) — so `.value.eventType`, `.key`, `.headers.rqUID`. Header keys are case-sensitive (as-produced). A **malformed expression** (syntax error) raises `ConfigError` (exit 2) before any polling; messages where the expression evaluates to `false` or raises a **runtime error** against that specific message are silently skipped. This enables partial matching — you do not need to know the full message structure.
@@ -594,6 +618,7 @@ agctl kafka produce
     --message '{...}'           # JSON string; value is published as-is
     [--key <string>]            # optional Kafka message key
     [--header key=value]        # repeatable; Kafka message headers
+    [--cluster <name>]          # named kafka cluster (default: kafka.default_cluster / single-cluster)
 ```
 
 **Example:**
@@ -628,6 +653,8 @@ agctl kafka assert
     --timeout <seconds>         # assert fails (AssertionError) if no match within this window
     [--from-beginning]          # seek to earliest offset (default: seek to now - lookback)
     [--consumer-group <name>]   # override default consumer group (default: agctl-consumer)
+    [--cluster <name>]          # named kafka cluster; overrides the pattern's bound cluster
+                                #   (default: pattern.cluster > kafka.default_cluster / single-cluster)
 ```
 
 **Examples:**
@@ -659,7 +686,9 @@ agctl kafka assert \
 
 **Offset & timing model (consume and assert):** By default the consumer seeks each partition to the timestamp `now - --lookback` (via `offsets_for_times`) and reads forward, rather than subscribing at "latest". This makes the common send-then-assert pattern reliable: an event published a moment before the command starts still falls inside the window. `--lookback` defaults to the resolved `--timeout` (look back as far as you wait forward); `--from-beginning` overrides to the earliest offset. For `assert`, committed offsets are ignored — each invocation re-seeks by time, so repeated asserts are independent and deterministic. On high-volume topics, narrow with `--match`/`--contains` to avoid matching stale events from prior runs.
 
-**TLS / transport model (produce, consume, assert):** All three commands connect to brokers using the `kafka.ssl` block (see §2.1). Setting any field to a non-empty value enables TLS and defaults `security.protocol` to `SSL` (mTLS); `ca_location` is optional and falls back to the system trust store when unset. Hostname verification is **on** by default (librdkafka default) — set `endpoint_identification_algorithm: "none"` only for self-signed or dev brokers. An empty string (e.g. an unresolved `${VAR:-}`) is treated as unset, so a partially-configured `ssl:` block never silently downgrades to plaintext nor disables verification. TLS configuration is unit-tested only; the live integration suite runs a plaintext broker.
+**TLS / transport model (produce, consume, assert):** All three commands connect to brokers using the resolved cluster's `ssl` block (see §2.1). Setting any field to a non-empty value enables TLS and defaults `security.protocol` to `SSL` (mTLS); `ca_location` is optional and falls back to the system trust store when unset. Hostname verification is **on** by default (librdkafka default) — set `endpoint_identification_algorithm: "none"` only for self-signed or dev brokers. An empty string (e.g. an unresolved `${VAR:-}`) is treated as unset, so a partially-configured `ssl:` block never silently downgrades to plaintext nor disables verification. TLS configuration is unit-tested only; the live integration suite runs a plaintext broker.
+
+**Cluster resolution (produce, consume, assert):** All three commands target a single named cluster per invocation. Resolution precedence: `--cluster` (explicit) > a pattern's bound `cluster` (`assert --pattern` only) > `kafka.default_cluster` > the single defined cluster when exactly one is configured. An unresolvable name (`>1 cluster` and no `--cluster`/`default_cluster`), or a name absent from `kafka.clusters`, raises `ConfigError` (exit 2). This mirrors DB connection resolution (`--connection` > template's `connection` > `defaults.database_connection`).
 
 ---
 
@@ -1093,7 +1122,7 @@ agctl mock run
 
 **Lifecycle:**
 - `--http-listen` is a **literal** `host:port` string (CLI args are not `${}`-interpolated, only YAML values).
-- `--only` restricts to one engine; `kafka`-extra / `kafka.brokers` checks are gated on engines actually started.
+- `--only` restricts to one engine; `kafka`-extra / per-reactor cluster `brokers` checks are gated on engines actually started.
 - **No `mocks` section** → emits `started` + `summary` with zero counts and exits `0` (idempotent no-op).
 - **`--only <engine>` with that engine absent** → `ConfigError` (exit 2).
 - **Startup hazard:** when backgrounding, wrap with `nohup`/`setsid` so the mock is not killed by `SIGHUP` when the launching shell exits, and capture the PID.
@@ -1357,7 +1386,7 @@ agctl config init
 
 #### `agctl config migrate`
 
-Rewrite a dialect-`"1"` config to dialect `"2"` (envelope-rooted `match`). Backs up the original to `<path>.bak` and writes the rewritten config back to `<path>`. A config already at `"2"` is a clean no-op (`already_v2: true`, `rewrites: []`). Refuses to clobber an existing `<path>.bak` (`ConfigError`, exit 2 — remove or rename it first); the backup is the only safety net for the reformat the rewrite performs.
+Rewrite a v1/v2 config to dialect `"3"` (named `kafka.clusters`). v3 restructured `Config.kafka` from a single flat object into a named map `kafka.clusters.<name>` (mirroring `database.connections`) plus `default_cluster`, and bumped the version. v1 configs additionally need the v2 jq-dialect rewrite (every `match` expression envelope-rooted: HTTP `.body`, Kafka `.value`); a v1 input is carried through BOTH the jq rewrite and the structural lift in one pass, a v2 input through the lift only. Backs up the original to `<path>.bak` and writes the rewritten config back to `<path>`. A config already at `"3"` is a clean no-op (`already_current: true`, `rewrites: []`). Refuses to clobber an existing `<path>.bak` (`ConfigError`, exit 2 — remove or rename it first); the backup is the only safety net for the reformat the rewrite performs.
 
 ```
 agctl config migrate
@@ -1365,15 +1394,17 @@ agctl config migrate
     [--dry-run]                 # preview the rewrite; do not write
 ```
 
-The rewrite walks the three `match`-site families and prepends the envelope prefix:
+The structural lift runs for any non-current source (v1 and v2 both may carry a flat `kafka:` block): when `kafka:` holds any of the five flat keys (`brokers`/`ssl`/`timeout_seconds`/`default_consumer_group`/`schema_registry_url`) and no `clusters` key, those keys move into `kafka.clusters.default` and `default_cluster: default` is set. A missing or already-clustered `kafka` contributes no rewrites and never raises.
+
+Additionally, for **v1 sources only** (v2 exprs are already envelope-rooted and would be double-prefixed), the rewrite walks the three `match`-site families and prepends the envelope prefix:
 
 - `mocks.http.stubs.<name>.match.jq` → prefix `.body | ` (e.g. `.amount > 1000` → `.body | .amount > 1000`).
 - `mocks.kafka.reactors.<name>.match` → prefix `.value | `.
 - `kafka.patterns.<name>.match` → prefix `.value | `.
 
-Then bumps `version` to `"2"`. `capture.*.from` and `match.body` are **not** visited (out of scope). Idempotent — expressions that already start with the prefix are not double-prefixed; an already-`"2"` config is returned unchanged.
+Then bumps `version` to `"3"`. `capture.*.from` and `match.body` are **not** visited (out of scope). Idempotent — jq-prefix expressions that already start with the prefix are not double-prefixed; the structural lift never double-lifts an already-clustered `kafka`; an already-`"3"` config is returned unchanged.
 
-**`cli_flags_note` (load-bearing caveat):** CLI `--match` flags (and the deprecated `--filter-key` alias) passed to `agctl http` / `agctl kafka` in shell scripts, agent prompts, or runbooks are **not** rewritten by this command (it walks the config file only). Prefix them manually: `.body | ` for HTTP, `.value | ` for Kafka. (`agctl mock run` has no `--match` CLI flag — mock matchers are config-file only, and ARE rewritten.)
+**`cli_flags_note` (load-bearing caveat):** CLI `--match` flags (and the deprecated `--filter-key` alias) passed to `agctl http` / `agctl kafka` in shell scripts, agent prompts, or runbooks are **not** rewritten by this command (it walks the config file only). The `.body | ` / `.value | ` prefix guidance applies only to **v1** inputs being lifted to v3 — v2/v3 exprs are already envelope-rooted. (`agctl mock run` has no `--match` CLI flag — mock matchers are config-file only, and ARE rewritten on v1 sources.)
 
 **`formatting_note`:** the rewritten file is emitted via `yaml.safe_dump`, which normalizes indentation/quotes and drops comments; the original is preserved verbatim in `<path>.bak`. Review the full diff before committing.
 
@@ -1385,13 +1416,14 @@ Then bumps `version` to `"2"`. `capture.*.from` and `match.body` are **not** vis
   "command": "config.migrate",
   "result": {
     "path": "./agctl.yaml",
-    "already_v2": false,
-    "from_version": "1",
-    "to_version": "2",
+    "already_current": false,
+    "from_version": "2",
+    "to_version": "3",
     "rewritten": [
-      {"path": "mocks.http.stubs.create-order.match.jq", "before": ".amount > 1000", "after": ".body | .amount > 1000"}
+      {"path": "kafka.clusters.default.brokers", "before": ["host:9092"], "after": ["host:9092"]},
+      {"path": "kafka.default_cluster", "before": null, "after": "default"}
     ],
-    "cli_flags_note": "CLI --match flags (and the deprecated --filter-key alias) on `agctl http` / `agctl kafka` … must be prefixed manually: `.body | ` for HTTP, `.value | ` for Kafka.",
+    "cli_flags_note": "CLI --match flags (and the deprecated --filter-key alias) on `agctl http` / `agctl kafka` … the `.body | ` / `.value | ` prefix applies only to v1 inputs; v2/v3 exprs are already envelope-rooted.",
     "formatting_note": "yaml.safe_dump reformats the file and drops comments; the original is preserved in <path>.bak …"
   },
   "duration_ms": 3
@@ -1520,6 +1552,7 @@ agctl discover --category <name> --name <item-name> [--overlay <path>]
     "name": "order-created",
     "description": "An ORDER_CREATED event for a specific order",
     "topic": "orders.created",
+    "cluster": "default",
     "params": ["orderId"],
     "example": "agctl kafka assert --pattern order-created --param orderId=X --timeout 10"
   },
@@ -1614,7 +1647,7 @@ Every invocation writes exactly one JSON object to stdout (the sole exception is
 | Type | Exit code | Applies when |
 |---|---|---|
 | `AssertionError` | 1 | An assertion was evaluated and failed — including `kafka assert` timing out (no matching message within the window), `kafka consume --expect-count` receiving fewer than expected, and `http call`/`http request` response assertions (`--status`/`--contains`/`--match`/`--jq-path`/`--equals`) evaluating false |
-| `ConfigError` | 2 | Config missing/invalid, an unresolvable **required** env var, or a major-version (jq-dialect) mismatch — a v1 config under the v2 tool is rejected with a pointer to `agctl config migrate` |
+| `ConfigError` | 2 | Config missing/invalid, an unresolvable **required** env var, or a major-version (config-schema) mismatch — a v1/v2 config under the v3 tool is rejected with a pointer to `agctl config migrate` |
 | `ConnectionError` | 2 | Could not reach a service, broker, or database |
 | `TimeoutError` | 1 | A non-assertion operation exceeded its time budget (e.g. a slow HTTP request or a hung DB query) |
 | `TemplateNotFound` | 2 | Named template/pattern/connection does not exist in config |
@@ -1904,7 +1937,7 @@ Every service entry always includes `response_time_ms` (an integer on success, `
 
 #### `discover.item`
 
-Shape varies by category. All items share `name`, `description`, `params[]`, and `example`. HTTP templates add `method`, `service`, `path`; Kafka patterns add `topic` and `match`; DB templates add `connection` and `sql` (so an agent can read a query's result columns before writing a `--path` value assertion).
+Shape varies by category. All items share `name`, `description`, `params[]`, and `example`. HTTP templates add `method`, `service`, `path`; Kafka patterns add `topic`, `cluster` (the resolved cluster name), and `match`; DB templates add `connection` and `sql` (so an agent can read a query's result columns before writing a `--path` value assertion).
 
 #### `discover.search`
 
@@ -2027,7 +2060,7 @@ Refused to overwrite (without `--force`):
 
 ```
 AGCTL_DEFAULTS__TIMEOUT_SECONDS=30
-AGCTL_KAFKA__DEFAULT_CONSUMER_GROUP=my-group
+AGCTL_KAFKA__CLUSTERS__DEFAULT__DEFAULT_CONSUMER_GROUP=my-group
 AGCTL_DATABASE__CONNECTIONS__MAIN_DB__PASSWORD=s3cr3t
 AGCTL_SERVICES__ORDER_SERVICE__BASE_URL=http://order-svc:8080
 ```
@@ -2404,7 +2437,7 @@ Full examples:
 
 ```bash
 AGCTL_DEFAULTS__TIMEOUT_SECONDS=30
-AGCTL_KAFKA__DEFAULT_CONSUMER_GROUP=ci-consumer
+AGCTL_KAFKA__CLUSTERS__DEFAULT__DEFAULT_CONSUMER_GROUP=ci-consumer
 AGCTL_DATABASE__CONNECTIONS__MAIN_DB__HOST=localhost
 AGCTL_DATABASE__CONNECTIONS__MAIN_DB__PASSWORD=supersecret
 AGCTL_SERVICES__ORDER_SERVICE__BASE_URL=http://order-svc:8080

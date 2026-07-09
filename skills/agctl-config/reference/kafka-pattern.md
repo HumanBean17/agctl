@@ -18,8 +18,13 @@ this file is the extraction detail.
    `.value.` (e.g. `.value.eventType`, `.value.payload.orderId == "{orderId}"`). Reach the
    message key / a header with `.key` / `.headers.<name>` (header keys are **case-sensitive** —
    use the producer's exact name). Use `{placeholder}` for the value that varies per assert.
-3. **description** — one line.
-4. **name** — kebab-case from the event (`ORDER_CREATED` → `order-created`;
+3. **cluster** *(optional)* — the named cluster this pattern binds to (a key under
+   `kafka.clusters`). Omit to fall back to `kafka.default_cluster`, or to the single
+   defined cluster when exactly one exists. Set it only when the event lives on a different
+   cluster than the default; a dangling name is a `config validate` error. The CLI
+   `kafka assert --cluster <name>` overrides whatever the pattern binds.
+4. **description** — one line.
+5. **name** — kebab-case from the event (`ORDER_CREATED` → `order-created`;
    `PAYMENT_FAILED` → `payment-failed`).
 
 A pattern answers "what does the event I care about look like?" — narrow enough to not match
@@ -55,13 +60,16 @@ stale events from prior runs on busy topics.
 - Prefer a sharp `--match` predicate over `--contains` (subset) for large/variable payloads —
   patterns live in config precisely so you can write one.
 
-## Migrating from dialect `"1"`
+## Migrating from dialect `"1"` / `"2"`
 
-If the repo's `agctl.yaml` is still at `version: "1"`, `agctl` rejects it (exit 2) with a
-pointer to `agctl config migrate`. Run that to rewrite every `kafka.patterns.<name>.match`
-(and reactor `match`) by prepending `.value | ` and bumping `version` to `"2"` — backups and
-`--dry-run` are supported; CLI `--match` flags in scripts/prompts are **not** rewritten
-(prefix those by hand).
+If the repo's `agctl.yaml` is still at `version: "1"` or `"2"`, `agctl` rejects it (exit 2)
+with a pointer to `agctl config migrate`. Run that to lift a flat `kafka:` block into
+`kafka.clusters.default` + `default_cluster: default` and bump `version` to `"3"`; a v1
+source additionally gets every `kafka.patterns.<name>.match` (and reactor `match`) rewritten
+by prepending `.value | ` (v2 exprs are already envelope-rooted and are left alone).
+Backups and `--dry-run` are supported; the result reports `already_current: true` for an
+already-v3 config. CLI `--match` flags in scripts/prompts are **not** rewritten — prefix
+those by hand, and only for v1 inputs (v2/v3 exprs are already envelope-rooted).
 
 ## What to clarify
 
@@ -81,5 +89,5 @@ Under `kafka.patterns:` (nested under `kafka:`).
 - The pattern's `topic` is what `kafka assert --pattern` uses (then omit `--topic`).
 - `kafka assert` reads a **window** (default lookback = `--timeout`); narrow with `match` so you
   don't match a stale event from a previous run.
-- If you also touch `kafka.ssl`, `security_protocol` (if set) must be one of
-  PLAINTEXT / SSL / SASL_SSL / SASL_PLAINTEXT.
+- If you also touch a cluster's `ssl` block (`kafka.clusters.<name>.ssl`),
+  `security_protocol` (if set) must be one of PLAINTEXT / SSL / SASL_SSL / SASL_PLAINTEXT.
