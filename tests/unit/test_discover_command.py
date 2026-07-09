@@ -191,6 +191,81 @@ def test_item_kafka_pattern(monkeypatch):
     )
 
 
+_KAFKA_TWO_CLUSTER_CONFIG = (
+    'version: "3"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+    "kafka:\n"
+    "  clusters:\n"
+    "    main:\n"
+    "      brokers:\n"
+    '        - "localhost:9092"\n'
+    "    analytics:\n"
+    "      brokers:\n"
+    '        - "analytics-host:9092"\n'
+    "  default_cluster: main\n"
+    "  patterns:\n"
+    "    evt:\n"
+    '      description: "An analytics event"\n'
+    "      topic: events\n"
+    '      match: \'.value.eventType == "EVT"\'\n'
+    "      cluster: analytics\n"
+)
+
+
+def test_kafka_pattern_item_shows_cluster(tmp_path, monkeypatch):
+    """Multi-cluster: discover surfaces the pattern's bound cluster name."""
+    result = _run_with(
+        ["--category", "kafka-patterns", "--name", "evt"],
+        _KAFKA_TWO_CLUSTER_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.item"
+    res = payload["result"]
+    assert res["name"] == "evt"
+    # The pattern binds cluster="analytics" — that wins over default_cluster.
+    assert res["cluster"] == "analytics"
+
+
+_KAFKA_DEFAULT_CLUSTER_CONFIG = (
+    'version: "3"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+    "kafka:\n"
+    "  clusters:\n"
+    "    main:\n"
+    "      brokers:\n"
+    '        - "localhost:9092"\n'
+    "  default_cluster: main\n"
+    "  patterns:\n"
+    "    evt:\n"
+    '      description: "A default-cluster event"\n'
+    "      topic: events\n"
+    '      match: \'.value.eventType == "EVT"\'\n'
+)
+
+
+def test_kafka_pattern_item_cluster_defaults(tmp_path, monkeypatch):
+    """A pattern with no cluster field resolves to default_cluster."""
+    result = _run_with(
+        ["--category", "kafka-patterns", "--name", "evt"],
+        _KAFKA_DEFAULT_CLUSTER_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["name"] == "evt"
+    # No pattern cluster + default_cluster="main" → resolved cluster "main".
+    assert res["cluster"] == "main"
+
+
 def test_item_service(monkeypatch):
     result = _run(["--category", "services", "--name", "order-service"], monkeypatch)
     assert result.exit_code == 0

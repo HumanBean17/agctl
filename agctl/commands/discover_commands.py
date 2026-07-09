@@ -28,6 +28,7 @@ import click
 from ..command import envelope, load_config_or_raise
 from ..config.models import parse_listen
 from ..errors import ConfigError, TemplateNotFound
+from .kafka_commands import resolve_cluster_name
 
 __all__ = ["discover"]
 
@@ -323,6 +324,11 @@ def _item_core(config_path: str | None, category: str, name: str, overlay_paths:
             "topic": pat.topic,
             "params": params,
             "example": _kafka_example(name, params),
+            # Resolved cluster name (DESIGN §6): pattern.cluster > default_cluster
+            # > single-cluster auto-default. Surfaces where this pattern asserts.
+            "cluster": resolve_cluster_name(
+                cfg.kafka, None, binding_cluster=pat.cluster
+            ),
         }
         if pat.match is not None:
             item["match"] = pat.match
