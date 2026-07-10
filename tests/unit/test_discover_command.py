@@ -914,7 +914,7 @@ def test_discover_item_log_sources_with_schema(tmp_path, monkeypatch):
         "logs:\n"
         "  sources:\n"
         "    svc:\n"
-        f"      path: \"{log_file}\"\n"
+        f"      path: \"{log_file.as_posix()}\"\n"
         '      type: "file"\n'
         '      format: "logstash"\n'
     )

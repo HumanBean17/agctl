@@ -843,7 +843,10 @@ def test_follow_yields_new_matches_then_stops(tmp_path):
         '"logger_name":"c.Foo","message":"err1"}\n'
     )
     full_content = initial_line + error_line
-    log_file.write_text(full_content)
+    # newline="" disables \n→\r\n translation on Windows so the on-disk bytes
+    # equal len(full_content), matching the faked st_size below (which counts LF).
+    # Otherwise the follow offset math misaligns and \r contaminates line parsing.
+    log_file.write_text(full_content, newline="")
 
     source = LogSource(path=str(log_file), format="logstash")
     stop_event = threading.Event()

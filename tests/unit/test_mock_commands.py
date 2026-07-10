@@ -1,6 +1,7 @@
 """Tests for agctl mock run command (Task 8)."""
 
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -640,6 +641,10 @@ mocks:
 
 
 # Task 7: mock start daemon argv forwards --overlay
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="managed daemon is POSIX-only; gated by _require_posix_daemon on Windows",
+)
 def test_mock_start_includes_overlay_in_daemon_argv(tmp_path, monkeypatch):
     """mock start includes --overlay in the daemon argv so the spawned daemon loads the overlay."""
     base = tmp_path / "agctl.yaml"
