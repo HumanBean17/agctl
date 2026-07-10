@@ -266,6 +266,55 @@ def test_kafka_pattern_item_cluster_defaults(tmp_path, monkeypatch):
     assert res["cluster"] == "main"
 
 
+_KAFKA_TWO_CLUSTER_NO_DEFAULT_CONFIG = (
+    'version: "3"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+    "kafka:\n"
+    "  clusters:\n"
+    "    main:\n"
+    "      brokers:\n"
+    '        - "localhost:9092"\n'
+    "    analytics:\n"
+    "      brokers:\n"
+    '        - "analytics-host:9092"\n'
+    # NO default_cluster: validation passes (a pattern is cluster-agnostic).
+    "  patterns:\n"
+    "    evt:\n"
+    '      description: "A cluster-agnostic event"\n'
+    "      topic: events\n"
+    '      match: \'.value.eventType == "EVT"\'\n'
+    # NO cluster field — disambiguated via --cluster at kafka assert time.
+)
+
+
+def test_kafka_pattern_item_unresolvable_cluster_is_null(tmp_path, monkeypatch):
+    """Two clusters, no default_cluster, pattern with no cluster field: discover
+    is resilient — it returns ok:true with cluster: null (still rendering topic/
+    match/params/example), NOT a hard ConfigError. The cluster is disambiguated
+    via --cluster at ``kafka assert`` time."""
+    result = _run_with(
+        ["--category", "kafka-patterns", "--name", "evt"],
+        _KAFKA_TWO_CLUSTER_NO_DEFAULT_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["ok"] is True
+    res = payload["result"]
+    assert res["name"] == "evt"
+    # No resolvable cluster (no pattern cluster, no default, >1 cluster) → null.
+    assert res["cluster"] is None
+    # Item still renders its full detail.
+    assert res["topic"] == "events"
+    assert res["match"] == '.value.eventType == "EVT"'
+    # No {brace} tokens in the match → empty params, simple example.
+    assert res["params"] == []
+    assert res["example"] == "agctl kafka assert --pattern evt --timeout 10"
+
+
 def test_item_service(monkeypatch):
     result = _run(["--category", "services", "--name", "order-service"], monkeypatch)
     assert result.exit_code == 0

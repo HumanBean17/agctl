@@ -276,7 +276,7 @@ def test_read_mode_template_with_read_only_connection_no_error():
 # --- mock server validation ---------------------------------------------------
 
 
-def test_mock_kafka_requires_resolvable_default_cluster_error():
+def test_mock_kafka_reactor_no_clusters_error():
     """mocks.kafka.reactors non-empty but no resolvable cluster -> error at
     mocks.kafka (no default/single cluster resolves)."""
     cfg = _cfg(

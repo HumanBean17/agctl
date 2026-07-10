@@ -1167,17 +1167,17 @@ def test_resolve_cluster_name_explicit_wins():
         },
         default_cluster="a",
     )
-    assert kafka_commands.resolve_cluster_name(k, "b") == "b"
+    assert kafka_commands.resolve_cluster_name(k, explicit="b") == "b"
     # binding_cluster beats default
-    assert kafka_commands.resolve_cluster_name(k, None, "b") == "b"
+    assert kafka_commands.resolve_cluster_name(k, binding_cluster="b") == "b"
     # default when no explicit/binding
-    assert kafka_commands.resolve_cluster_name(k, None) == "a"
+    assert kafka_commands.resolve_cluster_name(k) == "a"
 
 
 def test_resolve_cluster_name_single_cluster_auto_default():
     """One cluster defined, no default_cluster -> that cluster auto-resolves."""
     k = KafkaConfig(clusters={"only": KafkaCluster(brokers=["h:9092"])})
-    assert kafka_commands.resolve_cluster_name(k, None) == "only"
+    assert kafka_commands.resolve_cluster_name(k) == "only"
 
 
 def test_resolve_cluster_name_unknown_cluster_errors():
@@ -1188,7 +1188,7 @@ def test_resolve_cluster_name_unknown_cluster_errors():
         default_cluster="a",
     )
     with pytest.raises(ConfigError) as exc:
-        kafka_commands.resolve_cluster_name(k, "ghost")
+        kafka_commands.resolve_cluster_name(k, explicit="ghost")
     assert "Unknown kafka cluster: ghost" in exc.value.message
     assert exc.value.detail["cluster"] == "ghost"
 
@@ -1202,7 +1202,7 @@ def test_resolve_cluster_name_no_cluster_specified_errors():
         }
     )
     with pytest.raises(ConfigError) as exc:
-        kafka_commands.resolve_cluster_name(k, None)
+        kafka_commands.resolve_cluster_name(k)
     assert exc.value.message == "No kafka cluster specified"
     assert exc.value.detail == {}
 
@@ -1255,6 +1255,28 @@ def test_kafka_produce_explicit_cluster(install_fake, tmp_path):
             "--topic", "t",
             "--message", '{"a":1}',
             "--cluster", "analytics",
+        ]
+    )
+    payload = _payload(result)
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    # The factory received the analytics cluster (broker-b), not main (broker-a).
+    assert cap["cluster"].brokers == ["broker-b:9092"]
+
+
+def test_kafka_consume_explicit_cluster(install_fake, tmp_path):
+    """`consume --cluster analytics` selects the analytics cluster: the fake
+    client is built from analytics's brokers (broker-b), not the default main
+    (broker-a). Mirrors ``test_kafka_produce_explicit_cluster``."""
+    cap = install_fake([])
+    cfg = _write_two_cluster_cfg(tmp_path)
+    result = _run(
+        [
+            "--config", str(cfg),
+            "kafka", "consume",
+            "--topic", "t",
+            "--cluster", "analytics",
+            "--timeout", "1",
         ]
     )
     payload = _payload(result)

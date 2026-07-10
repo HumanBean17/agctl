@@ -317,6 +317,21 @@ def _item_core(config_path: str | None, category: str, name: str, overlay_paths:
             )
         pat = cfg.kafka.patterns[name]
         params = _kafka_params(pat)
+        # Resolved cluster name (DESIGN §6): pattern.cluster > default_cluster
+        # > single-cluster auto-default. Surfaces where this pattern asserts.
+        # A pattern is legitimately cluster-agnostic (disambiguated via
+        # ``--cluster`` at ``kafka assert`` time), and a config with >1 cluster
+        # and no ``default_cluster`` passes validation — so an inspection command
+        # must NOT hard-fail on the unresolvable case. On ConfigError, set
+        # ``cluster = None``: the item still renders its topic/match/params/
+        # example, and ``cluster: null`` signals "no implicit cluster — pass
+        # ``--cluster`` at assert time".
+        try:
+            cluster = resolve_cluster_name(
+                cfg.kafka, binding_cluster=pat.cluster
+            )
+        except ConfigError:
+            cluster = None
         item = {
             "category": "kafka-patterns",
             "name": name,
@@ -324,11 +339,7 @@ def _item_core(config_path: str | None, category: str, name: str, overlay_paths:
             "topic": pat.topic,
             "params": params,
             "example": _kafka_example(name, params),
-            # Resolved cluster name (DESIGN §6): pattern.cluster > default_cluster
-            # > single-cluster auto-default. Surfaces where this pattern asserts.
-            "cluster": resolve_cluster_name(
-                cfg.kafka, None, binding_cluster=pat.cluster
-            ),
+            "cluster": cluster,
         }
         if pat.match is not None:
             item["match"] = pat.match

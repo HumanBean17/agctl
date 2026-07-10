@@ -44,7 +44,8 @@ __all__ = [
 
 def resolve_cluster_name(
     cfg_kafka: "KafkaConfig",
-    explicit: str | None,
+    *,
+    explicit: str | None = None,
     binding_cluster: str | None = None,
 ) -> str:
     """Resolve the Kafka cluster **name** to use (DESIGN §6, D2/D3).
@@ -177,7 +178,7 @@ def _kafka_produce_core(
 @click.option("--message", "message", required=True, help="JSON message body")
 @click.option("--key", "key", default=None, help="Message key")
 @click.option("--header", "header", multiple=True, help="k=v message header")
-@click.option("--cluster", "cluster", default=None, help="Named kafka cluster (default: kafka.default_cluster)")
+@click.option("--cluster", "cluster", default=None, help="Cluster name override")
 @click.pass_context
 def kafka_produce(
     ctx: click.Context,
@@ -309,7 +310,7 @@ def _kafka_consume_core(
 @click.option("--expect-count", "expect_count", type=int, default=None, help="Min expected count")
 @click.option("--from-beginning", "from_beginning", is_flag=True, default=False)
 @click.option("--consumer-group", "consumer_group", default=None, help="Consumer group override")
-@click.option("--cluster", "cluster", default=None, help="Named kafka cluster (default: kafka.default_cluster)")
+@click.option("--cluster", "cluster", default=None, help="Cluster name override")
 @click.pass_context
 def kafka_consume(
     ctx: click.Context,
@@ -608,7 +609,7 @@ def _kafka_assert_core(
     default=None,
     help="Named custom assertion mode",
 )
-@click.option("--cluster", "cluster", default=None, help="Named kafka cluster (default: kafka.default_cluster)")
+@click.option("--cluster", "cluster", default=None, help="Cluster name override")
 @click.pass_context
 def kafka_assert(
     ctx: click.Context,

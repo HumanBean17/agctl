@@ -115,7 +115,7 @@ def _prepend(expr: str, prefix: str) -> str:
     return expr if expr.startswith(prefix) else prefix + expr
 
 
-def _migrate_http_stubs(config: dict[str, Any], rewrites: list[dict[str, str]]) -> None:
+def _migrate_http_stubs(config: dict[str, Any], rewrites: list[dict[str, Any]]) -> None:
     """Walk ``mocks.http.stubs.<name>.match.jq`` and prepend the HTTP prefix."""
     stubs = (
         config.get("mocks", {}).get("http", {}).get("stubs", {})
@@ -138,7 +138,7 @@ def _migrate_http_stubs(config: dict[str, Any], rewrites: list[dict[str, str]]) 
 
 
 def _migrate_kafka_reactors(
-    config: dict[str, Any], rewrites: list[dict[str, str]]
+    config: dict[str, Any], rewrites: list[dict[str, Any]]
 ) -> None:
     """Walk ``mocks.kafka.reactors.<name>.match`` and prepend the Kafka prefix."""
     reactors = (
@@ -159,7 +159,7 @@ def _migrate_kafka_reactors(
 
 
 def _migrate_kafka_patterns(
-    config: dict[str, Any], rewrites: list[dict[str, str]]
+    config: dict[str, Any], rewrites: list[dict[str, Any]]
 ) -> None:
     """Walk ``kafka.patterns.<name>.match`` and prepend the Kafka prefix."""
     patterns = config.get("kafka", {}).get("patterns", {})
@@ -250,7 +250,10 @@ def migrate_config(config: dict[str, Any]) -> MigrateResult:
     rewrites: list[dict[str, Any]] = []
 
     # jq-prefix walkers run ONLY on v1 sources: v2+ exprs are already
-    # envelope-rooted, so force-prepending would double-prefix them.
+    # envelope-rooted, so force-prepending would double-prefix them. A
+    # missing/legacy (source_major "" or "0") version is assumed already
+    # envelope-rooted (v2-style) and intentionally NOT jq-prefixed — do NOT
+    # broaden this gate to include them.
     if source_major == "1":
         # Traversal order per the brief: HTTP stubs -> Kafka reactors -> kafka.patterns.
         _migrate_http_stubs(new_config, rewrites)

@@ -477,9 +477,18 @@ def mock_run(
             kafka_clients = {}
             clients_by_cluster: dict[str, KafkaClient] = {}
             for reactor_name, reactor in cfg.mocks.kafka.reactors.items():
-                cluster_name = resolve_cluster_name(
-                    cfg.kafka, None, binding_cluster=reactor.cluster
-                )
+                try:
+                    cluster_name = resolve_cluster_name(
+                        cfg.kafka, binding_cluster=reactor.cluster
+                    )
+                except ConfigError as e:
+                    # load_config does NOT run validate_config, so mock_run is
+                    # the primary error surface for `agctl mock run`. Re-raise
+                    # with reactor context so a dangling reactor.cluster or
+                    # unresolvable (no default/single) cluster names the reactor.
+                    raise ConfigError(
+                        e.message, {**e.detail, "reactor": reactor_name}
+                    ) from e
                 cluster = cfg.kafka.clusters[cluster_name]
                 # Per-reactor brokers guard (spec §11): a reactor whose resolved
                 # cluster has empty brokers must fail fast with a clear
