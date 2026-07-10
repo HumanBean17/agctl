@@ -154,8 +154,8 @@ def test_config_init_writes_sample(tmp_path):
     assert payload["result"]["created"] is True
     assert payload["result"]["path"] == str(dest)
     # file content is the packaged sample, verbatim, and parses as YAML
-    assert dest.read_text() == _load_sample()
-    yaml.safe_load(dest.read_text())
+    assert dest.read_text(encoding="utf-8") == _load_sample()
+    yaml.safe_load(dest.read_text(encoding="utf-8"))
 
 
 def test_config_init_generates_valid_config(tmp_path):
@@ -188,7 +188,7 @@ def test_config_init_force_overwrites(tmp_path):
     payload = json.loads(result.output)
     assert result.exit_code == 0
     assert payload["result"]["created"] is True
-    assert dest.read_text() == _load_sample()
+    assert dest.read_text(encoding="utf-8") == _load_sample()
 
 
 def test_config_init_default_path():
@@ -205,7 +205,7 @@ def test_sample_matches_readme_block():
     """Drift guard: the packaged sample must stay byte-identical to the
     copy-paste block in README.md, so users never see two diverging samples."""
     readme = Path(__file__).parent.parent.parent / "README.md"
-    text = readme.read_text()
+    text = readme.read_text(encoding="utf-8")
     start = text.index("```yaml", text.index("Complete, copy-paste-ready config"))
     fence_start = start + len("```yaml")
     fence_end = text.index("```", fence_start)
