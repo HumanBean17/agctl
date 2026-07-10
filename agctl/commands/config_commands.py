@@ -29,7 +29,7 @@ import yaml
 
 from ..config import ConfigError, load_config
 from ..config.loader import compose_config, discover_config_path
-from ..config.migrate import migrate_match_exprs
+from ..config.migrate import migrate_config
 from ..config.validator import validate_config
 from ..mock.capture_validate import collect_capture_placement_errors
 from ..mock.jq_precompile import collect_jq_compile_errors
@@ -287,18 +287,32 @@ def config_init(ctx: click.Context, output: str | None, force: bool) -> None:
 
 # --- config migrate --------------------------------------------------------
 
-#: Fixed operator-facing reminder that CLI ``--match`` flags are NOT rewritten
-#: by ``agctl config migrate`` (the migration only walks the config file). Note
-#: ``agctl mock run`` has NO ``--match`` CLI flag (mock matchers are config-file
-#: only — and ARE rewritten); the deprecated ``--filter-key`` alias on
-#: ``agctl kafka consume`` is, like ``--match``, envelope-rooted under v2 and
-#: equally out of this command's reach.
-_CLI_FLAGS_NOTE = (
+#: Base operator-facing reminder, always emitted: CLI ``--match`` flags are
+#: NOT rewritten by ``agctl config migrate`` (the migration only walks the
+#: config file). Note ``agctl mock run`` has NO ``--match`` CLI flag (mock
+#: matchers are config-file only — and ARE rewritten); the deprecated
+#: ``--filter-key`` alias on ``agctl kafka consume`` is, like ``--match``,
+#: envelope-rooted under v2 and equally out of this command's reach. This base
+#: text contains NO prefix instruction — that is appended (see below) only for
+#: v1 sources, whose CLI flags genuinely still need a manual envelope prefix.
+_CLI_FLAGS_NOTE_BASE = (
     "CLI --match flags (and the deprecated --filter-key alias) on "
     "`agctl http` / `agctl kafka` live in shell scripts and agent prompts — "
-    "this command cannot reach them. Prefix those manually with `.body | ` "
-    "(HTTP) or `.value | ` (Kafka). Mock `match` expressions live in the "
-    "config file and ARE rewritten by this command."
+    "this command cannot reach them (it rewrites the config file only). Mock "
+    "`match` expressions live in the config file and ARE rewritten by this "
+    "command."
+)
+
+#: Appended to :data:`_CLI_FLAGS_NOTE_BASE` ONLY for v1 sources. ``migrate``
+#: jq-prefixes match expressions solely for v1 inputs (v2/v3 exprs are already
+#: envelope-rooted); telling a v2->v3 migrator to prefix would double-prefix
+#: working scripts. Composed in :func:`config_migrate` gated on
+#: ``from_version.split(".")[0] == "1"`` (mirroring ``migrate_config``'s own
+#: ``source_major == "1"`` gate).
+_CLI_FLAGS_NOTE_V1_PREFIX = (
+    " For v1 sources being lifted to v3, prefix those CLI flags manually with "
+    "`.body | ` (HTTP) or `.value | ` (Kafka); v2/v3 exprs are already "
+    "envelope-rooted and need no prefix."
 )
 
 #: yaml.safe_dump reformats the file and drops comments; the original is
@@ -317,11 +331,11 @@ _FORMATTING_NOTE = (
 def config_migrate(
     ctx: click.Context, config_path: str | None, dry_run: bool
 ) -> None:
-    """Rewrite a v1 agctl.yaml to dialect \"2\" (envelope-rooted match exprs).
+    """Rewrite a v1/v2 agctl.yaml to v3 (named kafka clusters; envelope-rooted match).
 
     Backs up the original to ``<path>.bak`` and writes the rewritten config
     back to ``<path>``. With ``--dry-run`` the rewrite is reported but nothing
-    is written. A config already at dialect \"2\" is a clean no-op.
+    is written. A config already at dialect \"3\" is a clean no-op.
     """
     start = time.monotonic()
     explicit = config_path or ctx.obj.get("config_path")
@@ -329,18 +343,28 @@ def config_migrate(
         path = discover_config_path(explicit=explicit, env=os.environ)
         raw = path.read_text(encoding="utf-8")
         parsed = yaml.safe_load(raw) or {}
-        result = migrate_match_exprs(parsed)
-        # Write only when migrating for real (not already_v2, not --dry-run).
-        will_write = not result.already_v2 and not dry_run
+        result = migrate_config(parsed)
+        # Write only when migrating for real (not already_current, not --dry-run).
+        will_write = not result.already_current and not dry_run
+        # The manual-prefix instruction applies ONLY to v1 sources (those are
+        # the inputs whose match expressions migrate_config actually jq-prefixed).
+        # For v2->v3 the exprs are already envelope-rooted, so emitting the
+        # prefix guidance would steer operators into double-prefixing working
+        # scripts. Gate on the from_version major, exactly as migrate_config
+        # gates its own jq-prefix walkers on source_major == "1".
+        is_v1_source = str(result.from_version).split(".")[0] == "1"
+        cli_flags_note = _CLI_FLAGS_NOTE_BASE + (
+            _CLI_FLAGS_NOTE_V1_PREFIX if is_v1_source else ""
+        )
         base_result = {
             "path": str(path),
-            "already_v2": result.already_v2,
+            "already_current": result.already_current,
             "from_version": result.from_version,
             "to_version": result.to_version,
             "rewritten": result.rewrites,
-            "cli_flags_note": _CLI_FLAGS_NOTE,
+            "cli_flags_note": cli_flags_note,
             # Surfaced only when the file is actually rewritten — on --dry-run
-            # and already_v2 nothing is reformatted, so the note would be noise.
+            # and already_current nothing is reformatted, so the note would be noise.
             "formatting_note": _FORMATTING_NOTE if will_write else None,
         }
         if will_write:

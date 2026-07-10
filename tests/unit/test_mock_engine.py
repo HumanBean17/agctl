@@ -64,12 +64,14 @@ class FakeKafkaClient:
         self._probe_raises = probe_raises
         self._consume_loop_returns_immediately = consume_loop_returns_immediately
         self.probe_called = False
+        self.probed_topic = None
         self.consume_loop_called = False
         self._stop_signal = None
 
     def probe(self, topic, group_id):
         """Fake probe - can raise if configured."""
         self.probe_called = True
+        self.probed_topic = topic  # records which reactor's topic was probed
         if self._probe_raises:
             raise self._probe_raises
 
@@ -249,7 +251,7 @@ def test_noop_engine_started_and_summary_with_zero_counts():
         run_http=False,
         run_kafka=False,
         http_listen="127.0.0.1:18080",
-        kafka_client=None,
+        kafka_clients=None,
         emit_fn=capture_emit,
         run_id="test-run-123",
     )
@@ -304,7 +306,7 @@ def test_http_only_engine_emits_started_with_stubs_count():
         run_http=True,
         run_kafka=False,
         http_listen="127.0.0.1:0",
-        kafka_client=None,
+        kafka_clients=None,
         emit_fn=capture_emit,
         run_id="test-run-456",
     )
@@ -367,7 +369,7 @@ def test_probe_then_bind_probe_failure_no_started_no_http_bind():
             run_http=False,  # Only test kafka probe failure
             run_kafka=True,
             http_listen="127.0.0.1:0",
-            kafka_client=fake_client,
+            kafka_clients={"reactor1": fake_client},
             emit_fn=capture_emit,
             run_id="test-run-789",
         )
@@ -417,7 +419,7 @@ def test_probe_then_bind_probe_success_then_http_bind():
             run_http=True,
             run_kafka=True,
             http_listen="127.0.0.1:0",
-            kafka_client=fake_client,
+            kafka_clients={"reactor1": fake_client},
             emit_fn=capture_emit,
             run_id="test-run-abc",
         )
@@ -467,7 +469,7 @@ def test_single_writer_concurrent_emission_no_interleaving():
         run_http=False,
         run_kafka=False,
         http_listen="127.0.0.1:0",
-        kafka_client=None,
+        kafka_clients=None,
         emit_fn=capture_emit,
         run_id="test-run-concurrent",
     )
@@ -525,7 +527,7 @@ def test_fail_fast_fatal_error_returns_exit_1():
         run_http=False,
         run_kafka=True,
         http_listen="127.0.0.1:0",
-        kafka_client=fake_client,
+        kafka_clients={"reactor1": fake_client},
         emit_fn=capture_emit,
         run_id="test-run-failfast",
         fail_fast=True,
@@ -574,7 +576,7 @@ def test_non_fatal_kafka_error_returns_exit_1():
         run_http=False,
         run_kafka=True,
         http_listen="127.0.0.1:0",
-        kafka_client=fake_client,
+        kafka_clients={"reactor1": fake_client},
         emit_fn=capture_emit,
         run_id="test-run-nonfatal",
         fail_fast=False,  # default continue mode: non-fatal error → COMMIT, not STOP
@@ -628,7 +630,7 @@ def test_winddown_kafka_error_after_stop_yields_exit_1():
         run_http=False,
         run_kafka=True,
         http_listen="127.0.0.1:0",
-        kafka_client=fake_client,
+        kafka_clients={"reactor1": fake_client},
         emit_fn=capture_emit,
         run_id="test-run-winddown",
         fail_fast=False,
@@ -698,7 +700,7 @@ def test_reactor_thread_death_emits_fatal_kafka_error_exit_1():
         run_http=False,
         run_kafka=True,
         http_listen="127.0.0.1:0",
-        kafka_client=fake_client,
+        kafka_clients={"failing-reactor": fake_client, "healthy-reactor": fake_client},
         emit_fn=capture_emit,
         run_id="test-run-thread-death",
         fail_fast=False,  # default: other reactors must continue
@@ -748,7 +750,7 @@ def test_summary_tally_counts_all_events():
         run_http=False,
         run_kafka=False,
         http_listen="127.0.0.1:0",
-        kafka_client=None,
+        kafka_clients=None,
         emit_fn=capture_emit,
         run_id="test-run-tally",
     )
@@ -804,7 +806,7 @@ def test_port_in_use_raises_config_error_with_hint():
             run_http=True,
             run_kafka=False,
             http_listen="127.0.0.1:18080",
-            kafka_client=None,
+            kafka_clients=None,
             emit_fn=capture_emit,
             run_id="test-run-portinuse",
         )
@@ -830,7 +832,7 @@ def test_duration_timer_stops_engine():
         run_http=False,
         run_kafka=False,
         http_listen="127.0.0.1:0",
-        kafka_client=None,
+        kafka_clients=None,
         emit_fn=capture_emit,
         run_id="test-run-duration",
         duration=0.1,  # 100ms
@@ -874,7 +876,7 @@ def test_signal_handlers_set_and_restored():
         run_http=False,
         run_kafka=False,
         http_listen="127.0.0.1:0",
-        kafka_client=None,
+        kafka_clients=None,
         emit_fn=capture_emit,
         run_id="test-run-signals",
     )
@@ -946,7 +948,7 @@ def test_run_id_defaults_to_pid():
             run_http=False,
             run_kafka=False,
             http_listen="127.0.0.1:0",
-            kafka_client=None,
+            kafka_clients=None,
             emit_fn=capture_emit,
             run_id=None,  # Should default to PID
         )
@@ -995,7 +997,7 @@ def test_step0_malformed_http_stub_match_jq_raises_config_error():
         run_http=True,
         run_kafka=False,
         http_listen="127.0.0.1:0",
-        kafka_client=None,
+        kafka_clients=None,
         emit_fn=capture_emit,
         run_id="test-run-step0-bad-http",
     )
@@ -1041,7 +1043,7 @@ def test_step0_malformed_kafka_reactor_match_raises_config_error():
         run_http=False,
         run_kafka=True,
         http_listen="127.0.0.1:0",
-        kafka_client=fake_client,
+        kafka_clients={"r1": fake_client},
         emit_fn=capture_emit,
         run_id="test-run-step0-bad-kafka",
     )
@@ -1089,7 +1091,7 @@ def test_step0_missing_jq_library_raises_config_error(monkeypatch):
         run_http=True,
         run_kafka=False,
         http_listen="127.0.0.1:0",
-        kafka_client=None,
+        kafka_clients=None,
         emit_fn=capture_emit,
         run_id="test-run-step0-no-jq",
     )
@@ -1145,7 +1147,7 @@ def test_step0_body_only_stubs_do_not_import_jq(monkeypatch):
             run_http=True,
             run_kafka=False,
             http_listen="127.0.0.1:0",
-            kafka_client=None,
+            kafka_clients=None,
             emit_fn=capture_emit,
             run_id="test-run-step0-body-only",
         )
@@ -1202,7 +1204,7 @@ def test_step0_inline_object_capture_violation_raises_config_error():
         run_http=True,
         run_kafka=False,
         http_listen="127.0.0.1:0",
-        kafka_client=None,
+        kafka_clients=None,
         emit_fn=capture_emit,
         run_id="test-run-step0-object-placement",
     )
@@ -1229,3 +1231,100 @@ def test_default_emit_renders_non_ascii_utf8(capsys):
     assert "Иван" in out
     assert "\\u" not in out
     assert json.loads(out)["body"] == {"name": "Иван"}
+
+
+# =============================================================================
+# Per-cluster reactor wiring (Task 3)
+# =============================================================================
+
+
+def test_reactors_use_per_cluster_clients():
+    """Each reactor is wired to its own client from ``kafka_clients`` keyed by
+    reactor name. Two reactors (rA, rB) each get a distinct FakeKafkaClient;
+    after ``start()`` each client must have probed ITS reactor's topic (proving
+    the reactor→client map was honored, not a single shared client)."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    clientA = FakeKafkaClient()
+    clientB = FakeKafkaClient()
+
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "rA": KafkaReactor(
+                    topic="topicA",
+                    reaction=KafkaReaction(topic="outA", value={}),
+                ),
+                "rB": KafkaReactor(
+                    topic="topicB",
+                    reaction=KafkaReaction(topic="outB", value={}),
+                ),
+            }
+        )
+    )
+
+    engine = MockEngine(
+        mocks=mocks,
+        run_http=False,
+        run_kafka=True,
+        http_listen="127.0.0.1:0",
+        kafka_clients={"rA": clientA, "rB": clientB},
+        emit_fn=capture_emit,
+        run_id="test-run-per-cluster",
+    )
+
+    engine.start()
+
+    # Both reactors appear in the started line.
+    started = [l for l in captured_lines if l.get("event") == "started"]
+    assert len(started) == 1
+    reactor_names = {r["name"] for r in started[0]["kafka"]["reactors"]}
+    assert reactor_names == {"rA", "rB"}
+
+    # Each client probed its own reactor's topic — proving the per-reactor
+    # client map was honored (a single shared client would leave one un-probed).
+    assert clientA.probe_called is True
+    assert clientB.probe_called is True
+    assert clientA.probed_topic == "topicA"
+    assert clientB.probed_topic == "topicB"
+
+    # Cleanup
+    engine._stop.set()
+    engine.run()
+    engine.shutdown()
+
+
+def test_run_kafka_without_kafka_clients_raises():
+    """run_kafka=True but kafka_clients is None -> ConfigError (guard holds)."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "r1": KafkaReactor(
+                    topic="t",
+                    reaction=KafkaReaction(topic="out", value={}),
+                )
+            }
+        )
+    )
+
+    engine = MockEngine(
+        mocks=mocks,
+        run_http=False,
+        run_kafka=True,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        emit_fn=capture_emit,
+        run_id="test-run-no-clients",
+    )
+
+    with pytest.raises(ConfigError):
+        engine.start()
+

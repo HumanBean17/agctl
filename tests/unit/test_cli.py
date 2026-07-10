@@ -52,7 +52,7 @@ def test_validate_structural_error_envelope(tmp_path):
     cfg_path = _write_config(
         tmp_path,
         """
-version: "2"
+version: "3"
 services:
   order-service:
     base_url: "http://localhost:8081"
@@ -121,18 +121,20 @@ def test_show_does_not_mask_ssl_key_path(tmp_path):
     'key' fragment in _is_secret must not match the key_* prefix."""
     cfg_path = _write_config(
         tmp_path,
-        'version: "2"\n'
+        'version: "3"\n'
         "kafka:\n"
-        "  brokers: [host:9092]\n"
-        "  ssl:\n"
-        "    ca_location: /etc/ssl/ca.pem\n"
-        "    certificate_location: /etc/ssl/client.crt\n"
-        "    key_location: /etc/ssl/client.key\n"
-        "    key_password: hunter2\n",
+        "  clusters:\n"
+        "    default:\n"
+        "      brokers: [host:9092]\n"
+        "      ssl:\n"
+        "        ca_location: /etc/ssl/ca.pem\n"
+        "        certificate_location: /etc/ssl/client.crt\n"
+        "        key_location: /etc/ssl/client.key\n"
+        "        key_password: hunter2\n",
     )
     result = CliRunner().invoke(cli, ["config", "show", "--config", str(cfg_path)])
     payload = json.loads(result.output)
-    ssl = payload["result"]["kafka"]["ssl"]
+    ssl = payload["result"]["kafka"]["clusters"]["default"]["ssl"]
     assert ssl["ca_location"] == "/etc/ssl/ca.pem"          # path, not masked
     assert ssl["certificate_location"] == "/etc/ssl/client.crt"
     assert ssl["key_location"] == "/etc/ssl/client.key"      # path, NOT masked

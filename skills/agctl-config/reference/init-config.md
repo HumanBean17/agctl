@@ -24,8 +24,11 @@ scan plan.
 2. **HTTP templates** → `templates:` — run the `http` extraction (see `http-template.md`) over
    controllers / OpenAPI. In a monorepo, emit one `services:` key per distinct `base_url`;
    controllers sharing a port / base URL fold into one service.
-3. **Kafka** → `kafka:` — brokers from compose / props → `kafka.brokers`; producers / topics →
-   `kafka.patterns:` (see `kafka-pattern.md`).
+3. **Kafka** → `kafka:` — brokers from compose / props → `kafka.clusters.<name>` (a named
+   map mirroring `database.connections`); set `default_cluster` to one of the cluster names
+   (or omit it when only one cluster is defined — it auto-defaults). Producers / topics →
+   `kafka.patterns:` (see `kafka-pattern.md`); a pattern may bind a `cluster` if its event
+   lives on a non-default cluster.
 4. **Database** → `database:` — datasource config (Spring `spring.datasource`, `DATABASE_URL`, a
    compose `postgres` service) → `database.connections:` (mark one `default: true`); queries /
    repos → `database.templates:` (see `db-template.md`).
@@ -58,11 +61,11 @@ Never put real secret values in it.
 - Which DB connection is the default.
 - `health_path` when it's not Spring / Actuator.
 - Env-var names for secrets if the repo doesn't already define them.
-- Whether to include the optional `kafka.ssl` block (only if brokers need TLS).
+- Whether to include the optional per-cluster `kafka.clusters.<name>.ssl` block (only if brokers need TLS).
 
 ## Close-out
 
-- Put `version: "2"` at the top.
+- Put `version: "3"` at the top.
 - Write `.env.example` (above), then have the user copy & fill it: `cp .env.example .env`
   (edit the secrets).
 - Source it before validating, so required `${VAR}`s resolve: `set -a; . ./.env; set +a`.

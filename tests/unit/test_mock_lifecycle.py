@@ -11,8 +11,8 @@ from click.testing import CliRunner
 from agctl.cli import cli
 from agctl.mock.daemon import is_alive
 
-# Test fixture config (minimal, version 2.0)
-MINIMAL_CONFIG = """version: "2.0"
+# Test fixture config (minimal, version 3)
+MINIMAL_CONFIG = """version: "3"
 mocks:
   http:
     listen: "127.0.0.1:18080"
@@ -26,7 +26,12 @@ mocks:
 """
 
 # Config without http section
-NO_HTTP_CONFIG = """version: "2.0"
+NO_HTTP_CONFIG = """version: "3"
+kafka:
+  clusters:
+    default:
+      brokers:
+        - "localhost:9092"
 mocks:
   kafka:
     reactors:

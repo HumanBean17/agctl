@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 __all__ = ["mock_run", "new_mock_engine", "mock_start", "mock_stop", "mock_status"]
 
 # Import from kafka_commands to avoid duplication (no circular import)
-from .kafka_commands import new_kafka_client
+from .kafka_commands import new_kafka_client, resolve_cluster_name
 
 # Import daemon lifecycle helpers (Task 2: pidfile, liveness; Task 3: log parser)
 from ..mock.daemon import (
@@ -117,7 +117,7 @@ def new_mock_engine(
     run_http: bool,
     run_kafka: bool,
     http_listen: str,
-    kafka_client: KafkaClient | None,
+    kafka_clients: dict[str, "KafkaClient"] | None = None,
     fail_fast: bool = False,
     duration: float | None = None,
     until_stopped: bool = True,
@@ -130,7 +130,7 @@ def new_mock_engine(
         run_http=run_http,
         run_kafka=run_kafka,
         http_listen=http_listen,
-        kafka_client=kafka_client,
+        kafka_clients=kafka_clients,
         fail_fast=fail_fast,
         duration=duration,
         until_stopped=until_stopped,
@@ -469,13 +469,41 @@ def mock_run(
         # Guard 2+3: Resolve engines to run
         run_http, run_kafka = _resolve_engines(only, cfg.mocks)
 
-        # Guard 5: If run_kafka, require non-empty kafka.brokers
-        kafka_client = None
+        # Guard 5: If run_kafka, resolve each reactor's cluster and build one
+        # KafkaClient per DISTINCT cluster (reactors sharing a cluster reuse the
+        # same client). The per-reactor client map is keyed by reactor name.
+        kafka_clients: dict[str, KafkaClient] | None = None
         if run_kafka:
-            if not cfg.kafka.brokers:
-                raise ConfigError("kafka.brokers is required when running Kafka reactors", {})
-            # Build KafkaClient (may raise ConfigError if kafka extra missing)
-            kafka_client = new_kafka_client(cfg.kafka)
+            kafka_clients = {}
+            clients_by_cluster: dict[str, KafkaClient] = {}
+            for reactor_name, reactor in cfg.mocks.kafka.reactors.items():
+                try:
+                    cluster_name = resolve_cluster_name(
+                        cfg.kafka, binding_cluster=reactor.cluster
+                    )
+                except ConfigError as e:
+                    # load_config does NOT run validate_config, so mock_run is
+                    # the primary error surface for `agctl mock run`. Re-raise
+                    # with reactor context so a dangling reactor.cluster or
+                    # unresolvable (no default/single) cluster names the reactor.
+                    raise ConfigError(
+                        e.message, {**e.detail, "reactor": reactor_name}
+                    ) from e
+                cluster = cfg.kafka.clusters[cluster_name]
+                # Per-reactor brokers guard (spec §11): a reactor whose resolved
+                # cluster has empty brokers must fail fast with a clear
+                # ConfigError at mock run, BEFORE any client build/probe. This
+                # restores the runtime guarantee dropped in Task 3 — but per
+                # reactor (honoring the brief's per-reactor resolution), not via
+                # the old single-cluster guard.
+                if not cluster.brokers:
+                    raise ConfigError(
+                        f"kafka.clusters.{cluster_name}.brokers is required when running Kafka reactors",
+                        {"reactor": reactor_name, "cluster": cluster_name},
+                    )
+                if cluster_name not in clients_by_cluster:
+                    clients_by_cluster[cluster_name] = new_kafka_client(cluster)
+                kafka_clients[reactor_name] = clients_by_cluster[cluster_name]
 
         # Guard 6: Resolve http_listen
         if http_listen is not None:
@@ -496,7 +524,7 @@ def mock_run(
             run_http=run_http,
             run_kafka=run_kafka,
             http_listen=http_listen,
-            kafka_client=kafka_client,
+            kafka_clients=kafka_clients,
             fail_fast=fail_fast,
             duration=duration,
             until_stopped=until_stopped,

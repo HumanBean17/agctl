@@ -5,6 +5,11 @@ from agctl.config.models import (
     Config,
     DatabaseConnection,
     DatabaseTemplate,
+    KafkaCluster,
+    KafkaConfig,
+    KafkaPattern,
+    KafkaReactor,
+    KafkaReaction,
     LogSource,
     LogsConfig,
     LogsDefaults,
@@ -13,17 +18,19 @@ from agctl.config.models import (
 
 def _full_config_dict():
     return {
-        "version": "1",
+        "version": "3",
         "services": {
             "order-service": {"base_url": "http://localhost:8081", "health_path": "/health"}
         },
         "kafka": {
-            "brokers": ["localhost:9092"],
-            "default_consumer_group": "agctl-consumer",
+            "clusters": {
+                "main": {"brokers": ["localhost:9092"]},
+            },
+            "default_cluster": "main",
             "patterns": {
                 "order-created": {
                     "topic": "orders.created",
-                    "match": '.eventType == "ORDER_CREATED"',
+                    "match": '.value.eventType == "ORDER_CREATED"',
                 }
             },
         },
@@ -52,11 +59,13 @@ def test_full_config_validates_with_connections_and_templates():
 
 
 def test_empty_sections_default():
-    cfg = Config.model_validate({"version": "1"})
+    cfg = Config.model_validate({"version": "3"})
     assert cfg.services == {}
     assert cfg.database.connections == {}
     assert cfg.database.templates == {}
-    assert cfg.kafka.brokers == []
+    assert cfg.kafka.clusters == {}
+    assert cfg.kafka.default_cluster is None
+    assert cfg.kafka.patterns == {}
 
 
 def test_http_template_requires_method_service_path():
@@ -173,3 +182,69 @@ def test_config_has_logs_field():
     )
     assert cfg2.logs.sources["svc"].path == "/tmp/x.log"
     assert cfg2.logs.sources["svc"].type == "file"  # default applied
+
+
+# --- v3 kafka clusters schema -------------------------------------------------
+
+
+def test_kafka_config_clusters_shape_parses():
+    """A KafkaConfig built from a clusters dict parses; the cluster's brokers,
+    default_cluster, and patterns are all reachable."""
+    cfg = Config.model_validate(
+        {
+            "version": "3",
+            "kafka": {
+                "clusters": {"main": {"brokers": ["h:9092"]}},
+                "default_cluster": "main",
+                "patterns": {"p": {"topic": "t"}},
+            },
+        }
+    )
+    assert cfg.kafka.clusters["main"].brokers == ["h:9092"]
+    assert cfg.kafka.default_cluster == "main"
+    assert cfg.kafka.patterns["p"].topic == "t"
+
+
+def test_kafka_cluster_carries_per_cluster_fields():
+    """KafkaCluster carries brokers/ssl/timeout_seconds/default_consumer_group/
+    schema_registry_url (the fields formerly on KafkaConfig)."""
+    cluster = KafkaCluster(
+        brokers=["h:9092"],
+        timeout_seconds=30,
+        default_consumer_group="g",
+        schema_registry_url="http://sr:8081",
+    )
+    assert cluster.brokers == ["h:9092"]
+    assert cluster.timeout_seconds == 30
+    assert cluster.default_consumer_group == "g"
+    assert cluster.schema_registry_url == "http://sr:8081"
+    assert cluster.ssl is None
+
+
+def test_kafka_config_default_is_empty():
+    """KafkaConfig() default: empty clusters, default_cluster None, empty patterns."""
+    k = KafkaConfig()
+    assert k.clusters == {}
+    assert k.default_cluster is None
+    assert k.patterns == {}
+
+
+def test_kafka_pattern_accepts_cluster_field():
+    """KafkaPattern gains an optional cluster field (consumed in Task 2)."""
+    pat = KafkaPattern(topic="t", cluster="analytics")
+    assert pat.cluster == "analytics"
+    # defaults to None when omitted
+    assert KafkaPattern(topic="t").cluster is None
+
+
+def test_kafka_reactor_accepts_cluster_field():
+    """KafkaReactor gains an optional cluster field (consumed in Task 3)."""
+    reactor = KafkaReactor(
+        topic="t",
+        cluster="analytics",
+        reaction=KafkaReaction(topic="out", value={}),
+    )
+    assert reactor.cluster == "analytics"
+    # defaults to None when omitted
+    plain = KafkaReactor(topic="t", reaction=KafkaReaction(topic="out", value={}))
+    assert plain.cluster is None

@@ -278,3 +278,31 @@ def require_kafka():
     except Exception as exc:  # noqa: BLE001 - any failure means no service
         pytest.skip(f"Kafka broker at {broker} unavailable: {exc}")
     return broker
+
+
+@pytest.fixture
+def require_kafka_second_broker():
+    """Skip if a SECOND live Kafka broker is unreachable.
+
+    Yields the second broker address (``$AGCTL_TEST_KAFKA_BROKER_2``). Used by
+    the multi-cluster integration test, which needs two independent brokers so
+    it can prove ``--cluster`` routes produce/assert to the named cluster.
+    Unset (the common single-broker dev/CI case) => skip, never fail.
+    """
+    broker = os.environ.get("AGCTL_TEST_KAFKA_BROKER_2")
+    if not broker:
+        pytest.skip(
+            "AGCTL_TEST_KAFKA_BROKER_2 not set; skipping multi-cluster Kafka test"
+        )
+
+    try:
+        from confluent_kafka import admin
+    except ImportError:
+        pytest.skip("confluent_kafka not installed; skipping live Kafka test")
+
+    try:
+        client = admin.AdminClient({"bootstrap.servers": broker})
+        client.list_topics(timeout=2)
+    except Exception as exc:  # noqa: BLE001 - any failure means no service
+        pytest.skip(f"Second Kafka broker at {broker} unavailable: {exc}")
+    return broker

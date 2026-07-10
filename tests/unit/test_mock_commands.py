@@ -32,9 +32,9 @@ class TestMockRunCommand:
     """Test the mock run command with various scenarios."""
 
     def test_only_http_with_stubs(self, temp_config, fake_engine):
-        """--only http with 2-stub mocks.http -> run_http=True, run_kafka=False, kafka_client=None."""
+        """--only http with 2-stub mocks.http -> run_http=True, run_kafka=False, kafka_clients=None."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -69,7 +69,7 @@ mocks:
             call_kwargs = mock_factory.call_args.kwargs
             assert call_kwargs["run_http"] is True
             assert call_kwargs["run_kafka"] is False
-            assert call_kwargs["kafka_client"] is None
+            assert call_kwargs["kafka_clients"] is None
 
             # Verify engine lifecycle
             fake_engine.start.assert_called_once()
@@ -77,15 +77,19 @@ mocks:
             fake_engine.shutdown.assert_called_once()
 
     def test_only_kafka_with_reactors(self, temp_config, fake_engine):
-        """--only kafka with reactors + kafka.brokers -> run_kafka=True, kafka_client is KafkaClient."""
+        """--only kafka with reactors resolved to the default v3 cluster
+        (kafka.clusters.default.brokers) -> run_kafka=True, kafka_clients maps
+        the reactor name to a KafkaClient built for that resolved cluster."""
         # Skip if confluent_kafka is not installed
         pytest.importorskip("confluent_kafka")
 
         config_content = """
-version: "2.0"
+version: "3"
 kafka:
-  brokers:
-    - "localhost:9092"
+  clusters:
+    default:
+      brokers:
+        - "localhost:9092"
 mocks:
   kafka:
     reactors:
@@ -113,14 +117,147 @@ mocks:
             assert call_kwargs["run_http"] is False
             assert call_kwargs["run_kafka"] is True
 
-            # Verify kafka_client is a KafkaClient instance
+            # Verify kafka_clients is a dict mapping reactor name -> KafkaClient
             from agctl.clients.kafka_client import KafkaClient
-            assert isinstance(call_kwargs["kafka_client"], KafkaClient)
+            kafka_clients = call_kwargs["kafka_clients"]
+            assert isinstance(kafka_clients, dict)
+            assert "reactor1" in kafka_clients
+            assert isinstance(kafka_clients["reactor1"], KafkaClient)
+
+    def test_mock_run_builds_per_cluster_clients(self, temp_config, fake_engine):
+        """mock run with two reactors binding two distinct clusters -> new_kafka_client
+        called once per distinct cluster, and kafka_clients maps each reactor name
+        to the client built for its resolved cluster."""
+        config_content = """
+version: "3"
+kafka:
+  clusters:
+    main:
+      brokers:
+        - "main:9092"
+    analytics:
+      brokers:
+        - "analytics:9092"
+  default_cluster: main
+mocks:
+  kafka:
+    reactors:
+      rA:
+        topic: topicA
+        cluster: main
+        reaction:
+          topic: out
+          value: {}
+      rB:
+        topic: topicB
+        cluster: analytics
+        reaction:
+          topic: out
+          value: {}
+"""
+        temp_config.write_text(config_content)
+
+        recorded_clusters = []
+
+        def fake_client_factory(cluster, group_id=None):
+            recorded_clusters.append(cluster)
+            return MagicMock()  # fake client; engine is also faked
+
+        with patch(
+            "agctl.commands.mock_commands.new_kafka_client",
+            side_effect=fake_client_factory,
+        ), patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "kafka"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+
+            # One new_kafka_client call per distinct cluster (main, analytics).
+            assert len(recorded_clusters) == 2
+            brokers_seen = {tuple(c.brokers) for c in recorded_clusters}
+            assert brokers_seen == {("main:9092",), ("analytics:9092",)}
+
+            # kafka_clients maps each reactor name to a client.
+            call_kwargs = mock_factory.call_args.kwargs
+            kafka_clients = call_kwargs["kafka_clients"]
+            assert set(kafka_clients.keys()) == {"rA", "rB"}
+            # Reactors sharing a cluster would reuse the same instance; here each
+            # has its own cluster, so the two client objects differ.
+            assert kafka_clients["rA"] is not kafka_clients["rB"]
+
+    def test_mock_run_reuses_client_for_shared_cluster(self, temp_config, fake_engine):
+        """Two reactors bound to the SAME cluster -> new_kafka_client called
+        exactly once, and both reactors share the same client instance.
+
+        Pins the DRY/reuse path that ``test_mock_run_builds_per_cluster_clients``
+        (2 reactors / 2 clusters) does not cover.
+        """
+        config_content = """
+version: "3"
+kafka:
+  clusters:
+    shared:
+      brokers:
+        - "shared:9092"
+  default_cluster: shared
+mocks:
+  kafka:
+    reactors:
+      rA:
+        topic: topicA
+        cluster: shared
+        reaction:
+          topic: out
+          value: {}
+      rB:
+        topic: topicB
+        cluster: shared
+        reaction:
+          topic: out
+          value: {}
+"""
+        temp_config.write_text(config_content)
+
+        call_count = {"n": 0}
+
+        def fake_client_factory(cluster, group_id=None):
+            call_count["n"] += 1
+            return MagicMock()  # fake client; engine is also faked
+
+        with patch(
+            "agctl.commands.mock_commands.new_kafka_client",
+            side_effect=fake_client_factory,
+        ), patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "kafka"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+
+            # The factory is called exactly once for the single shared cluster.
+            assert call_count["n"] == 1
+
+            # Both reactors map to the SAME client instance.
+            call_kwargs = mock_factory.call_args.kwargs
+            kafka_clients = call_kwargs["kafka_clients"]
+            assert set(kafka_clients.keys()) == {"rA", "rB"}
+            assert kafka_clients["rA"] is kafka_clients["rB"]
 
     def test_only_http_without_mocks_http(self, temp_config):
         """--only http with no mocks.http -> exit 2, ConfigError envelope."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   kafka:
     reactors:
@@ -151,10 +288,13 @@ mocks:
     def test_no_mocks_section_no_only(self, temp_config, fake_engine):
         """No mocks section, no --only -> exit 0, no-op engine (run_http=False, run_kafka=False)."""
         config_content = """
-version: "2.0"
+version: "3"
 kafka:
-  brokers:
-    - "localhost:9092"
+  clusters:
+    default:
+      brokers:
+        - "localhost:9092"
+  default_cluster: default
 """
         temp_config.write_text(config_content)
 
@@ -179,11 +319,20 @@ kafka:
             fake_engine.shutdown.assert_called_once()
 
     def test_kafka_reactors_without_brokers(self, temp_config):
-        """mocks.kafka reactors present but no kafka.brokers -> exit 2, ConfigError envelope."""
+        """mocks.kafka reactors whose resolved cluster has empty brokers ->
+        exit 2 with a clear ConfigError naming the reactor + cluster.
+
+        The per-reactor brokers guard in ``mock_run`` (spec §11) fires BEFORE
+        any confluent_kafka import/probe, so this guarantee holds regardless of
+        whether the extra is installed.
+        """
         config_content = """
-version: "2.0"
+version: "3"
 kafka:
-  brokers: []
+  clusters:
+    default:
+      brokers: []
+  default_cluster: default
 mocks:
   kafka:
     reactors:
@@ -208,13 +357,19 @@ mocks:
         envelope = json.loads(output_lines[0])
         assert envelope["ok"] is False
         assert envelope["command"] == "mock.run"
-        assert envelope["error"]["type"] == "ConfigError"
-        assert "kafka.brokers" in envelope["error"]["message"]
+
+        # Clear ConfigError naming the offending reactor + cluster (spec §11).
+        error = envelope["error"]
+        assert error["type"] == "ConfigError"
+        assert "brokers" in error["message"]
+        detail = error["detail"]
+        assert detail["reactor"] == "reactor1"
+        assert detail["cluster"] == "default"
 
     def test_duration_and_until_stopped_mutually_exclusive(self, temp_config):
         """--duration and --until-stopped together -> exit 2, ConfigError envelope."""
         config_content = """
-version: "2.0"
+version: "3"
 """
         temp_config.write_text(config_content)
 
@@ -237,7 +392,7 @@ version: "2.0"
     def test_engine_start_raises_connection_failure(self, temp_config):
         """Engine start() raises ConnectionFailure -> mock.run envelope with ConnectionError, exit 2."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -278,7 +433,7 @@ mocks:
     def test_http_listen_override(self, temp_config, fake_engine):
         """--http-listen 127.0.0.1:9999 overrides config listen -> engine called with http_listen."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -309,7 +464,7 @@ mocks:
     def test_http_listen_bad_value(self, temp_config):
         """--http-listen 'bad:no-port' -> exit 2 (parse_listen fails)."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -341,7 +496,7 @@ mocks:
     def test_started_line_emitted(self, temp_config, fake_engine):
         """Config with mocks.http, --only http -> stdout's first line is the engine's started."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -385,7 +540,7 @@ mocks:
     def test_fail_fast_flag_passed(self, temp_config, fake_engine):
         """--fail-fast flag is passed to the engine."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -416,7 +571,7 @@ mocks:
     def test_duration_flag_passed(self, temp_config, fake_engine):
         """--duration flag is passed to the engine."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -447,7 +602,7 @@ mocks:
     def test_exit_code_from_engine(self, temp_config):
         """Engine returns non-zero exit code -> process exits with that code."""
         config_content = """
-version: "2.0"
+version: "3"
 mocks:
   http:
     listen: "0.0.0.0:18080"
@@ -478,7 +633,7 @@ mocks:
 def test_mock_start_includes_overlay_in_daemon_argv(tmp_path, monkeypatch):
     """mock start includes --overlay in the daemon argv so the spawned daemon loads the overlay."""
     base = tmp_path / "agctl.yaml"
-    base.write_text("""version: "2"
+    base.write_text("""version: "3"
 services:
   orders:
     base_url: http://localhost:8081

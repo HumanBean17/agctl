@@ -126,13 +126,14 @@ live validation was skipped. **Never** declare done on config that doesn't valid
 ### Structural checklist (fallback when agctl is absent)
 
 - [ ] YAML parses.
-- [ ] `version` is present, major part `"2"` (the jq-dialect switch — `"2"` = envelope-rooted `match`).
+- [ ] `version` is present, major part `"3"` (the config schema version — `"3"` = named `kafka.clusters`; the `match` envelope-rooting from `"2"` is unchanged).
 - [ ] Every `templates.*.service` ∈ `services`.
 - [ ] Every `database.templates.*.connection` (if set) ∈ `database.connections`.
 - [ ] `defaults.database_connection` (if set) ∈ `database.connections`.
-- [ ] `kafka.ssl.security_protocol` (if set) ∈ {PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT}.
+- [ ] Every `kafka.clusters.<name>.ssl.security_protocol` (if set) ∈ {PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT}.
+- [ ] `kafka.default_cluster` (if set, or when >1 cluster is defined) ∈ `kafka.clusters`; each `kafka.patterns.<name>.cluster` (if set) ∈ `kafka.clusters`.
 - [ ] Every `templates` / `database.templates` / `kafka.patterns` entry has a non-empty `description`.
-- [ ] If `mocks.kafka.reactors` is set, `kafka.brokers` is non-empty (required at `mock run` startup).
+- [ ] If `mocks.kafka.reactors` is set, each reactor's resolved cluster (`reactor.cluster` → `default_cluster` → single-cluster auto-default) has non-empty `kafka.clusters.<name>.brokers` (required at `mock run` startup).
 - [ ] `mocks.http.listen` (if set) parses as `host:port` (IPv6 hosts bracketed, e.g. `[::1]:18080`).
 - [ ] Every `mocks.http.stubs` / `mocks.kafka.reactors` entry has a non-empty `description`.
 - [ ] Every `mocks.kafka.reactors.*.reaction.headers` value (if set) is a string.

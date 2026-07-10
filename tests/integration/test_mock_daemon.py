@@ -41,7 +41,7 @@ def _allocate_free_port() -> int:
 def _write_test_config(config_path: Path, port: int) -> None:
     """Write a minimal agctl.yaml config with one HTTP stub."""
     config_path.write_text(
-        f"""version: "2.0"
+        f"""version: "3"
 mocks:
   http:
     listen: "127.0.0.1:{port}"

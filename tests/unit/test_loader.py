@@ -31,7 +31,9 @@ def test_load_full_config_keeps_connections_and_templates():
     assert cfg.database.connections["main-db"].host == "h"
     assert cfg.database.templates["find-order"].connection == "main-db"
     assert cfg.services["order-service"].base_url == "http://localhost:8081"
-    assert cfg.kafka.schema_registry_url == ""  # ${VAR:-} resolved to empty
+    # schema_registry_url now lives on the cluster (v3), ${VAR:-} -> empty.
+    assert cfg.kafka.clusters["default"].schema_registry_url == ""
+    assert cfg.kafka.default_cluster == "default"
 
 
 def test_missing_required_env_raises(tmp_path):
@@ -50,8 +52,20 @@ def test_version_mismatch_raises(tmp_path):
     bad.write_text('version: "1"\n')
     with pytest.raises(ConfigError) as exc:
         load_config(str(bad), env={})
-    assert exc.value.detail["tool_major"] == "2"
+    assert exc.value.detail["tool_major"] == "3"
     assert "config migrate" in exc.value.message
+
+
+def test_v2_config_rejected_pointing_at_migrate(tmp_path):
+    """A v2 config is rejected under the v3 tool, with the message pointing at
+    `agctl config migrate` (structural lift)."""
+    bad = tmp_path / "agctl.yaml"
+    bad.write_text('version: "2"\nkafka:\n  brokers: [h:9092]\n')
+    with pytest.raises(ConfigError) as exc:
+        load_config(str(bad), env={})
+    assert exc.value.detail["tool_major"] == "3"
+    assert "config migrate" in exc.value.message
+    assert "v2" in exc.value.message
 
 
 def test_missing_version_raises_with_clear_message(tmp_path):
@@ -61,7 +75,7 @@ def test_missing_version_raises_with_clear_message(tmp_path):
     bad.write_text('kafka:\n  brokers: [h:9092]\n')
     with pytest.raises(ConfigError) as exc:
         load_config(str(bad), env={})
-    assert exc.value.detail["tool_major"] == "2"
+    assert exc.value.detail["tool_major"] == "3"
     assert "missing a `version`" in exc.value.message
 
 
@@ -79,70 +93,81 @@ def test_bare_version_key_treated_as_missing(tmp_path):
 
 def test_invalid_schema_raises(tmp_path):
     bad = tmp_path / "agctl.yaml"
-    bad.write_text('version: "2"\ntemplates:\n  x:\n    method: GET\n')  # missing service/path
+    bad.write_text('version: "3"\ntemplates:\n  x:\n    method: GET\n')  # missing service/path
     with pytest.raises(ConfigError):
         load_config(str(bad), env={})
 
 
 def test_kafka_ssl_loaded_from_config(tmp_path):
-    """kafka.ssl sub-block loads into the typed KafkaSSL model (DESIGN §2.1)."""
+    """kafka.clusters.<name>.ssl sub-block loads into the typed KafkaSSL model
+    (DESIGN §2.1, v3 shape)."""
     cfg_file = tmp_path / "agctl.yaml"
     cfg_file.write_text(
-        'version: "2"\n'
+        'version: "3"\n'
         "kafka:\n"
-        "  brokers: [host:9092]\n"
-        "  ssl:\n"
-        "    ca_location: /etc/ssl/kafka/ca.pem\n"
-        "    certificate_location: /etc/ssl/kafka/client.crt\n"
-        "    key_location: /etc/ssl/kafka/client.key\n"
-        "    key_password: hunter2\n"
-        "    endpoint_identification_algorithm: none\n"
+        "  clusters:\n"
+        "    default:\n"
+        "      brokers: [host:9092]\n"
+        "      ssl:\n"
+        "        ca_location: /etc/ssl/kafka/ca.pem\n"
+        "        certificate_location: /etc/ssl/kafka/client.crt\n"
+        "        key_location: /etc/ssl/kafka/client.key\n"
+        "        key_password: hunter2\n"
+        "        endpoint_identification_algorithm: none\n"
     )
     cfg = load_config(str(cfg_file), env={})
 
-    assert cfg.kafka.ssl is not None
-    assert cfg.kafka.ssl.ca_location == "/etc/ssl/kafka/ca.pem"
-    assert cfg.kafka.ssl.certificate_location == "/etc/ssl/kafka/client.crt"
-    assert cfg.kafka.ssl.key_location == "/etc/ssl/kafka/client.key"
-    assert cfg.kafka.ssl.key_password == "hunter2"
-    assert cfg.kafka.ssl.endpoint_identification_algorithm == "none"
+    ssl = cfg.kafka.clusters["default"].ssl
+    assert ssl is not None
+    assert ssl.ca_location == "/etc/ssl/kafka/ca.pem"
+    assert ssl.certificate_location == "/etc/ssl/kafka/client.crt"
+    assert ssl.key_location == "/etc/ssl/kafka/client.key"
+    assert ssl.key_password == "hunter2"
+    assert ssl.endpoint_identification_algorithm == "none"
     # security_protocol is optional and defaults to None (inferred at use time).
-    assert cfg.kafka.ssl.security_protocol is None
+    assert ssl.security_protocol is None
 
 
 def test_kafka_ssl_env_override(tmp_path):
-    """AGCTL_KAFKA__SSL__* overrides reach the typed model for free (§8)."""
+    """AGCTL_KAFKA__CLUSTERS__<NAME>__SSL__* overrides reach the typed model
+    for free (§8) under the v3 clusters shape."""
     cfg_file = tmp_path / "agctl.yaml"
     cfg_file.write_text(
-        'version: "2"\n'
+        'version: "3"\n'
         "kafka:\n"
-        "  brokers: [host:9092]\n"
+        "  clusters:\n"
+        "    default:\n"
+        "      brokers: [host:9092]\n"
     )
     cfg = load_config(
         str(cfg_file),
-        env={"AGCTL_KAFKA__SSL__CA_LOCATION": "/override/ca.pem"},
+        env={"AGCTL_KAFKA__CLUSTERS__DEFAULT__SSL__CA_LOCATION": "/override/ca.pem"},
     )
 
-    assert cfg.kafka.ssl is not None
-    assert cfg.kafka.ssl.ca_location == "/override/ca.pem"
+    ssl = cfg.kafka.clusters["default"].ssl
+    assert ssl is not None
+    assert ssl.ca_location == "/override/ca.pem"
 
 
 def test_kafka_ssl_path_interpolated(tmp_path):
-    """${VAR} interpolation resolves into nested kafka.ssl fields (the documented
-    primary TLS config mechanism); ${VAR:-} resolves to empty (== unset)."""
+    """${VAR} interpolation resolves into nested cluster ssl fields (the
+    documented primary TLS config mechanism); ${VAR:-} resolves to empty."""
     cfg_file = tmp_path / "agctl.yaml"
     cfg_file.write_text(
-        'version: "2"\n'
+        'version: "3"\n'
         "kafka:\n"
-        "  brokers: [host:9092]\n"
-        "  ssl:\n"
-        '    ca_location: "${KAFKA_SSL_CA}"\n'        # bare var, required
-        '    key_password: "${KAFKA_SSL_KEY_PASSWORD:-}"\n'  # default-to-empty
+        "  clusters:\n"
+        "    default:\n"
+        "      brokers: [host:9092]\n"
+        "      ssl:\n"
+        '        ca_location: "${KAFKA_SSL_CA}"\n'        # bare var, required
+        '        key_password: "${KAFKA_SSL_KEY_PASSWORD:-}"\n'  # default-to-empty
     )
     cfg = load_config(str(cfg_file), env={"KAFKA_SSL_CA": "/from/env/ca.pem"})
 
-    assert cfg.kafka.ssl.ca_location == "/from/env/ca.pem"
-    assert cfg.kafka.ssl.key_password == ""  # ${VAR:-} resolved to empty
+    ssl = cfg.kafka.clusters["default"].ssl
+    assert ssl.ca_location == "/from/env/ca.pem"
+    assert ssl.key_password == ""  # ${VAR:-} resolved to empty
 
 
 def test_kafka_ssl_invalid_security_protocol_raises(tmp_path):
@@ -150,11 +175,13 @@ def test_kafka_ssl_invalid_security_protocol_raises(tmp_path):
     not as an opaque connect-time error."""
     cfg_file = tmp_path / "agctl.yaml"
     cfg_file.write_text(
-        'version: "2"\n'
+        'version: "3"\n'
         "kafka:\n"
-        "  brokers: [host:9092]\n"
-        "  ssl:\n"
-        "    security_protocol: SSLT\n"  # typo
+        "  clusters:\n"
+        "    default:\n"
+        "      brokers: [host:9092]\n"
+        "      ssl:\n"
+        "        security_protocol: SSLT\n"  # typo
     )
     with pytest.raises(ConfigError):
         load_config(str(cfg_file), env={})
@@ -164,12 +191,14 @@ def test_kafka_ssl_security_protocol_normalized(tmp_path):
     """security.protocol is normalized to librdkafka's uppercase form."""
     cfg_file = tmp_path / "agctl.yaml"
     cfg_file.write_text(
-        'version: "2"\n'
+        'version: "3"\n'
         "kafka:\n"
-        "  brokers: [host:9092]\n"
-        "  ssl:\n"
-        "    ca_location: /ca.pem\n"
-        "    security_protocol: ssl\n"
+        "  clusters:\n"
+        "    default:\n"
+        "      brokers: [host:9092]\n"
+        "      ssl:\n"
+        "        ca_location: /ca.pem\n"
+        "        security_protocol: ssl\n"
     )
     cfg = load_config(str(cfg_file), env={})
-    assert cfg.kafka.ssl.security_protocol == "SSL"
+    assert cfg.kafka.clusters["default"].ssl.security_protocol == "SSL"

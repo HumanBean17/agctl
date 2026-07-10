@@ -191,6 +191,130 @@ def test_item_kafka_pattern(monkeypatch):
     )
 
 
+_KAFKA_TWO_CLUSTER_CONFIG = (
+    'version: "3"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+    "kafka:\n"
+    "  clusters:\n"
+    "    main:\n"
+    "      brokers:\n"
+    '        - "localhost:9092"\n'
+    "    analytics:\n"
+    "      brokers:\n"
+    '        - "analytics-host:9092"\n'
+    "  default_cluster: main\n"
+    "  patterns:\n"
+    "    evt:\n"
+    '      description: "An analytics event"\n'
+    "      topic: events\n"
+    '      match: \'.value.eventType == "EVT"\'\n'
+    "      cluster: analytics\n"
+)
+
+
+def test_kafka_pattern_item_shows_cluster(tmp_path, monkeypatch):
+    """Multi-cluster: discover surfaces the pattern's bound cluster name."""
+    result = _run_with(
+        ["--category", "kafka-patterns", "--name", "evt"],
+        _KAFKA_TWO_CLUSTER_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.item"
+    res = payload["result"]
+    assert res["name"] == "evt"
+    # The pattern binds cluster="analytics" — that wins over default_cluster.
+    assert res["cluster"] == "analytics"
+
+
+_KAFKA_DEFAULT_CLUSTER_CONFIG = (
+    'version: "3"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+    "kafka:\n"
+    "  clusters:\n"
+    "    main:\n"
+    "      brokers:\n"
+    '        - "localhost:9092"\n'
+    "  default_cluster: main\n"
+    "  patterns:\n"
+    "    evt:\n"
+    '      description: "A default-cluster event"\n'
+    "      topic: events\n"
+    '      match: \'.value.eventType == "EVT"\'\n'
+)
+
+
+def test_kafka_pattern_item_cluster_defaults(tmp_path, monkeypatch):
+    """A pattern with no cluster field resolves to default_cluster."""
+    result = _run_with(
+        ["--category", "kafka-patterns", "--name", "evt"],
+        _KAFKA_DEFAULT_CLUSTER_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    payload = _payload(result)
+    res = payload["result"]
+    assert res["name"] == "evt"
+    # No pattern cluster + default_cluster="main" → resolved cluster "main".
+    assert res["cluster"] == "main"
+
+
+_KAFKA_TWO_CLUSTER_NO_DEFAULT_CONFIG = (
+    'version: "3"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+    "kafka:\n"
+    "  clusters:\n"
+    "    main:\n"
+    "      brokers:\n"
+    '        - "localhost:9092"\n'
+    "    analytics:\n"
+    "      brokers:\n"
+    '        - "analytics-host:9092"\n'
+    # NO default_cluster: validation passes (a pattern is cluster-agnostic).
+    "  patterns:\n"
+    "    evt:\n"
+    '      description: "A cluster-agnostic event"\n'
+    "      topic: events\n"
+    '      match: \'.value.eventType == "EVT"\'\n'
+    # NO cluster field — disambiguated via --cluster at kafka assert time.
+)
+
+
+def test_kafka_pattern_item_unresolvable_cluster_is_null(tmp_path, monkeypatch):
+    """Two clusters, no default_cluster, pattern with no cluster field: discover
+    is resilient — it returns ok:true with cluster: null (still rendering topic/
+    match/params/example), NOT a hard ConfigError. The cluster is disambiguated
+    via --cluster at ``kafka assert`` time."""
+    result = _run_with(
+        ["--category", "kafka-patterns", "--name", "evt"],
+        _KAFKA_TWO_CLUSTER_NO_DEFAULT_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["ok"] is True
+    res = payload["result"]
+    assert res["name"] == "evt"
+    # No resolvable cluster (no pattern cluster, no default, >1 cluster) → null.
+    assert res["cluster"] is None
+    # Item still renders its full detail.
+    assert res["topic"] == "events"
+    assert res["match"] == '.value.eventType == "EVT"'
+    # No {brace} tokens in the match → empty params, simple example.
+    assert res["params"] == []
+    assert res["example"] == "agctl kafka assert --pattern evt --timeout 10"
+
+
 def test_item_service(monkeypatch):
     result = _run(["--category", "services", "--name", "order-service"], monkeypatch)
     assert result.exit_code == 0
@@ -477,7 +601,7 @@ def test_search_finds_mock_kafka_reactor(monkeypatch):
 
 
 _NO_MOCKS_CONFIG = (
-    'version: "2"\n'
+    'version: "3"\n'
     "services:\n"
     "  demo:\n"
     '    base_url: "http://localhost:9999"\n'
@@ -501,7 +625,7 @@ def test_category_mock_http_stubs_absent_is_empty(tmp_path, monkeypatch):
 
 
 _CAPTURE_CONFIG = (
-    'version: "2"\n'
+    'version: "3"\n'
     "services:\n"
     "  demo:\n"
     '    base_url: "http://localhost:9999"\n'
@@ -539,7 +663,7 @@ def test_item_mock_http_stub_with_capture(tmp_path, monkeypatch):
 
 
 _IPV6_CONFIG = (
-    'version: "2"\n'
+    'version: "3"\n'
     "services:\n"
     "  demo:\n"
     '    base_url: "http://localhost:9999"\n'
@@ -588,7 +712,7 @@ def test_item_mock_http_stub_ipv6_wildcard_normalized(tmp_path, monkeypatch):
 
 
 _BASE_CONFIG = (
-    'version: "2"\n'
+    'version: "3"\n'
     "services:\n"
     "  demo:\n"
     '    base_url: "http://localhost:9999"\n'
@@ -612,7 +736,7 @@ _BASE_CONFIG = (
 
 
 _OVERLAY_CONFIG = (
-    'version: "2"\n'
+    'version: "3"\n'
     "templates:\n"
     "  overlay-template:\n"
     '    description: "Overlay template"\n'
@@ -783,7 +907,7 @@ def test_discover_item_log_sources_with_schema(tmp_path, monkeypatch):
 
     # Create a temp config with a logs source pointing at the temp file
     config_yaml = (
-        'version: "2"\n'
+        'version: "3"\n'
         "services:\n"
         '  demo:\n'
         '    base_url: "http://localhost:9999"\n'

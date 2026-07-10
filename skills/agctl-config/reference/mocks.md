@@ -90,16 +90,22 @@ jq-shadowing warning (see Gotchas).
    (`{key, value, partition, offset, timestamp, headers}`), so `.value.command == "CREATE_ORDER"`,
    `.key`, `.headers.rqUID` (header keys are **case-sensitive**). Omit = match all. Non-JSON /
    non-object values never match — they're visibly skipped, not silently dropped.
-4. **reaction** — what to **produce** back: `topic` (the **event** topic), `key` (optional),
+4. **cluster** *(optional)* — the named cluster this reactor binds to (a key under
+   `kafka.clusters`). Omit to fall back to `kafka.default_cluster` or the single defined
+   cluster. Set it when the reactor consumes from a non-default cluster; a dangling name is
+   a `config validate` error. Each reactor gets its own `KafkaClient` built from the
+   resolved cluster (reactors sharing a cluster reuse one client).
+5. **reaction** — what to **produce** back: `topic` (the **event** topic), `key` (optional),
    `value` (JSON-serializable), `headers` (optional; **string values only** — a non-string
    value is a config error). Render `{name}` against the message-value context.
-5. **name** — kebab-case from the consumer/event.
-6. **description** — one line.
+6. **name** — kebab-case from the consumer/event.
+7. **description** — one line.
 
-**Requires top-level `kafka.brokers`.** `mocks.kafka` joins the SUT's *real* broker — it is
-not a broker itself. `mock run` enforces this at startup (exit 2 if `kafka.brokers` is
-absent), and needs the `kafka` extra installed (`pip install 'agctl[kafka]'`). HTTP-only
-mocks need neither.
+**Requires a resolved cluster with brokers.** `mocks.kafka` joins the SUT's *real* broker — it is
+not a broker itself. Each reactor resolves a cluster (`reactor.cluster` → `kafka.default_cluster`
+→ single-cluster auto-default); the resolved cluster must have non-empty `brokers`, or
+`mock run` fails fast at startup (exit 2). `mock run` also needs the `kafka` extra installed
+(`pip install 'agctl[kafka]'`). HTTP-only mocks need neither brokers nor the extra.
 
 ## Capture value coercion (load-bearing)
 
@@ -138,9 +144,10 @@ capture:
 ```
 
 - **`from`** — a jq path evaluated against the **envelope** (not the payload). Under
-  dialect `"2"` `match` shares this root (envelope-rooted); `capture.from` and `match`
+  dialect `"2"`+ `match` shares this root (envelope-rooted); `capture.from` and `match`
   reach the same fields. (Under dialect `"1"` `match` was payload-rooted — a `.`
-  divergence unified by #22 and the v2 dialect switch.)
+  divergence unified by #22 and the v2 dialect switch; the v3 schema lift left this
+  rooting unchanged.)
 - **`type`** — `scalar` (default) / `object` / `json`. See "Capture value coercion" above
   for what each renders. `object` is the only way to produce a real JSON object/array
   field; it requires the placeholder to occupy the **whole field** (`ctx: "{ctx}"`, not
@@ -290,8 +297,8 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
 
 - `{name}` = capture-from-trigger here — **never** `${}` in a path/reaction template, and
   there is no `--param` for mocks. `${ENV}` is fine in `listen`/`consumer_group`/topics.
-- `mocks.kafka` requires top-level `kafka.brokers` (and the `kafka` extra); HTTP-only mocks
-  don't.
+- `mocks.kafka` requires each reactor's resolved cluster to have non-empty
+  `kafka.clusters.<name>.brokers` (and the `kafka` extra); HTTP-only mocks don't.
 - `reaction.headers` values must be strings — a non-string is a config error.
 - `description` is optional but effectively required (contract #4); its absence degrades
   `discover` and earns a validate warning.
@@ -303,11 +310,12 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
   (exit 2); a jq **eval error** (or a `from` resolving to `null`) against a particular
   request/message is a soft non-match / `capture.missing` (falls through, empty string).
   Two different guards for two different error classes — see "jq match semantics" above.
-- Under dialect `"2"`, **`match` and `capture.from` share an envelope root** — `.body.amount`
+- Under dialect `"2"`+, **`match` and `capture.from` share an envelope root** — `.body.amount`
   (HTTP) / `.value.command` (Kafka) on both sides. Under dialect `"1"` `match` was
-  payload-rooted; `agctl config migrate` rewrites a v1 config (`.body | ` / `.value | `
-  prefix on the three match-site families) but does **not** touch CLI `--match` flags in
-  shell scripts / prompts.
+  payload-rooted; `agctl config migrate` lifts a v1/v2 config to v3 (structural
+  `kafka.clusters` lift for both; `.body | ` / `.value | ` prefix on the three match-site
+  families for v1 only) but does **not** touch CLI `--match` flags in shell scripts /
+  prompts.
 - HTTP `headers` in the capture envelope are **lowercased** (`.headers.authorization`);
   Kafka `headers` are **case-sensitive as-produced** (`.headers.rqUID`, exact producer
   casing). Don't lowercase Kafka header names.

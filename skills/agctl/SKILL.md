@@ -24,10 +24,10 @@ required args, even `--lookback`/`--consumer-group`/`--assertion`); this skill
 keeps only what `--help` won't tell you — semantics, roots, traps.
 
 **Pin the version you target.** `--match`/`--jq-path` roots and failure shapes
-moved in agctl ≥1.0 (dialect v2). A stale global install (e.g. `0.1.0`, where
-`--match` was body-rooted) silently contradicts this skill. After upgrading,
-reinstall in every env that runs it (`pip install -U 'agctl[jq]'`) so `--help`
-and behavior match.
+moved in agctl ≥1.0 (dialect v2), and the config schema moved to v3 (named
+`kafka.clusters`). A stale global install (e.g. `0.1.0`, where `--match` was
+body-rooted) silently contradicts this skill. After upgrading, reinstall in every
+env that runs it (`pip install -U 'agctl[jq]'`) so `--help` and behavior match.
 
 ## Orient first: `agctl discover`
 
@@ -48,10 +48,14 @@ flags: see `--help`.)
 | Publish a message | `kafka produce --topic T --message '{…}'` |
 | DB write / rows / value / inspect / schema | `db execute --write` / `db assert --expect-rows N` / `db assert --expect-value --path .x --equals v` / `db query` / `db schema` |
 | Impersonate a dependency | `mock run` (foreground) / `mock start\|stop\|status` (daemon) |
-| Are services up? / validate config / migrate v1→v2 | `check ready --all` / `config validate` / `config migrate` |
+| Are services up? / validate config / migrate v1/v2→v3 | `check ready --all` / `config validate` / `config migrate` |
 
 `--config <path>` and `--overlay <path>` (repeatable) are global; **`--timeout` is
 not global**. `<mode>` for kafka = `--contains '{…}' | --match '<jq>' | --pattern <name>`.
+`kafka produce|consume|assert` take `--cluster <name>` (default: the pattern's bound
+cluster for `assert --pattern`, else `kafka.default_cluster`, else the single defined
+cluster; `--cluster` always wins) — set it only when a command must target a non-default
+cluster.
 
 ## Flag semantics (`--help` shows flags; these are how they behave)
 
@@ -75,8 +79,9 @@ not global**. `<mode>` for kafka = `--contains '{…}' | --match '<jq>' | --patt
    *result*, not an error. Add `--status`/`--contains`/`--match`/`--jq-path`/
    `--equals` to `http call`/`request` to flip a wrong response into
    `AssertionError` (exit 1); zero assertion flags leaves the result path unchanged.
-3. **`--match` is envelope-rooted under dialect `"2"` (not payload-rooted).** `--help`
-   names the envelope; the trap is the migration:
+3. **`--match` is envelope-rooted (dialect `"2"`+; not payload-rooted).** `--help`
+   names the envelope; the trap is the migration. (v3 only changed the kafka config
+   shape to named clusters — the `match` rooting is unchanged.)
    - **HTTP** `--match` → response envelope `{status_code, response_time_ms, headers
      (lowercased), body, url, method}` ⇒ `.body.order_id`, `.status_code`, `.headers.x`.
      Prefix legacy body-form exprs with `.body | ` (`.status == "X"` → `.body | .status == "X"`).
@@ -86,9 +91,10 @@ not global**. `<mode>` for kafka = `--contains '{…}' | --match '<jq>' | --patt
      value-form with `.value | `.
    - **Unchanged:** `match.body` (json_subset), `--contains`, `--path`,
      `--jq-path`/`--equals` (still body-rooted), `--status`.
-   - A v1 `agctl.yaml` is rejected (exit 2) → `config migrate` rewrites the three
-     `match`-site families in-file. **CLI `--match` flags in scripts/prompts are
-     NOT rewritten** — prefix them by hand.
+   - A v1 or v2 `agctl.yaml` is rejected (exit 2) → `config migrate` lifts it to v3
+     (structural `kafka.clusters` lift for v1/v2; the three `match`-site families are
+     `.body | ` / `.value | `-prefixed for **v1 only**). **CLI `--match` flags in
+     scripts/prompts are NOT rewritten** — prefix them by hand, and only for v1 inputs.
 4. **Three placeholder syntaxes — don't mix:** `${VAR}` env, resolved at config
    load (required → exit 2 if unset; `${VAR:-default}` optional; `${VAR:-}`
    optional/empty); `{name}` HTTP path/body & Kafka patterns, filled at call time

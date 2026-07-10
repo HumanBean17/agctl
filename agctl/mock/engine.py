@@ -58,7 +58,7 @@ class MockEngine:
         run_http: bool,
         run_kafka: bool,
         http_listen: str,
-        kafka_client: Any,  # KafkaClient or None (only used if run_kafka=True)
+        kafka_clients: dict[str, Any] | None = None,  # reactor name -> KafkaClient (None if run_kafka=False)
         fail_fast: bool = False,
         duration: float | None = None,
         until_stopped: bool = True,
@@ -72,7 +72,9 @@ class MockEngine:
             run_http: If True, start HTTP mock server.
             run_kafka: If True, start Kafka reactors.
             http_listen: HTTP listen address string (host:port).
-            kafka_client: KafkaClient instance (required if run_kafka=True).
+            kafka_clients: Mapping of reactor name -> KafkaClient (required if
+                run_kafka=True). Each reactor is wired to its own client so it can
+                target its own cluster. None when run_kafka=False.
             fail_fast: If True, reactor STOP → immediate exit 1.
             duration: If set, stop after this many seconds.
             until_stopped: Ignored (kept for API compatibility).
@@ -83,7 +85,7 @@ class MockEngine:
         self._run_http = run_http
         self._run_kafka = run_kafka
         self._http_listen = http_listen
-        self._kafka_client = kafka_client
+        self._kafka_clients = kafka_clients
         self._fail_fast = fail_fast
         self._duration = duration
         self._emit_fn = emit_fn
@@ -196,15 +198,17 @@ class MockEngine:
                 if self._mocks is None or self._mocks.kafka is None:
                     raise ConfigError("run_kafka=True but no Kafka mocks configured", {})
 
-                if self._kafka_client is None:
-                    raise ConfigError("run_kafka=True but kafka_client is None", {})
+                if self._kafka_clients is None:
+                    raise ConfigError("run_kafka=True but kafka_clients is None", {})
 
-                # Build reactors and prepare (probe) each
+                # Build reactors, each wired to its own client (keyed by reactor
+                # name) so a reactor can target its own cluster. The reactor
+                # runtime class itself still takes a single ``client``.
                 for name, reactor_config in self._mocks.kafka.reactors.items():
                     reactor = KafkaReactorClass(
                         name=name,
                         config=reactor_config,
-                        client=self._kafka_client,
+                        client=self._kafka_clients[name],
                         emit_event=self.emit_event,
                         stop_event=self._stop,
                         fail_fast=self._fail_fast,
