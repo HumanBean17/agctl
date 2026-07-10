@@ -323,3 +323,7 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
   or a string-only slot (`reaction.key`, a header value) is a startup `ConfigError`.
 - `match.jq` / reactor `match` / `capture.*.from` need `pip install 'agctl[jq]'` (bundled
   in `agctl[kafka]` and `agctl[db]`). A stub/reactor with none of these imports nothing.
+- **Native Windows:** the managed daemon (`mock start`/`stop`/`status`) is unavailable —
+  it exits `2` with a `ConfigError`. Authoring the `mocks:` block, `agctl config validate`,
+  and `mock run` (the foreground smoke-test command above) all work natively on Windows;
+  for the managed daemon use `mock run` or run `agctl` inside WSL.

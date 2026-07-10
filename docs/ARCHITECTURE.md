@@ -1015,6 +1015,16 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
   (deferred).
 - **No MCP wrapper, no OpenTelemetry propagation, no parallel runner, no secret
   backends** — deferred per DESIGN §10.
+- **Native-Windows managed-daemon gate** — the three managed-daemon `_core`s
+  (`_mock_start_core`/`_mock_stop_core`/`_mock_status_core` in
+  `commands/mock_commands.py`) call `_require_posix_daemon()`, which raises
+  `ConfigError` (exit 2) when `os.name == "nt"`; WSL reports `"posix"`, so it
+  passes through ungated. `mock run` (foreground streaming) and every other
+  command group run natively on Windows. Streaming graceful-stop contract:
+  backgrounded streamers (`http ping`, `mock run`, `logs tail`, `grpc`
+  server-stream/bidi) install `SIGINT` handlers that fire on native Windows;
+  the `SIGTERM`-driven graceful-stop (and the daemon's `SIGTERM`-based shutdown
+  that `mock stop` drives) is POSIX/WSL — the reason the daemon is gated there.
 
 **Mock server MVP limitations** (see DESIGN §10 "Known-wrong-result / Not Covered" for the full list with failure-mode analysis):
 
