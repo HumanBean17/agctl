@@ -266,11 +266,10 @@ def make_handler(
             # this path: it is only needed for a matched stub, so building it
             # here would be wasted work whose result is immediately discarded.
             if matched_stub is None:
-                self._send_json_response(
-                    404,
-                    {"mock_error": "no matching stub"},
-                    headers={"Content-Type": "application/json"},
-                )
+                # Emit BEFORE sending the response: the handler thread runs
+                # emit -> send in program order, so once the client has the
+                # response the event is guaranteed appended (no test races on
+                # reading event_sink immediately after the response).
                 emit_event(
                     {
                         "event": "http.unmatched",
@@ -278,6 +277,11 @@ def make_handler(
                         "path": self.path,
                         "status": 404,
                     }
+                )
+                self._send_json_response(
+                    404,
+                    {"mock_error": "no matching stub"},
+                    headers={"Content-Type": "application/json"},
                 )
                 return
 
@@ -340,11 +344,10 @@ def make_handler(
                     if stub.delay_ms > 0:
                         time.sleep(stub.delay_ms / 1000.0)
 
-                    # Send response
-                    self._send_json_response(
-                        stub.response.status, rendered_body, rendered_headers
-                    )
-
+                    # Emit BEFORE sending the response (see the 404 path): the
+                    # handler thread runs emit -> send, so the event is appended
+                    # before the client can receive the response. duration_ms is
+                    # measured up to emit (after the delay, before the TCP write).
                     duration_ms = int((time.time() - start_time) * 1000)
                     emit_event(
                         {
@@ -355,6 +358,11 @@ def make_handler(
                             "status": stub.response.status,
                             "duration_ms": duration_ms,
                         }
+                    )
+
+                    # Send response
+                    self._send_json_response(
+                        stub.response.status, rendered_body, rendered_headers
                     )
                 finally:
                     semaphore.release()
