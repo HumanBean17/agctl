@@ -18,6 +18,15 @@ from agctl.mock.daemon import (
     RunningMock,
 )
 
+# The entire mock/daemon.py module is POSIX-only: it is reached only via the
+# managed daemon commands (mock start/stop/status), which _require_posix_daemon
+# gates to native Windows. is_alive()/os.kill(pid, 0) is unsupported on Windows
+# (TerminateProcess semantics) and destabilizes the run, so skip the whole file.
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="mock/daemon.py is POSIX-only (managed daemon surface); gated on Windows",
+)
+
 
 class TestIsAlive:
     """Tests for is_alive(pid)."""
