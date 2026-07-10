@@ -12,6 +12,29 @@ import uuid
 
 from .errors import AssertionFailure, ConfigError
 
+# gRPC status code mappings. Mirrors grpc.StatusCode; hardcoded to keep this module grpc-free.
+_GRPC_STATUS_BY_NAME: dict[str, int] = {
+    "OK": 0,
+    "CANCELLED": 1,
+    "UNKNOWN": 2,
+    "INVALID_ARGUMENT": 3,
+    "DEADLINE_EXCEEDED": 4,
+    "NOT_FOUND": 5,
+    "ALREADY_EXISTS": 6,
+    "PERMISSION_DENIED": 7,
+    "RESOURCE_EXHAUSTED": 8,
+    "FAILED_PRECONDITION": 9,
+    "ABORTED": 10,
+    "OUT_OF_RANGE": 11,
+    "UNIMPLEMENTED": 12,
+    "INTERNAL": 13,
+    "UNAVAILABLE": 14,
+    "DATA_LOSS": 15,
+    "UNAUTHENTICATED": 16,
+}
+
+_GRPC_STATUS_BY_CODE: dict[int, str] = {v: k for k, v in _GRPC_STATUS_BY_NAME.items()}
+
 # A dotted jq path whose final segment contains a hyphen, e.g.
 # ``.headers.x-request-id`` or ``.body.event-type``. jq parses such segments
 # as subtraction, producing a baffling compile error; this lets ``compile_jq``
@@ -403,5 +426,197 @@ def evaluate_http_assertions(
     if failures:
         raise AssertionFailure(
             f"HTTP response failed {len(failures)} assertion(s)",
+            {"response": result, "failures": failures},
+        )
+
+
+def validate_grpc_assertion_args(
+    *,
+    status: str | int | None = None,
+    contains: str | None = None,
+    match: str | None = None,
+    jq_path: str | None = None,
+    equals: str | None = None,
+) -> None:
+    """Pre-request gate for gRPC assertions (mirrors HTTP validation).
+
+    Pure arg validation only -- never touches the network, so misuse fails
+    BEFORE the request side-effect is triggered.
+
+    Raises :class:`ConfigError` (exit 2) on:
+      - **pairing**: exactly one of ``jq_path``/``equals`` set ->
+        ``--jq-path and --equals must be used together``.
+      - ``--contains`` present but not valid JSON ->
+        ``--contains must be valid JSON``.
+      - ``--status`` present but not a valid gRPC code name or number 0-16 ->
+        ``--status must be a gRPC code name or number 0-16, got {status!r}```.
+
+    Returns ``None`` (no-op) when args are sound -- including the all-None case.
+    """
+    # pairing: jq_path and equals must be used together (XOR on None-ness)
+    if (jq_path is None) != (equals is None):
+        raise ConfigError("--jq-path and --equals must be used together", {})
+    # --contains must parse as JSON when present
+    if contains is not None:
+        try:
+            json.loads(contains)
+        except (json.JSONDecodeError, ValueError):
+            raise ConfigError("--contains must be valid JSON", {})
+    # --status must be a valid gRPC code name or number 0-16
+    if status is not None:
+        # Coerce a numeric string (e.g. "5" arriving from the Click CLI, which
+        # declares --status as type=str) to int BEFORE the lookup — otherwise the
+        # int branch below is unreachable from the CLI and --status 5 is rejected.
+        # gRPC codes are 0-16 (non-negative); ``isdigit`` suffices.
+        if isinstance(status, str) and status.isdigit():
+            status = int(status)
+        # If it's a string, must be in _GRPC_STATUS_BY_NAME
+        if isinstance(status, str):
+            if status not in _GRPC_STATUS_BY_NAME:
+                raise ConfigError(
+                    f"--status must be a gRPC code name or number 0-16, got {status!r}",
+                    {},
+                )
+        # If it's an int, must be in _GRPC_STATUS_BY_CODE
+        elif isinstance(status, int):
+            if status not in _GRPC_STATUS_BY_CODE:
+                raise ConfigError(
+                    f"--status must be a gRPC code name or number 0-16, got {status!r}",
+                    {},
+                )
+        else:
+            # Wrong type (neither str nor int)
+            raise ConfigError(
+                f"--status must be a gRPC code name or number 0-16, got {status!r}",
+                {},
+            )
+    return None
+
+
+def evaluate_grpc_assertions(
+    result: dict,
+    *,
+    status: str | int | None = None,
+    contains: str | None = None,
+    match: str | None = None,
+    jq_path: str | None = None,
+    equals: str | None = None,
+) -> None:
+    """Post-request evaluation of a gRPC response against active assertion modes.
+
+    Assumes :func:`validate_grpc_assertion_args` has already run on the same
+    args (so pairing is satisfied, ``--contains`` is valid JSON, and ``--status``
+    is a valid code name or number).
+
+    Evaluates each active mode, collecting a failure entry per failing mode
+    (NO short-circuit -- all modes run, all failures are reported). If any
+    failures were collected, raises :class:`AssertionFailure` whose
+    ``detail`` carries BOTH the full ``response`` dict and the ``failures``
+    list.
+
+    For ``--match`` / ``--jq-path``, a missing ``jq`` library surfaces from
+    ``_jq()`` as a :class:`ConfigError` whose message names only db/kafka;
+    it is re-raised here pointing at ``pip install 'agctl[grpc]'``.
+
+    Per-mode failure entry shapes (pinned, parsed by downstream agents):
+      - ``status``:   ``{"mode":"status","expected":<arg>,"actual":<status name>}``
+      - ``contains``: ``{"mode":"contains","needle":<parsed>,"matched":False,
+                        "root":"response message","body":<message snapshot>}``
+      - ``match``:    ``{"mode":"match","expr":<match>,"result":False,
+                        "root":"response envelope","body":<message snapshot>}``
+      - ``jq-path``:  ``{"mode":"jq-path","path":<jq_path>,
+                        "expected":<parse_equals(equals)>,"actual":<jq_value or None>,
+                        "root":"response message","body":<message snapshot>}``
+
+    The ``root`` label differs per mode because the modes root differently:
+    ``--match`` at the response envelope (whole result dict), ``--contains``/``--jq-path``
+    at the response message (``result['message']``).
+    """
+    if all(arg is None for arg in (status, contains, match, jq_path, equals)):
+        return None
+
+    failures = []
+
+    # Status assertion: normalize arg to code, compare to result['status']['code']
+    if status is not None:
+        # Normalize status arg to a code (coerce numeric string from CLI — see
+        # validate_grpc_assertion_args; both must agree on the coercion).
+        if isinstance(status, str) and status.isdigit():
+            status = int(status)
+        if isinstance(status, str):
+            expected_code = _GRPC_STATUS_BY_NAME[status]
+        else:  # int
+            expected_code = status
+        actual_code = result["status"]["code"]
+        if expected_code != actual_code:
+            failures.append(
+                {
+                    "mode": "status",
+                    "expected": status,
+                    "actual": result["status"]["name"],
+                }
+            )
+
+    # Contains assertion: check result['message'] subset match
+    if contains is not None:
+        needle = json.loads(contains)  # validated safe by validate_grpc_assertion_args
+        if not json_subset(needle, result.get("message")):
+            failures.append(
+                {
+                    "mode": "contains",
+                    "needle": needle,
+                    "matched": False,
+                    "root": "response message",
+                    "body": _response_body_snapshot(result.get("message")),
+                }
+            )
+
+    # Match assertion: evaluate jq against the whole result dict (envelope-rooted)
+    if match is not None:
+        try:
+            ok = jq_bool(result, match)
+        except ConfigError:
+            # Re-raise with grpc-specific install hint
+            raise ConfigError(
+                "jq is required for match assertions: pip install 'agctl[grpc]'",
+                {"expr": match},
+            ) from None
+        if not ok:
+            failures.append(
+                {
+                    "mode": "match",
+                    "expr": match,
+                    "result": False,
+                    "root": "response envelope",
+                    "body": _response_body_snapshot(result.get("message")),
+                }
+            )
+
+    # jq-path assertion: evaluate against result['message']
+    if jq_path is not None:  # equals is non-None too (validated pairing)
+        expected = parse_equals(equals)
+        try:
+            actual = jq_value(result.get("message"), jq_path)
+        except ConfigError:
+            # Re-raise with grpc-specific install hint
+            raise ConfigError(
+                "jq is required for jq-path assertions: pip install 'agctl[grpc]'",
+                {"path": jq_path},
+            ) from None
+        if not type_aware_equal(actual, expected):
+            failures.append(
+                {
+                    "mode": "jq-path",
+                    "path": jq_path,
+                    "expected": expected,
+                    "actual": actual,
+                    "root": "response message",
+                    "body": _response_body_snapshot(result.get("message")),
+                }
+            )
+
+    if failures:
+        raise AssertionFailure(
+            f"gRPC response failed {len(failures)} assertion(s)",
             {"response": result, "failures": failures},
         )

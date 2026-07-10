@@ -46,12 +46,14 @@ _VALID_CATEGORIES = (
     "mock-http-stubs",
     "mock-kafka-reactors",
     "log-sources",
+    "grpc-services",
+    "grpc-methods",
 )
 
 _SUMMARY_HINT = (
     "Run 'agctl discover --category <name>' to list items. "
     "Categories: services, http-templates, kafka-patterns, db-templates, "
-    "mock-http-stubs, mock-kafka-reactors, log-sources"
+    "mock-http-stubs, mock-kafka-reactors, log-sources, grpc-services, grpc-methods"
 )
 _CATEGORY_HINT = "Run 'agctl discover --category <c> --name <name>' for full detail"
 _SEARCH_HINT = (
@@ -202,6 +204,8 @@ def _summary_core(config_path: str | None, overlay_paths: list[str] | None = Non
         "mock_http_stubs": len(_mock_http_stubs(cfg)),
         "mock_kafka_reactors": len(_mock_kafka_reactors(cfg)),
         "log_sources": len(cfg.logs.sources),
+        "grpc_targets": len(cfg.grpc.targets),
+        "grpc_methods": len(cfg.grpc.templates),
         "hint": _SUMMARY_HINT,
     }
 
@@ -253,6 +257,22 @@ def _category_core(config_path: str | None, category: str, overlay_paths: list[s
                 {
                     "name": name,
                     "description": f"{src.type} logs for {name} ({src.path or '?'})",
+                }
+            )
+    elif category == "grpc-services":
+        for name, tgt in cfg.grpc.targets.items():
+            items.append(
+                {
+                    "name": name,
+                    "description": f"gRPC target {name} at {tgt.address} (tls={tgt.use_tls})",
+                }
+            )
+    elif category == "grpc-methods":
+        for name, tpl in cfg.grpc.templates.items():
+            items.append(
+                {
+                    "name": name,
+                    "description": tpl.description or f"{tpl.service}/{tpl.method}",
                 }
             )
 
@@ -426,6 +446,65 @@ def _item_core(config_path: str | None, category: str, name: str, overlay_paths:
             "example": f"agctl logs query --source {name} --level ERROR --since 5m",
         }
 
+    if category == "grpc-services":
+        if name not in cfg.grpc.targets:
+            raise TemplateNotFound(
+                f"Unknown gRPC target: {name}",
+                {"path": f"grpc.targets.{name}"},
+            )
+        tgt = cfg.grpc.targets[name]
+        return {
+            "category": "grpc-services",
+            "name": name,
+            "description": f"gRPC target {name} at {tgt.address} (tls={tgt.use_tls})",
+            "address": tgt.address,
+            "use_tls": tgt.use_tls,
+            "reflection": tgt.reflection,
+            "example": f"agctl grpc call --target {name} --service <fq> --method <m>",
+        }
+
+    if category == "grpc-methods":
+        if name not in cfg.grpc.templates:
+            raise TemplateNotFound(
+                f"Unknown gRPC method template: {name}",
+                {"path": f"grpc.templates.{name}"},
+            )
+        tpl = cfg.grpc.templates[name]
+        # Local import to avoid module-load cycle (grpc_commands imports this file)
+        from ..commands.grpc_commands import new_grpc_client
+        from google.protobuf.descriptor import FieldDescriptor
+
+        try:
+            client = new_grpc_client(cfg.grpc.targets[tpl.target], descriptors=cfg.grpc.descriptors)
+            md = client.find_method(tpl.service, tpl.method)
+            # Map field type int to type name
+            type_map = {v: k for k, v in vars(FieldDescriptor).items() if k.startswith('TYPE_') and isinstance(v, int)}
+            request_fields = [
+                {"name": f.name, "type": type_map.get(f.type, f"UNKNOWN_{f.type}"), "repeated": f.is_repeated}
+                for f in md.input_type.fields
+            ]
+            call_type = client.call_type_of(md)
+            return {
+                "category": "grpc-methods",
+                "name": name,
+                "description": tpl.description,
+                "target": tpl.target,
+                "service": tpl.service,
+                "method": tpl.method,
+                "call_type": call_type,
+                "request_fields": request_fields,
+                "example": f"agctl grpc call {name}",
+            }
+        except ConfigError as err:
+            # Target unreachable or reflection unavailable - return unavailable marker
+            # instead of failing the whole discover call
+            return {
+                "category": "grpc-methods",
+                "name": name,
+                "unavailable": True,
+                "error": str(err),
+            }
+
     # category == "db-templates"
     if name not in cfg.database.templates:
         raise TemplateNotFound(
@@ -531,6 +610,26 @@ def _search_core(config_path: str | None, term: str, overlay_paths: list[str] | 
                     "category": "log-sources",
                     "name": name,
                     "description": f"{src.type} logs for {name} ({src.path or '?'})",
+                }
+            )
+
+    for name, tgt in cfg.grpc.targets.items():
+        if needle in name.lower() or needle in tgt.address.lower():
+            matches.append(
+                {
+                    "category": "grpc-services",
+                    "name": name,
+                    "description": f"gRPC target {name} at {tgt.address} (tls={tgt.use_tls})",
+                }
+            )
+
+    for name, tpl in cfg.grpc.templates.items():
+        if needle in name.lower() or _matches(tpl.description):
+            matches.append(
+                {
+                    "category": "grpc-methods",
+                    "name": name,
+                    "description": tpl.description or f"{tpl.service}/{tpl.method}",
                 }
             )
 

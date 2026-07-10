@@ -329,6 +329,51 @@ class LogsConfig(BaseModel):
     defaults: LogsDefaults = Field(default_factory=LogsDefaults)
 
 
+class GrpcTls(BaseModel):
+    """TLS/mTLS settings for a gRPC connection."""
+
+    ca_location: str | None = None
+    certificate_location: str | None = None
+    key_location: str | None = None
+    override_authority: str | None = None
+
+
+class GrpcTarget(BaseModel):
+    """gRPC target configuration: address, TLS, and server reflection settings."""
+
+    address: str
+    use_tls: bool = False
+    tls: GrpcTls | None = None
+    reflection: Literal["auto", "on", "off"] = "auto"
+
+
+class GrpcDescriptorSource(BaseModel):
+    """Protobuf descriptor source: either proto file or descriptor set."""
+
+    proto: str | None = None
+    include_paths: list[str] = Field(default_factory=list)
+    descriptor_set: str | None = None
+
+
+class GrpcTemplate(BaseModel):
+    """gRPC call template: target service, method, metadata, and message."""
+
+    description: str | None = None
+    target: str
+    service: str
+    method: str
+    metadata: dict[str, str] = Field(default_factory=dict)
+    message: dict | None = None
+
+
+class GrpcConfig(BaseModel):
+    """gRPC configuration: targets, descriptors, and templates."""
+
+    targets: dict[str, GrpcTarget] = Field(default_factory=dict)
+    descriptors: list[GrpcDescriptorSource] = Field(default_factory=list)
+    templates: dict[str, GrpcTemplate] = Field(default_factory=dict)
+
+
 class Config(BaseModel):
     version: str
     services: dict[str, ServiceConfig] = Field(default_factory=dict)
@@ -338,6 +383,7 @@ class Config(BaseModel):
     defaults: Defaults = Field(default_factory=Defaults)
     mocks: MocksConfig | None = None
     logs: LogsConfig = Field(default_factory=LogsConfig)
+    grpc: GrpcConfig = Field(default_factory=GrpcConfig)
 
 
 class PartialConfig(Config):

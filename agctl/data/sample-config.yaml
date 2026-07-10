@@ -141,6 +141,39 @@ defaults:
   timeout_seconds: 10
   database_connection: main-db
 
+# --- grpc: gRPC service targets and templates -------------------------------
+grpc:
+  # targets: named gRPC server addresses
+  targets:
+    order-service:
+      address: "localhost:50051"
+      use_tls: false               # optional; defaults to false (plaintext)
+      reflection: auto             # auto (default) | on | off
+      # tls:                       # optional TLS settings (when use_tls: true)
+      #   override_authority: ""  # optional; override the TLS server name
+
+  # descriptors: fallback proto descriptor sets when reflection is unavailable.
+  # Each entry sets exactly one of `descriptor_set` (a compiled FileDescriptorSet
+  # .pb file) or `proto` (a .proto glob compiled at load via protoc; pair with
+  # `include_paths`).
+  descriptors:
+    - descriptor_set: "protos/order-service.desc"
+    # - proto: "protos/orders/v1/*.proto"
+    #   include_paths: ["protos"]
+
+  # templates: named gRPC request templates
+  templates:
+    create-order:
+      description: "Create a new order via gRPC"
+      target: order-service
+      service: "orders.OrderService"
+      method: "CreateOrder"
+      message:
+        customer_id: "{customer_id}"
+        items:
+          - sku: "{sku}"
+            quantity: 1
+
 # --- logs: log file sources for tailing and searching ------------------------
 logs:
   sources:

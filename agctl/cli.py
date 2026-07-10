@@ -24,6 +24,7 @@ from .commands.config_commands import (
 )
 from .commands.db_commands import db_assert, db_execute, db_query, db_schema
 from .commands.discover_commands import discover
+from .commands.grpc_commands import grpc_call, grpc_healthcheck
 from .commands.http_commands import http_call, http_ping, http_request
 from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
 from .commands.logs_commands import logs_assert, logs_query, logs_tail
@@ -145,6 +146,11 @@ def logs_group() -> None:
     """Log query/assert/tail commands."""
 
 
+@cli.group(name="grpc")
+def grpc_group() -> None:
+    """gRPC call/healthcheck commands."""
+
+
 @cli.group(name="check")
 def check_group() -> None:
     """Health/readiness checks."""
@@ -184,6 +190,11 @@ kafka_group.add_command(kafka_assert)
 logs_group.add_command(logs_query)
 logs_group.add_command(logs_assert)
 logs_group.add_command(logs_tail)
+
+
+# Register subcommands on the grpc group.
+grpc_group.add_command(grpc_call)
+grpc_group.add_command(grpc_healthcheck)
 
 
 # Register subcommands on the check group.

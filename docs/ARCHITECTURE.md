@@ -1,7 +1,7 @@
 # `agctl` — Architecture Document
 
 **Status:** Source-of-truth (as-built).
-**Last updated:** 2026-07-06
+**Last updated:** 2026-07-10
 
 > `ARCHITECTURE.md` is the **source of truth for how the system works today** —
 > the as-built runtime, module boundaries, data flows, and extension model. Its
@@ -120,6 +120,7 @@ agctl/
 │   ├── check_commands.py       # check ready
 │   ├── config_commands.py      # config validate / show / init / migrate
 │   ├── discover_commands.py    # discover summary / category / item / search
+│   ├── grpc_commands.py        # grpc call / healthcheck
 │   └── mock_commands.py        # mock run / start / stop / status (HTTP mock + Kafka reactors)
 ├── mock/                       # mock server implementation (HTTP + Kafka)
 │   ├── routing.py              # path-template matching (pure functions)
@@ -138,6 +139,7 @@ agctl/
     ├── db_client.py            # driver dispatch via agctl.db_drivers entry points
     ├── db_driver_protocol.py   # DBDriver Protocol
     ├── db_drivers/postgresql.py  # built-in psycopg driver (lazy import)
+    ├── grpc_client.py          # grpcio wrapper (lazy import)
     ├── log_client.py           # log backend dispatch via agctl.logs_backends entry points
     ├── log_backend_protocol.py # LogBackend Protocol + CanonicalEntry DTOs
     └── log_backends/ndjson_file.py  # built-in NDJSON file backend (lazy import)
@@ -188,6 +190,34 @@ Trace of `agctl db query --template find-order --param orderId=42`:
    driver rewrites `:name`→`%(name)s` and returns coerced dict rows.
 6. **Return** — `{"rows": [...], "row_count": N, "connection": name}`.
 7. **Emit + exit** — `@envelope`'s `else` branch emits `ok:true` and exits 0.
+
+Trace of `agctl grpc call --target echo-server --service echo.EchoService --method Unary --message '{"msg":"hello"}'`:
+
+1. **Click parses** argv; the root group stored `--config` in
+   `ctx.obj["config_path"]`. Click invokes `grpc_call`, which routes based on
+   call type detection.
+2. **Call type detection** — `_detect_call_type` loads config, resolves the target
+   (`echo-server`), constructs `GrpcClient`, and calls `find_method` to get the
+   method descriptor and determine call type (`unary` for this example).
+3. **Unary routing** — for `unary`/`client_stream`, delegates to the wrapped
+   `_grpc_call_envelope` (which wraps `_grpc_call_core`).
+4. **`@envelope`** starts a monotonic timer and calls `_grpc_call_core` in a `try`.
+5. **Config load** — already loaded; `load_config_or_raise` re-validates.
+6. **Message serialization** — JSON request is parsed, placeholders are filled,
+   and `json_format.ParseDict` serializes to protobuf bytes.
+7. **gRPC call** — `GrpcClient.call_unary` invokes the channel's `unary_unary`
+   method with request/response serializers. Success → JSON response deserialized
+   via `json_format.MessageToDict`; RpcError (non-OK status) → caught and
+   returned as `GrpcUnaryResult` with status field.
+8. **Post-call assertions** — if assertion flags were set, `evaluate_grpc_assertions`
+   runs (reusing jq/subset/equals primitives); failure → `AssertionFailure`.
+9. **Return** — `{"target": "localhost:50051", "service": "echo.EchoService",
+   "method": "Unary", "call_type": "unary", "status": {"code": 0, "name": "OK",
+   "message": ""}, "message": {...}, "initial_metadata": {...}, "trailers": {...}}`.
+10. **Emit + exit** — `@envelope`'s `else` branch emits `ok:true` and exits 0.
+
+**Server-streaming/bidi routing** — for `server_stream`/`bidi` call types, the
+command bypasses `@envelope` and emits NDJSON directly (§6, streaming exceptions).
 
 **Failure paths** all funnel through `@envelope`:
 
@@ -358,6 +388,14 @@ results as they happen, so it violates "one object per invocation":
 - Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary:true, total_emitted, duration_ms}` and exits `0`.
 - Supports `--duration` (daemon timer) and `--until-stopped` (signal-only) modes, mutually exclusive.
 - Startup errors emit a single structured envelope **before** any entry line.
+
+**The fourth and fifth streaming exceptions — `grpc call` (server-streaming and bidi).** Like `http ping`, server-streaming and bidirectional gRPC calls emit NDJSON:
+
+- Not wrapped by `@envelope`.
+- Emits one JSON object **per response message** (NDJSON) directly as the stream runs.
+- Each line includes `event: "message"`, the `message` dict, and optional `trailers`.
+- Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary:true, messages, matched, status, duration_ms}` and exits `0` (or `1` if `--expect-count` is not met).
+- Startup errors emit a single structured envelope **before** any message line.
 
 **The managed daemon commands — `mock start`/`stop`/`status`** are NOT streaming exceptions. Each is a normal `@envelope`-wrapped command that emits exactly one JSON object and exits 0/1/2:
 
@@ -584,6 +622,58 @@ leaves the transaction ambiguous.
 
 ---
 
+### GrpcClient (`clients/grpc_client.py`)
+
+grpcio wrapper with descriptor resolution (reflection + descriptor fallback),
+JSON↔protobuf translation, and four call types. Lazy-import pattern: importing
+`agctl.clients.grpc_client` never requires `grpcio`; the constructor imports
+on-demand and raises `ConfigError` pointing at `pip install 'agctl[grpc]'`.
+
+**Descriptor resolution** (reflection-first, descriptor fallback):
+
+- **Path 1: Injected pool** — test seam; return directly.
+- **Path 2: Reflection** — query `grpc.reflection.v1alpha.ServerReflection` for
+  `list_services` → `file_containing_symbol` responses, deserialize
+  `FileDescriptorProto` messages into a `DescriptorPool`. Reflection mode is
+  controlled per-target: `"auto"` (try reflection, fall back to descriptors),
+  `"on"` (require reflection, error if UNIMPLEMENTED), `"off"` (skip reflection).
+- **Path 3: Descriptor fallback** — load proto files (compile via `grpc_tools.protoc`)
+  or precompiled `.pb` descriptor sets into a `DescriptorPool`.
+
+**JSON↔protobuf translation** — `MessageToJson` / `ParseFromJson` via
+`json_format.ParseDict` and `json_format.MessageToDict`. Request serialization
+fails with `ConfigError` on unknown fields (`ignore_unknown_fields=False`);
+response deserialization skips unknown fields.
+
+**Call types** — `call_type_of(method_desc)` returns one of four strings:
+
+- `"unary"` — `unary_unary` → single request, single response.
+- `"client_stream"` — `stream_unary` → request iterator, single response.
+- `"server_stream"` — `unary_stream` → single request, response iterator.
+- `"bidi"` — `stream_stream` → request iterator, response iterator.
+
+**Status-as-result semantics** — gRPC status is a result field, not an assertion.
+Non-OK `RpcError` (e.g. `NOT_FOUND`, `PERMISSION_DENIED`) is caught and
+returned as `GrpcUnaryResult` with `status` (code/name/message) and `message=None`;
+the envelope remains `ok:true`. Assertion flags (`--status`, `--contains`,
+`--match`, `--jq-path`, `--equals`) are evaluated separately via
+`evaluate_grpc_assertions` (reusing `jq_bool`/`json_subset`/`jq_value`/`parse_equals`
+primitives) and raise `AssertionFailure` on mismatch.
+
+**Exception mapping:** `RpcError.DEADLINE_EXCEEDED` → `OperationTimeout`;
+other `RpcError` → status-in-result (connection succeeded, call failed); bare
+`Exception` → `ConnectionFailure`.
+
+**Healthcheck** — calls `grpc.health.v1.Health/Check` via `HealthStub`.
+Returns `GrpcHealthResult` with `status` enum name (`SERVING`/`NOT_SERVING`/`UNKNOWN`)
+and optional `note`. `UNIMPLEMENTED` status returns `UNKNOWN` (not an error).
+
+**Lazy-grpcio rule** — grpcio, grpcio-tools, grpcio-health-checking,
+grpcio-reflection, and protobuf are imported only when `GrpcClient` is constructed;
+missing library surfaces as `ConfigError` (exit 2) pointing at the `grpc` extra.
+
+---
+
 ## 9. Assertion Engine
 
 Primitives in `assertions.py`, composed by the command layer. Five families:
@@ -751,6 +841,14 @@ and **skipped** — it never bricks the CLI, the registry, or driver discovery.
 - **Assertion modes** — loaded lazily on first `get_default_registry()` and
   cached. See §9.
 
+> **In-tree gRPC support:** The `grpc` command group is implemented in-tree
+> (`commands/grpc_commands.py` and `clients/grpc_client.py`) and does **not**
+> use the `agctl.plugins` entry point. Unlike protocol plugins (which add new
+> top-level groups via entry points), gRPC is a core transport and lives
+> alongside HTTP/Kafka/DB in the main module tree. The `grpc` extra
+> (`grpcio`, `grpcio-tools`, `grpcio-health-checking`, `grpcio-reflection`,
+> `protobuf`, `jq`) follows the same lazy-import pattern.
+
 ---
 
 ## 11. Dependency & Packaging Model
@@ -767,8 +865,9 @@ extras, so a user installs only what they need and the package imports fast:
 | `kafka` | `confluent-kafka`, `jq` | `kafka *` |
 | `db` | `psycopg[binary]`, `jq` | `db *` |
 | `logs` | `jq` | `logs *` (`--match` on logs query/assert/tail) |
+| `grpc` | `grpcio`, `grpcio-tools`, `grpcio-health-checking`, `grpcio-reflection`, `protobuf`, `jq` | `grpc *` |
 | `dev` | `pytest` | unit tests |
-| `integration` | `testcontainers`, `agctl[db,kafka,http]`, `pytest` | live integration tests |
+| `integration` | `testcontainers`, `agctl[db,kafka,http,grpc]`, `pytest` | live integration tests |
 
 `jq` is bundled under `kafka`/`db`/`logs` (which always needed it) **and** exposed as a
 dedicated `jq` extra for HTTP-only users (response assertions) and HTTP-only-mock

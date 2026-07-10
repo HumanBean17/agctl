@@ -47,6 +47,7 @@ flags: see `--help`.)
 | See what was published | `kafka consume --topic T [--match …]` |
 | Publish a message | `kafka produce --topic T --message '{…}'` |
 | DB write / rows / value / inspect / schema | `db execute --write` / `db assert --expect-rows N` / `db assert --expect-value --path .x --equals v` / `db query` / `db schema` |
+| Call gRPC services / healthcheck | `grpc call <tpl> [--param…]` / `grpc call --target T --address host:port` / `grpc healthcheck` |
 | Impersonate a dependency | `mock run` (foreground) / `mock start\|stop\|status` (daemon) |
 | Are services up? / validate config / migrate v1/v2→v3 | `check ready --all` / `config validate` / `config migrate` |
 
@@ -245,5 +246,52 @@ agctl db execute --template upsert-customer --param customerId=cust-42 --param e
 agctl http ping heartbeat --interval 5 --until-stopped &
 PID=$!; … run the scenario …; kill "$PID"
 ```
+
+## `agctl grpc` — gRPC service calls
+
+gRPC support requires the `grpc` extra: `pip install 'agctl[grpc]'` (includes grpcio, grpcio-tools, grpcio-health-checking, grpcio-reflection, protobuf, jq).
+
+**Two invocation modes:**
+- **Template mode** `grpc call <template>` — resolves `grpc.templates[<name>]` (service, method, request body with `{placeholder}` support)
+- **Free-form mode** `grpc call --target <name>` or `--address host:port` — ad-hoc calls without config templates
+
+**Four call types** (auto-detected from method descriptor):
+- **Unary** — single request, single response (returns `grpc.call` envelope with `call_type: "unary"`)
+- **Client-stream** — NDJSON stdin requests → single response (same envelope shape)
+- **Server-stream** — single request → NDJSON stdout responses (streaming exception; one JSON object per response + final `summary`)
+- **Bidi** — NDJSON stdin requests ↔ NDJSON stdout responses (streaming exception; bidirectional stream)
+
+**stdin/stdout NDJSON model:** For client-stream and bidi calls, pipe NDJSON request objects via stdin. Each line is a complete JSON request object (placeholders filled per line). Server-stream and bidi emit one NDJSON line per response message plus a final `{"summary": true, ...}`.
+
+**Status-as-result semantics:** gRPC status codes are result fields, not assertion failures. A non-OK status (e.g. `StatusCode.NOT_FOUND`) still returns `ok: true` with `result.status.code`/`name`/`message`. Assertions (`--status`, `--match`, etc.) evaluate separately and raise `AssertionFailure` (exit 1) on mismatch.
+
+**Config structure:**
+```yaml
+grpc:
+  targets:
+    my-service:
+      address: "host:port"
+      use_tls: false
+      # tls: { override_authority: "" }  # optional for TLS
+  descriptors:                    # fallback when reflection is off / unavailable
+    - proto: "protos/my-service/v1/*.proto"   # compile .proto globs at load
+      include_paths: ["protos"]
+    # OR a pre-compiled descriptor set:
+    # - descriptor_set: "protos/compiled/my-service.pb"
+  templates:
+    my-method:
+      target: my-service
+      service: "ServiceName"
+      method: "MethodName"
+      request: { field: "{value}" }
+```
+
+**Discovery:** `agctl discover --category grpc-services` / `--category grpc-methods` lists discoverable services and methods (reflection-based or from descriptors).
+
+**Gotchas:**
+- **`--address` format** must be `host:port` (single colon, both non-empty). Mutually exclusive with `--target`.
+- **Reflection-first fallback:** Agctl tries server reflection first; if unavailable, falls back to `descriptors[]` proto files. Provide descriptors for air-gapped environments.
+- **Plaintext by default:** Set `use_tls: true` (and optionally `tls.override_authority`) for TLS services. Plaintext h2c is the default.
+- **Streaming exceptions:** Server-stream and bidi are the 4th and 5th streaming exceptions (after `http ping`, `mock run`, `logs tail`). Background with `&`, capture PID, kill when done.
 
 Prefer **templates** over free-form. Explore with **`discover`**, never `config show`.

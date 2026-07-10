@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package echo;
+
+service Echo {
+  rpc Unary(Request) returns (Response);
+  rpc ServerStream(Request) returns (stream Response);
+  rpc ClientStream(stream Request) returns (Response);
+  rpc Bidi(stream Request) returns (stream Response);
+}
+
+message Request {
+  string msg = 1;
+}
+
+message Response {
+  string msg = 1;
+  int32 n = 2;
+}

@@ -963,3 +963,216 @@ def test_discover_item_unknown_log_source(monkeypatch):
     assert payload["ok"] is False
     assert payload["error"]["type"] == "TemplateNotFound"
     assert "Unknown logs source: nope" in payload["error"]["message"]
+
+
+# --------------------------------------------------------------------------- #
+# Task 12: grpc-services / grpc-methods categories
+# --------------------------------------------------------------------------- #
+
+
+def test_discover_summary_includes_grpc(monkeypatch):
+    """Task 12 Test 1: discover summary includes grpc_targets and grpc_methods counts and hint mentions grpc-services/grpc-methods."""
+    result = _run([], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["ok"] is True
+    counts = payload["result"]
+    # Fixture has 1 gRPC target (echo) and 1 template (echo-unary)
+    assert counts["grpc_targets"] == 1
+    assert counts["grpc_methods"] == 1
+    # Hint should mention both new categories
+    assert "grpc-services" in counts["hint"]
+    assert "grpc-methods" in counts["hint"]
+
+
+def test_discover_category_grpc_services(monkeypatch):
+    """Task 12 Test 2: discover --category grpc-services lists gRPC targets."""
+    result = _run(["--category", "grpc-services"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.category"
+    res = payload["result"]
+    assert res["category"] == "grpc-services"
+    assert res["count"] == 1
+    by_name = {item["name"]: item for item in res["items"]}
+    assert "echo" in by_name
+    # Description format: "gRPC target {name} at {address} (tls={use_tls})"
+    desc = by_name["echo"]["description"]
+    assert "gRPC target echo" in desc
+    assert "localhost:50051" in desc
+    assert "tls=False" in desc or "tls=false" in desc.lower()
+
+
+def test_discover_category_grpc_methods(monkeypatch):
+    """Task 12 Test 3: discover --category grpc-methods lists gRPC method templates."""
+    result = _run(["--category", "grpc-methods"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.category"
+    res = payload["result"]
+    assert res["category"] == "grpc-methods"
+    assert res["count"] == 1
+    by_name = {item["name"]: item for item in res["items"]}
+    assert "echo-unary" in by_name
+    # Description is the template description or "service/method"
+    assert by_name["echo-unary"]["description"] == "Unary echo call"
+
+
+def test_discover_item_grpc_methods_schema(monkeypatch):
+    """Task 12 Test 4: discover --category grpc-methods --name echo-unary returns request_fields and call_type."""
+    # Create a fake method descriptor with input_type.fields
+    from google.protobuf.descriptor import FieldDescriptor
+
+    class FakeField:
+        def __init__(self, name, type_int, is_repeated):
+            self.name = name
+            self.type = type_int
+            self.is_repeated = is_repeated
+
+    class FakeInputType:
+        def __init__(self):
+            self.fields = [
+                FakeField("msg", FieldDescriptor.TYPE_STRING, False),  # TYPE_STRING = 9
+                FakeField("count", FieldDescriptor.TYPE_INT64, False),  # TYPE_INT64 = 3
+                FakeField("items", FieldDescriptor.TYPE_STRING, True),  # repeated
+            ]
+
+    class FakeMethodDescriptor:
+        def __init__(self):
+            self.input_type = FakeInputType()
+
+    # Fake gRPC client
+    class FakeGrpcClient:
+        def __init__(self, target, *, descriptors=None):
+            self.target = target
+
+        def find_method(self, service, method):
+            return FakeMethodDescriptor()
+
+        def call_type_of(self, method_descriptor):
+            return "unary"
+
+    # Monkeypatch grpc_commands.new_grpc_client
+    import agctl.commands.grpc_commands as grpc_commands
+    monkeypatch.setattr(grpc_commands, "new_grpc_client", FakeGrpcClient)
+
+    result = _run(["--category", "grpc-methods", "--name", "echo-unary"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.item"
+    res = payload["result"]
+    assert res["category"] == "grpc-methods"
+    assert res["name"] == "echo-unary"
+    assert res["target"] == "echo"
+    assert res["service"] == "echo.Echo"
+    assert res["method"] == "Unary"
+    assert res["call_type"] == "unary"
+    # request_fields should enumerate the fields
+    fields = res["request_fields"]
+    assert len(fields) == 3
+    # msg field: TYPE_STRING, not repeated
+    msg_field = next(f for f in fields if f["name"] == "msg")
+    assert msg_field["type"] == "TYPE_STRING"
+    assert msg_field["repeated"] is False
+    # count field: TYPE_INT64, not repeated
+    count_field = next(f for f in fields if f["name"] == "count")
+    assert count_field["type"] == "TYPE_INT64"
+    assert count_field["repeated"] is False
+    # items field: TYPE_STRING, IS repeated
+    items_field = next(f for f in fields if f["name"] == "items")
+    assert items_field["type"] == "TYPE_STRING"
+    assert items_field["repeated"] is True
+    # example starts with "agctl grpc call echo-unary"
+    assert res["example"].startswith("agctl grpc call echo-unary")
+
+
+def test_discover_item_grpc_methods_unavailable_isolated(monkeypatch):
+    """Task 12 Test 5: discover --category grpc-methods --name unavailable when reflection fails returns unavailable=True instead of crashing."""
+    from agctl.errors import ConfigError
+
+    # Fake client that raises ConfigError (reflection unreachable)
+    class FakeGrpcClient:
+        def __init__(self, target, *, descriptors=None):
+            raise ConfigError("Reflection service unreachable", {"target": target.address})
+
+    # Monkeypatch grpc_commands.new_grpc_client BEFORE importing the module
+    import agctl.commands.grpc_commands as grpc_commands
+    original_new_grpc_client = grpc_commands.new_grpc_client
+    grpc_commands.new_grpc_client = FakeGrpcClient
+
+    # Create a temp config with an unavailable template
+    config_yaml = (
+        'version: "3"\n'
+        "services:\n"
+        '  demo:\n'
+        '    base_url: "http://localhost:9999"\n'
+        "grpc:\n"
+        "  targets:\n"
+        "    echo:\n"
+        '      address: "localhost:50051"\n'
+        "      use_tls: false\n"
+        "      reflection: auto\n"
+        "  descriptors: []\n"
+        "  templates:\n"
+        "    echo-unary:\n"
+        '      description: "Unary echo call"\n'
+        "      target: echo\n"
+        "      service: echo.Echo\n"
+        "      method: Unary\n"
+        "      message:\n"
+        '        msg: "{m}"\n'
+    )
+
+    from pathlib import Path
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg_file = Path(tmp_dir) / "agctl.yaml"
+            cfg_file.write_text(config_yaml)
+
+            runner = CliRunner()
+            result = runner.invoke(
+                cli,
+                ["--config", str(cfg_file), "discover", "--category", "grpc-methods", "--name", "echo-unary"],
+                env=ENV,
+                standalone_mode=False,
+            )
+
+        # Should NOT crash - exit 0 with unavailable marker
+        assert result.exit_code == 0, f"Expected exit 0, got {result.exit_code}. Output: {result.output}"
+        payload = _payload(result)
+        assert payload["ok"] is True
+        res = payload["result"]
+        assert res["category"] == "grpc-methods"
+        assert res["name"] == "echo-unary"
+        assert res["unavailable"] is True
+        assert "error" in res
+        assert "Reflection service unreachable" in res["error"]
+    finally:
+        # Restore the original function
+        grpc_commands.new_grpc_client = original_new_grpc_client
+
+
+def test_discover_search_grpc(monkeypatch):
+    """Task 12 Test 6: discover --search echo finds gRPC targets and templates."""
+    result = _run(["--search", "echo"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.search"
+    res = payload["result"]
+    matches = res["matches"]
+    by_key = {(m["category"], m["name"]) for m in matches}
+    # Should find the echo gRPC service
+    assert ("grpc-services", "echo") in by_key
+    # Should find the echo-unary template
+    assert ("grpc-methods", "echo-unary") in by_key
+
+
+def test_discover_unknown_grpc_target_item(monkeypatch):
+    """Task 12 Test 7: discover --category grpc-services --name nope returns TemplateNotFound."""
+    result = _run(["--category", "grpc-services", "--name", "nope"], monkeypatch)
+    assert result.exit_code == 2
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "TemplateNotFound"
+    assert "Unknown gRPC target: nope" in payload["error"]["message"]
