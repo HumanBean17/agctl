@@ -1,6 +1,7 @@
 """Tests for agctl mock run command (Task 8)."""
 
 import json
+import sys
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -771,7 +772,7 @@ class TestDaemonPlatformGate:
             _require_posix_daemon()
         assert exc_info.value.message == self._EXPECTED_MESSAGE
         assert exc_info.value.detail["hint"] == self._EXPECTED_HINT
-        assert "platform" in exc_info.value.detail
+        assert exc_info.value.detail["platform"] == sys.platform
 
     def test_require_posix_daemon_noop_on_posix(self, monkeypatch):
         monkeypatch.setattr(
