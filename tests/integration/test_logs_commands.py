@@ -23,7 +23,7 @@ from agctl.cli import cli
 def _write_config(tmp_path, log_path):
     """Write a minimal agctl.yaml config with a logs source pointing at log_path."""
     config_path = tmp_path / "agctl.yaml"
-    config_content = f"""version: "2"
+    config_content = f"""version: "3"
 services:
   demo:
     base_url: "http://localhost:9999"

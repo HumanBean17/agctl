@@ -30,9 +30,12 @@ except ImportError:
 def _build_config(mocks_config: dict) -> str:
     """Build a minimal agctl.yaml with mocks section."""
     base_config = {
-        "version": "2.0",
+        "version": "3",
         "kafka": {
-            "brokers": ["localhost:9092"]
+            "clusters": {
+                "default": {"brokers": ["localhost:9092"]}
+            },
+            "default_cluster": "default"
         },
         "mocks": mocks_config
     }
@@ -600,9 +603,12 @@ class TestMockRunKafka:
         # Create temp config with reactor
         # Build the config inline to ensure testcontainers broker is used
         config_content = json.dumps({
-            "version": "2.0",
+            "version": "3",
             "kafka": {
-                "brokers": [broker],
+                "clusters": {
+                    "default": {"brokers": [broker]}
+                },
+                "default_cluster": "default",
             },
             "mocks": {
                 "kafka": {
