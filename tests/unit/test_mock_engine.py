@@ -845,8 +845,11 @@ def test_duration_timer_stops_engine():
 
     engine.shutdown()
 
-    # Should have stopped roughly after duration
-    assert elapsed >= 0.1
+    # Should have stopped roughly after duration. Lower bound is loose: Windows
+    # time.sleep/timer granularity (~15ms) can return ~15ms early (observed 0.093s
+    # for a 0.1s duration), so 0.1 is over-strict; 0.05 still proves the engine
+    # did not bail instantly.
+    assert elapsed >= 0.05
     assert elapsed < 0.5  # Give some margin
     assert exit_code == 0
 
