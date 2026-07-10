@@ -199,3 +199,19 @@ mocks:
           topic: audit.events
           value:
             kind: payment_failed
+
+grpc:
+  targets:
+    echo:
+      address: "${TEST_GRPC_ADDR:-localhost:50051}"
+      use_tls: false
+      reflection: auto
+  descriptors: []
+  templates:
+    echo-unary:
+      description: "Unary echo call"
+      target: echo
+      service: echo.Echo
+      method: Unary
+      message:
+        msg: "{m}"

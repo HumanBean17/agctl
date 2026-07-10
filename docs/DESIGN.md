@@ -11,7 +11,7 @@
 
 1. [Goals & Non-Goals](#1-goals--non-goals)
 2. [Configuration Schema](#2-configuration-schema)
-3. [CLI Command Design](#3-cli-command-design) *(includes `agctl discover` §3.6)*
+3. [CLI Command Design](#3-cli-command-design) *(includes `agctl discover` §3.9)*
 4. [Output Schema](#4-output-schema)
 5. [Configuration Resolution Order](#5-configuration-resolution-order)
 6. [AGENTS.md Template](#6-agentsmd-template)
@@ -314,6 +314,61 @@ logs:
     limit: 50
     timeout_seconds: 10
     poll_interval_ms: 100
+
+# ---------------------------------------------------------------------------
+# grpc — gRPC targets, descriptors, and call templates.
+#   targets.<name>: gRPC endpoint configuration
+#     address: host:port of the gRPC server
+#     use_tls: enable TLS (default false)
+#     tls: optional TLS/mTLS settings
+#       ca_location: path to CA certificate (PEM)
+#       certificate_location: path to client certificate (mTLS)
+#       key_location: path to client private key (mTLS)
+#       override_authority: override TLS authority name for self-signed certs
+#     reflection: server reflection mode ("auto" tries reflection, falls back to descriptors; "on" requires reflection; "off" disables it)
+#   descriptors: fallback proto descriptor sources (used when reflection is unavailable/off)
+#     proto: path to .proto file to compile on-the-fly
+#     include_paths: proto import paths (optional, for proto files)
+#     descriptor_set: path to precompiled .pb descriptor set file
+#   templates.<name>: gRPC call templates
+#     description: human-readable description
+#     target: name of target from targets
+#     service: fully-qualified service name (e.g. echo.EchoService)
+#     method: method name within the service
+#     metadata: optional metadata dict (supports {placeholder})
+#     message: request message JSON (supports {placeholder})
+# ---------------------------------------------------------------------------
+grpc:
+  targets:
+    echo-server:
+      address: "localhost:50051"
+      use_tls: false
+      reflection: auto
+
+    secure-server:
+      address: "prod.example.com:443"
+      use_tls: true
+      tls:
+        ca_location: "/etc/ssl/certs/ca.pem"
+        certificate_location: "/etc/ssl/certs/client.pem"
+        key_location: "/etc/ssl/private/client.key"
+      reflection: auto
+
+  descriptors:
+    - proto: "/path/to/echo.proto"          # compile on-the-fly
+      include_paths: ["/path/to/protos"]
+    - descriptor_set: "/path/to/descriptor.pb"  # precompiled
+
+  templates:
+    echo-unary:
+      description: "Call the Echo unary method"
+      target: echo-server
+      service: "echo.EchoService"
+      method: "Unary"
+      message:
+        message: "{msg}"
+      metadata:
+        x-trace-id: "{trace_id}"
 
 # ---------------------------------------------------------------------------
 # templates — named HTTP request templates.
@@ -1432,7 +1487,110 @@ Then bumps `version` to `"3"`. `capture.*.from` and `match.body` are **not** vis
 
 ---
 
-### 3.8 `agctl discover` — Lazy Scoped Discovery
+### 3.8 `agctl grpc` — gRPC Operations
+
+The `agctl grpc` command group provides gRPC client operations: unary calls, streaming calls, and health checks. All commands support server reflection for descriptor resolution and fall back to configured proto descriptor files.
+
+#### `agctl grpc call`
+
+Make a gRPC call (unary, client-streaming, server-streaming, or bidirectional). Either invoke a template or provide free-form arguments.
+
+```
+# Template mode
+agctl grpc call <template>
+    [--param key=value]           # fill {placeholder} in template message/metadata
+
+# Free-form mode (mutually exclusive with template)
+agctl grpc call
+    [--target <name>]            # named gRPC target from config
+    [--address host:port]        # raw gRPC address (host:port format)
+    --service <Service>          # fully-qualified service name (e.g. echo.EchoService)
+    --method <Method>            # method name within the service
+    [--message 'JSON']           # request message body (JSON)
+    [--metadata k=v]             # repeatable metadata headers
+    [--timeout <seconds>]
+
+# Assertion flags (all require ≥1 to enter assertion mode)
+    [--status <code>]            # expected gRPC status code (name or number)
+    [--contains 'JSON']          # JSON needle in response message (subset match)
+    [--match <jq>]               # jq predicate against result envelope
+    [--jq-path <jq>]             # jq path (used with --equals)
+    [--equals <value>]           # expected value for --jq-path
+```
+
+**Call types and I/O model:**
+
+| Call type | Input | Output | Example |
+|---|---|---|---|
+| **unary** | Single `--message` JSON object | Single JSON response (envelope) | RPC-like request/response |
+| **client-stream** | NDJSON on stdin (one JSON per line) | Single JSON response (envelope) | Upload streaming |
+| **server-stream** | Single `--message` JSON object | NDJSON on stdout (one per line) | Download streaming |
+| **bidi** | NDJSON on stdin | NDJSON on stdout | Bidirectional chat |
+
+**Streaming calls (server-streaming, bidi):** Unlike unary/client-streaming which return a single JSON envelope, server-streaming and bidi emit one NDJSON line per response message. The command installs `SIGTERM`/`SIGINT` handlers and emits a final `summary` line with `messages`, `matched`, `status`, and `duration_ms`. Exit code is `0` on clean shutdown, or `1` if `--expect-count` is not met.
+
+**Template mode example:**
+
+```bash
+agctl grpc call echo-unary --param msg="hello world"
+```
+
+**Free-form example:**
+
+```bash
+agctl grpc call --target echo-server --service echo.EchoService --method Unary --message '{"msg":"hello"}'
+agctl grpc call --address localhost:50051 --service echo.EchoService --method Unary --message '{"msg":"hello"}'
+```
+
+**Client-streaming example (pipe NDJSON on stdin):**
+
+```bash
+echo '{"id":1}' '{"id":2}' '{"id":3}' | agctl grpc call --target echo-server --service upload.Uploader --method Upload
+```
+
+**Server-streaming example (NDJSON on stdout):**
+
+```bash
+agctl grpc call --target echo-server --service stream.Streamer --method Stream --message '{"count":10}'
+# Emits one JSON line per message, then final summary line
+```
+
+**Bidirectional streaming (NDJSON in, NDJSON out):**
+
+```bash
+echo '{"request":"a"}' '{"request":"b"}' | agctl grpc call --target echo-server --service chat.Chat --method ChatStream
+# Each stdin request generates one stdout response line
+```
+
+**Response assertions:** When any assertion flag (`--status`, `--contains`, `--match`, `--jq-path`, `--equals`) is set, the command evaluates all assertions post-call (AND logic). A failed assertion raises `AssertionError` (exit 1) with `error.detail` containing the full result and failure list. A non-OK gRPC status is **not** an assertion failure by default — status is a result field. Use `--status OK` (or `0`) to assert success.
+
+**Status-as-result semantics:** gRPC status is surfaced in the result envelope under `status` (with `code`, `name`, `message`). Even non-OK statuses (e.g. `NOT_FOUND`, `PERMISSION_DENIED`) return `ok:true` with the status in `result.status` — only assertion flags flip this to `ok:false`. This mirrors HTTP: a 4xx/5xx response is `ok:true` by default, assertions are opt-in.
+
+#### `agctl grpc healthcheck`
+
+Check health of gRPC services via the standard gRPC health protocol (grpc.health.v1.Health).
+
+```
+agctl grpc healthcheck
+    [--target <name>]            # check specific target
+    [--service <name>]           # optional service name (empty = overall health)
+    [--all]                      # check all targets (default when neither flag given)
+```
+
+Returns `ok:true` with `result.targets` (dict keyed by target name) and `result.all_serving` (bool). Each target entry contains `address`, `status` (`SERVING`/`NOT_SERVING`/`UNKNOWN`), and optional `note`.
+
+**Examples:**
+
+```bash
+agctl grpc healthcheck                     # Check all targets
+agctl grpc healthcheck --all              # Same
+agctl grpc healthcheck --target echo       # Check specific target
+agctl grpc healthcheck --target echo --service echo.EchoService  # Check specific service
+```
+
+---
+
+### 3.9 `agctl discover` — Lazy Scoped Discovery
 
 The discovery subsystem lets an agent understand what is available in the system **without loading everything into context at once**. It is structured as three progressive levels: a summary, a category listing, and a single-item detail. The agent fetches only what the current task requires.
 
@@ -1459,7 +1617,9 @@ agctl discover
     "kafka_patterns": 5,
     "db_templates": 8,
     "log_sources": 2,
-    "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates, mock-http-stubs, mock-kafka-reactors, log-sources"
+    "grpc_targets": 2,
+    "grpc_templates": 3,
+    "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates, mock-http-stubs, mock-kafka-reactors, log-sources, grpc-services, grpc-methods"
   },
   "duration_ms": 1
 }
@@ -1471,7 +1631,7 @@ Returns names and one-line descriptions for all items in a category. No params, 
 
 ```bash
 agctl discover --category <name> [--overlay <path>]
-# <name>: services | http-templates | kafka-patterns | db-templates | mock-http-stubs | mock-kafka-reactors | log-sources
+# <name>: services | http-templates | kafka-patterns | db-templates | mock-http-stubs | mock-kafka-reactors | log-sources | grpc-services | grpc-methods
 ```
 
 **Example — `agctl discover --category http-templates`:**
@@ -1555,6 +1715,26 @@ agctl discover --category <name> --name <item-name> [--overlay <path>]
     "cluster": "default",
     "params": ["orderId"],
     "example": "agctl kafka assert --pattern order-created --param orderId=X --timeout 10"
+  },
+  "duration_ms": 1
+}
+```
+
+**Example — `agctl discover --category grpc-methods --name echo-unary`:**
+
+```json
+{
+  "ok": true,
+  "command": "discover.item",
+  "result": {
+    "category": "grpc-methods",
+    "name": "echo-unary",
+    "description": "Call the Echo unary method",
+    "target": "echo-server",
+    "service": "echo.EchoService",
+    "method": "Unary",
+    "params": ["msg"],
+    "example": "agctl grpc call echo-unary --param msg=X"
   },
   "duration_ms": 1
 }
@@ -1951,6 +2131,58 @@ Shape varies by category. All items share `name`, `description`, `params[]`, and
   ],
   "hint": "Run 'agctl discover --category <category> --name <name>' for full detail on any match"
 }
+```
+
+#### `grpc.call` (unary / client-stream)
+
+```json
+{
+  "target": "localhost:50051",
+  "service": "echo.EchoService",
+  "method": "Unary",
+  "call_type": "unary",
+  "status": {
+    "code": 0,
+    "name": "OK",
+    "message": ""
+  },
+  "message": {
+    "message": "hello world"
+  },
+  "initial_metadata": {
+    "content-type": "application/grpc+proto"
+  },
+  "trailers": {}
+}
+```
+
+#### `grpc.healthcheck`
+
+```json
+{
+  "targets": {
+    "echo-server": {
+      "address": "localhost:50051",
+      "status": "SERVING"
+    },
+    "secure-server": {
+      "address": "prod.example.com:443",
+      "status": "SERVING"
+    }
+  },
+  "all_serving": true
+}
+```
+
+#### `grpc.call` (server-stream / bidi) — NDJSON stream
+
+Server-streaming and bidirectional calls emit one JSON object per response message (NDJSON), followed by a final `summary` line:
+
+```json
+{"event":"message","message":{"id":1,"result":"first"},"trailers":null}
+{"event":"message","message":{"id":2,"result":"second"},"trailers":null}
+{"event":"message","message":{"id":3,"result":"third"},"trailers":{"grpc-status":"0","grpc-message":"OK"}}
+{"summary":true,"messages":3,"matched":3,"status":{"code":0,"name":"OK","message":""},"duration_ms":45}
 ```
 
 #### `config.validate`
@@ -2605,7 +2837,6 @@ These items are intentionally deferred. Do not implement them until the core des
 | **MCP server wrapper** | Expose `agctl` as an MCP (Model Context Protocol) tool server so agents that support MCP can call it without shell access. The JSON output schema maps cleanly to MCP tool results. |
 | **Retry / polling DSL** | `agctl db assert --retry-until-pass --max-attempts 5 --interval-ms 500` for assertions against eventually-consistent state. Currently, callers must implement polling themselves. |
 | **Template variable validation** | Warn (or error) at call time if a template defines `{placeholder}` variables that are not supplied via `--param`. Currently, unsupplied placeholders are left as literal strings. |
-| **gRPC support** | First-class `agctl grpc call` command via a plugin. The plugin protocol is designed; implementation is deferred. |
 | **Secret backends** | Pull secrets from Vault or AWS Secrets Manager instead of environment variables. Would be implemented as a resolver plugin hooked into the config resolution pipeline (§5). |
 | **Parallel command execution** | `agctl run --parallel step1.sh step2.sh` for agents that want to fire multiple requests concurrently and assert on all results. |
 | **OpenTelemetry trace propagation** | Inject `traceparent` headers automatically when a trace context is available, enabling distributed traces that span `agctl` invocations. |

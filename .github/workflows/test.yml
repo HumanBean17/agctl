@@ -32,7 +32,7 @@ jobs:
       - name: Install agctl with all client extras and test deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,http,jq,kafka,db,logs]"
+          pip install -e ".[dev,http,jq,kafka,db,logs,grpc]"
 
       - name: Run tests
         run: pytest

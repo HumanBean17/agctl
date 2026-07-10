@@ -29,3 +29,9 @@ uv.lock
 
 # agctl test-runbook results (ephemeral per-run reports)
 *.results.md
+
+# agctl mock daemon runtime state (pidfiles + logs; default state-dir ./.agctl/)
+.agctl/
+
+# superpowers SDD scratch (task briefs/reports, review packages, progress ledger)
+.superpowers/

@@ -5,6 +5,11 @@ from agctl.config.models import (
     Config,
     DatabaseConnection,
     DatabaseTemplate,
+    GrpcConfig,
+    GrpcDescriptorSource,
+    GrpcTarget,
+    GrpcTemplate,
+    GrpcTls,
     KafkaCluster,
     KafkaConfig,
     KafkaPattern,
@@ -248,3 +253,84 @@ def test_kafka_reactor_accepts_cluster_field():
     # defaults to None when omitted
     plain = KafkaReactor(topic="t", reaction=KafkaReaction(topic="out", value={}))
     assert plain.cluster is None
+
+
+# gRPC model tests (Task 1)
+
+
+def test_grpc_tls_defaults():
+    """GrpcTls() has all four fields None."""
+    tls = GrpcTls()
+    assert tls.ca_location is None
+    assert tls.certificate_location is None
+    assert tls.key_location is None
+    assert tls.override_authority is None
+
+
+def test_grpc_target_defaults():
+    """GrpcTarget(address='localhost:50051') has use_tls is False, tls is None, reflection == 'auto'."""
+    target = GrpcTarget(address="localhost:50051")
+    assert target.address == "localhost:50051"
+    assert target.use_tls is False
+    assert target.tls is None
+    assert target.reflection == "auto"
+
+
+def test_grpc_target_explicit_values():
+    """GrpcTarget(address='x', use_tls=True, reflection='off') keeps those values."""
+    target = GrpcTarget(address="x", use_tls=True, reflection="off")
+    assert target.address == "x"
+    assert target.use_tls is True
+    assert target.reflection == "off"
+
+
+def test_grpc_target_rejects_bad_reflection():
+    """GrpcTarget(address='x', reflection='maybe') raises ValidationError."""
+    with pytest.raises(ValidationError):
+        GrpcTarget(address="x", reflection="maybe")
+
+
+def test_grpc_descriptor_source_all_none():
+    """GrpcDescriptorSource() has proto is None, descriptor_set is None, include_paths == []."""
+    source = GrpcDescriptorSource()
+    assert source.proto is None
+    assert source.descriptor_set is None
+    assert source.include_paths == []
+
+
+def test_grpc_template_defaults():
+    """GrpcTemplate(target='t', service='s.v1.S', method='M') has description is None, metadata == {}, message is None."""
+    tmpl = GrpcTemplate(target="t", service="s.v1.S", method="M")
+    assert tmpl.target == "t"
+    assert tmpl.service == "s.v1.S"
+    assert tmpl.method == "M"
+    assert tmpl.description is None
+    assert tmpl.metadata == {}
+    assert tmpl.message is None
+
+
+def test_grpc_config_empty_default():
+    """GrpcConfig() has targets == {}, descriptors == [], templates == {}."""
+    cfg = GrpcConfig()
+    assert cfg.targets == {}
+    assert cfg.descriptors == []
+    assert cfg.templates == {}
+
+
+def test_config_has_grpc_field():
+    """Config(version='2') has .grpc a GrpcConfig (empty)."""
+    cfg = Config(version="3")
+    assert isinstance(cfg.grpc, GrpcConfig)
+    assert cfg.grpc.targets == {}
+    assert cfg.grpc.descriptors == []
+    assert cfg.grpc.templates == {}
+
+    # Also test constructing with a dict via model_validate
+    cfg2 = Config.model_validate(
+        {
+            "version": "2",
+            "grpc": {"targets": {"svc": {"address": "h:1"}}},
+        }
+    )
+    assert cfg2.grpc.targets["svc"].address == "h:1"
+    assert cfg2.grpc.targets["svc"].reflection == "auto"  # default applied

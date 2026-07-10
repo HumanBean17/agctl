@@ -253,6 +253,41 @@ def validate_config(cfg: Config) -> tuple[list[dict], list[dict]]:
                 {"path": f"logs.sources.{name}", "message": str(err)}
             )
 
+    # --- gRPC validation --------------------------------------------------------
+
+    # §3.5.4 — gRPC template -> target dangling refs.
+    grpc_targets = set(cfg.grpc.targets.keys())
+    for name, tpl in cfg.grpc.templates.items():
+        if tpl.target not in grpc_targets:
+            errors.append(
+                {
+                    "path": f"grpc.templates.{name}.target",
+                    "message": f"gRPC template references unknown target '{tpl.target}'",
+                }
+            )
+
+    # §3.5.5 — gRPC descriptor source exactly-one rule.
+    for i, src in enumerate(cfg.grpc.descriptors):
+        has_proto = src.proto is not None
+        has_ds = src.descriptor_set is not None
+        if has_proto == has_ds:  # Both or neither
+            errors.append(
+                {
+                    "path": f"grpc.descriptors[{i}]",
+                    "message": "each grpc.descriptors entry must set exactly one of 'proto' or 'descriptor_set'",
+                }
+            )
+
+    # §3.6 — gRPC template missing-description warnings.
+    for name, tpl in cfg.grpc.templates.items():
+        if _missing_description(tpl.description):
+            warnings.append(
+                {
+                    "path": f"grpc.templates.{name}",
+                    "message": "missing description (discovery degrades without it)",
+                }
+            )
+
     return errors, warnings
 
 
