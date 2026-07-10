@@ -11,6 +11,8 @@ from click.testing import CliRunner
 from agctl.cli import cli
 from agctl.mock.daemon import is_alive
 
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="managed mock daemon is POSIX-only; use mock run or WSL on Windows")
+
 # Test fixture config (minimal, version 3)
 MINIMAL_CONFIG = """version: "3"
 mocks:
