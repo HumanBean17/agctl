@@ -1937,7 +1937,7 @@ Every service entry always includes `response_time_ms` (an integer on success, `
 
 #### `discover.item`
 
-Shape varies by category. All items share `name`, `description`, `params[]`, and `example`. HTTP templates add `method`, `service`, `path`; Kafka patterns add `topic`, `cluster` (the resolved cluster name), and `match`; DB templates add `connection` and `sql` (so an agent can read a query's result columns before writing a `--path` value assertion).
+Shape varies by category. All items share `name`, `description`, `params[]`, and `example`. HTTP templates add `method`, `service`, `path`; Kafka patterns add `topic`, `cluster` (the resolved cluster name, or `null` when no cluster resolves), and `match`; DB templates add `connection` and `sql` (so an agent can read a query's result columns before writing a `--path` value assertion).
 
 #### `discover.search`
 
