@@ -447,14 +447,10 @@ class TestBodyParseSkipped:
             assert len(parse_skipped) == 1
             assert parse_skipped[0]["stub"] == "echo"
 
-            # The handler thread appends events around/after sending the response;
-            # under CI load the http.hit event may land just after the response is
-            # received, so poll briefly before asserting.
-            deadline = time.monotonic() + 1.0
+            # emit-before-send (agctl/mock/http_server.py) guarantees the http.hit
+            # event is appended before the response is received, so assert directly
+            # (matches the sibling test_body_parse_skipped_event).
             hit_events = [e for e in event_sink if e["event"] == "http.hit"]
-            while len(hit_events) < 1 and time.monotonic() < deadline:
-                time.sleep(0.01)
-                hit_events = [e for e in event_sink if e["event"] == "http.hit"]
             assert len(hit_events) == 1
         finally:
             server.shutdown()

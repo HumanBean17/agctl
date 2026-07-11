@@ -1022,9 +1022,11 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
   passes through ungated. `mock run` (foreground streaming) and every other
   command group run natively on Windows. Streaming graceful-stop contract:
   backgrounded streamers (`http ping`, `mock run`, `logs tail`, `grpc`
-  server-stream/bidi) install `SIGINT` handlers that fire on native Windows;
-  the `SIGTERM`-driven graceful-stop (and the daemon's `SIGTERM`-based shutdown
-  that `mock stop` drives) is POSIX/WSL — the reason the daemon is gated there.
+  server-stream/bidi) install `SIGTERM`/`SIGINT` handlers; on native Windows
+  only the `SIGINT`/Ctrl+C path reaches the handler (a `SIGTERM` via `os.kill`
+  hard-terminates). The `SIGTERM`-driven graceful-stop (and the daemon's
+  `SIGTERM`-based shutdown that `mock stop` drives) is POSIX/WSL — the reason
+  the daemon is gated there.
 
 **Mock server MVP limitations** (see DESIGN §10 "Known-wrong-result / Not Covered" for the full list with failure-mode analysis):
 
