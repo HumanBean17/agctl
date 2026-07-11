@@ -1,6 +1,9 @@
 """Tests for agctl mock run command (Task 8)."""
 
 import json
+import os
+import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -8,7 +11,15 @@ import pytest
 from click.testing import CliRunner
 
 from agctl.cli import cli
-from agctl.commands.mock_commands import mock_run, new_mock_engine
+from agctl.commands.mock_commands import (
+    _mock_start_core,
+    _mock_status_core,
+    _mock_stop_core,
+    _require_posix_daemon,
+    mock_run,
+    new_mock_engine,
+)
+from agctl.errors import ConfigError
 
 
 @pytest.fixture
@@ -630,6 +641,10 @@ mocks:
 
 
 # Task 7: mock start daemon argv forwards --overlay
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="managed daemon is POSIX-only; gated by _require_posix_daemon on Windows",
+)
 def test_mock_start_includes_overlay_in_daemon_argv(tmp_path, monkeypatch):
     """mock start includes --overlay in the daemon argv so the spawned daemon loads the overlay."""
     base = tmp_path / "agctl.yaml"
@@ -730,3 +745,64 @@ mocks:
 
     # Assert the re-invoke succeeds (exit_code == 0)
     assert reinvoke_result.exit_code == 0, f"Re-invoke failed with exit code {reinvoke_result.exit_code}, output: {reinvoke_result.output}"
+
+
+class TestDaemonPlatformGate:
+    """The managed mock daemon (mock start/stop/status) is gated to POSIX.
+
+    On ``os.name == "nt"`` the three daemon ``_core`` entry points raise
+    ``ConfigError`` (exit 2) before touching any pidfile/process. The platform is
+    forced by replacing the module-level ``os`` binding in
+    ``agctl.commands.mock_commands``, so the seam never mutates the global ``os``
+    module and the suite is deterministic on the (posix) dev host.
+    """
+
+    # Verbatim from the plan's Global Constraints.
+    _EXPECTED_MESSAGE = (
+        "the managed mock daemon (mock start/stop/status) is supported on "
+        "Linux, macOS, and WSL; on native Windows use 'agctl mock run' or "
+        "run inside WSL"
+    )
+    _EXPECTED_HINT = (
+        "use 'agctl mock run' (foreground) or run agctl inside WSL for the "
+        "managed daemon"
+    )
+
+    def test_require_posix_daemon_raises_on_windows(self, monkeypatch):
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.os",
+            types.SimpleNamespace(name="nt"),
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            _require_posix_daemon()
+        assert exc_info.value.message == self._EXPECTED_MESSAGE
+        assert exc_info.value.detail["hint"] == self._EXPECTED_HINT
+        assert exc_info.value.detail["platform"] == sys.platform
+
+    def test_require_posix_daemon_noop_on_posix(self, monkeypatch):
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.os",
+            types.SimpleNamespace(name="posix"),
+        )
+        assert _require_posix_daemon() is None
+
+    def test_mock_start_core_gated_on_windows(self, monkeypatch):
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.os",
+            types.SimpleNamespace(name="nt"),
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            _mock_start_core(None, None, None, False, None, "./.agctl")
+        assert exc_info.value.message == self._EXPECTED_MESSAGE
+
+    def test_mock_stop_and_status_core_gated_on_windows(self, monkeypatch):
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.os",
+            types.SimpleNamespace(name="nt"),
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            _mock_stop_core(None, None, False, 10.0, "./.agctl")
+        assert exc_info.value.message == self._EXPECTED_MESSAGE
+        with pytest.raises(ConfigError) as exc_info:
+            _mock_status_core(None, "./.agctl")
+        assert exc_info.value.message == self._EXPECTED_MESSAGE

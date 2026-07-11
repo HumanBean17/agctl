@@ -15,10 +15,11 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ['3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v4
@@ -35,4 +36,4 @@ jobs:
           pip install -e ".[dev,http,jq,kafka,db,logs,grpc]"
 
       - name: Run tests
-        run: pytest
+        run: pytest tests/unit

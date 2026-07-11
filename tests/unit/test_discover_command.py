@@ -914,7 +914,7 @@ def test_discover_item_log_sources_with_schema(tmp_path, monkeypatch):
         "logs:\n"
         "  sources:\n"
         "    svc:\n"
-        f"      path: \"{log_file}\"\n"
+        f"      path: \"{log_file.as_posix()}\"\n"
         '      type: "file"\n'
         '      format: "logstash"\n'
     )
@@ -928,7 +928,7 @@ def test_discover_item_log_sources_with_schema(tmp_path, monkeypatch):
     assert res["name"] == "svc"
     assert res["type"] == "file"
     assert res["format"] == "logstash"
-    assert res["path"] == str(log_file)
+    assert res["path"] == log_file.as_posix()
     # schema_fields should have standard/conditional/observed
     schema = res["schema_fields"]
     # standard fields are present in any sampled entry (union): timestamp, level, logger, message

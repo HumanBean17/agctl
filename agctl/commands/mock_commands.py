@@ -212,6 +212,30 @@ def spawn_daemon(argv: list[str], log_path: str, env: dict | None = None) -> int
     return proc.pid
 
 
+def _require_posix_daemon() -> None:
+    """Gate the managed mock daemon to POSIX.
+
+    On native Windows (``os.name == "nt"``) the managed daemon
+    (``mock start``/``stop``/``status``) is unsupported; raise ``ConfigError``
+    pointing at ``mock run`` or WSL. WSL reports ``"posix"`` and passes through.
+    Detection reads ``os.name`` via this module's ``os`` binding so a unit test
+    can force the branch without mutating the global ``os`` module.
+    """
+    if os.name == "nt":
+        raise ConfigError(
+            "the managed mock daemon (mock start/stop/status) is supported on "
+            "Linux, macOS, and WSL; on native Windows use 'agctl mock run' or "
+            "run inside WSL",
+            {
+                "platform": sys.platform,
+                "hint": (
+                    "use 'agctl mock run' (foreground) or run agctl inside WSL "
+                    "for the managed daemon"
+                ),
+            },
+        )
+
+
 def _mock_start_core(
     config_path: str | None,
     http_listen: str | None,
@@ -231,6 +255,7 @@ def _mock_start_core(
     Raises:
         ConfigError: If already running, startup error, or timeout.
     """
+    _require_posix_daemon()
     # Step 1: Load config
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
 
@@ -589,6 +614,7 @@ def _mock_stop_core(
     Raises:
         AssertionFailure: When any stopped mock had fatal failure events.
     """
+    _require_posix_daemon()
     state_path = Path(state_dir)
 
     # Step 1: Resolve targets
@@ -715,6 +741,7 @@ def _mock_status_core(
         ConfigError: If multiple mocks running and no selector, or if
             specified --listen doesn't match any running mock.
     """
+    _require_posix_daemon()
     state_path = Path(state_dir)
 
     # Step 1: Resolve targets (no --all flag for status)

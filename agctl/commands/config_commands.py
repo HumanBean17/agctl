@@ -230,7 +230,14 @@ def _load_sample() -> str:
     """
     try:
         root = importlib.resources.files("agctl")
-        return (root.joinpath(*_SAMPLE_RESOURCE)).read_text(encoding="utf-8")
+        text = (root.joinpath(*_SAMPLE_RESOURCE)).read_text(encoding="utf-8")
+        # Normalize to LF: importlib's traversable read does NOT apply universal-
+        # newline translation, so a CRLF checkout on Windows (core.autocrlf=true)
+        # returns CRLF here, while pathlib.Path.read_text() DOES normalize to LF.
+        # That mismatch breaks consumers that compare a Path.read_text() result to
+        # this sample. Collapse CRLF and bare CR to LF so the packaged sample is
+        # consistent (LF) on every platform regardless of checkout.
+        return text.replace("\r\n", "\n").replace("\r", "\n")
     except (FileNotFoundError, OSError) as err:
         raise ConfigError(
             f"Sample config not found in the agctl package: {err}",

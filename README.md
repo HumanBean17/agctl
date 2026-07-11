@@ -44,7 +44,9 @@ source of truth in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 
 ## Setup
 
-**Requirements:** Python ≥ 3.11.
+**Requirements:** Python ≥ 3.11. Runs on Linux, macOS, native Windows, and WSL.
+The managed mock daemon (`mock start`/`stop`/`status`) is Linux/macOS/WSL-only —
+on native Windows use `mock run` (foreground) or run inside WSL.
 
 Install `agctl` into your project (this repo uses `uv` — `pip` works too):
 

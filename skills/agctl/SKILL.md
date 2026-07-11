@@ -193,6 +193,10 @@ Two modes: **foreground streaming** (`mock run`) and **managed daemon**
 collapses the four-step background protocol into `mock start` → `mock stop` and
 surfaces failures cleanly (see gotchas 13–15).
 
+**Windows:** the managed daemon is unavailable on native Windows (exits `2`
+with a `ConfigError` pointing at `mock run`/WSL) — use `agctl mock run`
+(foreground) there or run inside WSL.
+
 ### Using `mock run` directly — background lifecycle (load-bearing)
 
 The failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`,

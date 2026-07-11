@@ -1231,6 +1231,12 @@ agctl mock run --only http --http-listen 127.0.0.1:18080
 agctl mock run --duration 30 --fail-fast
 ```
 
+#### Platform support
+
+The managed daemon (`mock start`/`stop`/`status`) is supported on **Linux, macOS, and WSL**. On **native Windows** it exits `2` with a `ConfigError` whose message points at `mock run` (foreground) or running inside WSL. `mock run` (foreground) and every other command group are cross-platform, including native Windows — the jq-powered features (`--match`, `--jq-path`, mock `match.jq`) included.
+
+**Streaming graceful-stop.** Backgrounded streaming commands (`http ping`, `mock run`, `logs tail`, `grpc` server-stream/bidi) stop gracefully on `Ctrl+C`/`SIGINT` everywhere, including native Windows. The `SIGTERM`-driven graceful-stop pattern — which the managed daemon's shutdown (`mock stop`) relies on — is POSIX/WSL, which is why the daemon is gated to those platforms.
+
 #### `agctl mock start` — managed daemon (start)
 
 Start the mock server as a detached daemon with automatic pidfile management and readiness polling. The daemon runs the same engine as `mock run` but in the background, with its stdout redirected to a log file. The command returns a single JSON envelope once the daemon is ready (the `started` line has appeared in the log).
