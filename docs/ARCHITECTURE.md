@@ -108,7 +108,8 @@ agctl/
 ├── assertion_registry.py       # pluggable assertion-mode registry + entry-point discovery
 ├── plugin_protocol.py          # Protocol contract for protocol plugins
 ├── config/
-│   ├── loader.py               # discover → parse → interpolate → override → version → validate
+│   ├── loader.py               # discover → merge .env → parse → interpolate → version → overlay-merge → override → validate
+│   ├── env_file.py             # .env auto-load + precedence (--env-file > AGCTL_ENV_FILE > sibling)
 │   ├── resolver.py             # AGCTL_<SECTION>__<KEY> override layer
 │   ├── validator.py            # cross-reference checks + description warnings
 │   └── models.py               # Pydantic v2 typed config models
@@ -250,7 +251,7 @@ discovers, parses, and validates `agctl.yaml` from scratch. This is what makes
 `config/loader.py::load_config` → `compose_config`, fixed order; any stage may fail the load with a `ConfigError`:
 
 ```
-discover_config_path → yaml.safe_load → interpolate → _check_version (base must be v3)
+discover_config_path → merge .env defaults into env (real env wins) → yaml.safe_load → interpolate → _check_version (base must be v3)
                                                 ↓
                               for each overlay (in flag order):
                                 discover_config_path (explicit only) → yaml.safe_load → interpolate
@@ -271,6 +272,24 @@ discover_config_path → yaml.safe_load → interpolate → _check_version (base
 3. **Walk-up** — `cwd` then each parent for `agctl.yaml`; stop at the first
    `.git` or the filesystem root; first match wins.
 4. None found → `ConfigError`.
+
+**`.env` auto-load** (`config/env_file.py`, new) — after config discovery and
+*before* interpolation, a `.env` file is merged into the config env dict as
+**defaults**: real env wins (`env = {**dotenv, **env}` — a fresh dict, `os.environ`
+is never mutated). Source precedence: `--env-file` (explicit, `required=True`) >
+`AGCTL_ENV_FILE` (read from the *real* env only — a value set inside the `.env`
+itself would be circular and is ignored) > `.env` sibling of the resolved
+`agctl.yaml` (`required=False`: a missing sibling is a no-op, not an error). An
+explicit source that is missing raises `ConfigError` (mirrors `--config`).
+`load_env_file` parses with `dotenv_values(path, interpolate=False)` and drops
+bare-key `None` values, so raw `${...}` flows into agctl's single `interpolate()`
+— one engine owns all `${...}` resolution (chains, nested). Placement is
+deliberately post-discovery (the sibling sits next to the *resolved* config) and
+pre-interpolation (so `${VAR}` can resolve from `.env`); a consequence is that
+`AGCTL_CONFIG`/`AGCTL_ENV_FILE` set *inside* the `.env` cannot steer their own
+resolution — only real-env values do. `compose_config`, `load_config`, and
+`load_config_or_raise` gained an `env_file` param threaded from the CLI's global
+`--env-file` flag (DESIGN §3).
 
 **Env interpolation** (`interpolate`, DESIGN §2.2), in every string scalar:
 
@@ -859,7 +878,7 @@ extras, so a user installs only what they need and the package imports fast:
 
 | Group | Dependencies | Needed for |
 |---|---|---|
-| core (always) | `click`, `pyyaml`, `pydantic` | CLI, config loading, schema |
+| core (always) | `click`, `pyyaml`, `pydantic`, `python-dotenv` | CLI, config loading, schema, `.env` parsing |
 | `http` | `httpx` | `http *`, `check ready` |
 | `jq` | `jq` | HTTP response assertions (`--match`/`--jq-path` on `http call`/`request`), mock HTTP `match.jq` (and mock startup pre-compile of stub `match.jq` / reactor `match`) |
 | `kafka` | `confluent-kafka`, `jq` | `kafka *` |

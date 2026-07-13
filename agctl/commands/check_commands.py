@@ -76,8 +76,9 @@ def _check_ready_core(
     all_services: bool,
     timeout: float | None,
     overlay_paths: list[str] | None = None,
+    env_file: str | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
     return _check_ready_with_config(cfg, service, all_services, timeout)
 
 
@@ -100,9 +101,11 @@ def _check_ready_with_config(
 @click.option("--all", "all_services", is_flag=True, default=False, help="Check all services")
 @click.option("--timeout", "timeout", type=float, default=None)
 @click.option("--config", "config_path", default=None)
+@click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.pass_context
 def check_ready(
     ctx: click.Context,
+    env_file: str | None,
     service: str | None,
     all_services: bool,
     timeout: float | None,
@@ -111,7 +114,8 @@ def check_ready(
     """Probe configured service health endpoints."""
     path = config_path or (ctx.obj.get("config_path") if ctx.obj else None)
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
-    _check_ready_envelope(path, service, all_services, timeout, overlay_paths=list(ovs) if ovs else None)
+    env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
+    _check_ready_envelope(path, service, all_services, timeout, overlay_paths=list(ovs) if ovs else None, env_file=env_file)
 
 
 _check_ready_envelope = envelope("check.ready")(_check_ready_core)

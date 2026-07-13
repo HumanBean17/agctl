@@ -51,8 +51,10 @@ flags: see `--help`.)
 | Impersonate a dependency | `mock run` (foreground) / `mock start\|stop\|status` (daemon) |
 | Are services up? / validate config / migrate v1/v2→v3 | `check ready --all` / `config validate` / `config migrate` |
 
-`--config <path>` and `--overlay <path>` (repeatable) are global; **`--timeout` is
-not global**. `<mode>` for kafka = `--contains '{…}' | --match '<jq>' | --pattern <name>`.
+`--config <path>`, `--overlay <path>` (repeatable), and `--env-file <path>` are global;
+**`--timeout` is not global**. A `.env` next to the resolved `agctl.yaml` is auto-loaded as
+env defaults (real env wins) — reach for `--env-file`/`AGCTL_ENV_FILE` only to point at a
+different one. `<mode>` for kafka = `--contains '{…}' | --match '<jq>' | --pattern <name>`.
 `kafka produce|consume|assert` take `--cluster <name>` (default: the pattern's bound
 cluster for `assert --pattern`, else `kafka.default_cluster`, else the single defined
 cluster; `--cluster` always wins) — set it only when a command must target a non-default

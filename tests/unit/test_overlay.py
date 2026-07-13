@@ -598,7 +598,7 @@ templates:
     # Track what overlay_paths was passed to load_config_or_raise
     captured_overlays = []
 
-    def fake_load_config(config_path, overlay_paths=None):
+    def fake_load_config(config_path, overlay_paths=None, env_file=None):
         captured_overlays.append(overlay_paths)
         from agctl.config.models import HttpTemplate
         return Config(
@@ -656,7 +656,7 @@ database:
 
     captured_overlays = []
 
-    def fake_load_config(config_path, overlay_paths=None):
+    def fake_load_config(config_path, overlay_paths=None, env_file=None):
         captured_overlays.append(overlay_paths)
         from agctl.config.models import DatabaseConfig, ConnectionConfig
         return Config(
@@ -702,7 +702,7 @@ kafka:
 
     captured_overlays = []
 
-    def fake_load_config(config_path, overlay_paths=None):
+    def fake_load_config(config_path, overlay_paths=None, env_file=None):
         captured_overlays.append(overlay_paths)
         from agctl.config.models import KafkaCluster, KafkaConfig
         return Config(
@@ -741,7 +741,7 @@ services:
 
     captured_overlays = []
 
-    def fake_load_config(config_path, overlay_paths=None):
+    def fake_load_config(config_path, overlay_paths=None, env_file=None):
         captured_overlays.append(overlay_paths)
         return Config(
             version="2",
@@ -775,7 +775,7 @@ services:
 
     captured_overlays = []
 
-    def fake_load_config(config_path, overlay_paths=None):
+    def fake_load_config(config_path, overlay_paths=None, env_file=None):
         captured_overlays.append(overlay_paths)
         # Return minimal valid config (no mocks needed for this test)
         return Config(
@@ -827,7 +827,7 @@ templates:
 
     captured_overlays = []
 
-    def fake_load_config(config_path, overlay_paths=None):
+    def fake_load_config(config_path, overlay_paths=None, env_file=None):
         captured_overlays.append(overlay_paths)
         from agctl.config.models import HttpTemplate
         return Config(

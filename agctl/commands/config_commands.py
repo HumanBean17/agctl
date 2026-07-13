@@ -129,15 +129,17 @@ def _emit_config_error(command: str, err: ConfigError, start: float) -> None:
 @click.command("validate")
 @click.option("--config", "config_path", default=None)
 @click.option("--overlay", "overlay_paths", multiple=True, default=None)
+@click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.pass_context
-def config_validate(ctx: click.Context, config_path: str | None, overlay_paths: tuple[str, ...] | None) -> None:
+def config_validate(ctx: click.Context, config_path: str | None, overlay_paths: tuple[str, ...] | None, env_file: str | None) -> None:
     """Parse and validate agctl.yaml. Exit 2 on any error."""
     start = time.monotonic()
     path = config_path or ctx.obj.get("config_path")
     # Resolve overlay paths: own option takes precedence over ctx.obj
     ovs = tuple(overlay_paths) or ctx.obj.get("overlay_paths")
+    resolved_env_file = env_file or ctx.obj.get("env_file")
     try:
-        composed = compose_config(path, list(ovs) if ovs else None)
+        composed = compose_config(path, list(ovs) if ovs else None, env_file=resolved_env_file)
     except ConfigError as err:
         _emit_config_error("config.validate", err, start)
         raise SystemExit(2)
@@ -186,16 +188,18 @@ def config_validate(ctx: click.Context, config_path: str | None, overlay_paths: 
 @click.command("show")
 @click.option("--config", "config_path", default=None)
 @click.option("--overlay", "overlay_paths", multiple=True, default=None)
+@click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.option("--unmask", is_flag=True, default=False)
 @click.pass_context
-def config_show(ctx: click.Context, config_path: str | None, overlay_paths: tuple[str, ...] | None, unmask: bool) -> None:
+def config_show(ctx: click.Context, config_path: str | None, overlay_paths: tuple[str, ...] | None, env_file: str | None, unmask: bool) -> None:
     """Dump the resolved config as JSON, secrets masked."""
     start = time.monotonic()
     path = config_path or ctx.obj.get("config_path")
     # Resolve overlay paths: own option takes precedence over ctx.obj
     ovs = tuple(overlay_paths) or ctx.obj.get("overlay_paths")
+    resolved_env_file = env_file or ctx.obj.get("env_file")
     try:
-        composed = compose_config(path, list(ovs) if ovs else None)
+        composed = compose_config(path, list(ovs) if ovs else None, env_file=resolved_env_file)
     except ConfigError as err:
         _emit_config_error("config.show", err, start)
         raise SystemExit(2)

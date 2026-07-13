@@ -160,8 +160,9 @@ def _logs_query_core(
     since: str | None,
     until: str | None,
     limit: int | None,
+    env_file: str | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, env_file=env_file)
     src = _resolve_source(cfg, source)
     params = parse_params(param)
     filt = _build_log_filter(
@@ -209,9 +210,11 @@ def _logs_query_core(
 @click.option("--until", "until", default=None, help="End time (ISO-8601 or duration)")
 @click.option("--limit", "limit", type=int, default=None, help="Max entries to return")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
+@click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.pass_context
 def logs_query(
     ctx: click.Context,
+    env_file: str | None,
     source: str,
     level: str | None,
     logger: str | None,
@@ -228,6 +231,7 @@ def logs_query(
     config_path_resolved = config_path
     if ctx.obj and ctx.obj.get("config_path"):
         config_path_resolved = ctx.obj.get("config_path")
+    env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
     _logs_query_envelope(
         config_path_resolved,
         source,
@@ -239,6 +243,7 @@ def logs_query(
         since,
         until,
         limit,
+        env_file=env_file,
     )
 
 
@@ -261,8 +266,9 @@ def _logs_assert_core(
     since: str | None,
     not_: bool,
     timeout: float | None,
+    env_file: str | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path)
+    cfg = load_config_or_raise(config_path, env_file=env_file)
     src = _resolve_source(cfg, source)
     params = parse_params(param)
     filt = _build_log_filter(
@@ -343,9 +349,11 @@ def _logs_assert_core(
 @click.option("--not", "not_", is_flag=True, default=False, help="Invert: fail if a match IS found")
 @click.option("--timeout", "timeout", type=float, default=None, help="Poll timeout (seconds); omit for one-shot")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
+@click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.pass_context
 def logs_assert(
     ctx: click.Context,
+    env_file: str | None,
     source: str,
     level: str | None,
     logger: str | None,
@@ -362,6 +370,7 @@ def logs_assert(
     config_path_resolved = config_path
     if ctx.obj and ctx.obj.get("config_path"):
         config_path_resolved = ctx.obj.get("config_path")
+    env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
     _logs_assert_envelope(
         config_path_resolved,
         source,
@@ -373,6 +382,7 @@ def logs_assert(
         since,
         not_,
         timeout,
+        env_file=env_file,
     )
 
 
@@ -433,9 +443,11 @@ def _tail_run(
 @click.option("--duration", "duration", type=float, default=None, help="Stop after N seconds")
 @click.option("--until-stopped", "until_stopped", is_flag=True, default=False)
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
+@click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.pass_context
 def logs_tail(
     ctx: click.Context,
+    env_file: str | None,
     source: str,
     level: str | None,
     logger: str | None,
@@ -450,6 +462,7 @@ def logs_tail(
     config_path_resolved = config_path
     if ctx.obj and ctx.obj.get("config_path"):
         config_path_resolved = ctx.obj.get("config_path")
+    env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
 
     start = time.monotonic()
 
@@ -468,7 +481,7 @@ def logs_tail(
         raise SystemExit(2)
 
     try:
-        cfg = load_config_or_raise(config_path_resolved)
+        cfg = load_config_or_raise(config_path_resolved, env_file=env_file)
         src = _resolve_source(cfg, source)
         params = parse_params(param)
         filt = _build_log_filter(
