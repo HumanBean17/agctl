@@ -161,8 +161,9 @@ def _kafka_produce_core(
     header: tuple[str, ...],
     cluster: str | None = None,
     overlay_paths: list[str] | None = None,
+    env_file: str | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
     value = json.loads(message)
     headers = parse_params(header) if header else None
 
@@ -191,7 +192,8 @@ def kafka_produce(
     """Produce one message to a Kafka topic."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
-    _kafka_produce_envelope(config_path, topic, message, key, header, cluster, overlay_paths=list(ovs) if ovs else None)
+    env_file = ctx.obj.get("env_file") if ctx.obj else None
+    _kafka_produce_envelope(config_path, topic, message, key, header, cluster, overlay_paths=list(ovs) if ovs else None, env_file=env_file)
 
 
 _kafka_produce_envelope = envelope("kafka.produce")(_kafka_produce_core)
@@ -214,8 +216,9 @@ def _kafka_consume_core(
     consumer_group: str | None,
     cluster: str | None = None,
     overlay_paths: list[str] | None = None,
+    env_file: str | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
 
     # --filter-key is a deprecated alias of --match; both given -> error.
     if match is not None and filter_key is not None:
@@ -327,6 +330,7 @@ def kafka_consume(
     """Consume messages from a Kafka topic window."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    env_file = ctx.obj.get("env_file") if ctx.obj else None
     _kafka_consume_envelope(
         config_path,
         topic,
@@ -339,6 +343,7 @@ def kafka_consume(
         consumer_group,
         cluster,
         overlay_paths=list(ovs) if ovs else None,
+        env_file=env_file,
     )
 
 
@@ -430,8 +435,9 @@ def _kafka_assert_core(
     assertion: str | None,
     cluster: str | None = None,
     overlay_paths: list[str] | None = None,
+    env_file: str | None = None,
 ) -> dict:
-    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
     params = parse_params(param)
 
     # DESIGN §9.3: a custom assertion mode is mutually exclusive with the
@@ -629,6 +635,7 @@ def kafka_assert(
     """Assert a matching message exists in a Kafka window."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    env_file = ctx.obj.get("env_file") if ctx.obj else None
     _kafka_assert_envelope(
         config_path,
         topic,
@@ -644,6 +651,7 @@ def kafka_assert(
         assertion,
         cluster,
         overlay_paths=list(ovs) if ovs else None,
+        env_file=env_file,
     )
 
 

@@ -88,7 +88,10 @@ field (`{customer_id}`, `:orderId`) — never kebab-case inside a `{}` or `:`.
 changes, and ask before overwriting. Never duplicate a key or silently clobber.
 
 **6. Secrets → env.** Header values, DB passwords, tokens → `${ENV_VAR}` (or `${ENV:-}` if
-optional), and add the var to `.env.example`. Never inline a real secret.
+optional), and add the var to `.env.example`. Never inline a real secret. agctl auto-loads a
+`.env` next to the resolved `agctl.yaml` (real env wins), so those vars resolve at `config
+validate` time with no shell sourcing — reach for `--env-file`/`AGCTL_ENV_FILE` only to point
+at a different location.
 
 **7. Clarify, don't guess.** Ask only about genuine gaps (which connection? replace or append?
 what's the service's base URL?). Each question carries a recommended default.

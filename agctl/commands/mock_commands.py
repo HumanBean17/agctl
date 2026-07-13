@@ -244,6 +244,7 @@ def _mock_start_core(
     duration: float | None,
     state_dir: str,
     overlay_paths: list[str] | None = None,
+    env_file: str | None = None,
 ) -> dict:
     """Core logic for `mock start` (Task 4).
 
@@ -257,7 +258,7 @@ def _mock_start_core(
     """
     _require_posix_daemon()
     # Step 1: Load config
-    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
 
     # Step 2: Resolve which engines to run
     run_http, run_kafka = _resolve_engines(only, cfg.mocks)
@@ -321,6 +322,12 @@ def _mock_start_core(
     if overlay_paths is not None:
         for ov in overlay_paths:
             daemon_argv.extend(["--overlay", str(Path(ov).absolute())])
+    # Forward --env-file: the daemon re-loads config from scratch, so without
+    # this it would silently fall back to the default .env sibling and ignore
+    # the user's flag (the parent's readiness load uses the right file, the
+    # server that actually serves traffic would not).
+    if env_file is not None:
+        daemon_argv.extend(["--env-file", str(Path(env_file).absolute())])
     # Subcommand and mock-run-specific options
     daemon_argv.extend(["mock", "run"])
     if run_http:
@@ -420,9 +427,11 @@ def _mock_start_core(
 @click.option("--fail-fast", "fail_fast", is_flag=True, default=False, help="Exit on first reactor error")
 @click.option("--duration", "duration", type=float, default=None, help="Stop after N seconds")
 @click.option("--state-dir", "state_dir", default="./.agctl", help="Directory for mock state (pidfiles, logs)")
+@click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.pass_context
 def mock_start(
     ctx: click.Context,
+    env_file: str | None,
     config_path: str | None,
     http_listen: str | None,
     only: str | None,
@@ -435,8 +444,9 @@ def mock_start(
     if config_path is None:
         config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
 
-    _mock_start_envelope(config_path, http_listen, only, fail_fast, duration, state_dir, overlay_paths=list(ovs) if ovs else None)
+    _mock_start_envelope(config_path, http_listen, only, fail_fast, duration, state_dir, overlay_paths=list(ovs) if ovs else None, env_file=env_file)
 
 
 _mock_start_envelope = envelope("mock.start")(_mock_start_core)
@@ -455,9 +465,11 @@ _mock_start_envelope = envelope("mock.start")(_mock_start_core)
 @click.option("--fail-fast", "fail_fast", is_flag=True, default=False, help="Exit on first reactor error")
 @click.option("--duration", "duration", type=float, default=None, help="Stop after N seconds")
 @click.option("--until-stopped", "until_stopped", is_flag=True, default=False, help="Run until stopped")
+@click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.pass_context
 def mock_run(
     ctx: click.Context,
+    env_file: str | None,
     config_path: str | None,
     http_listen: str | None,
     only: str | None,
@@ -470,6 +482,7 @@ def mock_run(
     if config_path is None:
         config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
 
     start = time.monotonic()
 
@@ -489,7 +502,7 @@ def mock_run(
 
     try:
         # Guard 1: Load config (ConfigError → envelope + exit 2)
-        cfg = load_config_or_raise(config_path, overlay_paths=list(ovs) if ovs else None)
+        cfg = load_config_or_raise(config_path, overlay_paths=list(ovs) if ovs else None, env_file=env_file)
 
         # Guard 2+3: Resolve engines to run
         run_http, run_kafka = _resolve_engines(only, cfg.mocks)

@@ -435,6 +435,13 @@ Any YAML string value containing `${...}` is resolved at load time. Three forms 
 
 The `${...}` syntax is only supported in string scalar values, not in keys.
 
+**`.env` defaults.** Env vars for `${...}` interpolation and `AGCTL_*` overrides may also come from a `.env` file, loaded as **defaults** — a value already in the real environment overrides `.env`, so CI/production can inject real secrets over committed defaults (the universal convention: docker compose, python-dotenv, rails, django):
+
+- A `.env` next to the **resolved** `agctl.yaml` is loaded automatically — no need to `source` it in the shell first.
+- Point at a different file with `--env-file <path>` (global flag) or `AGCTL_ENV_FILE`. Precedence: `--env-file` > `AGCTL_ENV_FILE` > sibling `.env`; an explicit source *replaces* the auto-load (like `--config` replaces walk-up).
+- A missing sibling `.env` is a silent no-op; a missing explicit `--env-file` / `AGCTL_ENV_FILE` is a config error (exit 2), mirroring `--config`.
+- Raw `.env` values flow into the same `${...}` interpolation as real env vars — agctl's single engine owns all `${...}` resolution (chained, nested), so a line like `FOO=a-${BAR}` resolves consistently. The `.env` itself does not do its own `${VAR}` expansion.
+
 ### 2.3 Path Parameter Syntax
 
 HTTP template `path` and `body` values use `{placeholder}` (single braces) for runtime substitution via `--param key=value`. SQL (templates and free-form) uses `:paramName` (JDBC-style) instead — `{...}` is avoided in SQL to prevent collisions with JSON literals. Both are distinct from env var interpolation (`${...}`), which is resolved at config load time.
@@ -467,6 +474,7 @@ All commands share these global flags:
 | Flag | Default | Description |
 |---|---|---|
 | `--config <path>` | auto-discovered | Explicit path to `agctl.yaml` |
+| `--env-file <path>` | `.env` next to resolved config | Explicit path to a `.env` file; values are defaults, real env wins (precedence: `--env-file` > `AGCTL_ENV_FILE` > sibling `.env`) |
 | `--overlay <path>` | — | Overlay config fragment (repeatable; later wins); layered on base config |
 | `--timeout <seconds>` | from config `defaults` | Override request/operation timeout |
 | `--version` | — | Print version and exit |
@@ -2288,7 +2296,7 @@ Refused to overwrite (without `--force`):
 1. **`--config <path>` CLI flag** — if provided, only this file is loaded; no discovery walk is performed.
 2. **`AGCTL_CONFIG` environment variable** — if set, used as the config file path. Ignored when `--config` is explicitly passed.
 3. **Auto-discovery** — search for `agctl.yaml` starting in the current working directory, walking up parent directories until the filesystem root or a `.git` directory is found (whichever is first). The first `agctl.yaml` found wins.
-4. **`${ENV_VAR}` interpolation within YAML values** — after the file is located and parsed, all `${VAR}` references in string values are resolved from the process environment.
+4. **`${ENV_VAR}` interpolation within YAML values** — after the file is located and parsed, all `${VAR}` references in string values are resolved from the process environment, supplemented by `.env` defaults (real env wins; see §2.2 for `.env` source precedence). `AGCTL_*` overrides (step 6) likewise read from this merged env, so an `AGCTL_*` line in `.env` applies unless overridden by the real env.
 5. **`--overlay <path>` CLI flags (repeatable)** — after base interpolation, each overlay file is loaded, interpolated, and deep-merged into the base config in flag order (later overlays win on conflict). Overlay version (if present) must match the base config's major version.
 6. **`AGCTL_<SECTION>_<KEY>` environment variable overrides** — after overlays are merged, specific values can be overridden by structured env vars (see §8 for the exact convention). These have the highest precedence and win over both base and overlay values.
 
@@ -2328,7 +2336,9 @@ that code changes work correctly against running services.
 ### Setup
 
 `agctl` reads `agctl.yaml` at the project root. Required environment variables
-are listed in `.env.example`. Ensure they are set before running any `agctl` command.
+are listed in `.env.example` — copy it to `.env` and fill in the values. agctl
+auto-loads a `.env` next to `agctl.yaml` (real env wins), so no shell sourcing
+is needed before running `agctl` commands.
 
 ### Discovering Available Resources
 

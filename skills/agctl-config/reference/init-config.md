@@ -68,8 +68,11 @@ Never put real secret values in it.
 - Put `version: "3"` at the top.
 - Write `.env.example` (above), then have the user copy & fill it: `cp .env.example .env`
   (edit the secrets).
-- Source it before validating, so required `${VAR}`s resolve: `set -a; . ./.env; set +a`.
+- agctl auto-loads a `.env` next to the resolved `agctl.yaml` (real env wins) — required
+  `${VAR}`s resolve at `config validate` with **no shell sourcing**. `--env-file`/`AGCTL_ENV_FILE`
+  point at a different location. (`set -a; . ./.env; set +a` is only needed if other shell
+  tooling reads the same vars.)
 - **Then** run the mandatory verify from `SKILL.md`: `agctl config validate` (expect `ok:true`)
   followed by `agctl discover` (summary → a category → a sample item).
-- A bare-required `${VAR}` makes `config validate` exit 2 *until `.env` is sourced* — that's
+- A bare-required `${VAR}` makes `config validate` exit 2 *until `.env` provides it* — that's
   expected, not a failure. Never declare done while it still exits 2.

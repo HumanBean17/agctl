@@ -203,7 +203,7 @@ AGCTL_SERVICES__ORDER_SERVICE__BASE_URL=http://order-svc:8080
 `agctl config init` writes exactly this file — shown here for reference and for
 browsing on GitHub without installing. It has **concrete localhost values and no
 required env vars**, so `agctl config validate` passes as-is. (The production
-version is the same file with secrets/hosts moved into `${...}` and sourced from a
+version is the same file with secrets/hosts moved into `${...}` and loaded from a
 `.env` — see the note after it.)
 
 ```yaml
@@ -400,10 +400,12 @@ logs:
 > **Note:** `charge-payment` uses the `${PAYMENT_SERVICE_TOKEN:-change-me}` form —
 > an *optional* env var with a literal default — so `config validate` passes even
 > with nothing exported. For production, `export PAYMENT_SERVICE_TOKEN=<real token>`
-> (or move the whole value into `${...}` sourced from a `.env`); see below.
+> (or move the whole value into `${...}` loaded from a `.env`); see below.
 
 **Moving to environment-driven config** — replace the concrete values above with
-`${...}` and source them from a `.env` (agctl resolves them at load time):
+`${...}` and put them in a `.env`. agctl auto-loads the `.env` next to the resolved
+`agctl.yaml` at config load time (real env wins, so CI/prod can override committed
+defaults); point at a different location with `--env-file <path>` or `AGCTL_ENV_FILE`:
 
 ```bash
 # .env  — never commit real secrets

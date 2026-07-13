@@ -367,6 +367,7 @@ def _grpc_healthcheck_core(
     service: str | None,
     all_: bool,
     overlay_paths: list[str] | None = None,
+    env_file: str | None = None,
 ) -> dict:
     """Core gRPC healthcheck logic.
 
@@ -383,7 +384,7 @@ def _grpc_healthcheck_core(
     Raises:
         ConfigError: If target is unknown.
     """
-    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths)
+    cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
 
     # Select targets: if all_ OR neither target given → all targets; else [target]
     if all_ or target is None:
@@ -449,6 +450,7 @@ def grpc_healthcheck(
     """
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    env_file = ctx.obj.get("env_file") if ctx.obj else None
 
     _grpc_healthcheck_envelope(
         config_path,
@@ -456,6 +458,7 @@ def grpc_healthcheck(
         service,
         all_,
         overlay_paths=list(ovs) if ovs else None,
+        env_file=env_file,
     )
 
 
@@ -601,6 +604,7 @@ def grpc_call(
     """
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    env_file = ctx.obj.get("env_file") if ctx.obj else None
     start = time.monotonic()
 
     # Step 1: Resolve EXACTLY ONCE — config load, target/template resolution,
@@ -608,7 +612,7 @@ def grpc_call(
     # resulting context is handed to both the single-result path
     # (``_grpc_call_core``) and the streaming path; neither re-resolves.
     try:
-        cfg = load_config_or_raise(config_path, overlay_paths=list(ovs) if ovs else None)
+        cfg = load_config_or_raise(config_path, overlay_paths=list(ovs) if ovs else None, env_file=env_file)
         resolved = _resolve_grpc_call(
             cfg,
             target_name=target,

@@ -194,8 +194,8 @@ def _mock_kafka_example(reactor) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _summary_core(config_path: str | None, overlay_paths: list[str] | None = None) -> dict:
-    cfg = load_config_or_raise(config_path, overlay_paths)
+def _summary_core(config_path: str | None, overlay_paths: list[str] | None = None, env_file: str | None = None) -> dict:
+    cfg = load_config_or_raise(config_path, overlay_paths, env_file=env_file)
     return {
         "services": len(cfg.services),
         "http_templates": len(cfg.templates),
@@ -213,8 +213,8 @@ def _summary_core(config_path: str | None, overlay_paths: list[str] | None = Non
 _summary_envelope = envelope("discover.summary")(_summary_core)
 
 
-def _category_core(config_path: str | None, category: str, overlay_paths: list[str] | None = None) -> dict:
-    cfg = load_config_or_raise(config_path, overlay_paths)
+def _category_core(config_path: str | None, category: str, overlay_paths: list[str] | None = None, env_file: str | None = None) -> dict:
+    cfg = load_config_or_raise(config_path, overlay_paths, env_file=env_file)
     if category not in _VALID_CATEGORIES:
         raise ConfigError(f"Unknown category: {category}", {"category": category})
 
@@ -287,8 +287,8 @@ def _category_core(config_path: str | None, category: str, overlay_paths: list[s
 _category_envelope = envelope("discover.category")(_category_core)
 
 
-def _item_core(config_path: str | None, category: str, name: str, overlay_paths: list[str] | None = None) -> dict:
-    cfg = load_config_or_raise(config_path, overlay_paths)
+def _item_core(config_path: str | None, category: str, name: str, overlay_paths: list[str] | None = None, env_file: str | None = None) -> dict:
+    cfg = load_config_or_raise(config_path, overlay_paths, env_file=env_file)
     if category not in _VALID_CATEGORIES:
         raise ConfigError(f"Unknown category: {category}", {"category": category})
 
@@ -530,8 +530,8 @@ def _item_core(config_path: str | None, category: str, name: str, overlay_paths:
 _item_envelope = envelope("discover.item")(_item_core)
 
 
-def _search_core(config_path: str | None, term: str, overlay_paths: list[str] | None = None) -> dict:
-    cfg = load_config_or_raise(config_path, overlay_paths)
+def _search_core(config_path: str | None, term: str, overlay_paths: list[str] | None = None, env_file: str | None = None) -> dict:
+    cfg = load_config_or_raise(config_path, overlay_paths, env_file=env_file)
     needle = term.lower()
 
     def _matches(haystack: str | None) -> bool:
@@ -673,9 +673,11 @@ def _emit_argument_error(message: str) -> None:
 @click.option("--search", "search", default=None, help="Substring to search for")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
 @click.option("--overlay", "overlay_paths", multiple=True, default=None, help="Overlay config paths")
+@click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.pass_context
 def discover(
     ctx: click.Context,
+    env_file: str | None,
     category: str | None,
     name: str | None,
     search: str | None,
@@ -686,6 +688,7 @@ def discover(
     resolved_config = config_path or (ctx.obj.get("config_path") if ctx.obj else None)
     ovs = tuple(overlay_paths) or (ctx.obj.get("overlay_paths") if ctx.obj else None)
     resolved_overlay = list(ovs) if ovs else None
+    env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
 
     # Mutual exclusion: --category + --search together is an error.
     if category is not None and search is not None:
@@ -697,16 +700,16 @@ def discover(
         return
 
     if search is not None:
-        _search_envelope(resolved_config, search, resolved_overlay)
+        _search_envelope(resolved_config, search, resolved_overlay, env_file=env_file)
         return
 
     if category is not None and name is None:
-        _category_envelope(resolved_config, category, resolved_overlay)
+        _category_envelope(resolved_config, category, resolved_overlay, env_file=env_file)
         return
 
     if category is not None and name is not None:
-        _item_envelope(resolved_config, category, name, resolved_overlay)
+        _item_envelope(resolved_config, category, name, resolved_overlay, env_file=env_file)
         return
 
     # No flags — summary.
-    _summary_envelope(resolved_config, resolved_overlay)
+    _summary_envelope(resolved_config, resolved_overlay, env_file=env_file)

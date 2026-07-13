@@ -723,6 +723,69 @@ mocks:
     # Next item should be the absolute path to the overlay
     assert daemon_argv[overlay_idx + 1] == str(Path(ov).absolute())
 
+
+# Regression: mock start daemon argv forwards --env-file (the daemon re-loads
+# config from scratch, so it must receive the flag or it silently falls back to
+# the default .env sibling — the parent's readiness load used the right file,
+# the server that serves traffic would not).
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="managed daemon is POSIX-only; gated by _require_posix_daemon on Windows",
+)
+def test_mock_start_includes_env_file_in_daemon_argv(tmp_path, monkeypatch):
+    """mock start forwards --env-file to the daemon argv so the spawned daemon
+    loads the same .env as the parent (otherwise it silently uses the default)."""
+    base = tmp_path / "agctl.yaml"
+    base.write_text("""version: "3"
+services:
+  orders:
+    base_url: http://localhost:8081
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+""")
+    envf = tmp_path / "secrets.env"
+    envf.write_text("BASE=http://from-envfile\n")
+
+    captured_argv = []
+
+    def fake_spawn_daemon(argv, log_path, env=None):
+        captured_argv.append(argv)
+        return 12345  # Fake PID
+
+    monkeypatch.setattr("agctl.commands.mock_commands.spawn_daemon", fake_spawn_daemon)
+    monkeypatch.setattr("agctl.commands.mock_commands.is_alive", lambda pid: True)
+
+    from unittest.mock import MagicMock
+
+    fake_parsed = MagicMock()
+    fake_parsed.started = {"http": {"listen": "0.0.0.0:18080", "stubs": 1}}
+    fake_parsed.startup_error = None
+    monkeypatch.setattr("agctl.commands.mock_commands.parse_log", lambda log_path: fake_parsed)
+    monkeypatch.setattr("agctl.commands.mock_commands.read_pidfile", lambda pidfile: None)
+
+    result = CliRunner().invoke(
+        cli,
+        ["--env-file", str(envf), "--config", str(base), "mock", "start"],
+    )
+
+    assert len(captured_argv) == 1, result.output
+    daemon_argv = captured_argv[0]
+
+    # Global flags (--env-file) must appear BEFORE the "mock" subcommand.
+    mock_idx = daemon_argv.index("mock")
+    assert "--env-file" in daemon_argv
+    env_file_idx = daemon_argv.index("--env-file")
+    assert env_file_idx < mock_idx, "--env-file must appear before the 'mock' subcommand"
+    assert daemon_argv[env_file_idx + 1] == str(Path(envf).absolute())
+
     # Verify --config also appears BEFORE the "mock" subcommand (if provided)
     if "--config" in daemon_argv:
         config_idx = daemon_argv.index("--config")

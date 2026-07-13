@@ -9,6 +9,7 @@ import yaml
 from pydantic import ValidationError
 
 from ..errors import ConfigError
+from .env_file import resolve_dotenv_values
 from .models import Config, PartialConfig
 from .resolver import apply_env_overrides
 
@@ -231,28 +232,32 @@ def compose_config(
     path: str | None = None,
     overlays: list[str] | None = None,
     env: dict[str, str] | None = None,
+    env_file: str | None = None,
 ) -> ComposedConfig:
     """Compose base config with overlay fragments.
 
     Pipeline:
       1. Resolve env (defaults to os.environ).
       2. Discover base config path.
-      3. Load and interpolate base YAML.
-      4. Check base version (must be v3).
-      5. For each overlay (in order):
+      3. Merge `.env` defaults into env (real env wins; DESIGN §2.2).
+      4. Load and interpolate base YAML.
+      5. Check base version (must be v3).
+      6. For each overlay (in order):
          - Verify file exists.
          - Load and interpolate overlay YAML.
          - Validate fragment with PartialConfig.
          - Check overlay version major matches TOOL_MAJOR_VERSION if present.
          - Deep merge into base, recording overrides.
-      6. Apply environment variable overrides to merged dict.
-      7. Validate final Config.
-      8. Return ComposedConfig(config, overrides).
+      7. Apply environment variable overrides to merged dict.
+      8. Validate final Config.
+      9. Return ComposedConfig(config, overrides).
 
     Args:
         path: Explicit base config path (discovery if None).
         overlays: List of overlay file paths to apply in order.
         env: Environment dict (defaults to os.environ).
+        env_file: Explicit `.env` path (``--env-file``). None → fall back to
+            ``AGCTL_ENV_FILE``, then the `.env` sibling of the resolved config.
 
     Returns:
         ComposedConfig with final Config and override records.
@@ -262,6 +267,15 @@ def compose_config(
     """
     env = env if env is not None else os.environ
     base_path = discover_config_path(explicit=path, env=env)
+    # Merge `.env` defaults BEFORE interpolation so ${VAR} can resolve from it.
+    # Done after config discovery so the sibling .env sits next to the RESOLVED
+    # agctl.yaml, and so AGCTL_CONFIG / AGCTL_ENV_FILE set inside .env cannot
+    # steer their own resolution (only real-env values do — no cycle). Real env
+    # wins: .env only fills keys not already set. We build a NEW dict rather than
+    # mutate os.environ, so config loading has no process-env side effects.
+    dotenv = resolve_dotenv_values(env_file, env, base_path)
+    if dotenv:
+        env = {**dotenv, **env}
     base_raw = interpolate(yaml.safe_load(base_path.read_text()) or {}, env)
     _check_version(base_raw)
 
@@ -314,6 +328,7 @@ def load_config(
     path: str | None = None,
     env: dict[str, str] | None = None,
     overlays: list[str] | None = None,
+    env_file: str | None = None,
 ) -> Config:
     """Full pipeline: discover -> parse -> interpolate -> merge overlays -> override -> validate.
 
@@ -321,6 +336,7 @@ def load_config(
         path: Explicit config path (discovery if None).
         env: Environment dict (defaults to os.environ).
         overlays: Optional list of overlay file paths to compose.
+        env_file: Explicit `.env` path (``--env-file``); None → AGCTL_ENV_FILE → sibling.
 
     Returns:
         Validated Config object.
@@ -328,7 +344,7 @@ def load_config(
     Raises:
         ConfigError: On any pipeline error.
     """
-    return compose_config(path, overlays, env).config
+    return compose_config(path, overlays, env, env_file).config
 
 
 def _check_version(data: dict) -> None:
