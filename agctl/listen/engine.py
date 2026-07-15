@@ -303,7 +303,13 @@ class ListenEngine:
                 self._duration_timer.start()
 
             # Block until stop is set (signal, duration timer, or shutdown).
-            self._stop.wait()
+            # Bounded loop (matches MockEngine.run): a short timed wait is
+            # reliably interruptible across platforms, where an indefinite
+            # ``wait()`` can block past an already-set flag on some Windows
+            # runtimes (the mock engine uses the same pattern and passes on
+            # Windows; the prior unbounded ``self._stop.wait()`` hung CI there).
+            while not self._stop.is_set():
+                self._stop.wait(0.1)
 
             # Signal stop so still-running capture threads begin winding down,
             # then JOIN before deciding the exit code. A loop finishing its
