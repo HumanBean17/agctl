@@ -15,5 +15,5 @@ def pytest_collection_modifyitems(config, items):
         skip = pytest.mark.skip(reason="diagnostic: isolating Windows-only exit 1")
         for item in items:
             p = str(item.fspath).replace("\\", "/").lower()
-            if "test_listen" in p or "test_kafka_listen" in p:
+            if "test_kafka_listen" in p:
                 item.add_marker(skip)
