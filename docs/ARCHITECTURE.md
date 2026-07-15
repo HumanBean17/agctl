@@ -100,7 +100,8 @@ agctl/
 ├── __main__.py                 # python -m agctl entry point (enables `mock start` daemon spawn)
 ├── cli.py                      # Click entry point; registers groups; loads plugins; secret masking
 ├── command.py                  # @envelope decorator + load_config_or_raise
-├── output.py                   # emit() — the single permitted stdout write path
+├── daemon.py                   # generic daemon primitives (spawn_daemon/terminate/require_posix_daemon/is_alive/pidfile ops) shared by mock + listen; imports only errors
+├── output.py                   # emit() (one-shot envelope) + emit_ndjson_line() (streaming event sink) — the only permitted stdout write paths
 ├── errors.py                   # typed AgctlError hierarchy
 ├── params.py                   # --param k=v  →  dict[str,str]
 ├── resolution.py               # {placeholder} fill, body deep_merge, :name→%(name)s
@@ -116,6 +117,7 @@ agctl/
 ├── commands/                   # one module per command group
 │   ├── http_commands.py        # http call / request / ping
 │   ├── kafka_commands.py       # kafka produce / consume / assert
+│   ├── kafka_listen_commands.py # kafka listen run / start / status / stop / assert / results / messages (long-lived capture daemon)
 │   ├── db_commands.py          # db query / assert / execute / schema
 │   ├── logs_commands.py        # logs query / assert / tail
 │   ├── check_commands.py       # check ready
@@ -130,8 +132,14 @@ agctl/
 │   ├── jq_precompile.py        # walks mocks → (label, expr) pairs; compile-only validate
 │   ├── capture.py              # envelope capture resolver: jq_value(envelope, from) → typed CaptureValue
 │   ├── capture_validate.py     # walks mocks → object-capture placement errors; pure Python (no jq)
-│   ├── daemon.py               # daemon lifecycle: pidfile, liveness, target resolution, NDJSON log parser, failure taxonomy
+│   ├── daemon.py               # mock-specific daemon layer: port-keyed pidfile/log paths, RunningMock, target resolution, NDJSON log parser, failure taxonomy (generic primitives live in agctl/daemon.py)
 │   └── engine.py               # MockEngine lifecycle (start/run/shutdown; Step 0 pre-compiles jq)
+├── listen/                     # kafka listen capture daemon (long-lived, capture-to-disk)
+│   ├── daemon.py               # run_id keying, state paths, RunningListener, meta/asserts.jsonl helpers, events.log parser
+│   ├── capture_file.py         # per-topic capture reader (filter/count/first/paginate) + build_predicate
+│   ├── assert_eval.py          # evaluate_expectations: reuses kafka assert predicate machinery over capture files (no deadline)
+│   ├── capture.py              # CaptureLoop: per-topic consume_loop wrapper (seek-to-end-on-assign + jq capture-match + overflow valve)
+│   └── engine.py               # ListenEngine lifecycle (start/run/shutdown; per-topic threads; single-writer NDJSON emit; summary)
 ├── data/
 │   └── sample-config.yaml      # packaged starter config (read via importlib.resources)
 └── clients/
@@ -416,12 +424,27 @@ results as they happen, so it violates "one object per invocation":
 - Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary:true, messages, matched, status, duration_ms}` and exits `0` (or `1` if `--expect-count` is not met).
 - Startup errors emit a single structured envelope **before** any message line.
 
+**The sixth streaming exception — `kafka listen run`.** Like `mock run`, the Kafka capture listener streams lifecycle events as they happen:
+
+- Not wrapped by `@envelope`.
+- Emits one JSON object **per event** (`started`, per-topic `capture.overflow`, `kafka.error`, `summary`) directly as they occur (the per-message capture is written to disk, not stdout).
+- All emission goes through a single-writer path (`threading.Lock` in `ListenEngine.emit_event`) so concurrent per-topic `CaptureLoop` threads emit safely without interleaved lines.
+- Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{event: "summary", topics:[{topic, captured, overflowed}], errors, duration_ms}` and exits `0` (clean) or `1` (any `kafka.error` occurred).
+- Startup errors emit a single structured envelope **before** any event line.
+
 **The managed daemon commands — `mock start`/`stop`/`status`** are NOT streaming exceptions. Each is a normal `@envelope`-wrapped command that emits exactly one JSON object and exits 0/1/2:
 
 - `mock start` blocks until the daemon's `started` line appears in the log (or a startup error or timeout), then returns the `mock.start` envelope (`ok:true` with pid/listen/log_path/stubs/reactors/started_at).
 - `mock stop` signals the daemon, waits for shutdown, parses the log for summary + failure events, and returns the `mock.stop` verdict (`stopped`/`pid`/`signal`/`summary`/`failures`). When fatal failures are found, it raises `AssertionFailure` (exit 1) with the verdict in `error.detail`.
 - `mock status` reads the live log and returns the `mock.status` snapshot (`running`/`pid`/`listen`/`uptime_ms`/`summary_so_far`/`failures_so_far`).
 - All three commands are wrapped by `@envelope` and follow the one-emit contract; they do NOT stream NDJSON like `mock run`.
+
+**The managed daemon commands — `kafka listen start`/`stop`/`status`** mirror the mock trio (POSIX/WSL-gated via `require_posix_daemon()`, state-keyed by `run_id` under `<state-dir>/listen-<run_id>/`). Each is a normal `@envelope`-wrapped command that emits one JSON object:
+
+- `kafka listen start` spawns a detached `kafka listen run` daemon (unique per-run group `agctl-listen-<run_id>`), writes the pidfile + `meta.json`, and readiness-polls `events.log` for the `started` line. The daemon seeks every assigned partition to `OFFSET_END` via the `consume_loop` `on_assign` callback BEFORE the first poll delivers data, so only messages produced AFTER `start` are captured.
+- `kafka listen stop` SIGTERMs the daemon (SIGKILL after `--timeout`), parses `events.log` for `summary` + fatal events, then deletes the run dir + pidfile. Fatal events (`kafka.error`, or `capture.overflow` on a topic with an attached expectation) raise `AssertionFailure` (exit 1); cleanup runs on every path. `stop` does NOT auto-run `results` — an uncollected expectation is silently dropped.
+- `kafka listen status` is read-only (live per-topic `captured`/`bytes`/`overflowed` snapshot; never signals the daemon, never removes the pidfile).
+- `kafka listen assert`/`results`/`messages` are `@envelope`-wrapped client-side file readers (no daemon IPC, no wall-clock deadline — bounded by capture-file size).
 
 **stdout vs stderr** — all machine-readable output on stdout; stderr carries
 only diagnostics an agent must never parse (plugin-load failures, entry-point
@@ -554,7 +577,7 @@ reactors sharing a cluster reuse a single client built via `clients_by_cluster`)
   older than the window, the result is `-1`; the client seeks such partitions to
   `OFFSET_END`, else `auto.offset.reset=earliest` would re-read every stale
   message and violate the window.
-- **`consume_loop`** — committed consume loop for mock reactors. The reactor owns its consumer lifecycle (D13); each message invokes a `handle(message, attempt, final)` callback and returns a `ReactionResult` (`COMMIT` → store_offsets + commit; `RETRY` → re-handle the same in-memory message; `STOP` → exit loop). Supports `max_retries` (must be >= 1), `stop_event`, and optional rebalance callbacks (`on_assign`/`on_revoke`). The consumer is closed in `finally` after the loop exits.
+- **`consume_loop`** — committed consume loop for mock reactors AND the `kafka listen` `CaptureLoop`. The reactor/listener owns its consumer lifecycle (D13); each message invokes a `handle(message, attempt, final)` callback and returns a `ReactionResult` (`COMMIT` → store_offsets + commit; `RETRY` → re-handle the same in-memory message; `STOP` → exit loop). Supports `max_retries` (must be >= 1), `stop_event`, and optional rebalance callbacks (`on_assign`/`on_revoke`). `kafka listen`'s `CaptureLoop` forwards an `on_assign` that seeks every partition to `OFFSET_END` BEFORE the first poll delivers data (overriding the client's hardcoded `auto.offset.reset: earliest`), so the listener begins at the head — immune to scan-window misses, volume truncation, and broker retention cleanup. The consumer is closed in `finally` after the loop exits.
 - **`probe`** — one-shot broker connectivity check. Builds a consumer, calls `list_topics(topic, timeout)`, and closes the consumer. Raises `ConnectionFailure` on any Kafka/broker error (the engine calls this at startup before binding HTTP to satisfy the spec §11 "broker unreachable at startup → exit 2" guarantee).
 - **Test seams** — `producer_factory`/`consumer_factory` inject fakes sharing
   the real Producer/Consumer contract, including confluent-kafka 2.15.0's
@@ -748,6 +771,7 @@ Primitives in `assertions.py`, composed by the command layer. Five families:
   (`--jq-path`); a `from` resolving to `null`/missing is the soft-miss path
   (emits `capture.missing`, substitutes empty string), distinct from a missing
   `jq` library which re-raises as `ConfigError` (exit 2).
+- **`kafka listen assert`/`results`** — `listen/assert_eval.py::evaluate_expectations` reuses the `kafka assert` predicate composition (`_build_assert_predicate` mode merge: `contains`/`match`/`pattern`/`path`) via `listen/capture_file.py::build_predicate`, scanning the per-topic `<topic>.ndjson` capture to exhaustion with `count_matching`. There is deliberately **no wall-clock deadline** anywhere — the scan is bounded by file size only, so a listener's capture (a finite on-disk artifact) cannot hit a timeout-truncation false negative. Each `ExpectationResult` carries the same self-debugging `messages_scanned` + per-mode `root` payload as `kafka assert`'s no-match detail.
 
 **Dialect `"2"` — five `match` eval sites are envelope-rooted.** Under the v2
 dialect (gated by `_check_version`), `jq_bool` feeds the whole envelope — not
@@ -1022,7 +1046,8 @@ divergence is introduced.
 
 What the system does **not** do today (as-built; see DESIGN §10 for the roadmap):
 
-- **Bounded statelessness carve-out — mock daemon state.** The managed daemon commands (`mock start`/`stop`/`status`) introduce the sole on-disk state in the system: a pidfile (`mock-<port>.pid`) and NDJSON log (`mock-<port>.log`) under `<state-dir>/` (default `./.agctl/`). This is a deliberate, scoped exception to the stateless-invocation principle, confined to the daemon lifecycle. No other commands read or write cross-invocation state.
+- **Bounded statelessness carve-out — mock daemon state.** The managed daemon commands (`mock start`/`stop`/`status`) introduce on-disk state in the system: a pidfile (`mock-<port>.pid`) and NDJSON log (`mock-<port>.log`) under `<state-dir>/` (default `./.agctl/`). This is a deliberate, scoped exception to the stateless-invocation principle, confined to the daemon lifecycle. No other commands read or write cross-invocation state.
+- **Bounded statelessness carve-out — listen daemon state (second carve-out).** The `kafka listen` managed daemon (`start`/`stop`/`status`/`assert`/`results`/`messages`) is the second on-disk-state surface: a run-id-keyed pidfile (`listen-<run_id>.pid`) plus a run dir (`listen-<run_id>/`) holding `meta.json`, `asserts.jsonl` (attached expectations), per-topic `<topic>.ndjson` capture files, and `events.log`, all under `<state-dir>/`. Same scope discipline as mock — confined to the daemon lifecycle; the generic primitives (`spawn_daemon`/`terminate`/`require_posix_daemon`/`is_alive`/pidfile ops) are shared with mock via `agctl/daemon.py` (no `listen → mock` coupling). `stop` deletes the run dir + pidfile on every path (fatal or clean), so an uncollected expectation (`results` not run first) is silently dropped.
 - **No Schema Registry / Avro/Protobuf decoding** — Kafka values are raw JSON;
   `schema_registry_url` is parsed but unused.
 - **No retry/polling DSL** — eventually-consistent assertions need a caller-side
@@ -1034,18 +1059,21 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
   (deferred).
 - **No MCP wrapper, no OpenTelemetry propagation, no parallel runner, no secret
   backends** — deferred per DESIGN §10.
-- **Native-Windows managed-daemon gate** — the three managed-daemon `_core`s
+- **Native-Windows managed-daemon gate** — the managed-daemon `_core`s
   (`_mock_start_core`/`_mock_stop_core`/`_mock_status_core` in
-  `commands/mock_commands.py`) call `_require_posix_daemon()`, which raises
+  `commands/mock_commands.py`, `_kafka_listen_start_core`/`_stop_core`/
+  `_status_core` in `commands/kafka_listen_commands.py`) call
+  `require_posix_daemon()` (from `agctl/daemon.py`), which raises
   `ConfigError` (exit 2) when `os.name == "nt"`; WSL reports `"posix"`, so it
-  passes through ungated. `mock run` (foreground streaming) and every other
-  command group run natively on Windows. Streaming graceful-stop contract:
-  backgrounded streamers (`http ping`, `mock run`, `logs tail`, `grpc`
-  server-stream/bidi) install `SIGTERM`/`SIGINT` handlers; on native Windows
-  only the `SIGINT`/Ctrl+C path reaches the handler (a `SIGTERM` via `os.kill`
-  hard-terminates). The `SIGTERM`-driven graceful-stop (and the daemon's
-  `SIGTERM`-based shutdown that `mock stop` drives) is POSIX/WSL — the reason
-  the daemon is gated there.
+  passes through ungated. `mock run` and `kafka listen run` (foreground
+  streaming) and every other command group run natively on Windows. Streaming
+  graceful-stop contract: backgrounded streamers (`http ping`, `mock run`,
+  `logs tail`, `grpc` server-stream/bidi, `kafka listen run`) install
+  `SIGTERM`/`SIGINT` handlers; on native Windows only the `SIGINT`/Ctrl+C path
+  reaches the handler (a `SIGTERM` via `os.kill` hard-terminates). The
+  `SIGTERM`-driven graceful-stop (and the daemon's `SIGTERM`-based shutdown
+  that `mock stop`/`kafka listen stop` drive) is POSIX/WSL — the reason both
+  daemons are gated there.
 
 **Mock server MVP limitations** (see DESIGN §10 "Known-wrong-result / Not Covered" for the full list with failure-mode analysis):
 
