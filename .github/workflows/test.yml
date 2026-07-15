@@ -36,4 +36,7 @@ jobs:
           pip install -e ".[dev,http,jq,kafka,db,logs,grpc]"
 
       - name: Run tests
-        run: pytest tests/unit
+        # TEMP diagnostic: -X dev surfaces ResourceWarning (unclosed files/threads);
+        # --faulthandler-timeout dumps all thread tracebacks if the process stalls
+        # (investigating a Windows-only post-summary exit 1). Revert after.
+        run: python -X dev -m pytest tests/unit --faulthandler-timeout=30 -rA
