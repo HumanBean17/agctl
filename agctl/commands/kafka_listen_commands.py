@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 import click
 
+from ..assertions import compile_jq
 from ..command import envelope, load_config_or_raise
 from ..daemon import (
     is_alive,
@@ -284,6 +285,16 @@ def kafka_listen_run(
                 {},
             )
 
+        # Validate --capture-match jq up front (loud-on-typo → ConfigError, exit 2),
+        # BEFORE the engine starts. Parity with the other jq modes, which are
+        # compile-validated in capture_file.build_predicate. Without this, a
+        # malformed expression compiles-fails inside jq_bool (which swallows the
+        # error → False for every message), silently emptying the capture file.
+        if effective_capture_match is not None:
+            compile_jq(
+                effective_capture_match, label="kafka listen --capture-match"
+            )
+
         # Resolve the cluster: --cluster (explicit) > pattern.cluster (binding) >
         # default > single-cluster.
         name = resolve_cluster_name(
@@ -387,6 +398,14 @@ def _kafka_listen_start_core(
             "kafka listen start requires at least one --topic or --pattern",
             {},
         )
+
+    # Validate --capture-match jq up front (loud-on-typo → ConfigError, exit 2),
+    # BEFORE spawning the daemon. Parity with the other jq modes (compile-validated
+    # in capture_file.build_predicate). Without this, a malformed expression would
+    # silently skip every message in the capture loop (jq_bool swallows the compile
+    # error), leaving an empty capture file and a false ``matched_count=0`` verdict.
+    if eff_capture_match is not None:
+        compile_jq(eff_capture_match, label="kafka listen --capture-match")
 
     name = resolve_cluster_name(
         cfg.kafka, explicit=cluster, binding_cluster=binding_cluster

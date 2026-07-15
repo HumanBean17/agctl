@@ -354,6 +354,31 @@ class TestStart:
                 env_file=None,
             )
 
+    def test_start_malformed_capture_match_raises_configerror_no_spawn(self, tmp_path):
+        """A malformed --capture-match jq expression → ConfigError BEFORE spawn_daemon
+        (loud-on-typo parity with the other jq modes); the spawn monkeypatch is NOT
+        called, mirroring how the no-topics / startup guards are tested."""
+        cfg_path = _write_config(tmp_path)
+
+        with patch(
+            "agctl.commands.kafka_listen_commands.spawn_daemon"
+        ) as mock_spawn:
+            with pytest.raises(ConfigError) as ei:
+                _kafka_listen_start_core(
+                    config_path=str(cfg_path),
+                    topics=["orders.created"],
+                    patterns=[],
+                    cluster=None,
+                    capture_match="value.eventType ==",
+                    max_bytes=268435456,
+                    state_dir=str(tmp_path / "state"),
+                    overlay_paths=None,
+                    env_file=None,
+                )
+        assert "invalid jq expression" in ei.value.message
+        # spawn_daemon was never called (compile check runs before spawn).
+        mock_spawn.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # status

@@ -384,6 +384,38 @@ class TestKafkaListenRunCli:
         assert envelope["error"]["type"] == "ConfigError"
         assert "at least one" in envelope["error"]["message"]
 
+    def test_run_malformed_capture_match_raises_configerror(self, tmp_path):
+        """A malformed --capture-match jq expression → single ConfigError envelope,
+        exit 2, no event lines, engine never built (loud-on-typo parity with the
+        other jq modes, which are compile-validated in capture_file.build_predicate)."""
+        cfg = _write_config(tmp_path)
+
+        with patch(
+            "agctl.commands.kafka_listen_commands.new_listen_engine"
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "--config", str(cfg),
+                    "kafka", "listen", "run",
+                    "--topic", "orders.created",
+                    "--capture-match", "value.eventType ==",
+                    "--duration", "0.01",
+                ],
+            )
+
+        assert result.exit_code == 2
+        # No engine constructed (compile check short-circuits before build/start).
+        mock_factory.assert_not_called()
+        lines = [json.loads(ln) for ln in result.output.splitlines() if ln.strip()]
+        # Exactly one line: the structured startup-error envelope, no event lines.
+        assert len(lines) == 1
+        envelope = lines[0]
+        assert envelope["ok"] is False
+        assert envelope["command"] == "kafka.listen.run"
+        assert envelope["error"]["type"] == "ConfigError"
+        assert "invalid jq expression" in envelope["error"]["message"]
+
 
 # ---------------------------------------------------------------------------
 # CLI group registration
