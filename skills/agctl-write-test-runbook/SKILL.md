@@ -80,10 +80,11 @@ Identify the fixtures and the cleanup that reverses them:
 - **Seed data** when the test needs specific DB state (`agctl db execute --write`).
 - **Mocks** when a downstream dependency should not be hit for real (`agctl mock run`).
 - **Heartbeat** when the SUT enforces a session timeout a long run would trip (`agctl http ping`).
+- **Long-lived Kafka capture** when verifying events on a long saga / high-volume topic where a windowed `kafka assert` could miss (`agctl kafka listen start` BEFORE the trigger → `assert` → `results` → `stop`). See the `agctl` skill for the lifecycle; `stop` does NOT auto-run `results`.
 
 If none apply, omit the Fixtures section entirely. Background commands
-(`mock run`, `http ping`) go under Fixtures, never as Steps — they stream NDJSON,
-not a single envelope.
+(`mock run`, `http ping`, `kafka listen run`) go under Fixtures, never as Steps —
+they stream NDJSON, not a single envelope.
 
 **Config placement rule:** Ground every template, mock, seed-template, and pattern via `agctl discover` against the main config. When a needed definition is **not** present, place it in a sidecar `<runbook-base>.agctl.yaml` (sibling to the runbook) rather than editing the main `agctl.yaml`. Shared infrastructure stays in the main config; runbook-specific fixtures (one-off seed templates, ad-hoc mocks, scratch HTTP templates) and per-runbook overrides belong in the sidecar.
 

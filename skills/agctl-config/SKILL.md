@@ -120,8 +120,9 @@ item appears in `discover`, then verify with `agctl config validate` and a smoke
 
 **Mock daemon state directory:** The managed daemon commands (`mock start`/`stop`/`status`)
 write a pidfile (`mock-<port>.pid`) and NDJSON log (`mock-<port>.log`) under `<state-dir>/`
-(default `./.agctl/`). This is the sole on-disk state in `agctl`, confined to the daemon
-lifecycle. Clean up with `rm -rf .agctl`.
+(default `./.agctl/`). This is on-disk state in `agctl`, confined to the daemon lifecycle
+(the `kafka listen` daemon writes its own run dir under the same `<state-dir>/`; see the
+`agctl` skill). Clean up with `rm -rf .agctl`.
 
 If `agctl` isn't installed, run the **structural checklist** below instead and tell the user
 live validation was skipped. **Never** declare done on config that doesn't validate.

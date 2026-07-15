@@ -46,6 +46,8 @@ flags: see `--help`.)
 | Verify an event was published | `kafka assert [--topic T] <mode> --timeout N` |
 | See what was published | `kafka consume --topic T [--match …]` |
 | Publish a message | `kafka produce --topic T --message '{…}'` |
+| Capture a long saga / high-volume topic | `kafka listen start …` → `assert …` (repeat) → `results` → `stop` (see § `agctl kafka listen` below) |
+| Tap what a listener captured / peek at live state | `kafka listen messages --topic T` / `kafka listen status` |
 | DB write / rows / value / inspect / schema | `db execute --write` / `db assert --expect-rows N` / `db assert --expect-value --path .x --equals v` / `db query` / `db schema` |
 | Call gRPC services / healthcheck | `grpc call <tpl> [--param…]` / `grpc call --target T --address host:port` / `grpc healthcheck` |
 | Impersonate a dependency | `mock run` (foreground) / `mock start\|stop\|status` (daemon) |
@@ -73,11 +75,14 @@ cluster.
 
 ## Gotchas (what `--help` won't tell you)
 
-1. **Two streaming commands** — `http ping` (one JSON object **per ping**) and
-   `mock run` (one NDJSON event per line + a final `summary`). Background with `&`,
-   `kill` when done; exit 0 (all ok) / 1 (any failed). The managed `mock start`/
-   `stop`/`status` are **not** streaming — each emits one object. Every other
-   command emits exactly one object.
+1. **Six streaming commands** — `http ping` (one JSON object **per ping**),
+   `mock run` (one NDJSON event per line + a final `summary`), `logs tail`
+   (one entry per line + `summary`), `grpc call` server-stream/bidi (one message
+   per line + `summary`), and `kafka listen run` (one NDJSON event per line +
+   `summary`). Background with `&`, `kill` when done; exit 0 (all ok) / 1 (any
+   failed). The managed daemons (`mock start`/`stop`/`status`, `kafka listen
+   start`/`stop`/`status`) are **not** streaming — each emits one object. Every
+   other command emits exactly one object.
 2. **A 4xx/5xx HTTP response is `ok:true` — unless you assert.** Status is a
    *result*, not an error. Add `--status`/`--contains`/`--match`/`--jq-path`/
    `--equals` to `http call`/`request` to flip a wrong response into
@@ -152,9 +157,13 @@ cluster.
     line appears (or a startup error/timeout), then returns — no separate polling.
     The old four-step protocol is now `mock start` → `mock stop`.
 16. **Daemon state under `.agctl/` is the only on-disk state.** Managed daemons
-    write a pidfile (`mock-<port>.pid`) and log (`mock-<port>.log`) under
-    `<state-dir>/` (default `./.agctl/`). Sole exception to the stateless-invocation
-    principle, scoped to the daemon lifecycle. Clean up with `rm -rf .agctl`.
+    write per-run state under `<state-dir>/` (default `./.agctl/`): `mock` writes a
+    pidfile (`mock-<port>.pid`) + log (`mock-<port>.log`); `kafka listen` writes a
+    pidfile (`listen-<run_id>.pid`) + run dir (`listen-<run_id>/` holding `meta.json`,
+    `asserts.jsonl`, per-topic `<topic>.ndjson`, `events.log`). Sole exception to the
+    stateless-invocation principle, scoped to the daemon lifecycle. Clean up with
+    `rm -rf .agctl`. `kafka listen stop` deletes its run dir on every path (fatal or
+    clean) — `results` not run first ⇒ the expectation is silently dropped.
 
 ## Discover live schema before authoring SQL
 
@@ -226,6 +235,72 @@ until grep -q '"event":"started"' mock.log; do sleep 0.1; done    # poll, don't 
 kill -TERM "$MOCK_PID"; wait "$MOCK_PID"                            # SIGTERM + wait, never SIGKILL
 grep -E 'http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error|capture.missing' mock.log && exit 1
 ```
+
+## `agctl kafka listen` — long-lived Kafka capture
+
+A long-lived Kafka capture daemon for verifying events on **long sagas**,
+**high-volume topics**, or topics under **broker retention pressure** — the three
+cases where a windowed `kafka assert` can false-negative (scan-window miss,
+volume-induced timeout truncation, retention cleanup). Where `kafka assert` scans
+a bounded lookback window against a wall-clock deadline:
+
+- **Start BEFORE the trigger.** `kafka listen start` seeks every assigned
+  partition to its head (`OFFSET_END`) BEFORE the first poll delivers data, so
+  only messages produced AFTER `start` are captured. No scan-window miss, no
+  backlog replay.
+- **Captures to disk.** Per-topic NDJSON under `<state-dir>/listen-<run_id>/`.
+  A byte valve (`--max-bytes-per-topic`, default 256 MiB; `0` = unlimited) emits
+  `capture.overflow` once and STOPs that topic instead of silently truncating.
+- **Asserts with no deadline.** `kafka listen results` scans the capture file
+  client-side, bounded by file size only. No timeout-truncation false negative.
+
+**Runbook protocol (load-bearing):**
+
+```bash
+# 1. Start the listener BEFORE the trigger (blocks until seeked-to-end + ready)
+agctl kafka listen start --topic orders.created --topic payments.events
+
+# 2. Trigger the runbook (HTTP call, DB write, etc.)
+OID=$(agctl http call create-order --param customer_id=cust-42 --param sku=WIDGET-001 | jq -r '.result.body.order_id')
+
+# 3. Attach expectations (repeatable across topics; modes + roots identical to kafka assert)
+agctl kafka listen assert --topic orders.created --pattern order-created --param orderId="$OID"
+agctl kafka listen assert --topic payments.events --contains '{"status":"SUCCESS"}' --expect-count 1
+
+# 4. Give the saga time to complete, then collect (exit 1 if any expectation fails)
+agctl kafka listen results
+
+# 5. Stop + cleanup (deletes the run dir)
+agctl kafka listen stop
+```
+
+**`stop` does NOT auto-run `results`** — it is termination + cleanup only. If you
+skip `results`, attached expectations are **silently dropped** when the run dir is
+deleted. Always run `results` BEFORE `stop`.
+
+**Commands:** `start` (daemon, POSIX/WSL-only) · `assert` (attach, repeatable,
+exit 0; does NOT evaluate) · `results` (evaluate all, exit 1 on any failure) ·
+`stop` (SIGTERM + cleanup) · `status` (read-only peek) · `messages` (debug tap on
+a topic's capture) · `run` (foreground streaming — the daemon's spawn target and
+native-Windows fallback; sixth streaming exception).
+
+**Selectors:** every subcommand takes `--run-id <id>` / `--pid <pid>` /
+implicit-singleton (when exactly one listener is running in `--state-dir`).
+Multiple listeners + no selector ⇒ exit 2 listing candidates. `stop --all`
+iterates every running listener.
+
+**`--topic` vs `--pattern`:** `--pattern <name>` reuses `kafka.patterns`
+(contributes the pattern's `topic` + `match` + `cluster`); `--topic` is bare.
+Both repeatable and de-duped. `--capture-match` is a coarse capture filter
+(volume guardrail); assertion narrowing uses `assert --match`/`--contains`/
+`--path` (same modes + envelope roots as `kafka assert`).
+
+**Fatal at `stop`** (raise `AssertionFailure`, exit 1): `kafka.error`, or
+`capture.overflow` on a topic that has an attached expectation. Overflow on a
+non-asserted topic is a warning (visible in `status`, non-fatal at `stop`).
+
+**Windows:** the managed daemon (`start`/`stop`/`status`) is POSIX/WSL-only —
+use `agctl kafka listen run` (foreground streaming) on native Windows.
 
 ## Recipes
 

@@ -42,6 +42,8 @@
 
 > **Mocking support:** `agctl` now includes a built-in mock server for HTTP and Kafka (see `agctl mock` in §3.3 and the `mocks:` config section in §2.1). This supersedes the earlier non-goal — local testing no longer requires external tools like WireMock or LocalStack for common HTTP stubbing and Kafka reaction patterns.
 
+> **Long-saga / high-volume capture:** `agctl kafka listen` runs a long-lived Kafka capture daemon that seeks to the latest offset at `start` (positioned at the head BEFORE the runbook trigger fires), records every matching message to disk, and evaluates attached expectations with no wall-clock deadline (see §3.2). This closes the three false-negative surfaces a windowed `kafka assert` can hit on long sagas or high-volume topics: scan-window misses, volume-induced timeout truncation, and broker retention cleanup.
+
 ---
 
 ## 2. Configuration Schema
@@ -752,6 +754,139 @@ agctl kafka assert \
 **TLS / transport model (produce, consume, assert):** All three commands connect to brokers using the resolved cluster's `ssl` block (see §2.1). Setting any field to a non-empty value enables TLS and defaults `security.protocol` to `SSL` (mTLS); `ca_location` is optional and falls back to the system trust store when unset. Hostname verification is **on** by default (librdkafka default) — set `endpoint_identification_algorithm: "none"` only for self-signed or dev brokers. An empty string (e.g. an unresolved `${VAR:-}`) is treated as unset, so a partially-configured `ssl:` block never silently downgrades to plaintext nor disables verification. TLS configuration is unit-tested only; the live integration suite runs a plaintext broker.
 
 **Cluster resolution (produce, consume, assert):** All three commands target a single named cluster per invocation. Resolution precedence: `--cluster` (explicit) > a pattern's bound `cluster` (`assert --pattern` only) > `kafka.default_cluster` > the single defined cluster when exactly one is configured. An unresolvable name (`>1 cluster` and no `--cluster`/`default_cluster`), or a name absent from `kafka.clusters`, raises `ConfigError` (exit 2). This mirrors DB connection resolution (`--connection` > template's `connection` > `defaults.database_connection`).
+
+#### `agctl kafka listen` — Long-lived Capture Daemon
+
+A long-lived Kafka capture daemon for verifying events on **long sagas**, **high-volume topics**, or topics under **broker retention pressure** — the three cases where a windowed `kafka assert` can false-negative (scan-window miss, volume-induced timeout truncation, retention cleanup). It mirrors the `agctl mock` managed-daemon pattern (DESIGN §3.6).
+
+**Listener / offset model (contrast with `kafka assert`):** where `assert`/`consume` seek each partition to `now - --lookback` and read forward against a wall-clock deadline, `kafka listen`:
+
+- **Seeks to the latest offset at `start`** — every assigned partition is positioned at its head (`OFFSET_END`) BEFORE the first poll delivers data, so only messages produced AFTER `start` are captured. No scan-window miss, no backlog replay.
+- **Captures to disk** — every matching message is appended to a per-topic NDJSON file under `<state-dir>/listen-<run_id>/`. A byte-bound overflow valve (`--max-bytes-per-topic`, default 256 MiB; `0` disables) emits `capture.overflow` once and STOPs capturing that topic rather than silently truncating.
+- **Asserts with no deadline** — `kafka listen results` scans the capture file client-side, bounded by file size only. No timeout-truncation false negative.
+
+**Lifecycle:** `start` → `assert` (attach, repeatable across topics) → `results` (evaluate all, exit 1 on any failure) → `stop` (terminate + cleanup). `stop` does **not** auto-run `results` — an uncollected expectation is silently dropped when the run dir is deleted. Always run `results` BEFORE `stop`.
+
+##### `agctl kafka listen start` — managed daemon (start)
+
+Spawn a detached capture daemon; block until ready (subscribed + seeked-to-end); return the start envelope.
+
+```
+agctl kafka listen start
+    (--topic <name> | --pattern <name>)+   # repeatable; --pattern reuses kafka.patterns (topic/match/cluster)
+    [--cluster <name>]                      # overrides the pattern's bound cluster
+    [--capture-match <jq>]                  # coarse capture filter (volume guardrail; default: capture all)
+    [--max-bytes-per-topic <bytes>]         # overflow valve; default 256 MiB; 0 = unlimited
+    [--state-dir <path>]                    # default ./.agctl
+    [--config/--env-file/--overlay ...]
+```
+
+**Result (`kafka.listen.start`):** `{pid, run_id, state_dir, topics, group, cluster, started_at}`. POSIX/WSL only — on native Windows use `kafka listen run` (foreground) or run inside WSL. Exits 2 if a listener is already running for the resolved key, the broker is unreachable at startup, or no/ambiguous cluster resolves.
+
+##### `agctl kafka listen assert` — attach an expectation
+
+Attach an expectation to the listener's `asserts.jsonl`. Does **not** evaluate and does **not** stop the listener. Callable repeatedly across topics; the same predicate modes and roots as `kafka assert` (`--contains` / `--match` / `--pattern` / `--path`), all active modes AND-ed.
+
+```
+agctl kafka listen assert
+    --topic <name>
+    [--contains '{...}'] [--match <jq>] [--pattern <name>]   # ≥1 mode required; all active modes AND together
+    [--expect-count <n>]            # minimum matching count (at-least; default 1)
+    [--path <jq>]                   # narrows --contains (as in kafka assert)
+    [--param key=value]             # fills {placeholder} in --pattern match (resolved at results time)
+    [--id <name>]                   # stable id; default exp-<n>
+    [--run-id <id> | --pid <pid>]
+    [--state-dir <path>]
+```
+
+**Result (`kafka.listen.assert`):** `{attached: true, id, topic, modes: [...], expect_count}`. Exit 0 / 2.
+
+##### `agctl kafka listen results` — evaluate all
+
+Evaluate every attached expectation against the captured files. **Exits 1 if any expectation fails.**
+
+```
+agctl kafka listen results [--run-id <id> | --pid <pid>] [--state-dir <path>]
+```
+
+**Result (`kafka.listen.results`) — all pass:**
+
+```json
+{
+  "evaluated": 2, "passed": 2, "failed": 0,
+  "results": [
+    {"id": "ord", "topic": "orders.created", "passed": true, "matched_count": 1, "expect_count": 1, "modes": [...], "detail": {}},
+    {"id": "pay", "topic": "payments.events", "passed": true, "matched_count": 1, "expect_count": 1, "modes": [...], "detail": {}}
+  ]
+}
+```
+
+**Failure (`AssertionFailure`, exit 1):** `error.detail.results[]` carries, per failed expectation, the same self-debugging payload as `kafka assert` (`messages_scanned`, per-mode `root`) so an agent self-corrects a mis-rooted expression in one shot.
+
+##### `agctl kafka listen messages` — debug tap
+
+Dump captured messages for a topic, optionally further filtered/limited. Reads the topic's capture file directly.
+
+```
+agctl kafka listen messages
+    --topic <name>
+    [--match <jq>] [--param key=value]      # further filter the captured set
+    [--limit <n>]                            # default 50
+    [--run-id <id> | --pid <pid>] [--state-dir <path>]
+```
+
+**Result (`kafka.listen.messages`):** `{topic, matched, truncated, messages: [<envelope>…]}`. Exit 0 / 2.
+
+##### `agctl kafka listen status` — live snapshot (read-only)
+
+Live, read-only snapshot; never signals the daemon, never removes the pidfile.
+
+```
+agctl kafka listen status [--run-id <id> | --pid <pid>] [--state-dir <path>]
+```
+
+**Result (`kafka.listen.status`):**
+
+```json
+{
+  "running": true, "pid": 24001, "run_id": "9f3c1a2b", "uptime_ms": 12034,
+  "topics": [
+    {"topic": "orders.created", "captured": 412, "bytes": 183402, "overflowed": false},
+    {"topic": "payments.events", "captured": 7, "bytes": 2104, "overflowed": false}
+  ]
+}
+```
+
+A not-running listener returns `{running: false}` (`ok:true`, exit 0). Stale pidfiles (dead pid) are detected and cleaned up automatically.
+
+##### `agctl kafka listen stop` — managed daemon (stop)
+
+SIGTERM the daemon (SIGKILL after `--timeout`), parse `events.log` for the final summary, **delete the run state dir** (capture files + asserts + meta + pidfile).
+
+```
+agctl kafka listen stop [--run-id <id> | --pid <pid>] [--all] [--timeout <seconds>] [--state-dir <path>]
+```
+
+**Result (`kafka.listen.stop`):** `{stopped: true, pid, signal, summary: {…}, cleaned: true, failures: [...]}`. Fatal capture errors found in the log (`kafka.error`, or `capture.overflow` on a topic with an attached expectation) raise `AssertionFailure` (exit 1). With `--all`, one verdict per listener; any fatal → exit 1. `--all` returns `result.stopped` as an **array** (one entry per listener); on any fatal failure the array moves to `error.detail.stopped` and the command exits 1. `capture.overflow` on a non-asserted topic is a warning (visible in `status`, non-fatal at `stop`).
+
+##### `agctl kafka listen run` — foreground (daemon spawn target; streaming)
+
+The capture engine in the foreground, emitting NDJSON — the daemon's spawn target (used by `start`) and the cross-platform / native-Windows fallback. Parallels `mock run`.
+
+```
+agctl kafka listen run
+    (--topic <name> | --pattern <name>)+
+    [--cluster <name>] [--capture-match <jq>] [--max-bytes-per-topic <bytes>]
+    [--duration <seconds>] [--until-stopped]    # mutually exclusive (until-stopped is the default)
+    [--state-dir <path>] [--run-id <id>]
+    [--config/--env-file/--overlay ...]
+```
+
+**NDJSON stream (the sixth streaming exception after `http ping` / `mock run` / `logs tail` / `grpc` server-stream/bidi):** `started`, per-topic `capture.overflow`, `kafka.error`, `summary` (the per-message capture is written to disk, not stdout). Installs `SIGTERM`/`SIGINT` handlers that flush a final `summary` and exit `0` (clean) / `1` (any `kafka.error`). Startup errors emit one structured envelope *before* any event line. Not wrapped by `@envelope`.
+
+**Selector resolution (start/stop/status/assert/results/messages):** `--run-id <id>` / `--pid <pid>` / implicit-singleton (no flag works when exactly one listener is running in `--state-dir`). With multiple listeners running and no selector, the command raises `ConfigError` (exit 2) listing the candidates. `--all` (stop only) iterates every running listener.
+
+**Cluster resolution (start/run):** same precedence as `kafka produce/consume/assert` — `--cluster` > a `--pattern`'s bound `cluster` > `kafka.default_cluster` > single-cluster auto-default — with the same `ConfigError` (exit 2) on unresolvable/absent name.
 
 ---
 
@@ -1801,7 +1936,7 @@ Every template and pattern in `agctl.yaml` should have a `description` field. `a
 
 ### 4.1 Envelope
 
-Every invocation writes exactly one JSON object to stdout (the sole exception is `http ping`, which streams one JSON object per ping plus a final summary — see §3.1):
+Every invocation writes exactly one JSON object to stdout (the streaming commands — `http ping`, `mock run`, `logs tail`, `grpc call` server-stream/bidi, `kafka listen run` — emit one JSON object per line plus a final summary; see §3):
 
 ```json
 {
@@ -2287,6 +2422,26 @@ Refused to overwrite (without `--force`):
 - `1` — runtime errors occurred (`kafka_errors > 0` or fatal reactor failure) or `--fail-fast` triggered.
 - `2` — startup error (config, bind, broker probe, or missing `kafka` extra).
 
+#### `kafka.listen.run` streaming output
+
+`kafka listen run` is the sixth streaming exception (after `http ping` / `mock run` / `logs tail` / `grpc` server-stream/bidi). It emits one JSON object per line (NDJSON) as lifecycle events happen, plus a final `summary` line. Each line carries an `event` field; the per-message capture is written to disk (`<run_dir>/<topic>.ndjson`), not stdout.
+
+**Event types (per-line vocabulary):**
+
+| Event | Description |
+|---|---|
+| `started` | Emitted once at startup after every topic's capture loop has seeked its partitions to `OFFSET_END`. Includes `run_id`, `topics[]`, `group`, `cluster`, `started_at`. |
+| `capture.overflow` | Emitted at most once per topic when its capture file reaches `--max-bytes-per-topic`; the topic's capture loop STOPs (no truncation). Includes `topic`, `bytes`. |
+| `kafka.error` | Emitted on a per-topic capture-loop death (e.g. broker error). Includes `topic`, `error`, `fatal: true`. The engine exit code flips to 1. |
+| `summary` | Emitted once at shutdown. Includes `topics[]` (each `{topic, captured, overflowed}`), `errors`, `duration_ms`. |
+
+**Startup errors:** Like `mock run`, startup failures emit **one** structured envelope before any event line (with `command: "kafka.listen.run"` and `error.type`), then exit `2`.
+
+**Exit codes:**
+- `0` — clean shutdown, no `kafka.error` events.
+- `1` — at least one `kafka.error` occurred (a per-topic capture loop died).
+- `2` — startup error (config, broker probe, missing `kafka` extra, or `--duration` + `--until-stopped` both given).
+
 ---
 
 ## 5. Configuration Resolution Order
@@ -2638,7 +2793,7 @@ def emit(
 
 ### One JSON object per invocation
 
-`output.emit()` is the **only** permitted stdout write path. Every command calls it exactly once before exiting. Any intermediate logging goes to stderr. The sole exception is `http ping`, which streams newline-delimited objects (one per ping plus a final summary) for background/keepalive use — see §3.1.
+`output.emit()` is the **only** permitted stdout write path. Every command calls it exactly once before exiting. Any intermediate logging goes to stderr. The streaming commands (`http ping`, `mock run`, `logs tail`, `grpc call` server-stream/bidi, `kafka listen run`) are the deliberate exceptions — they stream newline-delimited objects (one per event plus a final summary) for background / keepalive / live-capture use; see §3.
 
 This is enforced structurally: each command callback is split into a thin Click command and a `_core` function, and the `_core` is wrapped by an `@envelope(command)` decorator (`command.py`) that guarantees exactly one `emit()` — and one process exit code — on every code path (success, assertion failure, or error).
 
@@ -2650,7 +2805,12 @@ Stderr is reserved for unexpected internal errors and stack traces. An agent mus
 
 No session files, no lock files, no local state databases. Each invocation is fully self-contained. Kafka consumer groups are used for offset tracking when needed; that state lives in Kafka, not on disk.
 
-**Bounded exception — mock daemon state.** The managed daemon commands (`mock start`/`stop`/`status`) introduce a deliberate, scoped carve-out: a pidfile (`mock-<port>.pid`) and NDJSON log (`mock-<port>.log`) under `<state-dir>/` (default `./.agctl/`). This is the sole exception to "no session files" and is confined to the daemon lifecycle only. No other commands write disk state.
+**Bounded exceptions — daemon state.** Two managed-daemon surfaces introduce a deliberate, scoped carve-out to "no session files", each confined to its own daemon lifecycle:
+
+- **Mock daemon** (`mock start`/`stop`/`status`) — a pidfile (`mock-<port>.pid`) and NDJSON log (`mock-<port>.log`) under `<state-dir>/` (default `./.agctl/`).
+- **Listen daemon** (`kafka listen start`/`stop`/`status`/`assert`/`results`/`messages`) — a run-id-keyed pidfile (`listen-<run_id>.pid`) plus a run dir (`listen-<run_id>/`) holding `meta.json`, `asserts.jsonl`, per-topic `<topic>.ndjson` capture files, and `events.log`, all under `<state-dir>/`. `stop` deletes the run dir on every path, so an uncollected expectation is silently dropped.
+
+No other commands write disk state.
 
 ### Windowed assertions (reliable send-then-assert)
 

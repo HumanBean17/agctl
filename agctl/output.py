@@ -26,3 +26,17 @@ def emit(
     sys.stdout.write(json.dumps(payload, default=str, ensure_ascii=False))
     sys.stdout.write("\n")
     sys.stdout.flush()
+
+
+def emit_ndjson_line(line: dict) -> None:
+    """Write one NDJSON line to stdout and flush (streaming event sink).
+
+    Sibling to :func:`emit`: where ``emit`` writes the single command envelope
+    once per invocation, ``emit_ndjson_line`` is the recurring event sink used by
+    streaming daemons (e.g. ``ListenEngine``) that emit one JSON object per event
+    as they occur. The emission lock lives in the caller (e.g.
+    ``ListenEngine.emit_event``), not here.
+    """
+    sys.stdout.write(json.dumps(line, ensure_ascii=False))
+    sys.stdout.write("\n")
+    sys.stdout.flush()

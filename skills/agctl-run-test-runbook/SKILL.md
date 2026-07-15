@@ -29,8 +29,11 @@ A runbook is markdown with these sections, in order:
   - **Expected** — `<envelope-path>: <literal>` pairs (ANDed; compared type-aware), or `exit 0` for an assertion step.
 - **Cleanup** — the reverse of fixtures; run in Teardown.
 
-Background commands (`mock run`, `http ping`) live under **Fixtures**, never
-**Steps** — they stream NDJSON, not a single envelope.
+Background commands (`mock run`, `http ping`, `kafka listen run`) live under
+**Fixtures**, never **Steps** — they stream NDJSON, not a single envelope. (The
+managed-daemon trio `kafka listen start`/`assert`/`results`/`stop` emits one
+envelope each and goes into Setup/Steps/Teardown like any other command; see the
+`agctl` skill for the lifecycle, and remember `results` must run BEFORE `stop`.)
 
 ## Procedure
 

@@ -27,6 +27,7 @@ from .commands.discover_commands import discover
 from .commands.grpc_commands import grpc_call, grpc_healthcheck
 from .commands.http_commands import http_call, http_ping, http_request
 from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
+from .commands.kafka_listen_commands import kafka_listen_group
 from .commands.logs_commands import logs_assert, logs_query, logs_tail
 from .commands.mock_commands import mock_run, mock_start, mock_stop, mock_status
 
@@ -191,6 +192,9 @@ db_group.add_command(db_schema)
 kafka_group.add_command(kafka_produce)
 kafka_group.add_command(kafka_consume)
 kafka_group.add_command(kafka_assert)
+# Register the `listen` subgroup under `kafka` (DESIGN §8 — Task 7). Tasks 8/9
+# add start/status/stop/assert/results/messages to this same group.
+kafka_group.add_command(kafka_listen_group)
 
 
 # Register subcommands on the logs group.
