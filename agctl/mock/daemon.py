@@ -9,13 +9,12 @@ This module provides the foundational utilities for managing mock daemon process
 No dependency on the mock engine — fully unit-testable with temporary directories.
 """
 
-import errno
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..daemon import is_alive, read_pidfile, remove_pidfile, write_pidfile
 from ..errors import ConfigError
 
 
@@ -74,73 +73,6 @@ def log_path(state_dir: Path, port: int | None) -> Path:
     if port is None:
         return state_dir / "mock-kafka.log"
     return state_dir / f"mock-{port}.log"
-
-
-def read_pidfile(path: Path) -> dict[str, Any] | None:
-    """Read a pidfile and return its contents as a dict.
-
-    Never raises: returns None if the file is missing or unparseable.
-
-    Args:
-        path: Path to the pidfile.
-
-    Returns:
-        The pidfile contents as a dict, or None if the file is missing or
-        contains invalid JSON.
-    """
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def write_pidfile(path: Path, data: dict[str, Any]) -> None:
-    """Write mock process data to a pidfile as JSON.
-
-    Args:
-        path: Path to the pidfile (will be overwritten if it exists).
-        data: Dictionary with keys: pid, listen, port, log_path, config_path,
-              started_at (ISO-8601 Z), run_id.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data))
-
-
-def remove_pidfile(path: Path) -> None:
-    """Remove a pidfile, ignoring FileNotFoundError if it doesn't exist.
-
-    Args:
-        path: Path to the pidfile to remove.
-    """
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-
-
-def is_alive(pid: int) -> bool:
-    """Check if a process with the given PID is alive.
-
-    Uses os.kill(pid, 0) which sends no signal but checks process existence.
-
-    Args:
-        pid: Process ID to check.
-
-    Returns:
-        True if the process exists, False otherwise.
-    """
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except OSError as e:
-        if e.errno == errno.ESRCH:
-            return False
-        # PermissionError means the process exists but we don't own it
-        return True
 
 
 def list_running_mocks(state_dir: Path) -> list[RunningMock]:

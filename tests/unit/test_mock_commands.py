@@ -815,9 +815,10 @@ class TestDaemonPlatformGate:
 
     On ``os.name == "nt"`` the three daemon ``_core`` entry points raise
     ``ConfigError`` (exit 2) before touching any pidfile/process. The platform is
-    forced by replacing the module-level ``os`` binding in
-    ``agctl.commands.mock_commands``, so the seam never mutates the global ``os``
-    module and the suite is deterministic on the (posix) dev host.
+    forced by replacing the module-level ``os`` binding in ``agctl.daemon`` (the
+    home of ``require_posix_daemon`` since the D8 primitive extraction), so the
+    seam never mutates the global ``os`` module and the suite is deterministic on
+    the (posix) dev host.
     """
 
     # Verbatim from the plan's Global Constraints.
@@ -833,7 +834,7 @@ class TestDaemonPlatformGate:
 
     def test_require_posix_daemon_raises_on_windows(self, monkeypatch):
         monkeypatch.setattr(
-            "agctl.commands.mock_commands.os",
+            "agctl.daemon.os",
             types.SimpleNamespace(name="nt"),
         )
         with pytest.raises(ConfigError) as exc_info:
@@ -844,14 +845,14 @@ class TestDaemonPlatformGate:
 
     def test_require_posix_daemon_noop_on_posix(self, monkeypatch):
         monkeypatch.setattr(
-            "agctl.commands.mock_commands.os",
+            "agctl.daemon.os",
             types.SimpleNamespace(name="posix"),
         )
         assert _require_posix_daemon() is None
 
     def test_mock_start_core_gated_on_windows(self, monkeypatch):
         monkeypatch.setattr(
-            "agctl.commands.mock_commands.os",
+            "agctl.daemon.os",
             types.SimpleNamespace(name="nt"),
         )
         with pytest.raises(ConfigError) as exc_info:
@@ -860,7 +861,7 @@ class TestDaemonPlatformGate:
 
     def test_mock_stop_and_status_core_gated_on_windows(self, monkeypatch):
         monkeypatch.setattr(
-            "agctl.commands.mock_commands.os",
+            "agctl.daemon.os",
             types.SimpleNamespace(name="nt"),
         )
         with pytest.raises(ConfigError) as exc_info:
