@@ -40,7 +40,11 @@ from ..daemon import (
     write_pidfile,
 )
 from ..errors import AgctlError, AssertionFailure, ConfigError, TemplateNotFound
+from ..listen.assert_eval import evaluate_expectations
+from ..listen.capture_file import build_predicate, read_messages
 from ..listen.daemon import (
+    ExpectationSpec,
+    append_expectation,
     capture_path,
     events_log_path,
     new_run_id,
@@ -52,6 +56,8 @@ from ..listen.daemon import (
     write_meta,
 )
 from ..output import emit
+from ..params import parse_params
+from ..resolution import fill_placeholders
 from .kafka_commands import new_kafka_client, resolve_cluster_name
 
 if TYPE_CHECKING:
@@ -64,6 +70,9 @@ __all__ = [
     "kafka_listen_start",
     "kafka_listen_status",
     "kafka_listen_stop",
+    "kafka_listen_assert",
+    "kafka_listen_results",
+    "kafka_listen_messages",
     "new_listen_engine",
     "resolve_subscriptions",
 ]
@@ -744,12 +753,323 @@ _kafka_listen_stop_envelope = envelope("kafka.listen.stop")(_kafka_listen_stop_c
 
 
 # ---------------------------------------------------------------------------
+# kafka listen assert (attach an expectation to a running listener)
+# ---------------------------------------------------------------------------
+
+
+def _kafka_listen_assert_core(
+    topic: str,
+    contains: str | None,
+    match: str | None,
+    pattern: str | None,
+    path: str | None,
+    param: tuple[str, ...],
+    expect_count: int,
+    id: str | None,
+    run_id: str | None,
+    pid: int | None,
+    state_dir: str,
+) -> dict:
+    """Core logic for ``kafka listen assert`` (Task 9).
+
+    Resolves the running listener, validates that at least one match mode is
+    supplied (``--path`` alone is not a mode — mirrors ``kafka assert``'s
+    zero-modes rule), builds an :class:`ExpectationSpec`, and appends it to the
+    run dir's ``asserts.jsonl``. ``contains`` is stored RAW (the JSON string
+    from ``--contains``); :func:`evaluate_expectations` json.loads it later, so
+    the assert-write and results-read share one source of truth.
+
+    Never signals the daemon and never removes the pidfile — it only appends a
+    file line the running listener never reads (the file is consumed at
+    ``results`` time, after the listener has captured its window).
+
+    Returns:
+        ``{"attached": True, "id", "topic", "modes": [<active modes>],
+        "expect_count"}``.
+    """
+    state_path = Path(state_dir)
+    targets = resolve_listener_target(state_path, run_id=run_id, pid=pid, all_=False)
+    if not targets:
+        raise ConfigError(
+            "no running kafka listener; run 'agctl kafka listen start' first",
+            {},
+        )
+    target = targets[0]
+    rdir = run_dir(Path(target.state_dir), target.run_id)
+
+    # path alone is NOT a mode (it scopes --contains) — at least one of
+    # contains/match/pattern is required, mirroring `kafka assert`.
+    if contains is None and match is None and pattern is None:
+        raise ConfigError(
+            "kafka listen assert requires at least one of --contains/--match/--pattern",
+            {},
+        )
+
+    params = parse_params(param)
+    spec_id = id or f"exp-{len(read_expectations(rdir)) + 1}"
+    spec = ExpectationSpec(
+        id=spec_id,
+        topic=topic,
+        modes={
+            "contains": contains,
+            "match": match,
+            "pattern": pattern,
+            "path": path,
+        },
+        params=params,
+        expect_count=expect_count,
+    )
+    append_expectation(rdir, spec)
+
+    active_modes = [
+        name
+        for name, val in (
+            ("contains", contains),
+            ("match", match),
+            ("pattern", pattern),
+        )
+        if val is not None
+    ]
+
+    return {
+        "attached": True,
+        "id": spec_id,
+        "topic": topic,
+        "modes": active_modes,
+        "expect_count": expect_count,
+    }
+
+
+@click.command("assert")
+@click.option("--topic", "topic", required=True, help="Kafka topic whose capture this expectation scans")
+@click.option("--contains", "contains", default=None, help="JSON subset to match against the message value")
+@click.option(
+    "--match",
+    "match",
+    default=None,
+    help="jq predicate against the message envelope {key, value, partition, offset, timestamp, headers}; reach value fields via .value.<field>",
+)
+@click.option("--pattern", "pattern", default=None, help="Named kafka pattern")
+@click.option(
+    "--path",
+    "path",
+    default=None,
+    help="jq path into the MESSAGE VALUE that narrows --contains (e.g. .eventType)",
+)
+@click.option("--param", "param", multiple=True, help="k=v pattern placeholder (repeatable)")
+@click.option("--expect-count", "expect_count", type=int, default=1, help="Minimum matching message count for a passing verdict")
+@click.option("--id", "id", default=None, help="Stable id for this expectation (default: exp-<n>)")
+@click.option("--run-id", "run_id", default=None, help="Run id selector")
+@click.option("--pid", "pid", type=int, default=None, help="Process id selector")
+@click.option("--state-dir", "state_dir", default="./.agctl", help="Directory for listen state (run dirs, capture files)")
+@click.pass_context
+def kafka_listen_assert(
+    ctx: click.Context,
+    topic: str,
+    contains: str | None,
+    match: str | None,
+    pattern: str | None,
+    path: str | None,
+    param: tuple[str, ...],
+    expect_count: int,
+    id: str | None,
+    run_id: str | None,
+    pid: int | None,
+    state_dir: str,
+) -> None:
+    """Attach an expectation to a running ``kafka listen`` capture (appended to asserts.jsonl)."""
+    _kafka_listen_assert_envelope(
+        topic, contains, match, pattern, path, param, expect_count, id, run_id, pid, state_dir
+    )
+
+
+_kafka_listen_assert_envelope = envelope("kafka.listen.assert")(_kafka_listen_assert_core)
+
+
+# ---------------------------------------------------------------------------
+# kafka listen results (evaluate attached expectations)
+# ---------------------------------------------------------------------------
+
+
+def _kafka_listen_results_core(
+    run_id: str | None,
+    pid: int | None,
+    state_dir: str,
+    config_path: str | None = None,
+    overlay_paths: list[str] | None = None,
+    env_file: str | None = None,
+) -> dict:
+    """Core logic for ``kafka listen results`` (Task 9).
+
+    Resolves the running listener, loads config (for ``cfg.kafka.patterns`` —
+    named patterns are filled at evaluation time, not attach time), and
+    evaluates every attached expectation via :func:`evaluate_expectations`.
+    Any failure raises :class:`AssertionFailure` so each per-result
+    ``ExpectationResult`` (with its self-debugging ``matched_count``/``modes``
+    detail) flows out through ``error.detail.results``.
+
+    Returns:
+        ``{"evaluated", "passed", "failed", "results": [ExpectationResult, ...]}``
+        when every expectation passes.
+    """
+    state_path = Path(state_dir)
+    targets = resolve_listener_target(state_path, run_id=run_id, pid=pid, all_=False)
+    if not targets:
+        raise ConfigError(
+            "no running kafka listener; run 'agctl kafka listen start' first",
+            {},
+        )
+    target = targets[0]
+    rdir = run_dir(Path(target.state_dir), target.run_id)
+
+    exps = read_expectations(rdir)
+    if not exps:
+        raise ConfigError(
+            "no expectations attached; run 'kafka listen assert' first",
+            {},
+        )
+
+    cfg = load_config_or_raise(
+        config_path, overlay_paths=overlay_paths, env_file=env_file
+    )
+    results = evaluate_expectations(rdir, cfg.kafka.patterns)
+    passed = sum(1 for r in results if r["passed"])
+    failed = len(results) - passed
+    if failed > 0:
+        raise AssertionFailure(
+            f"kafka listen: {failed}/{len(results)} expectation(s) failed",
+            {"results": results},
+        )
+    return {
+        "evaluated": len(results),
+        "passed": passed,
+        "failed": failed,
+        "results": results,
+    }
+
+
+@click.command("results")
+@click.option("--run-id", "run_id", default=None, help="Run id selector")
+@click.option("--pid", "pid", type=int, default=None, help="Process id selector")
+@click.option("--state-dir", "state_dir", default="./.agctl", help="Directory for listen state (run dirs, capture files)")
+@click.pass_context
+def kafka_listen_results(
+    ctx: click.Context,
+    run_id: str | None,
+    pid: int | None,
+    state_dir: str,
+) -> None:
+    """Evaluate attached expectations against a running listener's captures."""
+    config_path = ctx.obj.get("config_path") if ctx.obj else None
+    ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
+    env_file = ctx.obj.get("env_file") if ctx.obj else None
+    _kafka_listen_results_envelope(
+        run_id,
+        pid,
+        state_dir,
+        config_path=config_path,
+        overlay_paths=list(ovs) if ovs else None,
+        env_file=env_file,
+    )
+
+
+_kafka_listen_results_envelope = envelope("kafka.listen.results")(_kafka_listen_results_core)
+
+
+# ---------------------------------------------------------------------------
+# kafka listen messages (debug-tap a topic's captured messages)
+# ---------------------------------------------------------------------------
+
+
+def _kafka_listen_messages_core(
+    topic: str,
+    match: str | None,
+    param: tuple[str, ...],
+    limit: int,
+    run_id: str | None,
+    pid: int | None,
+    state_dir: str,
+) -> dict:
+    """Core logic for ``kafka listen messages`` (Task 9).
+
+    Resolves the running listener and reads up to ``limit`` captured envelopes
+    from ``<run_dir>/<topic>.ndjson``. An optional ``--match`` is
+    placeholder-filled and compile-validated up front via
+    :func:`build_predicate` (loud-on-typo → :class:`ConfigError`), then applied
+    as a filter. ``matched`` is the total count of matching envelopes in the
+    file (independent of ``limit``); ``truncated`` is True iff more matched than
+    ``limit`` allowed back.
+
+    Returns:
+        ``{"topic", "matched", "truncated", "messages": [<CapturedEnvelope>, ...]}``.
+    """
+    state_path = Path(state_dir)
+    targets = resolve_listener_target(state_path, run_id=run_id, pid=pid, all_=False)
+    if not targets:
+        raise ConfigError(
+            "no running kafka listener; run 'agctl kafka listen start' first",
+            {},
+        )
+    target = targets[0]
+    rdir = run_dir(Path(target.state_dir), target.run_id)
+
+    predicate = None
+    if match is not None:
+        filled = fill_placeholders(match, parse_params(param))
+        # Validate the jq expression up front (loud-on-typo); build_predicate
+        # compiles each present expression and raises ConfigError on a malformed one.
+        predicate = build_predicate({"match": filled})
+
+    out = read_messages(capture_path(rdir, topic), predicate=predicate, limit=limit)
+    return {
+        "topic": topic,
+        "matched": out["matched"],
+        "truncated": out["truncated"],
+        "messages": out["messages"],
+    }
+
+
+@click.command("messages")
+@click.option("--topic", "topic", required=True, help="Kafka topic whose capture to read")
+@click.option(
+    "--match",
+    "match",
+    default=None,
+    help="jq predicate against the message envelope (optional filter); reach value fields via .value.<field>",
+)
+@click.option("--param", "param", multiple=True, help="k=v placeholder (repeatable; fills {name} tokens in --match)")
+@click.option("--limit", "limit", type=int, default=50, help="Maximum number of matching messages to return")
+@click.option("--run-id", "run_id", default=None, help="Run id selector")
+@click.option("--pid", "pid", type=int, default=None, help="Process id selector")
+@click.option("--state-dir", "state_dir", default="./.agctl", help="Directory for listen state (run dirs, capture files)")
+@click.pass_context
+def kafka_listen_messages(
+    ctx: click.Context,
+    topic: str,
+    match: str | None,
+    param: tuple[str, ...],
+    limit: int,
+    run_id: str | None,
+    pid: int | None,
+    state_dir: str,
+) -> None:
+    """Read up to ``--limit`` captured messages from a running listener's topic."""
+    _kafka_listen_messages_envelope(topic, match, param, limit, run_id, pid, state_dir)
+
+
+_kafka_listen_messages_envelope = envelope("kafka.listen.messages")(_kafka_listen_messages_core)
+
+
+# ---------------------------------------------------------------------------
 # Command registration
 # ---------------------------------------------------------------------------
 
-# Register ``run`` (foreground streaming) + the managed-daemon trio on the
-# ``listen`` group. Task 9 will add assert/results/messages alongside these.
+# Register ``run`` (foreground streaming) + the managed-daemon trio + the
+# assert/results/messages file-reader commands on the ``listen`` group.
 kafka_listen_group.add_command(kafka_listen_run)
 kafka_listen_group.add_command(kafka_listen_start)
 kafka_listen_group.add_command(kafka_listen_status)
 kafka_listen_group.add_command(kafka_listen_stop)
+kafka_listen_group.add_command(kafka_listen_assert)
+kafka_listen_group.add_command(kafka_listen_results)
+kafka_listen_group.add_command(kafka_listen_messages)
