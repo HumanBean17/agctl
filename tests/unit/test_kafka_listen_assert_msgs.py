@@ -7,7 +7,12 @@ Kafka client, no signaling — so the tests drive the ``_core`` functions with
 nothing more than a temp state dir, a live-pid pidfile (``os.getpid()``), and a
 canned capture file.
 
-Cross-platform (no ``require_posix_daemon``): these commands only read files.
+Cross-platform at the command layer (no ``require_posix_daemon`` — the commands
+only read files), but the TESTS plant a live-pid pidfile (``os.getpid()``) that
+the commands resolve via ``is_alive`` → ``os.kill(getpid(), 0)``. On Windows
+``os.kill`` of the live pid destabilizes the process at shutdown (the same
+issue documented for ``test_mock_daemon.py`` / ``test_kafka_listen_daemon_cmds.py``),
+so this module skips on Windows (see ``pytestmark`` below).
 """
 
 from __future__ import annotations
@@ -25,6 +30,15 @@ from agctl.commands.kafka_listen_commands import (
     _kafka_listen_results_core,
 )
 from agctl.errors import AssertionFailure, ConfigError
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "tests plant a live-pid pidfile (os.getpid()) resolved via is_alive "
+        "(os.kill), which destabilizes the process on Windows shutdown — same "
+        "as test_mock_daemon / test_kafka_listen_daemon_cmds"
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
