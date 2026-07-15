@@ -92,6 +92,28 @@ class _NeverReadyFake(_FakeCaptureLoop):
         self.stop_event.wait(timeout=5.0)
 
 
+class _MixedFake(_FakeCaptureLoop):
+    """Signal ready for the ``orders`` topic only; block (never ready) for any other.
+
+    Locks down the ready-gate's "ALL topics ready, not just the first" semantics
+    (Scenario 3a): a single ready topic must not satisfy the gate when a second
+    topic never signals.
+    """
+
+    def run(self) -> None:
+        if self.topic == "orders":
+            line = json.dumps(
+                {"topic": self.topic, "value": {"id": "a"}, "captured_at": "now"},
+                ensure_ascii=False,
+            )
+            with self.capture_path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            self.ready_event.set()
+        else:
+            # Second topic: block without ever signaling ready.
+            self.stop_event.wait(timeout=5.0)
+
+
 def _make_engine(tmp_path: Path, emitted: list, factory, *, topics=("orders",)):
     """Build a ListenEngine wired to a recording emit_fn and a fake factory."""
 
@@ -199,6 +221,38 @@ def test_never_ready_topic_raises_connection_failure_within_budget(tmp_path):
 
     assert "did not become ready" in str(exc_info.value)
     assert "orders" in str(exc_info.value)
+
+    # A failed start never emitted started, so shutdown (called by start's
+    # except handler) must NOT emit a spurious summary (started gate).
+    assert not any(e.get("event") == "started" for e in emitted)
+    assert not any(e.get("event") == "summary" for e in emitted)
+
+
+# ---------------------------------------------------------------------------
+# Scenario 3a: multi-topic partial-never-ready → start() raises ConnectionFailure
+# ---------------------------------------------------------------------------
+
+
+def test_multi_topic_partial_never_ready_raises_connection_failure(tmp_path):
+    """One of two topics ready, the other never → start() raises ConnectionFailure.
+
+    Locks down the ready-gate's "ALL topics ready, not just the first" semantics:
+    a single ready topic (orders) must not satisfy the gate when a second topic
+    (payments) never signals, and the error must name the not-ready topic.
+    """
+    emitted: list[dict] = []
+    engine = _make_engine(
+        tmp_path, emitted, _MixedFake, topics=("orders", "payments")
+    )
+    engine._startup_budget = 0.1  # tiny budget seam (matches Scenario 3)
+
+    with pytest.raises(ConnectionFailure) as exc_info:
+        engine.start()
+
+    assert "did not become ready" in str(exc_info.value)
+    # The not-ready topic is named — not the one that did become ready.
+    assert "payments" in str(exc_info.value)
+    assert "orders" not in str(exc_info.value)
 
     # A failed start never emitted started, so shutdown (called by start's
     # except handler) must NOT emit a spurious summary (started gate).

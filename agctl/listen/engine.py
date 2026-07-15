@@ -176,8 +176,10 @@ class ListenEngine:
         exception emits a fatal ``kafka.error`` (mirrors MockEngine's
         reactor-thread error handling). Then wait until EVERY topic's
         ``ready_event`` is set or the startup budget elapses (→
-        :class:`ConnectionFailure`). Once ready, mark ``_started`` and emit the
-        ``started`` line.
+        :class:`ConnectionFailure`). Once ready, emit the ``started`` line and
+        THEN mark ``_started`` (so a failed emit cannot leave ``_started`` True,
+        which would let the except handler's ``shutdown()`` emit a spurious
+        ``summary`` for a stream that never received a started line).
 
         On any exception, run :meth:`shutdown` to release threads, then re-raise.
         """
@@ -238,8 +240,10 @@ class ListenEngine:
                     )
                 time.sleep(min(0.02, remaining))
 
-            self._started = True
-            self._start_time = time.monotonic()
+            # Emit the started line FIRST, then mark _started. Mirrors
+            # MockEngine's rationale: if the emit raises, _started is still
+            # False, so the except handler's shutdown() will NOT emit a spurious
+            # summary for a stream that never received a started line.
             self.emit_event(
                 {
                     "event": "started",
@@ -250,6 +254,9 @@ class ListenEngine:
                     "started_at": _now_iso_z(),
                 }
             )
+            # Mark started: only now may shutdown emit a summary.
+            self._started = True
+            self._start_time = time.monotonic()
 
         except Exception:
             # On any exception, release what we acquired (join spawned threads).
