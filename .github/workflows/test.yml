@@ -39,4 +39,4 @@ jobs:
         # TEMP diagnostic: -X dev surfaces ResourceWarning (unclosed files/threads);
         # --faulthandler-timeout dumps all thread tracebacks if the process stalls
         # (investigating a Windows-only post-summary exit 1). Revert after.
-        run: python -X dev -m pytest tests/unit --faulthandler-timeout=30 -rA
+        run: python -X dev -m pytest tests/unit -p faulthandler --faulthandler-timeout=45 -rA
