@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..assertions import compile_jq
-from ..config.models import MocksConfig, parse_listen
+from ..config.models import GrpcDescriptorSource, MocksConfig, parse_listen
 from ..errors import ConfigError
 from .capture_validate import collect_capture_placement_errors
 from .http_server import MockHTTPServer
@@ -67,6 +67,7 @@ class MockEngine:
         run_grpc: bool = False,
         grpc_listen: str | None = None,
         grpc_server_factory: Callable[..., Any] | None = None,
+        top_level_descriptors: list[GrpcDescriptorSource] | None = None,
     ):
         """Initialize the mock engine.
 
@@ -93,6 +94,11 @@ class MockEngine:
                 ``(config=..., top_level_descriptors=..., emit_event=...)``.
                 None → a default factory that lazy-imports the real
                 ``MockGrpcServer`` from ``..mock.grpc_server`` and constructs it.
+            top_level_descriptors: ``Config.grpc.descriptors`` forwarded by the
+                command layer (Task 10) — MockEngine only sees ``MocksConfig``,
+                so this is the only path the top-level fallback reaches the
+                server. ``MockGrpcServer`` falls back to it when the per-mock
+                ``mocks.grpc.descriptors`` is None. Defaults None (no fallback).
         """
         self._mocks = mocks
         self._run_http = run_http
@@ -105,6 +111,7 @@ class MockEngine:
         self._run_id = run_id if run_id is not None else str(os.getpid())
         self._run_grpc = run_grpc
         self._grpc_listen = grpc_listen
+        self._top_level_descriptors = top_level_descriptors
 
         # DI seam. The default lazy-imports the real MockGrpcServer INSIDE the
         # closure body so the engine module stays grpcio-free at import time
@@ -346,15 +353,16 @@ class MockEngine:
                     )
 
                 # Top-level Config.grpc.descriptors fallback: MockEngine only
-                # sees MocksConfig, so the real top-level fallback is threaded
-                # in Task 10 (the command layer has the full Config). For now
-                # pass None — MockGrpcServer will surface an empty-descriptors
-                # ConfigError if mocks.grpc.descriptors is also None. Passing
-                # mocks.grpc.descriptors here would be redundant (the server
-                # already reads it off ``config``).
+                # sees MocksConfig, so the command layer (Task 10) threads the
+                # real ``Config.grpc.descriptors`` list through ``new_mock_engine``
+                # → here. ``MockGrpcServer`` falls back to it when the per-mock
+                # ``mocks.grpc.descriptors`` is None (sources = config.descriptors
+                # or top_level_descriptors or []). Passing the per-mock
+                # ``grpc_config.descriptors`` here as well would be redundant —
+                # the server already reads it off ``config``.
                 server = self._grpc_server_factory(
                     config=grpc_config,
-                    top_level_descriptors=None,
+                    top_level_descriptors=self._top_level_descriptors,
                     emit_event=self.emit_event,
                 )
                 # ``start()`` binds; MockGrpcServer converts EADDRINUSE to

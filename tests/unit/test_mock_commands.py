@@ -16,6 +16,7 @@ from agctl.commands.mock_commands import (
     _mock_status_core,
     _mock_stop_core,
     _require_posix_daemon,
+    _resolve_engines,
     mock_run,
     new_mock_engine,
 )
@@ -870,3 +871,555 @@ class TestDaemonPlatformGate:
         with pytest.raises(ConfigError) as exc_info:
             _mock_status_core(None, "./.agctl")
         assert exc_info.value.message == self._EXPECTED_MESSAGE
+
+
+# ----------------------------------------------------------------------------
+# Task 10: --grpc-listen / --only grpc / 3-tuple engines / mock start grpc block
+# ----------------------------------------------------------------------------
+
+
+# A minimal gRPC stub config (no descriptors needed for run_grpc=True wiring —
+# the engine factory is monkeypatched in run tests; lifecycle tests fabricate
+# the started line directly).
+GRPC_ONLY_CONFIG = """
+version: "3"
+mocks:
+  grpc:
+    listen: "0.0.0.0:50051"
+    stubs:
+      stub1:
+        service: helloworld.Greeter
+        method: SayHello
+        response:
+          message: {"message": "hello"}
+"""
+
+HTTP_AND_GRPC_CONFIG = """
+version: "3"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+  grpc:
+    listen: "0.0.0.0:50051"
+    stubs:
+      grpcstub1:
+        service: helloworld.Greeter
+        method: SayHello
+        response:
+          message: {"message": "hello"}
+"""
+
+
+class TestResolveEnginesGrpc:
+    """`_resolve_engines` returns a 3-tuple (run_http, run_kafka, run_grpc)."""
+
+    def test_only_grpc_with_stubs(self, temp_config):
+        """--only grpc with mocks.grpc.stubs -> (False, False, True)."""
+        from agctl.config.loader import load_config
+        cfg_text = GRPC_ONLY_CONFIG
+        temp_config.write_text(cfg_text)
+        cfg = load_config(temp_config)
+        run_http, run_kafka, run_grpc = _resolve_engines("grpc", cfg.mocks)
+        assert (run_http, run_kafka, run_grpc) == (False, False, True)
+
+    def test_only_grpc_no_mocks_grpc(self, temp_config):
+        """--only grpc with no mocks.grpc -> ConfigError."""
+        temp_config.write_text("""
+version: "3"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+""")
+        from agctl.config.loader import load_config
+        cfg = load_config(temp_config)
+        with pytest.raises(ConfigError) as exc_info:
+            _resolve_engines("grpc", cfg.mocks)
+        assert "no mocks.grpc.stubs configured" in exc_info.value.message
+
+    def test_only_grpc_empty_stubs(self, temp_config):
+        """--only grpc with mocks.grpc.stubs={} (empty) -> ConfigError."""
+        temp_config.write_text("""
+version: "3"
+mocks:
+  grpc:
+    listen: "0.0.0.0:50051"
+    stubs: {}
+""")
+        from agctl.config.loader import load_config
+        cfg = load_config(temp_config)
+        with pytest.raises(ConfigError) as exc_info:
+            _resolve_engines("grpc", cfg.mocks)
+        assert "no mocks.grpc.stubs configured" in exc_info.value.message
+
+    def test_default_resolves_grpc_with_http(self, temp_config):
+        """No --only with mocks.http + mocks.grpc -> (True, False, True)."""
+        temp_config.write_text(HTTP_AND_GRPC_CONFIG)
+        from agctl.config.loader import load_config
+        cfg = load_config(temp_config)
+        result = _resolve_engines(None, cfg.mocks)
+        assert result == (True, False, True)
+
+    def test_default_resolves_grpc_only(self, temp_config):
+        """No --only with only mocks.grpc -> (False, False, True)."""
+        temp_config.write_text(GRPC_ONLY_CONFIG)
+        from agctl.config.loader import load_config
+        cfg = load_config(temp_config)
+        result = _resolve_engines(None, cfg.mocks)
+        assert result == (False, False, True)
+
+    def test_only_http_returns_false_grpc(self, temp_config):
+        """--only http -> (True, False, False) — existing branch gains trailing False."""
+        temp_config.write_text(HTTP_AND_GRPC_CONFIG)
+        from agctl.config.loader import load_config
+        cfg = load_config(temp_config)
+        result = _resolve_engines("http", cfg.mocks)
+        assert result == (True, False, False)
+
+    def test_only_kafka_returns_false_grpc(self, temp_config):
+        """--only kafka -> (False, True, False) — existing branch gains trailing False."""
+        temp_config.write_text("""
+version: "3"
+kafka:
+  clusters:
+    default:
+      brokers:
+        - "localhost:9092"
+mocks:
+  kafka:
+    reactors:
+      r1:
+        topic: t
+        reaction:
+          topic: out
+          value: {}
+  grpc:
+    listen: "0.0.0.0:50051"
+    stubs:
+      stub1:
+        service: helloworld.Greeter
+        method: SayHello
+        response:
+          message: {"message": "hello"}
+""")
+        from agctl.config.loader import load_config
+        cfg = load_config(temp_config)
+        result = _resolve_engines("kafka", cfg.mocks)
+        assert result == (False, True, False)
+
+
+class TestMockRunGrpcFlags:
+    """`mock run` --grpc-listen / --only grpc wiring."""
+
+    def test_only_grpc_builds_engine_with_run_grpc(self, temp_config, fake_engine):
+        """mock run --only grpc with stubs -> new_mock_engine called with run_grpc=True."""
+        temp_config.write_text(GRPC_ONLY_CONFIG)
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "grpc"],
+                catch_exceptions=False,
+            )
+            assert result.exit_code == 0
+            mock_factory.assert_called_once()
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs["run_http"] is False
+            assert call_kwargs["run_kafka"] is False
+            assert call_kwargs["run_grpc"] is True
+
+    def test_only_grpc_no_mocks_grpc_exits_2(self, temp_config):
+        """--only grpc with no mocks.grpc -> exit 2 ConfigError envelope."""
+        temp_config.write_text("""
+version: "3"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+""")
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(temp_config), "mock", "run", "--only", "grpc"],
+        )
+        assert result.exit_code == 2
+        output_lines = [line for line in result.output.split("\n") if line.strip()]
+        assert len(output_lines) == 1
+        envelope = json.loads(output_lines[0])
+        assert envelope["ok"] is False
+        assert envelope["command"] == "mock.run"
+        assert envelope["error"]["type"] == "ConfigError"
+        assert "no mocks.grpc.stubs configured" in envelope["error"]["message"]
+
+    def test_grpc_listen_forwarded_to_engine(self, temp_config, fake_engine):
+        """--grpc-listen 127.0.0.1:50051 is forwarded into the engine call."""
+        temp_config.write_text(GRPC_ONLY_CONFIG)
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "--config", str(temp_config),
+                    "mock", "run",
+                    "--only", "grpc",
+                    "--grpc-listen", "127.0.0.1:50051",
+                ],
+                catch_exceptions=False,
+            )
+            assert result.exit_code == 0
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs["grpc_listen"] == "127.0.0.1:50051"
+            assert call_kwargs["run_grpc"] is True
+
+    def test_grpc_listen_bad_value(self, temp_config):
+        """--grpc-listen 'bad:no-port' -> exit 2 ConfigError (parse_listen fails)."""
+        temp_config.write_text(GRPC_ONLY_CONFIG)
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", str(temp_config),
+                "mock", "run",
+                "--only", "grpc",
+                "--grpc-listen", "bad:no-port",
+            ],
+        )
+        assert result.exit_code == 2
+        output_lines = [line for line in result.output.split("\n") if line.strip()]
+        assert len(output_lines) == 1
+        envelope = json.loads(output_lines[0])
+        assert envelope["ok"] is False
+        assert envelope["error"]["type"] == "ConfigError"
+        assert "Invalid --grpc-listen" in envelope["error"]["message"]
+
+    def test_only_rejects_unknown_choice(self, temp_config):
+        """--only bogus -> Click usage error (exit 2), not an agctl envelope."""
+        temp_config.write_text(GRPC_ONLY_CONFIG)
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(temp_config), "mock", "run", "--only", "bogus"],
+        )
+        assert result.exit_code == 2
+        # Click's choice validation surfaces a usage error before our envelope
+        # handler runs — verify it's a Click-reported invalid choice, not a
+        # JSON envelope.
+        assert result.output.lstrip().startswith("Usage:") or "Invalid value" in result.output
+
+    def test_http_and_grpc_starts_both_engines(self, temp_config, fake_engine):
+        """A config with HTTP+gRPC and no --only → both run_http and run_grpc True."""
+        temp_config.write_text(HTTP_AND_GRPC_CONFIG)
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run"],
+                catch_exceptions=False,
+            )
+            assert result.exit_code == 0
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs["run_http"] is True
+            assert call_kwargs["run_kafka"] is False
+            assert call_kwargs["run_grpc"] is True
+
+    def test_top_level_descriptors_threaded(self, temp_config, fake_engine):
+        """cfg.grpc.descriptors (top-level) is forwarded as top_level_descriptors."""
+        temp_config.write_text("""
+version: "3"
+grpc:
+  descriptors:
+    - proto: "helloworld.proto"
+      include_paths: ["./protos"]
+mocks:
+  grpc:
+    listen: "0.0.0.0:50051"
+    stubs:
+      stub1:
+        service: helloworld.Greeter
+        method: SayHello
+        response:
+          message: {"message": "hi"}
+""")
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "grpc"],
+                catch_exceptions=False,
+            )
+            assert result.exit_code == 0
+            call_kwargs = mock_factory.call_args.kwargs
+            # Forwarded as the top-level descriptors list (length matches config).
+            assert call_kwargs.get("top_level_descriptors") is not None
+            assert len(call_kwargs["top_level_descriptors"]) == 1
+
+    def test_top_level_descriptors_none_when_unset(self, temp_config, fake_engine):
+        """top_level_descriptors defaults to None when cfg.grpc.descriptors is empty."""
+        temp_config.write_text(GRPC_ONLY_CONFIG)
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "grpc"],
+                catch_exceptions=False,
+            )
+            assert result.exit_code == 0
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs.get("top_level_descriptors") is None
+
+
+class TestMockStartGrpc:
+    """`mock start` --grpc-listen / grpc result block / pidfile keying."""
+
+    def _patch_start_seam(self, monkeypatch, started_line: dict) -> list:
+        """Patch the spawn_daemon + log parse seams; return captured argv list."""
+        captured_argv: list[list[str]] = []
+
+        def fake_spawn_daemon(argv, log_path, env=None):
+            captured_argv.append(argv)
+            log_file = Path(log_path)
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            log_file.write_text(json.dumps(started_line) + "\n")
+            return 12345
+
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.spawn_daemon", fake_spawn_daemon
+        )
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.is_alive", lambda pid: True
+        )
+        fake_parsed = MagicMock()
+        fake_parsed.started = started_line
+        fake_parsed.startup_error = None
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.parse_log", lambda log_path: fake_parsed
+        )
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.read_pidfile", lambda pidfile: None
+        )
+        return captured_argv
+
+    def test_start_grpc_only_result_block(self, temp_config, monkeypatch, tmp_path):
+        """mock start --only grpc → result envelope includes a `grpc` block."""
+        temp_config.write_text(GRPC_ONLY_CONFIG)
+        started_line = {
+            "event": "started",
+            "http": None,
+            "kafka": None,
+            "grpc": {
+                "listen": "127.0.0.1:50051",
+                "stubs": 1,
+                "services": ["helloworld.Greeter"],
+                "reflection": True,
+                "health": True,
+            },
+        }
+        captured_argv = self._patch_start_seam(monkeypatch, started_line)
+
+        state_dir = tmp_path / "state"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", str(temp_config),
+                "mock", "start",
+                "--only", "grpc",
+                "--grpc-listen", "127.0.0.1:50051",
+                "--state-dir", str(state_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["ok"] is True
+        # HTTP keys remain (None / no stubs) when only grpc is running.
+        assert payload["result"]["listen"] is None
+        assert payload["result"]["stubs"] is None
+        # gRPC block is present and matches the started line.
+        grpc = payload["result"]["grpc"]
+        assert grpc["listen"] == "127.0.0.1:50051"
+        assert grpc["stubs"] == 1
+        assert grpc["services"] == ["helloworld.Greeter"]
+        assert grpc["reflection"] is True
+        assert grpc["health"] is True
+
+        # argv forwarded --only grpc and --grpc-listen.
+        argv = captured_argv[0]
+        assert "--only" in argv
+        only_idx = argv.index("--only")
+        assert argv[only_idx + 1] == "grpc"
+        assert "--grpc-listen" in argv
+        gl_idx = argv.index("--grpc-listen")
+        assert argv[gl_idx + 1] == "127.0.0.1:50051"
+        # HTTP listen should NOT appear in a grpc-only argv.
+        assert "--http-listen" not in argv
+
+    def test_start_grpc_only_pidfile_keying(self, temp_config, monkeypatch, tmp_path):
+        """grpc-only daemon's pidfile + log are keyed mock-grpc-<port>.* (Task 9)."""
+        temp_config.write_text(GRPC_ONLY_CONFIG)
+        started_line = {
+            "event": "started",
+            "http": None,
+            "kafka": None,
+            "grpc": {
+                "listen": "127.0.0.1:50051",
+                "stubs": 1,
+                "services": ["helloworld.Greeter"],
+                "reflection": True,
+                "health": True,
+            },
+        }
+        self._patch_start_seam(monkeypatch, started_line)
+
+        state_dir = tmp_path / "state"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", str(temp_config),
+                "mock", "start",
+                "--only", "grpc",
+                "--grpc-listen", "127.0.0.1:50051",
+                "--state-dir", str(state_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # Pidfile + log live under mock-grpc-50051.* (no collision with HTTP).
+        assert (state_dir / "mock-grpc-50051.pid").exists()
+        assert (state_dir / "mock-grpc-50051.log").exists()
+        # Legacy HTTP-keyed names must NOT be present.
+        assert not (state_dir / "mock-50051.pid").exists()
+
+    def test_start_pidfile_persists_listen_fields(
+        self, temp_config, monkeypatch, tmp_path
+    ):
+        """pidfile JSON persists http_listen + grpc_listen so stop/status can target either."""
+        temp_config.write_text(HTTP_AND_GRPC_CONFIG)
+        started_line = {
+            "event": "started",
+            "http": {"listen": "127.0.0.1:18080", "stubs": 1},
+            "kafka": None,
+            "grpc": {
+                "listen": "127.0.0.1:50051",
+                "stubs": 1,
+                "services": ["helloworld.Greeter"],
+                "reflection": True,
+                "health": True,
+            },
+        }
+        self._patch_start_seam(monkeypatch, started_line)
+
+        state_dir = tmp_path / "state"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", str(temp_config),
+                "mock", "start",
+                "--http-listen", "127.0.0.1:18080",
+                "--grpc-listen", "127.0.0.1:50051",
+                "--state-dir", str(state_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        pidfile = state_dir / "mock-18080.pid"
+        assert pidfile.exists()
+        data = json.loads(pidfile.read_text())
+        assert data["http_listen"] == "127.0.0.1:18080"
+        assert data["grpc_listen"] == "127.0.0.1:50051"
+
+    def test_start_http_and_grpc_argv_carries_both(
+        self, temp_config, monkeypatch, tmp_path
+    ):
+        """HTTP+gRPC daemon argv carries both --http-listen and --grpc-listen."""
+        temp_config.write_text(HTTP_AND_GRPC_CONFIG)
+        started_line = {
+            "event": "started",
+            "http": {"listen": "127.0.0.1:18080", "stubs": 1},
+            "kafka": None,
+            "grpc": {
+                "listen": "127.0.0.1:50051",
+                "stubs": 1,
+                "services": ["helloworld.Greeter"],
+                "reflection": True,
+                "health": True,
+            },
+        }
+        captured_argv = self._patch_start_seam(monkeypatch, started_line)
+
+        state_dir = tmp_path / "state"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", str(temp_config),
+                "mock", "start",
+                "--http-listen", "127.0.0.1:18080",
+                "--grpc-listen", "127.0.0.1:50051",
+                "--state-dir", str(state_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        argv = captured_argv[0]
+        assert "--http-listen" in argv
+        assert argv[argv.index("--http-listen") + 1] == "127.0.0.1:18080"
+        assert "--grpc-listen" in argv
+        assert argv[argv.index("--grpc-listen") + 1] == "127.0.0.1:50051"
+
+    def test_start_http_only_no_grpc_block(self, temp_config, monkeypatch, tmp_path):
+        """HTTP-only start: result has no `grpc` key (omit when not run_grpc)."""
+        temp_config.write_text("""
+version: "3"
+mocks:
+  http:
+    listen: "127.0.0.1:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+""")
+        started_line = {
+            "event": "started",
+            "http": {"listen": "127.0.0.1:18080", "stubs": 1},
+            "kafka": None,
+            "grpc": None,
+        }
+        self._patch_start_seam(monkeypatch, started_line)
+        state_dir = tmp_path / "state"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", str(temp_config),
+                "mock", "start",
+                "--only", "http",
+                "--state-dir", str(state_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert "grpc" not in payload["result"]
+        assert payload["result"]["listen"] == "127.0.0.1:18080"
