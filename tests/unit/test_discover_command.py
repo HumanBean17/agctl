@@ -1176,3 +1176,107 @@ def test_discover_unknown_grpc_target_item(monkeypatch):
     assert payload["ok"] is False
     assert payload["error"]["type"] == "TemplateNotFound"
     assert "Unknown gRPC target: nope" in payload["error"]["message"]
+
+
+# --------------------------------------------------------------------------- #
+# Task 11: mock-grpc-stubs category + grpc_mock_stubs count
+# --------------------------------------------------------------------------- #
+
+
+def test_valid_categories_includes_mock_grpc_stubs():
+    """Task 11: ``mock-grpc-stubs`` is a recognized discover category."""
+    from agctl.commands.discover_commands import _VALID_CATEGORIES
+
+    assert "mock-grpc-stubs" in _VALID_CATEGORIES
+
+
+def test_discover_summary_includes_grpc_mock_stubs(monkeypatch):
+    """Task 11 Test 1: Level-0 — summary surfaces ``grpc_mock_stubs`` count + hint."""
+    result = _run([], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["ok"] is True
+    counts = payload["result"]
+    # Fixture has 2 gRPC mock stubs (echo-ok, echo-status).
+    assert counts["grpc_mock_stubs"] == 2
+    assert "mock-grpc-stubs" in counts["hint"]
+
+
+def test_discover_category_mock_grpc_stubs(monkeypatch):
+    """Task 11 Test 2: Level-1 — listing returns name + description per stub."""
+    result = _run(["--category", "mock-grpc-stubs"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.category"
+    res = payload["result"]
+    assert res["category"] == "mock-grpc-stubs"
+    assert res["count"] == 2
+    by_name = {item["name"]: item for item in res["items"]}
+    assert set(by_name) == {"echo-ok", "echo-status"}
+    # Level-1 listing is name + description only (mirrors mock-http-stubs shape).
+    for item in res["items"]:
+        assert set(item.keys()) == {"name", "description"}
+    assert "unary" in by_name["echo-ok"]["description"].lower()
+
+
+def test_discover_item_mock_grpc_stub_with_match(monkeypatch):
+    """Task 11 Test 3: Level-2 — detail exposes service/method/match/params/example."""
+    result = _run(["--category", "mock-grpc-stubs", "--name", "echo-ok"], monkeypatch)
+    assert result.exit_code == 0
+    payload = _payload(result)
+    assert payload["command"] == "discover.item"
+    res = payload["result"]
+    assert res["category"] == "mock-grpc-stubs"
+    assert res["name"] == "echo-ok"
+    assert res["service"] == "echo.Echo"
+    assert res["method"] == "Unary"
+    assert res["match"] == {"body": {"msg": "hello"}}
+    # params = capture names (none) + {placeholder} scan of response message.
+    assert res["params"] == ["msg"]
+    # example is a ready-to-use external hint (NOT ``agctl grpc call``).
+    assert res["example"].startswith("grpcurl")
+    assert "echo.Echo/Unary" in res["example"]
+    assert "mock run" in res["note"]
+
+
+def test_discover_item_mock_grpc_stub_minimal(monkeypatch):
+    """Task 11: a stub without match/placeholder omits ``match`` and has empty params."""
+    result = _run(["--category", "mock-grpc-stubs", "--name", "echo-status"], monkeypatch)
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["name"] == "echo-status"
+    assert res["service"] == "grpc.health.v1.Health"
+    assert res["method"] == "Check"
+    assert "match" not in res
+    assert res["params"] == []
+    assert res["example"].startswith("grpcurl")
+    assert "grpc.health.v1.Health/Check" in res["example"]
+
+
+def test_discover_item_mock_grpc_stub_unknown(monkeypatch):
+    """Task 11 Test 4: unknown stub name → TemplateNotFound (exit 2)."""
+    result = _run(["--category", "mock-grpc-stubs", "--name", "nope"], monkeypatch)
+    assert result.exit_code == 2
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "TemplateNotFound"
+
+
+def test_discover_search_finds_mock_grpc_stub(monkeypatch):
+    """Task 11 Test 5: ``--search`` matches gRPC mock stubs by name/description."""
+    result = _run(["--search", "echo"], monkeypatch)
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    by_key = {(m["category"], m["name"]) for m in res["matches"]}
+    assert ("mock-grpc-stubs", "echo-ok") in by_key
+
+
+def test_discover_mock_grpc_stubs_absent_is_empty(tmp_path, monkeypatch):
+    """Task 11: no ``mocks.grpc`` section → empty listing and zero count (graceful)."""
+    result = _run_with(["--category", "mock-grpc-stubs"], _NO_MOCKS_CONFIG, tmp_path, monkeypatch)
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["count"] == 0
+    assert res["items"] == []
+    summary = _run_with([], _NO_MOCKS_CONFIG, tmp_path, monkeypatch)
+    assert _payload(summary)["result"]["grpc_mock_stubs"] == 0

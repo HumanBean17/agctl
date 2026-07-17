@@ -180,6 +180,28 @@ mocks:
           status: 200
           body:
             status: ok
+  grpc:
+    listen: "0.0.0.0:50051"
+    stubs:
+      echo-ok:
+        description: "Successful unary echo response"
+        service: echo.Echo
+        method: Unary
+        match:
+          body:
+            msg: hello
+        response:
+          status: OK
+          message:
+            msg: "{msg}"
+      echo-status:
+        description: "Health status response"
+        service: grpc.health.v1.Health
+        method: Check
+        response:
+          status: OK
+          message:
+            status: SERVING
   kafka:
     reactors:
       order-confirmation:

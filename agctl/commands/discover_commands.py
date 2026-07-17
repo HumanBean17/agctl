@@ -48,12 +48,14 @@ _VALID_CATEGORIES = (
     "log-sources",
     "grpc-services",
     "grpc-methods",
+    "mock-grpc-stubs",
 )
 
 _SUMMARY_HINT = (
     "Run 'agctl discover --category <name>' to list items. "
     "Categories: services, http-templates, kafka-patterns, db-templates, "
-    "mock-http-stubs, mock-kafka-reactors, log-sources, grpc-services, grpc-methods"
+    "mock-http-stubs, mock-kafka-reactors, log-sources, grpc-services, "
+    "grpc-methods, mock-grpc-stubs"
 )
 _CATEGORY_HINT = "Run 'agctl discover --category <c> --name <name>' for full detail"
 _SEARCH_HINT = (
@@ -189,6 +191,54 @@ def _mock_kafka_example(reactor) -> str:
     )
 
 
+def _mock_grpc_stubs(cfg) -> dict:
+    """``cfg.mocks.grpc.stubs``, or ``{}`` when mocks/grpc are absent."""
+    if cfg.mocks is None or cfg.mocks.grpc is None:
+        return {}
+    return cfg.mocks.grpc.stubs
+
+
+def _mock_grpc_listen(cfg) -> str:
+    """Configured gRPC mock listen address (default ``0.0.0.0:50051``)."""
+    if cfg.mocks is None or cfg.mocks.grpc is None:
+        return "0.0.0.0:50051"
+    return cfg.mocks.grpc.listen
+
+
+def _grpc_mock_params(stub) -> list[str]:
+    """Capture keys + ``{placeholder}`` tokens scanned over the authored response.
+
+    Mirrors the mock-http-stubs philosophy (surface what the operator can
+    parameterize), but folds capture *names* into ``params`` rather than
+    exposing the structured ``capture`` dict (per Task 11 brief). The
+    ``{placeholder}`` scan covers both ``response.message`` (unary/
+    server-streaming single payload) and each entry of ``response.messages``
+    (client/bidi streaming sequence).
+    """
+    tokens: set[str] = set()
+    if stub.capture:
+        tokens.update(stub.capture.keys())
+    if stub.response.message is not None:
+        tokens.update(_collect_brace_tokens(stub.response.message))
+    if stub.response.messages is not None:
+        for entry in stub.response.messages:
+            tokens.update(_collect_brace_tokens(entry.message))
+    return sorted(tokens)
+
+
+def _mock_grpc_example(stub, listen: str) -> str:
+    # Mirror ``_mock_http_example``: a ready-to-use external command against the
+    # mock listen address. ``grpcurl`` is the gRPC analogue of ``curl``; the
+    # wildcard bind is normalized to localhost and IPv6 hosts are re-bracketed.
+    # These are MOCK stubs (not call templates), so ``agctl grpc call`` is the
+    # wrong hint — the operator exercises the mock directly via grpcurl.
+    host, port = parse_listen(listen)
+    if host in ("0.0.0.0", "::", ""):
+        host = "localhost"
+    bracketed = f"[{host}]" if ":" in host else host
+    return f"grpcurl -plaintext {bracketed}:{port} {stub.service}/{stub.method}"
+
+
 # --------------------------------------------------------------------------- #
 # Mode cores (each wrapped in its own envelope)
 # --------------------------------------------------------------------------- #
@@ -206,6 +256,7 @@ def _summary_core(config_path: str | None, overlay_paths: list[str] | None = Non
         "log_sources": len(cfg.logs.sources),
         "grpc_targets": len(cfg.grpc.targets),
         "grpc_methods": len(cfg.grpc.templates),
+        "grpc_mock_stubs": len(_mock_grpc_stubs(cfg)),
         "hint": _SUMMARY_HINT,
     }
 
@@ -273,6 +324,14 @@ def _category_core(config_path: str | None, category: str, overlay_paths: list[s
                 {
                     "name": name,
                     "description": tpl.description or f"{tpl.service}/{tpl.method}",
+                }
+            )
+    elif category == "mock-grpc-stubs":
+        for name, stub in _mock_grpc_stubs(cfg).items():
+            items.append(
+                {
+                    "name": name,
+                    "description": stub.description,
                 }
             )
 
@@ -505,6 +564,28 @@ def _item_core(config_path: str | None, category: str, name: str, overlay_paths:
                 "error": str(err),
             }
 
+    if category == "mock-grpc-stubs":
+        stubs = _mock_grpc_stubs(cfg)
+        if name not in stubs:
+            raise TemplateNotFound(
+                f"Unknown mock gRPC stub: {name}",
+                {"path": f"mocks.grpc.stubs.{name}"},
+            )
+        stub = stubs[name]
+        item = {
+            "category": "mock-grpc-stubs",
+            "name": name,
+            "description": stub.description,
+            "service": stub.service,
+            "method": stub.method,
+            "params": _grpc_mock_params(stub),
+            "example": _mock_grpc_example(stub, _mock_grpc_listen(cfg)),
+            "note": "Active only while `agctl mock run` (grpc engine) is running.",
+        }
+        if stub.match is not None:
+            item["match"] = stub.match.model_dump(by_alias=True, exclude_none=True)
+        return item
+
     # category == "db-templates"
     if name not in cfg.database.templates:
         raise TemplateNotFound(
@@ -630,6 +711,16 @@ def _search_core(config_path: str | None, term: str, overlay_paths: list[str] | 
                     "category": "grpc-methods",
                     "name": name,
                     "description": tpl.description or f"{tpl.service}/{tpl.method}",
+                }
+            )
+
+    for name, stub in _mock_grpc_stubs(cfg).items():
+        if needle in name.lower() or _matches(stub.description):
+            matches.append(
+                {
+                    "category": "mock-grpc-stubs",
+                    "name": name,
+                    "description": stub.description,
                 }
             )
 
