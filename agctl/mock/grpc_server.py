@@ -1,4 +1,4 @@
-"""Transport-agnostic gRPC dispatch core (Task 5 of the gRPC mock server).
+"""Transport-agnostic gRPC dispatch core (Task 5) + ``MockGrpcServer`` (Task 6).
 
 This module is the **brain** of the gRPC mock: given a resolved method's call
 type, the stub list registered for that ``(service, method)`` pair, and the
@@ -9,8 +9,8 @@ or signals UNIMPLEMENTED (``matched=False``).
 It is **pure Python with no ``grpc`` import** anywhere in the file. The
 dispatch functions are importable and unit-testable without the grpcio extra
 installed; this keeps the mock brain fully covered by the fast unit suite,
-independent of the gRPC transport. Task 6/7 will add ``MockGrpcServer`` to
-this same module, importing ``grpc`` **lazily inside its methods** (never at
+independent of the gRPC transport. Task 6 adds ``MockGrpcServer`` to this
+same module, importing ``grpc`` **lazily inside its methods** (never at
 module top) so this dispatch core stays grpcio-free.
 
 Per-call-type behavior (DESIGN §8.1):
@@ -48,12 +48,24 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ..assertions import jq_bool, json_subset, parse_grpc_status
-from ..config.models import GrpcStub
+from ..clients.grpc_descriptors import (
+    build_descriptor_pool,
+    call_type_of,
+    find_method,
+)
+from ..config.models import (
+    GrpcDescriptorSource,
+    GrpcMockConfig,
+    GrpcStub,
+    parse_listen,
+)
+from ..errors import ConfigError, TemplateNotFound
 from ..resolution import render_typed
 from .capture import resolve_captures
 
 __all__ = [
     "GrpcDispatchOutcome",
+    "MockGrpcServer",
     "build_envelope",
     "dispatch_grpc",
 ]
@@ -281,3 +293,189 @@ def _render_response(
             for entry in (stub.response.messages or [])
         ]
     return [render_typed(stub.response.message, captures)]
+
+
+# ---------------------------------------------------------------------------
+# MockGrpcServer — construction, validation, method table (Task 6)
+# ---------------------------------------------------------------------------
+
+
+class MockGrpcServer:
+    """Validated, not-yet-bound gRPC mock server (Task 6 of the gRPC mock feature).
+
+    Construction does everything that does NOT need the grpc runtime:
+
+    - Resolves the protobuf ``DescriptorPool`` ONCE (via the shared kernel or
+      an injected pool — the DI seam used by tests).
+    - Validates every stub's ``(service, method)`` against the pool
+      (unknown service/method -> :class:`ConfigError` at
+      ``mocks.grpc.stubs.<name>``).
+    - Validates response-shape-vs-call-type: ``server_stream`` requires
+      ``response.messages``; ``unary``/``client_stream``/``bidi`` require
+      ``response.message``. Violation -> :class:`ConfigError` at
+      ``mocks.grpc.stubs.<name>.response`` naming the call type.
+    - Precomputes :attr:`stubs_by_method` (dict-of-dicts keyed by
+      ``(service, method)`` -> ordered ``{stub_name: GrpcStub}``) and
+      :attr:`method_meta` (parallel ``{(service, method):
+      (input_msg_desc, output_msg_desc, call_type)}``).
+
+    Construction deliberately does NOT bind a port or build a
+    ``grpc.Server`` — that is Task 7's ``serve_forever``. ``self._server``
+    stays ``None`` until then, and every lazy ``import grpc`` lives inside
+    Task 7's methods (this module remains grpcio-free at module top so the
+    dispatch brain stays unit-testable without the gRPC extra).
+
+    ``stubs_by_method`` shape (load-bearing): an ordered
+    ``dict[tuple[str, str], dict[str, GrpcStub]]`` — the OUTER key is
+    ``(service, method)``; the INNER dict is ``{config_key: GrpcStub}``
+    preserving insertion order for first-match-wins dispatch (Task 5's
+    ``dispatch_grpc`` takes ``dict[str, GrpcStub]`` because ``GrpcStub`` has
+    no ``.name`` field — the dict key carries the name).
+    """
+
+    def __init__(
+        self,
+        config: GrpcMockConfig,
+        *,
+        top_level_descriptors: list[GrpcDescriptorSource] | None,
+        emit_event: Callable[[dict], None],
+        descriptor_pool: Any = None,
+    ) -> None:
+        # 1. Resolve the descriptor pool ONCE. Production passes
+        #    ``descriptor_pool=None``; tests inject a prebuilt pool to skip
+        #    the (slow) protoc compile and isolate construction from the
+        #    kernel's source-resolution paths.
+        if descriptor_pool is None:
+            # config.descriptors wins; fall back to top_level (the engine's
+            # ``grpc.descriptors``); an empty/None everywhere surfaces as a
+            # context-labeled ConfigError from the kernel (mentions
+            # "mocks.grpc") — no special-casing here.
+            sources = config.descriptors or top_level_descriptors or []
+            pool = build_descriptor_pool(sources, context_label="mocks.grpc")
+        else:
+            pool = descriptor_pool
+
+        # 2. Validate each stub + build the per-method tables in one pass.
+        # Partial state is discarded if any stub fails validation (the
+        # constructor raises and never returns an instance), so we don't
+        # need a two-phase build.
+        stubs_by_method: dict[tuple[str, str], dict[str, GrpcStub]] = {}
+        method_meta: dict[tuple[str, str], tuple[Any, Any, str]] = {}
+        services_seen: set[str] = set()
+
+        for name, stub in config.stubs.items():
+            method_desc = self._resolve_method(pool, stub, name)
+            call_type = call_type_of(method_desc)
+            self._check_response_shape(stub, call_type, name)
+
+            key = (stub.service, stub.method)
+            # First stub for this (service, method) seeds both tables; later
+            # stubs append to the existing inner dict. Insertion order is
+            # preserved across stubs (Python 3.7+ dict semantics) and within
+            # each inner dict — the contract Task 5's dispatch relies on.
+            if key not in stubs_by_method:
+                stubs_by_method[key] = {}
+                method_meta[key] = (
+                    method_desc.input_type,
+                    method_desc.output_type,
+                    call_type,
+                )
+            stubs_by_method[key][name] = stub
+            services_seen.add(stub.service)
+
+        # 3. Expose the resolved state. ``_server`` stays None until Task 7's
+        #    serve_forever actually binds.
+        self.stubs_by_method: dict[tuple[str, str], dict[str, GrpcStub]] = (
+            stubs_by_method
+        )
+        self.method_meta: dict[tuple[str, str], tuple[Any, Any, str]] = (
+            method_meta
+        )
+        self.services: list[str] = sorted(services_seen)
+        self._listen_host, self._listen_port = parse_listen(config.listen)
+        self._config = config
+        self._emit_event = emit_event
+        self._server: Any = None  # grpc.Server — built in Task 7's serve_forever.
+
+    # -- validation helpers -------------------------------------------------
+
+    @staticmethod
+    def _resolve_method(pool: Any, stub: GrpcStub, name: str) -> Any:
+        """``find_method`` with a ConfigError wrap naming ``mocks.grpc.stubs.<name>``.
+
+        The kernel raises :class:`TemplateNotFound` on a missing service or
+        method; that is a config-shaped failure (exit 2), but the path prefix
+        ``mocks.grpc.stubs.<name>`` is the contract Task 6 owns, so we wrap.
+        """
+        try:
+            return find_method(pool, stub.service, stub.method)
+        except TemplateNotFound as exc:
+            raise ConfigError(
+                f"mocks.grpc.stubs.{name}: {exc.message}",
+                {
+                    "stub": name,
+                    "service": stub.service,
+                    "method": stub.method,
+                    "path": f"mocks.grpc.stubs.{name}",
+                    **exc.detail,
+                },
+            ) from exc
+
+    @staticmethod
+    def _check_response_shape(
+        stub: GrpcStub, call_type: str, name: str
+    ) -> None:
+        """Response-shape vs derived call type.
+
+        - ``server_stream`` -> ``response.messages`` set (``message`` unset).
+        - ``unary``/``client_stream``/``bidi`` -> ``response.message`` set
+          (``messages`` unset).
+
+        Structural exactly-one-of is already enforced at model parse time
+        (Task 3's :class:`GrpcResponse`); this check pins the call-type side
+        of the contract — the only place the descriptor pool is available.
+        """
+        response = stub.response
+        path = f"mocks.grpc.stubs.{name}.response"
+        method_loc = f"{stub.service}/{stub.method}"
+
+        if call_type == "server_stream":
+            if response.message is not None or response.messages is None:
+                raise ConfigError(
+                    f"{path}: server_stream method {method_loc} requires "
+                    f"'response.messages' (got 'response.message')",
+                    {
+                        "stub": name,
+                        "call_type": call_type,
+                        "service": stub.service,
+                        "method": stub.method,
+                        "path": path,
+                    },
+                )
+            return
+
+        # unary / client_stream / bidi -> message-shaped response.
+        if response.message is None or response.messages is not None:
+            raise ConfigError(
+                f"{path}: {call_type} method {method_loc} requires "
+                f"'response.message' (got 'response.messages')",
+                {
+                    "stub": name,
+                    "call_type": call_type,
+                    "service": stub.service,
+                    "method": stub.method,
+                    "path": path,
+                },
+            )
+
+    # -- accessors ----------------------------------------------------------
+
+    @property
+    def listen_address(self) -> str:
+        """Human-readable ``host:port`` (for logs / status lines)."""
+        return f"{self._listen_host}:{self._listen_port}"
+
+    @property
+    def bind_address(self) -> tuple[str, int]:
+        """``(host, port)`` tuple for the engine's started line / socket bind."""
+        return (self._listen_host, self._listen_port)
