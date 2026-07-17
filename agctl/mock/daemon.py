@@ -24,13 +24,20 @@ class RunningMock:
 
     Attributes:
         pid: Process ID of the running mock.
-        listen: Listen address (e.g., "127.0.0.1:18080") or None for kafka-only.
-        port: HTTP port (e.g., 18080) or None for kafka-only.
+        listen: Legacy primary listen address (e.g., "127.0.0.1:18080") or
+            None for kafka-only / grpc-only daemons that don't expose HTTP.
+        port: Primary port (e.g., 18080) or None for kafka-only mocks.
         log_path: Absolute path to the mock's NDJSON log file.
         config_path: Absolute path to the mock's config.yaml, or None if no config.
         started_at: ISO-8601 timestamp when the mock was started (UTC, Z suffix).
         run_id: Unique run identifier for this mock invocation.
         pidfile_path: Path to the pidfile this data was read from.
+        http_listen: HTTP listen address (e.g., "127.0.0.1:18080") when an HTTP
+            engine is attached, else None. Recorded in the pidfile so multi-engine
+            (HTTP+gRPC) and HTTP-only daemons can be targeted by their HTTP address.
+        grpc_listen: gRPC listen address (e.g., "127.0.0.1:50051") when a gRPC
+            engine is attached, else None. Recorded in the pidfile so grpc-only
+            and HTTP+gRPC daemons can be targeted by their gRPC address.
     """
 
     pid: int
@@ -41,35 +48,58 @@ class RunningMock:
     started_at: str
     run_id: str
     pidfile_path: Path
+    http_listen: str | None = None
+    grpc_listen: str | None = None
 
 
-def pidfile_path(state_dir: Path, port: int | None) -> Path:
-    """Return the pidfile path for a mock with the given port.
+def pidfile_path(
+    state_dir: Path, port: int | None, *, engine: str | None = None
+) -> Path:
+    """Return the pidfile path for a mock with the given port/engine.
 
     Args:
         state_dir: Directory where mock state is stored.
-        port: HTTP port number, or None for kafka-only mocks.
+        port: Primary port number, or None for kafka-only mocks.
+        engine: Optional engine hint. ``"grpc"`` keys a grpc-only daemon under
+            ``mock-grpc-<port>.pid`` so it doesn't collide with an HTTP daemon on
+            the same numeric port. ``None`` (default) preserves the legacy
+            ``mock-<port>.pid`` / ``mock-kafka.pid`` naming so existing HTTP and
+            kafka call sites are unaffected.
 
     Returns:
-        Path to the pidfile: `<state_dir>/mock-<port>.pid` for HTTP mocks,
-        `<state_dir>/mock-kafka.pid` for kafka-only mocks.
+        Path to the pidfile:
+        - ``<state_dir>/mock-grpc-<port>.pid`` when ``engine == "grpc"``
+        - ``<state_dir>/mock-kafka.pid`` when ``engine is None`` and port is None
+        - ``<state_dir>/mock-<port>.pid`` otherwise (HTTP-present default)
     """
+    if engine == "grpc":
+        return state_dir / f"mock-grpc-{port}.pid"
     if port is None:
         return state_dir / "mock-kafka.pid"
     return state_dir / f"mock-{port}.pid"
 
 
-def log_path(state_dir: Path, port: int | None) -> Path:
-    """Return the log file path for a mock with the given port.
+def log_path(
+    state_dir: Path, port: int | None, *, engine: str | None = None
+) -> Path:
+    """Return the log file path for a mock with the given port/engine.
+
+    Mirrors :func:`pidfile_path` naming so a daemon's pidfile and log share a
+    stem.
 
     Args:
         state_dir: Directory where mock state is stored.
-        port: HTTP port number, or None for kafka-only mocks.
+        port: Primary port number, or None for kafka-only mocks.
+        engine: Optional engine hint (see :func:`pidfile_path`).
 
     Returns:
-        Path to the log file: `<state_dir>/mock-<port>.log` for HTTP mocks,
-        `<state_dir>/mock-kafka.log` for kafka-only mocks.
+        Path to the log file:
+        - ``<state_dir>/mock-grpc-<port>.log`` when ``engine == "grpc"``
+        - ``<state_dir>/mock-kafka.log`` when ``engine is None`` and port is None
+        - ``<state_dir>/mock-<port>.log`` otherwise (HTTP-present default)
     """
+    if engine == "grpc":
+        return state_dir / f"mock-grpc-{port}.log"
     if port is None:
         return state_dir / "mock-kafka.log"
     return state_dir / f"mock-{port}.log"
@@ -109,6 +139,8 @@ def list_running_mocks(state_dir: Path) -> list[RunningMock]:
                     started_at=data.get("started_at", ""),
                     run_id=data.get("run_id", ""),
                     pidfile_path=pidfile,
+                    http_listen=data.get("http_listen"),
+                    grpc_listen=data.get("grpc_listen"),
                 )
             )
         else:
@@ -153,7 +185,10 @@ def resolve_target(
     if listen is not None:
         candidates = list_running_mocks(state_dir)
         for mock in candidates:
-            if mock.listen == listen:
+            # Match against any of the engine listen addresses a daemon exposes:
+            # legacy ``listen`` (primary identity) plus explicit ``http_listen``
+            # / ``grpc_listen`` for multi-engine and engine-only daemons.
+            if listen in (mock.listen, mock.http_listen, mock.grpc_listen):
                 return [mock]
         raise ConfigError(f"no running mock on {listen}", {"listen": listen})
 
@@ -181,6 +216,8 @@ FATAL_FAILURE_EVENTS: frozenset[str] = frozenset(
         "http.body_parse_skipped",
         "kafka.skipped",
         "kafka.error",
+        "grpc.unmatched",
+        "grpc.error",
     }
 )
 
@@ -193,6 +230,9 @@ EVENT_TO_COUNTER: dict[str, str] = {
     "kafka.reacted": "kafka_reactions",
     "kafka.skipped": "kafka_skipped",
     "kafka.error": "kafka_errors",
+    "grpc.hit": "grpc_hits",
+    "grpc.unmatched": "grpc_unmatched",
+    "grpc.error": "grpc_errors",
 }
 
 
