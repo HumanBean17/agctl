@@ -1,4 +1,4 @@
-"""Tests for mock server config models (Task 1)."""
+"""Tests for mock server config models (Task 1, Task 3)."""
 
 import pytest
 from pydantic import ValidationError
@@ -6,6 +6,11 @@ from pydantic import ValidationError
 from agctl.config.models import (
     Config,
     CaptureSpec,
+    GrpcMatch,
+    GrpcMockConfig,
+    GrpcResponse,
+    GrpcResponseMessage,
+    GrpcStub,
     HttpMatch,
     HttpMockConfig,
     HttpResponse,
@@ -279,3 +284,267 @@ def test_kafka_reactor_with_capture():
     )
     assert reactor.capture is not None
     assert reactor.capture["op_id"].from_ == ".value.id"
+
+
+# --- gRPC mock models (Task 3: mocks.grpc structural config) ---
+#
+# Offline structural validation only: exactly-one-of message/messages, status
+# validity via parse_grpc_status, listen parsing, concurrency_cap >= 1.
+# Response-shape-vs-call-type (e.g. `messages` on a unary method) is deferred to
+# Task 6 (needs the descriptor pool) and intentionally NOT exercised here.
+
+
+def test_grpc_mock_config_defaults():
+    """GrpcMockConfig() -> listen=='0.0.0.0:50051', reflection is True, health is True, concurrency_cap==64, stubs empty."""
+    cfg = GrpcMockConfig()
+    assert cfg.listen == "0.0.0.0:50051"
+    assert cfg.reflection is True
+    assert cfg.health is True
+    assert cfg.concurrency_cap == 64
+    assert cfg.stubs == {}
+
+
+def test_grpc_mock_config_listen_accepts_ipv4_and_ipv6():
+    """listen='0.0.0.0:50051' and '[::1]:50051' both parse (delegate to parse_listen)."""
+    cfg4 = GrpcMockConfig(listen="0.0.0.0:50051")
+    assert cfg4.listen == "0.0.0.0:50051"
+    cfg6 = GrpcMockConfig(listen="[::1]:50051")
+    assert cfg6.listen == "[::1]:50051"
+
+
+def test_grpc_mock_config_listen_rejects_noport():
+    """listen='noport' -> ValidationError (mirrors HttpMockConfig.listen validator)."""
+    with pytest.raises(ValidationError):
+        GrpcMockConfig(listen="noport")
+
+
+def test_grpc_mock_config_concurrency_cap_zero_rejected():
+    """concurrency_cap=0 -> ValidationError (must be >= 1)."""
+    with pytest.raises(ValidationError):
+        GrpcMockConfig(concurrency_cap=0)
+
+
+def test_grpc_mock_config_concurrency_cap_one_ok():
+    """concurrency_cap=1 -> ok (boundary)."""
+    cfg = GrpcMockConfig(concurrency_cap=1)
+    assert cfg.concurrency_cap == 1
+
+
+def test_grpc_mock_config_full_stub_parse():
+    """GrpcMockConfig parses a full stub: service/method/match/capture/response.message/status/metadata."""
+    cfg = GrpcMockConfig(
+        listen="0.0.0.0:50051",
+        reflection=True,
+        health=True,
+        concurrency_cap=8,
+        stubs={
+            "get-order": {
+                "description": "mock GetOrder",
+                "service": "shop.OrderService",
+                "method": "GetOrder",
+                "match": {"body": {"order_id": "123"}, "jq": ".order_id == \"123\""},
+                "capture": {"op_id": {"from": ".body.order_id"}},
+                "response": {
+                    "status": "OK",
+                    "message": {"order_id": "123", "total": 999},
+                    "metadata": {"x-trace-id": "abc"},
+                },
+                "delay_ms": 5,
+            }
+        },
+    )
+    stub = cfg.stubs["get-order"]
+    assert stub.service == "shop.OrderService"
+    assert stub.method == "GetOrder"
+    assert stub.description == "mock GetOrder"
+    assert stub.match is not None
+    assert stub.match.body == {"order_id": "123"}
+    assert stub.match.jq == '.order_id == "123"'
+    assert stub.capture is not None
+    assert stub.capture["op_id"].from_ == ".body.order_id"
+    assert stub.response.status == "OK"
+    assert stub.response.message == {"order_id": "123", "total": 999}
+    assert stub.response.messages is None
+    assert stub.response.metadata == {"x-trace-id": "abc"}
+    assert stub.delay_ms == 5
+
+
+def test_grpc_match_defaults():
+    """GrpcMatch() -> body is None, jq is None."""
+    match = GrpcMatch()
+    assert match.body is None
+    assert match.jq is None
+
+
+def test_grpc_response_message_defaults():
+    """GrpcResponseMessage(message={...}) -> delay_ms==0."""
+    msg = GrpcResponseMessage(message={"a": 1})
+    assert msg.message == {"a": 1}
+    assert msg.delay_ms == 0
+
+
+def test_grpc_response_message_delay_negative_rejected():
+    """GrpcResponseMessage(message=..., delay_ms=-1) -> ValidationError."""
+    with pytest.raises(ValidationError):
+        GrpcResponseMessage(message={"a": 1}, delay_ms=-1)
+
+
+def test_grpc_response_default_status_ok():
+    """GrpcResponse(message={...}) -> status=='OK' default, metadata None."""
+    resp = GrpcResponse(message={"a": 1})
+    assert resp.status == "OK"
+    assert resp.message == {"a": 1}
+    assert resp.messages is None
+    assert resp.metadata is None
+
+
+def test_grpc_response_message_alone_ok():
+    """GrpcResponse(message={...}) -> ok (exactly-one-of satisfied)."""
+    resp = GrpcResponse(message={"a": 1})
+    assert resp.message == {"a": 1}
+    assert resp.messages is None
+
+
+def test_grpc_response_messages_alone_ok():
+    """GrpcResponse(messages=[...]) -> ok (exactly-one-of satisfied)."""
+    resp = GrpcResponse(
+        messages=[
+            GrpcResponseMessage(message={"chunk": 1}, delay_ms=10),
+            GrpcResponseMessage(message={"chunk": 2}),
+        ]
+    )
+    assert resp.message is None
+    assert resp.messages is not None
+    assert len(resp.messages) == 2
+    assert resp.messages[0].message == {"chunk": 1}
+    assert resp.messages[0].delay_ms == 10
+    assert resp.messages[1].delay_ms == 0
+
+
+def test_grpc_response_rejects_both_message_and_messages():
+    """Both message and messages set -> ValidationError."""
+    with pytest.raises(ValidationError):
+        GrpcResponse(
+            message={"a": 1},
+            messages=[GrpcResponseMessage(message={"chunk": 1})],
+        )
+
+
+def test_grpc_response_rejects_neither_message_nor_messages():
+    """Neither message nor messages set -> ValidationError."""
+    with pytest.raises(ValidationError):
+        GrpcResponse()
+
+
+def test_grpc_response_status_name_string_preserved():
+    """status='NOT_FOUND' parses; the original string is preserved verbatim (code/name resolution is render-time)."""
+    resp = GrpcResponse(message={"a": 1}, status="NOT_FOUND")
+    assert resp.status == "NOT_FOUND"
+
+
+def test_grpc_response_status_int_code_preserved():
+    """status=5 parses; the original int is preserved verbatim."""
+    resp = GrpcResponse(message={"a": 1}, status=5)
+    assert resp.status == 5
+
+
+def test_grpc_response_status_digit_string_preserved():
+    """status='5' parses (digit-string coercion in parse_grpc_status); stored as the original string '5'."""
+    resp = GrpcResponse(message={"a": 1}, status="5")
+    assert resp.status == "5"
+
+
+def test_grpc_response_status_zero_ok():
+    """status=0 / 'OK' boundary -> ok (gRPC OK code is 0)."""
+    assert GrpcResponse(message={"a": 1}, status=0).status == 0
+    assert GrpcResponse(message={"a": 1}, status="OK").status == "OK"
+
+
+def test_grpc_response_status_invalid_name_rejected():
+    """status='FOO' -> ValidationError (invalid name; case-sensitive lookup)."""
+    with pytest.raises(ValidationError):
+        GrpcResponse(message={"a": 1}, status="FOO")
+
+
+def test_grpc_response_status_out_of_range_code_rejected():
+    """status=17 -> ValidationError (out of gRPC 0-16 range)."""
+    with pytest.raises(ValidationError):
+        GrpcResponse(message={"a": 1}, status=17)
+
+
+def test_grpc_response_status_lowercase_name_rejected():
+    """status='not_found' -> ValidationError (case-sensitive; caller must upper-case)."""
+    with pytest.raises(ValidationError):
+        GrpcResponse(message={"a": 1}, status="not_found")
+
+
+def test_grpc_stub_minimal():
+    """GrpcStub(service=..., method=..., response={...}) -> defaults: description/capture None, delay_ms 0."""
+    stub = GrpcStub(
+        service="shop.OrderService",
+        method="GetOrder",
+        response=GrpcResponse(message={"a": 1}),
+    )
+    assert stub.description is None
+    assert stub.capture is None
+    assert stub.delay_ms == 0
+    assert stub.match is None
+
+
+def test_grpc_stub_delay_negative_rejected():
+    """GrpcStub(... delay_ms=-1) -> ValidationError."""
+    with pytest.raises(ValidationError):
+        GrpcStub(
+            service="shop.OrderService",
+            method="GetOrder",
+            response=GrpcResponse(message={"a": 1}),
+            delay_ms=-1,
+        )
+
+
+def test_mocks_config_grpc_only():
+    """MocksConfig(grpc={...}) -> grpc set, http/kafka None."""
+    mocks = MocksConfig(
+        grpc={"listen": "0.0.0.0:50051", "stubs": {"s": {
+            "service": "S", "method": "M", "response": {"message": {"x": 1}},
+        }}}
+    )
+    assert mocks.grpc is not None
+    assert mocks.grpc.listen == "0.0.0.0:50051"
+    assert "s" in mocks.grpc.stubs
+    assert mocks.http is None
+    assert mocks.kafka is None
+
+
+def test_mocks_config_empty_has_grpc_none():
+    """MocksConfig() -> grpc is None (default)."""
+    assert MocksConfig().grpc is None
+
+
+def test_config_with_grpc_mocks_end_to_end():
+    """End-to-end: a Config with mocks.grpc parses into typed GrpcMockConfig."""
+    cfg = Config.model_validate({
+        "version": "1",
+        "mocks": {
+            "grpc": {
+                "listen": "0.0.0.0:50051",
+                "reflection": True,
+                "health": False,
+                "concurrency_cap": 4,
+                "stubs": {
+                    "get-order": {
+                        "service": "shop.OrderService",
+                        "method": "GetOrder",
+                        "response": {"status": "OK", "message": {"id": "1"}},
+                    }
+                },
+            }
+        },
+    })
+    assert cfg.mocks is not None
+    assert cfg.mocks.grpc is not None
+    assert cfg.mocks.grpc.health is False
+    assert cfg.mocks.grpc.concurrency_cap == 4
+    stub = cfg.mocks.grpc.stubs["get-order"]
+    assert stub.method == "GetOrder"
+    assert stub.response.status == "OK"

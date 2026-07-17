@@ -2,7 +2,10 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from ..assertions import parse_grpc_status
+from ..errors import ConfigError
 
 
 def parse_listen(listen: str) -> tuple[str, int]:
@@ -298,10 +301,16 @@ class KafkaMockConfig(BaseModel):
 
 
 class MocksConfig(BaseModel):
-    """Mock server configuration (HTTP and Kafka)."""
+    """Mock server configuration (HTTP, Kafka, gRPC).
+
+    ``grpc`` is defined after the gRPC mock models below (which depend on
+    :class:`GrpcDescriptorSource`); see the gRPC mock section near the bottom of
+    this module.
+    """
 
     http: HttpMockConfig | None = None
     kafka: KafkaMockConfig | None = None
+    grpc: "GrpcMockConfig | None" = None
 
 
 class LogSource(BaseModel):
@@ -372,6 +381,121 @@ class GrpcConfig(BaseModel):
     targets: dict[str, GrpcTarget] = Field(default_factory=dict)
     descriptors: list[GrpcDescriptorSource] = Field(default_factory=list)
     templates: dict[str, GrpcTemplate] = Field(default_factory=dict)
+
+
+class GrpcMatch(BaseModel):
+    """gRPC request matching criteria for mock stubs (mirrors :class:`HttpMatch`).
+
+    ``body`` is a subset match against the incoming request message; ``jq`` is a
+    predicate evaluated against the incoming envelope. Both optional and may
+    coexist; a stub matches only if all provided criteria pass.
+    """
+
+    body: dict | None = None
+    jq: str | None = None
+
+
+class GrpcResponseMessage(BaseModel):
+    """A single streaming-response message (one element of ``GrpcResponse.messages``)."""
+
+    message: Any
+    delay_ms: int = Field(default=0, ge=0)
+
+
+class GrpcResponse(BaseModel):
+    """gRPC response definition for a mock stub.
+
+    Exactly one of ``message`` (unary/server-streaming single authored payload)
+    or ``messages`` (client/bidi streaming sequence) must be set. ``status`` is
+    validated here against the gRPC status enum via :func:`parse_grpc_status`,
+    but stored verbatim (name or int as authored) — ``(code, name)`` resolution
+    happens at render time (Task 5). Response-shape-vs-call-type (e.g.
+    ``messages`` on a unary method) needs the descriptor pool and is therefore
+    deferred to the server (Task 6); this model enforces only the structural
+    exactly-one-of and status validity.
+    """
+
+    status: str | int = "OK"
+    message: Any = None
+    messages: list[GrpcResponseMessage] | None = None
+    metadata: dict[str, str] | None = None
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, v: str | int) -> str | int:
+        """Reject invalid gRPC status at model parse time.
+
+        Delegates name/code resolution to :func:`parse_grpc_status` (single
+        source of truth; case-sensitive name lookup, digit-string→int coercion,
+        0-16 range). The helper raises :class:`ConfigError`; re-raise as
+        ``ValueError`` so Pydantic surfaces it as a ``ValidationError`` (the
+        config loader turns that into exit 2). The original ``v`` is returned
+        unchanged — resolution to ``(code, name)`` is deferred to render time.
+        """
+        try:
+            parse_grpc_status(v)
+        except ConfigError as e:
+            raise ValueError(str(e)) from e
+        return v
+
+    @model_validator(mode="after")
+    def _exactly_one_of_message_or_messages(self) -> "GrpcResponse":
+        """Enforce exactly-one-of ``message`` / ``messages`` (structural check).
+
+        Both set, or neither set, -> ``ValidationError``. ``message is None`` is
+        treated as "unset" (the field's default): an explicitly-authored
+        ``message: None`` is indistinguishable from omission. Authoring intent
+        for an empty unary response is expressed via ``message: {}`` (an
+        empty-but-present payload); omitting both keys is rejected.
+        """
+        if (self.message is not None) == (self.messages is not None):
+            raise ValueError(
+                "grpc response must set exactly one of 'message' or 'messages'"
+            )
+        return self
+
+
+class GrpcStub(BaseModel):
+    """gRPC mock stub definition: match an incoming call and author its response."""
+
+    description: str | None = None
+    service: str
+    method: str
+    match: GrpcMatch | None = None
+    capture: dict[str, CaptureSpec] | None = None
+    response: GrpcResponse
+    delay_ms: int = Field(default=0, ge=0)
+
+
+class GrpcMockConfig(BaseModel):
+    """gRPC mock server configuration (mirrors :class:`HttpMockConfig`).
+
+    ``descriptors`` supplies the proto/descriptor-set sources used to resolve
+    service/method names and encode response messages at render time (Task 5/6).
+    """
+
+    listen: str = "0.0.0.0:50051"
+    descriptors: list[GrpcDescriptorSource] | None = None
+    reflection: bool = True
+    health: bool = True
+    concurrency_cap: int = Field(default=64, ge=1)
+    stubs: dict[str, GrpcStub] = Field(default_factory=dict)
+
+    @field_validator("listen")
+    @classmethod
+    def _validate_listen(cls, v: str) -> str:
+        """Validate listen address format (mirrors ``HttpMockConfig.listen``)."""
+        try:
+            parse_listen(v)
+        except ValueError as e:
+            raise ValueError(f"invalid listen address: {e}") from e
+        return v
+
+
+# ``MocksConfig`` (defined above, before the gRPC mock section) references
+# ``GrpcMockConfig`` via a forward reference; rebuild now that the gRPC mock
+# models are in scope so the ``grpc`` field's core schema resolves.
+MocksConfig.model_rebuild()
 
 
 class Config(BaseModel):
