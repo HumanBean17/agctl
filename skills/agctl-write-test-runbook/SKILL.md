@@ -40,6 +40,7 @@ agctl discover                                   # summary first
 agctl discover --category http-templates
 agctl discover --category kafka-patterns
 agctl discover --category db-templates
+agctl discover --category log-sources
 agctl discover --category services
 agctl discover --category mock-http-stubs
 agctl discover --category mock-kafka-reactors
@@ -68,12 +69,23 @@ Sequence the steps. For each step decide:
 
 - **Command** — prefer a named template (`agctl http call <name>`,
   `agctl db assert --template <name>`, `agctl kafka assert --pattern <name>`).
-  Use free-form (`http request`, `db --sql`) only when no template exists.
+  Use free-form (`http request`, `db --sql`) only when no template exists. Logs
+  are a co-equal assertion channel for effects with no HTTP/Kafka/DB signal:
+  `agctl logs assert <source> --match '<jq>'` (see **Log assertions** below).
 - **Capture** *(optional)* — `VAR=<envelope-path>` when a later step needs a
   value from this step's result (e.g. `ORDER_ID=result.body.order_id`). Captured
   values are stringified (a numeric id `42` becomes `"42"`).
 - **Expected** — `<envelope-path>: <literal>` pairs (ANDed; compared type-aware,
   like `--equals`), or `exit 0` for an assertion step.
+- **Log assertions** — reach for `agctl logs assert` when the effect is visible
+  only in the SUT's own log (audit lines, retry attempts, background work with no
+  HTTP/Kafka/DB signal). `--match` is **entry-rooted** over the canonical entry
+  (`.level`, `.message`, `.fields.orderId`), with `{placeholder}` filled via
+  `--param` (needs `pip install 'agctl[logs]'`). Use **poll** (`--timeout N>0`)
+  for "this line appears after the trigger" — logs already persist to a file, so
+  no background-capture fixture is needed (unlike Kafka `listen`). Add `--not` to
+  assert absence ("no ERROR logs in the window"). The source must resolve in
+  `discover --category log-sources`.
 
 Identify the fixtures and the cleanup that reverses them:
 
@@ -86,7 +98,7 @@ If none apply, omit the Fixtures section entirely. Background commands
 (`mock run`, `http ping`, `kafka listen run`) go under Fixtures, never as Steps —
 they stream NDJSON, not a single envelope.
 
-**Config placement rule:** Ground every template, mock, seed-template, and pattern via `agctl discover` against the main config. When a needed definition is **not** present, place it in a sidecar `<runbook-base>.agctl.yaml` (sibling to the runbook) rather than editing the main `agctl.yaml`. Shared infrastructure stays in the main config; runbook-specific fixtures (one-off seed templates, ad-hoc mocks, scratch HTTP templates) and per-runbook overrides belong in the sidecar.
+**Config placement rule:** Ground every template, mock, seed-template, pattern, and log-source via `agctl discover` against the main config. When a needed definition is **not** present, place it in a sidecar `<runbook-base>.agctl.yaml` (sibling to the runbook) rather than editing the main `agctl.yaml`. Shared infrastructure stays in the main config; runbook-specific fixtures (one-off seed templates, ad-hoc mocks, scratch HTTP templates, scratch log sources) and per-runbook overrides belong in the sidecar.
 
 ### 5. Emit
 
@@ -97,7 +109,7 @@ sections entirely. Write the file as `runbook.md` wherever you prefer (a
 `runbooks/` directory at the repo root is common). It is committable — a test
 plan; the `*.results.md` report produced at execution is gitignored.
 
-**Sidecar emission:** When any template, mock, seed-template, or pattern definition was placed in a sidecar (per the Design rule), also write `<runbook-base>.agctl.yaml` next to the runbook, and add a `Preconditions` line to the runbook: `Requires overlay: <runbook-base>.agctl.yaml`. The runbook stays pure markdown — no YAML front-matter, no embedded config block. The companion `agctl-run-test-runbook` skill looks for this sibling sidecar and activates the overlay at run-time.
+**Sidecar emission:** When any template, mock, seed-template, pattern, or log-source definition was placed in a sidecar (per the Design rule), also write `<runbook-base>.agctl.yaml` next to the runbook, and add a `Preconditions` line to the runbook: `Requires overlay: <runbook-base>.agctl.yaml`. The runbook stays pure markdown — no YAML front-matter, no embedded config block. The companion `agctl-run-test-runbook` skill looks for this sibling sidecar and activates the overlay at run-time.
 
 ### 6. Self-review
 
@@ -108,8 +120,8 @@ Before declaring the runbook done, scan it and fix inline:
 - Cleanup reverses every fixture — one teardown line per fixture (mock PID,
   heartbeat PID, seed reset).
 - Each `Expected` asserts the field that actually answers the Goal.
-- Every template, mock, seed-template, and pattern resolves in `agctl discover`
-  against the main config or the sidecar — nothing invented.
+- Every template, mock, seed-template, pattern, and log-source resolves in
+  `agctl discover` against the main config or the sidecar — nothing invented.
 
 ## Reference
 

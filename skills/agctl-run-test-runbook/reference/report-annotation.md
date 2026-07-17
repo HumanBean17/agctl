@@ -36,8 +36,9 @@ agent logs.
   fabricate these; the point is that a reviewer can re-run any **Run** command
   and compare (see "For reviewers" below).
 - **What to excerpt.** Include the few fields that matter for the assertion:
-  HTTP `status_code` plus a key body field, the matched Kafka message, or the DB
-  row asserted on. Omit headers and timing boilerplate.
+  HTTP `status_code` plus a key body field, the matched Kafka message, the DB
+  row asserted on, or the matched log entry (level + message + any identifying
+  `.fields.*`). Omit headers and timing boilerplate.
 - **PASS / FAIL / SKIPPED.** PASS and FAIL show the spine + Actual + Expected
   (with ✓ / ✗). **SKIPPED** steps echo **Expected** for context but show **no**
   Run / Exit / Actual, and are marked *not exercised* — they were blocked by an

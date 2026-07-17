@@ -29,11 +29,13 @@ A runbook is markdown with these sections, in order:
   - **Expected** — `<envelope-path>: <literal>` pairs (ANDed; compared type-aware), or `exit 0` for an assertion step.
 - **Cleanup** — the reverse of fixtures; run in Teardown.
 
-Background commands (`mock run`, `http ping`, `kafka listen run`) live under
-**Fixtures**, never **Steps** — they stream NDJSON, not a single envelope. (The
-managed-daemon trio `kafka listen start`/`assert`/`results`/`stop` emits one
-envelope each and goes into Setup/Steps/Teardown like any other command; see the
-`agctl` skill for the lifecycle, and remember `results` must run BEFORE `stop`.)
+Background commands (`mock run`, `http ping`, `kafka listen run`, `logs tail`)
+live under **Fixtures**, never **Steps** — they stream NDJSON, not a single
+envelope. (`logs assert` is **not** streaming — one-shot or poll, one envelope —
+so it is a normal Step. The managed-daemon trio `kafka listen
+start`/`assert`/`results`/`stop` emits one envelope each and goes into
+Setup/Steps/Teardown like any other command; see the `agctl` skill for the
+lifecycle, and remember `results` must run BEFORE `stop`.)
 
 ## Procedure
 
@@ -73,7 +75,7 @@ For each step, in order:
 - Substitute `$VAR` from prior Captures into the Command.
 - **Overlay injection:** When a sidecar is active (per Validate), prefix the command with the global `--overlay <sidecar>` form: `agctl --overlay <sidecar> <group> <cmd> …`. If no sidecar exists, run the command as-is.
 - Run the verbatim command.
-- From the JSON envelope `agctl` emits on stdout, capture the exit code, `ok`, `error.type` (if any), and a curated excerpt (e.g. `result.status_code`, a DB row, the matched Kafka message).
+- From the JSON envelope `agctl` emits on stdout, capture the exit code, `ok`, `error.type` (if any), and a curated excerpt (e.g. `result.status_code`, a DB row, the matched Kafka message, the matched log entry).
 
 ### 4. Annotate
 
