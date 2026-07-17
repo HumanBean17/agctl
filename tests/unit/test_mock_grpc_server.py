@@ -484,3 +484,564 @@ def test_mock_grpc_server_module_remains_grpcio_free_at_module_top():
                     f"`from {node.module} import ...` — must remain "
                     f"grpcio-free at module top."
                 )
+
+
+# ---------------------------------------------------------------------------
+# Task 7: gRPC runtime wiring — generic servicer, 4 call types, Health,
+# Reflection, lifecycle (start/serve_forever/shutdown/actual_listen).
+#
+# These tests spin up a REAL grpcio server on an ephemeral port and exercise
+# it via raw ``grpc.insecure_channel`` calls. The whole section is gated on
+# the gRPC extra (``grpc``/``grpcio-health-checking``/``grpcio-reflection``):
+# ``pytest.importorskip`` so a missing extra skips cleanly rather than erroring.
+# ---------------------------------------------------------------------------
+
+
+# Gate the Task-7 section on the gRPC runtime extras. The Task-6 tests above
+# already gated on ``grpc_tools``/``google.protobuf`` (the build-time extras);
+# Task 7 additionally needs the runtime extras (``grpc``/``grpc_health``/
+# ``grpc_reflection``). ``pytest.importorskip`` returns a "skip" marker object
+# when missing — keep it as a module-level statement so collection skips.
+pytest.importorskip("grpc")
+pytest.importorskip("grpc_health")
+pytest.importorskip("grpc_reflection")
+
+import contextlib  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+import grpc  # noqa: E402
+
+from agctl.clients.grpc_descriptors import (  # noqa: E402
+    deserialize,
+    serialize,
+)
+from agctl.config.models import (  # noqa: E402
+    CaptureSpec,
+    GrpcMatch,
+)
+
+
+SERVICE = "echo.EchoService"  # re-stated for proximity to the Task-7 tests below
+
+
+def _start_server(
+    stubs: dict[str, GrpcStub],
+    pool,
+    *,
+    health: bool = True,
+    reflection: bool = True,
+    listen: str = "127.0.0.1:0",
+    concurrency_cap: int = 8,
+) -> tuple[MockGrpcServer, list[dict]]:
+    """Build + start a ``MockGrpcServer`` against ``pool`` on an ephemeral port.
+
+    Returns ``(server, events)``. Caller MUST shut the server down (the
+    ``stop_and_wait`` context manager below does both).
+    """
+    events: list[dict] = []
+    config = GrpcMockConfig(
+        listen=listen,
+        stubs=stubs,
+        health=health,
+        reflection=reflection,
+        concurrency_cap=concurrency_cap,
+    )
+    server = MockGrpcServer(
+        config,
+        top_level_descriptors=None,
+        emit_event=events.append,
+        descriptor_pool=pool,
+    )
+    server.start()
+    return server, events
+
+
+@contextlib.contextmanager
+def _running_server(
+    stubs: dict[str, GrpcStub],
+    pool,
+    *,
+    health: bool = True,
+    reflection: bool = True,
+    listen: str = "127.0.0.1:0",
+):
+    """Context manager: yields ``(server, events, channel)``; shuts down on exit."""
+    server, events = _start_server(
+        stubs,
+        pool,
+        health=health,
+        reflection=reflection,
+        listen=listen,
+    )
+    channel = grpc.insecure_channel(server.actual_listen())
+    try:
+        # Wait for the channel to become ready (bounded; ephemeral bind is up).
+        grpc.channel_ready_future(channel).result(timeout=2.0)
+        yield server, events, channel
+    finally:
+        channel.close()
+        server.shutdown()
+
+
+def _make_invoker(pool, channel, svc: str, mtd: str):
+    """Build raw unary/stream invokers for /svc/mtd off the echo proto pool.
+
+    Returns a 4-tuple ``(unary, server_stream, client_stream, bidi)`` of callables
+    wired with serialize/deserialize for the method's input/output types.
+    """
+    from agctl.clients.grpc_descriptors import find_method
+
+    md = find_method(pool, svc, mtd)
+    ser = serialize(md.input_type)
+    deser = deserialize(md.output_type)
+    method_path = f"/{svc}/{mtd}"
+    return (
+        channel.unary_unary(method_path, request_serializer=ser, response_deserializer=deser),
+        channel.unary_stream(method_path, request_serializer=ser, response_deserializer=deser),
+        channel.stream_unary(method_path, request_serializer=ser, response_deserializer=deser),
+        channel.stream_stream(method_path, request_serializer=ser, response_deserializer=deser),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: start / actual_listen / shutdown
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycle:
+    """start/actual_listen/shutdown wiring."""
+
+    def test_start_builds_server_and_binds_ephemeral_port(self, mock_grpc_echo_pool):
+        """start() -> _server is a grpc.Server; actual_listen() reflects the bound port."""
+        with _running_server({"u": _unary_stub()}, mock_grpc_echo_pool) as (server, _, _):
+            assert server._server is not None
+            # actual_listen is "host:port" with port > 0 (ephemeral bind succeeded).
+            host, _, port = server.actual_listen().rpartition(":")
+            assert host == "127.0.0.1"
+            assert int(port) > 0
+
+    def test_actual_listen_uses_fixed_port_when_requested(self, mock_grpc_echo_pool):
+        """A non-zero requested port is reflected verbatim in actual_listen()."""
+        # Pick a likely-free high port. Bind + immediate teardown.
+        with _running_server(
+            {"u": _unary_stub()},
+            mock_grpc_echo_pool,
+            listen="127.0.0.1:50151",
+        ) as (server, _, _):
+            assert server.actual_listen() == "127.0.0.1:50151"
+
+    def test_shutdown_is_idempotent(self, mock_grpc_echo_pool):
+        """shutdown() can be called twice without raising."""
+        server, _ = _start_server({"u": _unary_stub()}, mock_grpc_echo_pool)
+        try:
+            server.shutdown()
+        finally:
+            server.shutdown()  # second call must not raise
+
+    def test_serve_forever_returns_when_stop_event_is_set(self, mock_grpc_echo_pool):
+        """serve_forever blocks until stop_event.is_set(), then returns promptly."""
+        import threading
+
+        server, _ = _start_server({"u": _unary_stub()}, mock_grpc_echo_pool)
+        try:
+            stop_event = threading.Event()
+            serve_thread = threading.Thread(
+                target=server.serve_forever, args=(stop_event,), daemon=True
+            )
+            serve_thread.start()
+            # Give serve_forever a moment to enter the wait_for_termination loop.
+            time.sleep(0.05)
+            stop_event.set()
+            serve_thread.join(timeout=2.0)
+            assert not serve_thread.is_alive(), "serve_forever did not return after stop_event"
+        finally:
+            server.shutdown()
+
+    def test_serve_forever_without_start_is_a_noop(self, mock_grpc_echo_pool):
+        """serve_forever on an un-started server returns immediately (no _server)."""
+        import threading
+
+        config = GrpcMockConfig(stubs={"u": _unary_stub()})
+        server = MockGrpcServer(
+            config,
+            top_level_descriptors=None,
+            emit_event=lambda _event: None,
+            descriptor_pool=mock_grpc_echo_pool,
+        )
+        # Not started -> _server is None -> serve_forever returns immediately.
+        stop_event = threading.Event()
+        serve_thread = threading.Thread(
+            target=server.serve_forever, args=(stop_event,), daemon=True
+        )
+        serve_thread.start()
+        serve_thread.join(timeout=2.0)
+        assert not serve_thread.is_alive()
+
+    def test_port_in_use_raises_config_error(self, mock_grpc_echo_pool):
+        """Binding on an already-bound port -> ConfigError.
+
+        Uses a plain ``socket.socket`` to hold the port (without SO_REUSEPORT)
+        so the grpc C core's bind genuinely fails with EADDRINUSE and
+        ``add_insecure_port`` raises ``RuntimeError``. Two grpc servers can
+        otherwise share a port via SO_REUSEPORT, which would not exercise the
+        error path under test.
+        """
+        import socket
+
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", 0))  # ephemeral — discover via getsockname.
+        blocker.listen(1)
+        port = blocker.getsockname()[1]
+        try:
+            with pytest.raises(ConfigError) as exc_info:
+                _start_server(
+                    {"u": _unary_stub()},
+                    mock_grpc_echo_pool,
+                    listen=f"127.0.0.1:{port}",
+                )
+            msg = str(exc_info.value)
+            # Message must mention the listen address and the in-use condition.
+            assert f"127.0.0.1:{port}" in msg
+            assert "in use" in msg.lower() or "already" in msg.lower()
+        finally:
+            blocker.close()
+
+
+# ---------------------------------------------------------------------------
+# Unary dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestUnaryDispatch:
+    """Unary RPC end-to-end: match, unmatched, capture, non-OK status."""
+
+    def test_unary_match_returns_response_and_emits_hit(self, mock_grpc_echo_pool):
+        """Echo/Unary with match.body {msg} + response.message {msg:"{msg}"}:
+        call {msg:"hi"} -> {msg:"hi"}; exactly one grpc.hit event recorded."""
+        stub = GrpcStub(
+            service=SERVICE,
+            method="Unary",
+            match=GrpcMatch(body={"msg": "hi"}),
+            capture={
+                "msg": CaptureSpec(from_=".message.msg"),
+            },
+            response=GrpcResponse(message={"msg": "{msg}"}),
+        )
+        with _running_server({"echo_unary": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            unary, _, _, _ = _make_invoker(mock_grpc_echo_pool, channel, SERVICE, "Unary")
+            resp, _call = unary.with_call({"msg": "hi"})
+            assert resp == {"msg": "hi"}
+
+            hits = [e for e in events if e.get("event") == "grpc.hit"]
+            assert len(hits) == 1
+            assert hits[0]["stub"] == "echo_unary"
+            assert hits[0]["service"] == SERVICE
+            assert hits[0]["method"] == "Unary"
+            assert hits[0]["call_type"] == "unary"
+            assert hits[0]["status"] == "OK"
+            assert isinstance(hits[0]["duration_ms"], int)
+
+    def test_unary_unmatched_aborts_unimplemented_and_emits_unmatched(
+        self, mock_grpc_echo_pool
+    ):
+        """A request that matches no stub -> UNIMPLEMENTED + grpc.unmatched event."""
+        stub = GrpcStub(
+            service=SERVICE,
+            method="Unary",
+            match=GrpcMatch(body={"msg": "hi"}),
+            response=GrpcResponse(message={"msg": "{msg}"}),
+        )
+        with _running_server({"echo_unary": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            unary, _, _, _ = _make_invoker(mock_grpc_echo_pool, channel, SERVICE, "Unary")
+            with pytest.raises(grpc.RpcError) as exc_info:
+                unary({"msg": "bye"})  # no stub matches
+            assert exc_info.value.code() == grpc.StatusCode.UNIMPLEMENTED
+
+            unmatched = [e for e in events if e.get("event") == "grpc.unmatched"]
+            assert len(unmatched) == 1
+            assert unmatched[0]["service"] == SERVICE
+            assert unmatched[0]["method"] == "Unary"
+            assert unmatched[0]["call_type"] == "unary"
+
+    def test_unary_non_ok_status_aborts_with_authored_code(self, mock_grpc_echo_pool):
+        """status: NOT_FOUND -> call aborts with NOT_FOUND (no grpc.hit for an
+        unmatched-style miss; here we DO match, then abort with the stub's status)."""
+        stub = GrpcStub(
+            service=SERVICE,
+            method="Unary",
+            match=GrpcMatch(body={"msg": "ghost"}),
+            response=GrpcResponse(message={"msg": "should-not-see"}, status="NOT_FOUND"),
+        )
+        with _running_server({"missing": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            unary, _, _, _ = _make_invoker(mock_grpc_echo_pool, channel, SERVICE, "Unary")
+            with pytest.raises(grpc.RpcError) as exc_info:
+                unary({"msg": "ghost"})
+            assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+
+            # Matched: a grpc.hit event is recorded (status_name NOT_FOUND).
+            hits = [e for e in events if e.get("event") == "grpc.hit"]
+            assert len(hits) == 1
+            assert hits[0]["status"] == "NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# Server-stream dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestServerStreamDispatch:
+    """Server-stream RPC: N rendered messages in authored order."""
+
+    def test_server_stream_returns_n_messages_in_order(self, mock_grpc_echo_pool):
+        stub = GrpcStub(
+            service=SERVICE,
+            method="ServerStream",
+            response=GrpcResponse(
+                messages=[
+                    GrpcResponseMessage(message={"msg": "one"}),
+                    GrpcResponseMessage(message={"msg": "two"}),
+                    GrpcResponseMessage(message={"msg": "three"}),
+                ]
+            ),
+        )
+        with _running_server({"ss": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            _, server_stream, _, _ = _make_invoker(
+                mock_grpc_echo_pool, channel, SERVICE, "ServerStream"
+            )
+            msgs = list(server_stream({"msg": "anything"}))
+            assert [m["msg"] for m in msgs] == ["one", "two", "three"]
+
+            # One grpc.hit per yielded message.
+            hits = [e for e in events if e.get("event") == "grpc.hit"]
+            assert len(hits) == 3
+            assert [h["method"] for h in hits] == ["ServerStream"] * 3
+            assert all(h["call_type"] == "server_stream" for h in hits)
+
+
+# ---------------------------------------------------------------------------
+# Client-stream dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestClientStreamDispatch:
+    """Client-stream RPC: aggregated match at iterator close, single reply."""
+
+    def test_client_stream_aggregated_match_returns_single_reply(
+        self, mock_grpc_echo_pool
+    ):
+        # Match on the LAST request's msg via jq (client_stream uses jq only).
+        stub = GrpcStub(
+            service=SERVICE,
+            method="ClientStream",
+            match=GrpcMatch(jq='.messages[-1].msg == "end"'),
+            response=GrpcResponse(message={"msg": "aggregated"}),
+        )
+        with _running_server({"cs": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            _, _, client_stream, _ = _make_invoker(
+                mock_grpc_echo_pool, channel, SERVICE, "ClientStream"
+            )
+            resp, _call = client_stream.with_call(
+                iter([{"msg": "a"}, {"msg": "b"}, {"msg": "end"}])
+            )
+            assert resp == {"msg": "aggregated"}
+
+            hits = [e for e in events if e.get("event") == "grpc.hit"]
+            assert len(hits) == 1
+            assert hits[0]["call_type"] == "client_stream"
+
+
+# ---------------------------------------------------------------------------
+# Bidi dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestBidiDispatch:
+    """Bidi RPC: one response per matched incoming request."""
+
+    def test_bidi_echo_style_yields_one_response_per_request(self, mock_grpc_echo_pool):
+        # Capture the incoming msg, echo it back. Per-turn unary-style envelope.
+        stub = GrpcStub(
+            service=SERVICE,
+            method="Bidi",
+            capture={"msg": CaptureSpec(from_=".message.msg")},
+            response=GrpcResponse(message={"msg": "echo:{msg}"}),
+        )
+        with _running_server({"bidi": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            _, _, _, bidi = _make_invoker(
+                mock_grpc_echo_pool, channel, SERVICE, "Bidi"
+            )
+            replies = list(bidi(iter([{"msg": "x"}, {"msg": "y"}, {"msg": "z"}])))
+            assert [r["msg"] for r in replies] == ["echo:x", "echo:y", "echo:z"]
+
+            # One grpc.hit per turn (3 requests -> 3 hits).
+            hits = [e for e in events if e.get("event") == "grpc.hit"]
+            assert len(hits) == 3
+            assert all(h["call_type"] == "bidi" for h in hits)
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+
+class TestHealth:
+    """health=True -> HealthStub.Check returns SERVING for overall + per service."""
+
+    def test_overall_health_is_serving(self, mock_grpc_echo_pool):
+        from grpc_health.v1 import health_pb2, health_pb2_grpc
+
+        with _running_server({"u": _unary_stub()}, mock_grpc_echo_pool, health=True) as (
+            server,
+            events,
+            channel,
+        ):
+            stub = health_pb2_grpc.HealthStub(channel)
+            resp = stub.Check(health_pb2.HealthCheckRequest(service=""))
+            assert resp.status == health_pb2.HealthCheckResponse.SERVING
+
+    def test_per_service_health_is_serving(self, mock_grpc_echo_pool):
+        from grpc_health.v1 import health_pb2, health_pb2_grpc
+
+        with _running_server({"u": _unary_stub()}, mock_grpc_echo_pool, health=True) as (
+            server,
+            events,
+            channel,
+        ):
+            stub = health_pb2_grpc.HealthStub(channel)
+            resp = stub.Check(health_pb2.HealthCheckRequest(service=SERVICE))
+            assert resp.status == health_pb2.HealthCheckResponse.SERVING
+
+    def test_health_disabled_omits_health_service(self, mock_grpc_echo_pool):
+        """health=False -> Check on the overall service aborts UNIMPLEMENTED."""
+        from grpc_health.v1 import health_pb2, health_pb2_grpc
+
+        with _running_server(
+            {"u": _unary_stub()}, mock_grpc_echo_pool, health=False
+        ) as (server, events, channel):
+            stub = health_pb2_grpc.HealthStub(channel)
+            with pytest.raises(grpc.RpcError) as exc_info:
+                stub.Check(health_pb2.HealthCheckRequest(service=""))
+            assert exc_info.value.code() == grpc.StatusCode.UNIMPLEMENTED
+
+
+# ---------------------------------------------------------------------------
+# Reflection
+# ---------------------------------------------------------------------------
+
+
+class TestReflection:
+    """reflection=True -> ServerReflectionStub.list_services returns configured services."""
+
+    def test_reflection_lists_configured_services(self, mock_grpc_echo_pool):
+        from grpc_reflection.v1alpha import reflection_pb2, reflection_pb2_grpc
+
+        with _running_server(
+            {"u": _unary_stub()}, mock_grpc_echo_pool, reflection=True
+        ) as (server, events, channel):
+            stub = reflection_pb2_grpc.ServerReflectionStub(channel)
+            resp_iter = stub.ServerReflectionInfo(
+                iter([reflection_pb2.ServerReflectionRequest(list_services="")])
+            )
+            listed = []
+            for r in resp_iter:
+                listed.extend(s.name for s in r.list_services_response.service)
+            # The configured service must be present.
+            assert SERVICE in listed
+
+    def test_reflection_disabled_omits_reflection_service(self, mock_grpc_echo_pool):
+        """reflection=False -> the reflection bidi call aborts UNIMPLEMENTED."""
+        from grpc_reflection.v1alpha import reflection_pb2, reflection_pb2_grpc
+
+        with _running_server(
+            {"u": _unary_stub()}, mock_grpc_echo_pool, reflection=False
+        ) as (server, events, channel):
+            stub = reflection_pb2_grpc.ServerReflectionStub(channel)
+            with pytest.raises(grpc.RpcError) as exc_info:
+                # Consume the iterator to surface the terminal status.
+                list(
+                    stub.ServerReflectionInfo(
+                        iter([reflection_pb2.ServerReflectionRequest(list_services="")])
+                    )
+                )
+            assert exc_info.value.code() == grpc.StatusCode.UNIMPLEMENTED
+
+
+# ---------------------------------------------------------------------------
+# Missing-grpc-extra path: _build_server must surface ConfigError pointing at
+# the ``grpc`` extra when grpc/grpc_health/grpc_reflection can't be imported.
+# ---------------------------------------------------------------------------
+
+
+class TestMissingGrpcExtra:
+    """When ``import grpc`` fails inside _build_server, surface ConfigError."""
+
+    def test_missing_grpc_extra_raises_config_error(self, mock_grpc_echo_pool, monkeypatch):
+        """Simulate a missing grpc extra by hiding the module via sys.modules.
+
+        ``sys.modules[name] = None`` makes Python raise ImportError on
+        ``import name`` (the standard "halted; None in sys.modules" path).
+        The lazy ``import grpc`` inside ``_build_server`` must translate that
+        ImportError into a :class:`ConfigError` pointing at the ``grpc`` extra.
+        """
+        import sys
+
+        monkeypatch.setitem(sys.modules, "grpc", None)
+
+        events: list[dict] = []
+        config = GrpcMockConfig(
+            listen="127.0.0.1:0",
+            stubs={"u": _unary_stub()},
+        )
+        server = MockGrpcServer(
+            config,
+            top_level_descriptors=None,
+            emit_event=events.append,
+            descriptor_pool=mock_grpc_echo_pool,
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            server.start()
+        assert "agctl[grpc]" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Module stays importable without the grpc extra (the dispatch core path).
+# This test runs unconditionally: it constructs the server (no grpc import)
+# and verifies _server stays None without ever calling start().
+# ---------------------------------------------------------------------------
+
+
+def test_module_imports_and_constructs_without_grpc_runtime(mock_grpc_echo_pool):
+    """The module + dispatch core remain importable without the grpc runtime.
+
+    ``MockGrpcServer.__init__`` must not import ``grpc`` (only the kernel-level
+    ``google.protobuf``/``grpc_tools`` already gated at module top). This test
+    is a smoke test that construction succeeds and ``_server`` stays None until
+    ``start()`` is actually called (which would lazy-import grpc).
+    """
+    server = _build({"u": _unary_stub()}, mock_grpc_echo_pool)
+    assert server._server is None
