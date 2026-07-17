@@ -2,7 +2,8 @@
 
 An ``object``-typed capture name ``N`` may only be used as a WHOLE-FIELD
 placeholder — a string whose value is exactly ``"{N}"`` — inside ``response.body``
-(HTTP) / ``reaction.value`` (Kafka). Used anywhere else it would render
+(HTTP) / ``reaction.value`` (Kafka) / ``response.message`` and
+``response.messages[*].message`` (gRPC). Used anywhere else it would render
 incorrectly at request time (an object forced into a string slot has no honest
 string form). Rather than discover this on the first matching request, this
 module scans a :class:`MocksConfig` at startup / validate time and reports each
@@ -11,10 +12,12 @@ violation as a ``{"path", "message"}`` record, mirroring
 
 Placement rule for an ``object``-typed name ``N`` (per stub/reactor):
 
-- VALID: some field in ``response.body`` / ``reaction.value`` is exactly ``"{N}"``.
+- VALID: some field in ``response.body`` / ``reaction.value`` / gRPC
+  ``response.message`` (or any ``response.messages[*].message``) is exactly
+  ``"{N}"``.
 - VIOLATION (one error each):
   - (a) ``"{N}"`` appears inline within a larger string anywhere in the
-    ``response.body`` / ``reaction.value`` tree.
+    ``response.body`` / ``reaction.value`` / gRPC message tree(s).
   - (b) ``reaction.key`` is or contains ``"{N}"`` (Kafka only — string-only slot).
   - (c) any ``reaction.headers`` value is or contains ``"{N}"`` (Kafka only).
 - ``scalar``/``json``-typed names are NEVER flagged.
@@ -73,16 +76,20 @@ def _walk_tree(value: Any, name: str) -> bool:
 def collect_capture_placement_errors(mocks: MocksConfig | None) -> list[dict]:
     """Scan ``mocks`` for object-capture misplacement; return one record per violation.
 
-    For each HTTP stub / Kafka reactor whose ``capture`` declares a ``type ==
-    "object"`` name ``N``, scans the relevant template tree(s) and appends a
-    ``{"path": str, "message": str}`` per violation category (inline-in-body/value,
-    ``reaction.key``, ``reaction.headers``). At most one error per category per
-    name; up to three errors per name (inline + key + headers). ``scalar``/``json``
+    For each HTTP stub / Kafka reactor / gRPC stub whose ``capture`` declares a
+    ``type == "object"`` name ``N``, scans the relevant template tree(s) and
+    appends a ``{"path": str, "message": str}`` per violation category
+    (inline-in-body/value/message, ``reaction.key``, ``reaction.headers``).
+    At most one error per category per name; up to three errors per name
+    (inline + key + headers). For gRPC, only the inline-in-message category
+    applies: both the unary ``response.message`` tree and every streaming
+    ``response.messages[*].message`` tree are walked. ``scalar``/``json``
     captures and stubs/reactors with ``capture=None`` contribute nothing.
 
-    ``mocks is None`` (or its ``http``/``kafka`` subsections None) -> ``[]``.
-    Never raises — callers (``config validate``, ``MockEngine.start()``) decide
-    whether to collect-and-report or fail-fast on the first record.
+    ``mocks is None`` (or its ``http``/``kafka``/``grpc`` subsections None)
+    -> ``[]``. Never raises — callers (``config validate``,
+    ``MockEngine.start()``) decide whether to collect-and-report or fail-fast
+    on the first record.
     """
     if mocks is None:
         return []
@@ -155,5 +162,33 @@ def collect_capture_placement_errors(mocks: MocksConfig | None) -> list[dict]:
                                 ),
                             })
                             break
+
+    if mocks.grpc is not None:
+        for name, stub in mocks.grpc.stubs.items():
+            if stub.capture is None:
+                continue
+            for cap_name, spec in stub.capture.items():
+                if spec.type != "object":
+                    continue
+                path = f"mocks.grpc.stubs.{name}"
+                response = stub.response
+                # gRPC has no key/headers analogue — only the inline-in-message
+                # tree category (like HTTP's response.body). Walk BOTH the unary
+                # response.message tree and every streaming messages[*].message
+                # tree; a single inline occurrence anywhere is one violation.
+                trees: list[Any] = []
+                if response.message is not None:
+                    trees.append(response.message)
+                if response.messages is not None:
+                    trees.extend(m.message for m in response.messages)
+                if any(_walk_tree(tree, cap_name) for tree in trees):
+                    errors.append({
+                        "path": path,
+                        "message": (
+                            f'capture {cap_name!r} of type "object" must occupy '
+                            f'the whole field ("{{{cap_name}}}"); it appears inline '
+                            f"within a larger string in response.message"
+                        ),
+                    })
 
     return errors

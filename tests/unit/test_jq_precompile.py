@@ -9,6 +9,11 @@ typos in one pass rather than stopping at the first.
 
 from agctl.config.models import (
     CaptureSpec,
+    GrpcMatch,
+    GrpcMockConfig,
+    GrpcResponse,
+    GrpcResponseMessage,
+    GrpcStub,
     HttpMatch,
     HttpMockConfig,
     HttpResponse,
@@ -493,6 +498,175 @@ def test_collect_valid_capture_froms_return_empty():
                     match='.eventType == "ORDER_CREATED"',
                     capture={"k": CaptureSpec(from_=".key")},
                     reaction=KafkaReaction(topic="out", value={"ok": True}),
+                ),
+            },
+        ),
+    )
+    assert collect_jq_compile_errors(mocks) == []
+
+
+# --- (i) grpc stubs walked as a third block (Task 4) -----------------------
+def test_iter_grpc_stub_match_jq_yielded():
+    """A grpc stub with match.jq='.msg == "hi"' yields one pair labelled
+    ``mocks.grpc.stubs.{name}.match.jq`` carrying the expression verbatim."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    match=GrpcMatch(jq='.msg == "hi"'),
+                    response=GrpcResponse(message={}),
+                ),
+            },
+        ),
+    )
+    assert list(iter_mock_jq_expressions(mocks)) == [
+        ("mocks.grpc.stubs.s.match.jq", '.msg == "hi"'),
+    ]
+
+
+def test_iter_grpc_stub_capture_from_yielded():
+    """A grpc stub with a capture yields ``capture.{cap}.from`` (verbatim) right
+    after its match.jq label — mirroring HTTP stubs / Kafka reactors."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    match=GrpcMatch(jq=".a"),
+                    capture={"id": CaptureSpec(from_=".msg.id")},
+                    response=GrpcResponse(message={}),
+                ),
+            },
+        ),
+    )
+    assert list(iter_mock_jq_expressions(mocks)) == [
+        ("mocks.grpc.stubs.s.match.jq", ".a"),
+        ("mocks.grpc.stubs.s.capture.id.from", ".msg.id"),
+    ]
+
+
+def test_iter_grpc_skips_none_match_and_none_capture():
+    """A grpc stub with match=None / capture=None contributes no pairs."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "bare": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    match=None,
+                    response=GrpcResponse(message={}),
+                ),
+            },
+        ),
+    )
+    assert list(iter_mock_jq_expressions(mocks)) == []
+
+
+def test_iter_grpc_block_comes_after_http_and_kafka():
+    """Order is HTTP stubs -> Kafka reactors -> gRPC stubs (gRPC is the third
+    block). Within gRPC, dict insertion order is preserved."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "h": HttpStub(
+                    method="POST",
+                    path="/x",
+                    match=HttpMatch(jq=".h"),
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+        kafka=KafkaMockConfig(
+            reactors={
+                "k": KafkaReactor(
+                    topic="t",
+                    match=".k",
+                    reaction=KafkaReaction(topic="o", value=1),
+                ),
+            },
+        ),
+        grpc=GrpcMockConfig(
+            stubs={
+                "g1": GrpcStub(
+                    service="pkg.Svc",
+                    method="A",
+                    match=GrpcMatch(jq=".g1"),
+                    response=GrpcResponse(message={}),
+                ),
+                "g2": GrpcStub(
+                    service="pkg.Svc",
+                    method="B",
+                    match=GrpcMatch(jq=".g2"),
+                    response=GrpcResponse(message={}),
+                ),
+            },
+        ),
+    )
+    assert list(iter_mock_jq_expressions(mocks)) == [
+        ("mocks.http.stubs.h.match.jq", ".h"),
+        ("mocks.kafka.reactors.k.match", ".k"),
+        ("mocks.grpc.stubs.g1.match.jq", ".g1"),
+        ("mocks.grpc.stubs.g2.match.jq", ".g2"),
+    ]
+
+
+def test_collect_grpc_malformed_match_jq():
+    """collect_jq_compile_errors on a grpc stub with malformed match.jq
+    ('.msg ==') -> one error whose ``path`` is the grpc stub's jq label."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    match=GrpcMatch(jq=".msg =="),
+                    response=GrpcResponse(message={}),
+                ),
+            },
+        ),
+    )
+    errors = collect_jq_compile_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.grpc.stubs.s.match.jq"
+    assert "invalid jq expression" in errors[0]["message"]
+    assert set(errors[0].keys()) == {"path", "message"}
+
+
+def test_collect_grpc_malformed_capture_from_under_capture_label():
+    """A malformed grpc capture ``from`` surfaces under the capture label, not
+    the match.jq label (same behaviour as HTTP/Kafka)."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    match=GrpcMatch(jq=".a"),
+                    capture={"id": CaptureSpec(from_=".msg[")},
+                    response=GrpcResponse(message={}),
+                ),
+            },
+        ),
+    )
+    errors = collect_jq_compile_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.grpc.stubs.s.capture.id.from"
+
+
+def test_collect_grpc_valid_returns_empty():
+    """A grpc config whose match.jq and capture ``from`` both compile -> []."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    match=GrpcMatch(jq='.msg == "hi"'),
+                    capture={"id": CaptureSpec(from_=".msg.id")},
+                    response=GrpcResponse(message={}),
                 ),
             },
         ),
