@@ -81,8 +81,8 @@ def build_envelope(
       request-stream close.
 
     Exactly one of ``message`` / ``messages`` should be supplied; if both are
-    passed, ``message`` wins (the client_stream shape is opted into explicitly
-    by passing ``messages=...`` and leaving ``message`` unset, which is how
+    passed, ``messages`` wins — opt into the client_stream shape explicitly
+    by passing ``messages=...`` and leaving ``message`` unset (which is how
     Task 6/7 will call this).
     """
     lowered = {k.lower(): v for k, v in metadata.items()}

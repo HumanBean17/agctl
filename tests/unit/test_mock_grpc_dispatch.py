@@ -560,17 +560,44 @@ class TestGrpcDispatchOutcomeShape:
 
 
 def test_grpc_server_module_does_not_import_grpc():
-    """The dispatch module must NOT import grpc/grpcio at module top —
-    the dispatcher is unit-testable without the gRPC extra. Task 6/7 will add
-    a MockGrpcServer that imports grpc lazily INSIDE its methods."""
+    """The dispatch module must NOT import grpc/grpcio/google.protobuf at
+    MODULE TOP — the dispatcher is unit-testable without the gRPC extra.
+    Task 6/7 will add a MockGrpcServer that imports grpc lazily INSIDE its
+    methods, so this test AST-parses the source and inspects ONLY top-level
+    body nodes: a banned import nested inside a function/method/class body
+    must NOT fail this test (that is the contract).
+    """
+    import ast
+
     import agctl.mock.grpc_server as mod
 
-    src = open(mod.__file__).read()
-    # Crude but load-bearing: any module-top ``import grpc``/``from grpc``/
-    # ``import grpcio`` would break the unit-testable-without-grpcio contract.
-    for forbidden in ("import grpc", "from grpc", "import grpcio"):
-        assert forbidden not in src, (
-            f"agctl/mock/grpc_server.py must remain grpcio-free at module "
-            f"top (found {forbidden!r}); Task 6/7 imports grpc lazily inside "
-            f"MockGrpcServer methods."
-        )
+    # ``google``/``google.protobuf`` are banned at module top alongside the
+    # grpc transports: any of them at module top would pull grpcio into the
+    # dispatch brain's import graph and break unit-testability.
+    banned = ("grpc", "grpcio", "grpc_tools", "google", "google.protobuf")
+
+    def _is_banned(dotted: str) -> bool:
+        # ``grpc`` bans ``grpc`` and ``grpc.anything``; same for the others.
+        return any(dotted == b or dotted.startswith(b + ".") for b in banned)
+
+    tree = ast.parse(open(mod.__file__).read())
+    # Inspect ONLY ``tree.body`` (module-level statements). Nodes nested
+    # inside ``def``/``class``/etc. are intentionally ignored — lazy imports
+    # are the contract this test guards.
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not _is_banned(alias.name), (
+                    f"agctl/mock/grpc_server.py has a module-top "
+                    f"`import {alias.name}` — must remain grpcio-free at "
+                    f"module top; Task 6/7 imports grpc lazily inside "
+                    f"MockGrpcServer methods."
+                )
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and _is_banned(node.module):
+                raise AssertionError(
+                    f"agctl/mock/grpc_server.py has a module-top "
+                    f"`from {node.module} import ...` — must remain "
+                    f"grpcio-free at module top; Task 6/7 imports grpc "
+                    f"lazily inside MockGrpcServer methods."
+                )
