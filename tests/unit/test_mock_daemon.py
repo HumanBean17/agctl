@@ -399,10 +399,15 @@ class TestResolveTarget:
         assert result[0].grpc_listen == "127.0.0.1:50051"
 
     def test_resolve_target_listen_matches_http_listen(self, tmp_path):
-        """--listen matches a RunningMock by its http_listen field."""
+        """--listen matches a RunningMock by its http_listen field.
+
+        Legacy ``listen`` is set to a DIFFERENT address than the lookup (and
+        grpc_listen to yet another), so the match can only succeed through
+        ``http_listen`` — isolating that branch of the membership check.
+        """
         data = {
             "pid": os.getpid(),
-            "listen": "127.0.0.1:18080",
+            "listen": "127.0.0.1:19090",
             "port": 18080,
             "log_path": "/path/to/log.log",
             "config_path": "/path/to/config.yaml",
@@ -413,12 +418,13 @@ class TestResolveTarget:
         }
         write_pidfile(pidfile_path(tmp_path, 18080), data)
 
-        # Match by http_listen explicitly
+        # Match by http_listen explicitly — legacy listen and grpc_listen differ.
         result = resolve_target(
             tmp_path, listen="127.0.0.1:18080", pid=None, all_=False
         )
         assert len(result) == 1
         assert result[0].port == 18080
+        assert result[0].http_listen == "127.0.0.1:18080"
 
 
 class TestTaxonomyConstants:
