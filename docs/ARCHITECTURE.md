@@ -1,7 +1,7 @@
 # `agctl` — Architecture Document
 
 **Status:** Source-of-truth (as-built).
-**Last updated:** 2026-07-10
+**Last updated:** 2026-07-17
 
 > `ARCHITECTURE.md` is the **source of truth for how the system works today** —
 > the as-built runtime, module boundaries, data flows, and extension model. Its
@@ -125,15 +125,16 @@ agctl/
 │   ├── discover_commands.py    # discover summary / category / item / search
 │   ├── grpc_commands.py        # grpc call / healthcheck
 │   └── mock_commands.py        # mock run / start / stop / status (HTTP mock + Kafka reactors)
-├── mock/                       # mock server implementation (HTTP + Kafka)
+├── mock/                       # mock server implementation (HTTP + Kafka + gRPC)
 │   ├── routing.py              # path-template matching (pure functions)
 │   ├── http_server.py          # stdlib ThreadingHTTPServer + handler
 │   ├── kafka_reactor.py        # Kafka consumer loop + jq match + reaction
-│   ├── jq_precompile.py        # walks mocks → (label, expr) pairs; compile-only validate
+│   ├── grpc_server.py          # MockGrpcServer: grpc.Server + generic servicer dispatching `/<svc>/<mtd>` via the descriptor pool; pure dispatch core (build_envelope, dispatch_grpc, GrpcDispatchOutcome) reused from here; Health + Reflection registered on the same server; lifecycle start/serve_forever/shutdown/actual_listen
+│   ├── jq_precompile.py        # walks mocks (http/kafka/grpc) → (label, expr) pairs; compile-only validate
 │   ├── capture.py              # envelope capture resolver: jq_value(envelope, from) → typed CaptureValue
-│   ├── capture_validate.py     # walks mocks → object-capture placement errors; pure Python (no jq)
-│   ├── daemon.py               # mock-specific daemon layer: port-keyed pidfile/log paths, RunningMock, target resolution, NDJSON log parser, failure taxonomy (generic primitives live in agctl/daemon.py)
-│   └── engine.py               # MockEngine lifecycle (start/run/shutdown; Step 0 pre-compiles jq)
+│   ├── capture_validate.py     # walks mocks (http/kafka/grpc response.message/messages) → object-capture placement errors; pure Python (no jq)
+│   ├── daemon.py               # mock-specific daemon layer: port-keyed pidfile/log paths (mock-<port>|mock-kafka|mock-grpc-<port>), RunningMock (http_listen/grpc_listen), resolve_target (matches --listen against any of listen/http_listen/grpc_listen), NDJSON log parser, failure taxonomy incl. grpc.unmatched/grpc.error (generic primitives live in agctl/daemon.py)
+│   └── engine.py               # MockEngine lifecycle (start/run/shutdown; Step 0 pre-compiles jq; Step 2b constructs+binds the gRPC server via grpc_server_factory seam)
 ├── listen/                     # kafka listen capture daemon (long-lived, capture-to-disk)
 │   ├── daemon.py               # run_id keying, state paths, RunningListener, meta/asserts.jsonl helpers, events.log parser
 │   ├── capture_file.py         # per-topic capture reader (filter/count/first/paginate) + build_predicate
@@ -148,7 +149,8 @@ agctl/
     ├── db_client.py            # driver dispatch via agctl.db_drivers entry points
     ├── db_driver_protocol.py   # DBDriver Protocol
     ├── db_drivers/postgresql.py  # built-in psycopg driver (lazy import)
-    ├── grpc_client.py          # grpcio wrapper (lazy import)
+    ├── grpc_client.py          # grpcio wrapper (lazy import); reflection-resolution + JSON↔protobuf via the shared kernel
+    ├── grpc_descriptors.py     # shared gRPC proto kernel: build_descriptor_pool, find_method, call_type_of, message_class, serialize, deserialize (grpcio-free at module top; lazy imports)
     ├── log_client.py           # log backend dispatch via agctl.logs_backends entry points
     ├── log_backend_protocol.py # LogBackend Protocol + CanonicalEntry DTOs
     └── log_backends/ndjson_file.py  # built-in NDJSON file backend (lazy import)
@@ -156,7 +158,7 @@ agctl/
 
 > DESIGN §7's structure sketch predates several modules; §14 lists the deltas.
 
-> **Module location note (mock):** The Pydantic models for `mocks` (`MocksConfig`, `HttpMockConfig`, `KafkaMockConfig`, etc.) live in `config/models.py` alongside every other section model — *not* in `agctl/mock/`. This preserves config's dependency isolation (`config/* → {errors}` only) and keeps the one-place convention. The `mock/` subpackage holds only runtime engine/server/reactor code.
+> **Module location note (mock):** The Pydantic models for `mocks` (`MocksConfig`, `HttpMockConfig`, `KafkaMockConfig`, `GrpcMockConfig`/`GrpcStub`/`GrpcMatch`/`GrpcResponse`/`GrpcResponseMessage`, etc.) live in `config/models.py` alongside every other section model — *not* in `agctl/mock/`. This preserves config's dependency isolation (`config/* → {errors}` only) and keeps the one-place convention. The `mock/` subpackage holds only runtime engine/server/reactor code.
 
 **Dependency direction (inward-only, no cycles):** `cli → commands → {config,
 clients, resolution, assertions, params, errors, command, output}`; `clients →
@@ -227,6 +229,52 @@ Trace of `agctl grpc call --target echo-server --service echo.EchoService --meth
 
 **Server-streaming/bidi routing** — for `server_stream`/`bidi` call types, the
 command bypasses `@envelope` and emits NDJSON directly (§6, streaming exceptions).
+
+Trace of an inbound unary RPC hitting a gRPC mock stub (the SUT calls
+`echo.EchoService/Unary` against `mocks.grpc.listen`):
+
+1. **grpc.Server dispatch** — `MockGrpcServer._build_server` registered one
+   `method_handlers_generic_handler` per service at construction, with the
+   right `RpcMethodHandler` shape (unary_unary/unary_stream/stream_unary/
+   stream_stream) per `(service, method)` keyed from `method_meta`. grpcio
+   dispatches `/echo.EchoService/Unary` to the matching handler, deserializing
+   the request bytes via the kernel's `deserialize(input_desc)`.
+2. **Behavior callable** (`_make_behavior("unary")`) closes over the dispatch
+   glue. `_handle_unary` reads `context.invocation_metadata()` (lowercased
+   into a dict by `_metadata_to_dict`) and builds the §8.1 envelope via
+   `build_envelope(service, method, metadata, message=<deserialized dict>)`.
+3. **Dispatch** (`dispatch_grpc`) — first-match-wins over
+   `stubs_by_method[(svc, mtd)]` (insertion-ordered dict-of-dicts). Each
+   candidate is filtered by `_match_body` (`json_subset` over the request
+   `message`, skipped for `client_stream`) AND `_match_jq` (`jq_bool` over
+   the envelope). The first match → `resolve_captures` + `render_typed` (the
+   exact HTTP/Kafka capture/render pipeline reuses `mock/capture.py` and
+   `resolution.render_typed`). No match → `GrpcDispatchOutcome(matched=False)`
+   and the behavior aborts with `UNIMPLEMENTED` after emitting `grpc.unmatched`
+   (a fatal event).
+4. **Status resolution** — `outcome.status` is `(code, name)` from
+   `parse_grpc_status(response.status)` (the public helper in
+   `assertions.py`, single source of truth for name/code coercion). A non-OK
+   status makes the behavior `context.abort(code, name)` after emitting the
+   `grpc.hit` line; an OK status returns the rendered message dict, which the
+   response serializer (kernel `serialize(output_desc)`) encodes to bytes.
+5. **Emission** — `emit_event` is the engine's single-writer sink
+   (`threading.Lock`); `grpc.hit` increments `_grpc_hits`, `grpc.unmatched` /
+   `grpc.error` increment their counters AND set `_runtime_error` (so the run
+   exits `1` at shutdown). `capture.missing` is emitted by the same
+   `emit_capture_missing` helper HTTP/Kafka use.
+6. **Server lifecycle** — `MockEngine.start` Step 2b constructs the server via
+   the `grpc_server_factory` seam (production lazy-imports `MockGrpcServer`
+   inside the closure; tests inject a fake) and binds via `add_insecure_port`
+   (EADDRINUSE → `ConfigError`). `serve_forever(stop_event)` blocks on a
+   dedicated engine thread; `shutdown()` calls `server.stop(grace=2)`.
+
+The other three call types share the dispatch core: `server_stream` reuses
+the unary envelope and emits N `grpc.hit`s (one per `response.messages`
+entry); `client_stream` aggregates the request stream into a `{messages,
+count}` envelope at close (matched once, `match.body` skipped); `bidi` is
+request/response pairing (one envelope per incoming request, one rendered
+response per match, no stateful conversation).
 
 **Failure paths** all funnel through `@envelope`:
 
@@ -403,9 +451,9 @@ results as they happen, so it violates "one object per invocation":
 **The second streaming exception — `mock run`.** Like `http ping`, the mock server must stream events as they happen:
 
 - Not wrapped by `@envelope`.
-- Emits one JSON object **per event** (`started`, `http.hit`, `http.unmatched`, `http.body_parse_skipped`, `capture.missing`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, `summary`) directly as they occur.
-- All emission goes through a single-writer path (`threading.Lock` in `MockEngine.emit_event` or a dedicated writer thread) — concurrent HTTP handler threads and Kafka reactor threads emit safely without interleaved lines.
-- Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary, http_hits, http_unmatched, http_body_parse_skipped, kafka_reactions, kafka_skipped, kafka_errors, duration_ms}` and exits `0` (clean, no runtime errors) or `1` (runtime errors occurred, or `--fail-fast` triggered).
+- Emits one JSON object **per event** (`started`, `http.hit`, `http.unmatched`, `http.body_parse_skipped`, `capture.missing`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, `grpc.hit`, `grpc.unmatched`, `grpc.error`, `summary`) directly as they occur. The three engines share one event stream and one `started`/`summary` line; engines not running report `null` in `started` and zero counters in `summary`.
+- All emission goes through a single-writer path (`threading.Lock` in `MockEngine.emit_event`) — concurrent HTTP handler threads, Kafka reactor threads, and gRPC per-RPC handler threads (served by the gRPC server's own `ThreadPoolExecutor(max_workers=concurrency_cap)`) emit safely without interleaved lines.
+- Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary, http_hits, http_unmatched, http_body_parse_skipped, kafka_reactions, kafka_skipped, kafka_errors, grpc_hits, grpc_unmatched, grpc_errors, duration_ms}` and exits `0` (clean, no runtime errors) or `1` (runtime errors occurred — any `kafka.error`, `grpc.unmatched`, `grpc.error`, or `--fail-fast` triggered).
 - Startup errors emit a single structured envelope **before** any event line.
 
 **The third streaming exception — `logs tail`.** Like `http ping`, the log tail command must stream entries as they appear:
@@ -482,11 +530,19 @@ assertion mode on `db`/`kafka assert` (`ConfigError` before any network call),
 `http request` (`ConfigError` before the request is sent, via
 `validate_http_assertion_args` — gating pre-request so a bad invocation never
 triggers a wasted side-effect),
-a malformed `match.jq`/reactor `match` in `mock run` (`ConfigError` at engine
-startup before probe/bind — `MockEngine.start()` Step 0 walks mocks via
-`iter_mock_jq_expressions` and `compile_jq`s each expression; a body-only
-config imports nothing), and a match-miss in `kafka assert` / `db assert` /
-`http call` / `http request` (`AssertionFailure`, exit 1).
+a malformed `match.jq`/reactor `match`/gRPC stub `match.jq` in `mock run`
+(`ConfigError` at engine startup before probe/bind — `MockEngine.start()`
+Step 0 walks mocks via `iter_mock_jq_expressions` and `compile_jq`s each
+expression; the walker now covers `mocks.grpc.stubs` alongside HTTP/Kafka;
+a body-only config imports nothing), an unresolved gRPC `service`/`method`,
+response-shape-vs-call-type mismatch, invalid `response.status`, or missing
+descriptor files at `MockGrpcServer` construction (`ConfigError` at
+`mocks.grpc.stubs.<name>.<field>`), and a match-miss in `kafka assert` /
+`db assert` / `http call` / `http request` (`AssertionFailure`, exit 1).
+At runtime, `grpc.unmatched` (no stub matches `service/method`) and
+`grpc.error` (handler failure) are fatal — both set the runtime-error flag
+so `mock run` exits `1` at shutdown and `mock stop` raises `AssertionFailure`
+(they are in `FATAL_FAILURE_EVENTS` alongside `http.unmatched`/`kafka.error`).
 
 **`db execute` write-safety failures** — the command rejects writes at multiple
 gates, each surfacing as `ConfigError` (exit 2): missing `--write` flag, omitted
@@ -671,6 +727,22 @@ JSON↔protobuf translation, and four call types. Lazy-import pattern: importing
 `agctl.clients.grpc_client` never requires `grpcio`; the constructor imports
 on-demand and raises `ConfigError` pointing at `pip install 'agctl[grpc]'`.
 
+**Shared proto kernel** (`clients/grpc_descriptors.py`) — descriptor
+resolution, JSON↔protobuf translation, and call-type derivation live in a
+standalone module so the gRPC client and the gRPC mock server agree on how
+service/method descriptors are resolved and how protobuf messages are
+(de)serialized. Public surface: `build_descriptor_pool(sources,
+context_label=)`, `find_method(pool, service, method)`, `call_type_of(method_desc)`,
+`message_class(message_desc)`, `serialize(message_desc)`, `deserialize(message_desc)`,
+plus `add_file_protos_order_tolerant` (multi-pass add that defers a file whose
+import is not yet loaded — protoc's FileDescriptorSet order is not
+dependency-first). The kernel is **pure Python with no `grpc` import at module
+top**; every `google.protobuf.*` / `grpc_tools.protoc` import lives inside the
+function that needs it via `_require(module_name)`, which raises `ConfigError`
+pointing at `pip install 'agctl[grpc]'` on a missing library. `GrpcClient`
+keeps its reflection-resolution path (it talks to a live server) and delegates
+descriptor-pool building, JSON↔protobuf, and call-type derivation to the kernel.
+
 **Descriptor resolution** (reflection-first, descriptor fallback):
 
 - **Path 1: Injected pool** — test seam; return directly.
@@ -680,14 +752,15 @@ on-demand and raises `ConfigError` pointing at `pip install 'agctl[grpc]'`.
   controlled per-target: `"auto"` (try reflection, fall back to descriptors),
   `"on"` (require reflection, error if UNIMPLEMENTED), `"off"` (skip reflection).
 - **Path 3: Descriptor fallback** — load proto files (compile via `grpc_tools.protoc`)
-  or precompiled `.pb` descriptor sets into a `DescriptorPool`.
+  or precompiled `.pb` descriptor sets into a `DescriptorPool` (kernel
+  `build_descriptor_pool`).
 
-**JSON↔protobuf translation** — `MessageToJson` / `ParseFromJson` via
-`json_format.ParseDict` and `json_format.MessageToDict`. Request serialization
+**JSON↔protobuf translation** — kernel `serialize`/`deserialize` wrap
+`json_format.ParseDict` / `json_format.MessageToDict`. Request serialization
 fails with `ConfigError` on unknown fields (`ignore_unknown_fields=False`);
 response deserialization skips unknown fields.
 
-**Call types** — `call_type_of(method_desc)` returns one of four strings:
+**Call types** — kernel `call_type_of(method_desc)` returns one of four strings:
 
 - `"unary"` — `unary_unary` → single request, single response.
 - `"client_stream"` — `stream_unary` → request iterator, single response.
@@ -700,7 +773,10 @@ returned as `GrpcUnaryResult` with `status` (code/name/message) and `message=Non
 the envelope remains `ok:true`. Assertion flags (`--status`, `--contains`,
 `--match`, `--jq-path`, `--equals`) are evaluated separately via
 `evaluate_grpc_assertions` (reusing `jq_bool`/`json_subset`/`jq_value`/`parse_equals`
-primitives) and raise `AssertionFailure` on mismatch.
+primitives) and raise `AssertionFailure` on mismatch. Name/code resolution
+everywhere routes through the public `parse_grpc_status(status)` helper in
+`assertions.py` — single source of truth for the gRPC status enum (case-sensitive
+name lookup, digit-string→int coercion, 0–16 range; no `grpc` import).
 
 **Exception mapping:** `RpcError.DEADLINE_EXCEEDED` → `OperationTimeout`;
 other `RpcError` → status-in-result (connection succeeded, call failed); bare
@@ -711,8 +787,73 @@ Returns `GrpcHealthResult` with `status` enum name (`SERVING`/`NOT_SERVING`/`UNK
 and optional `note`. `UNIMPLEMENTED` status returns `UNKNOWN` (not an error).
 
 **Lazy-grpcio rule** — grpcio, grpcio-tools, grpcio-health-checking,
-grpcio-reflection, and protobuf are imported only when `GrpcClient` is constructed;
-missing library surfaces as `ConfigError` (exit 2) pointing at the `grpc` extra.
+grpcio-reflection, and protobuf are imported only when `GrpcClient` is constructed
+(or, for the mock server, inside `MockGrpcServer` methods); missing library
+surfaces as `ConfigError` (exit 2) pointing at the `grpc` extra.
+
+### MockGrpcServer (`mock/grpc_server.py`)
+
+Validated, lazily-bound gRPC mock server. Same descriptor-driven model as the
+gRPC client, but inverted: it *serves* stub responses for `/<service>/<method>`
+instead of calling them. Two layers live in one module:
+
+- **Pure dispatch core (grpcio-free at module top):** `build_envelope(service,
+  method, metadata, *, message=, messages=)` builds the per-call-type match
+  envelope (`{service, method, metadata (lowercased), message}` for unary /
+  server_stream / bidi; `{service, method, metadata, messages:[…], count}` for
+  client_stream, built at stream close). `dispatch_grpc(stubs, envelope,
+  call_type, emit_capture_missing=)` does first-match-wins over the
+  insertion-ordered `dict[str, GrpcStub]` (config key → stub), running
+  `_match_body` (`json_subset`, skipped for client_stream) AND `_match_jq`
+  (`jq_bool` over the envelope), then `resolve_captures` + `render_typed` (the
+  exact HTTP/Kafka pipeline reuses `mock/capture.py` and `resolution.render_typed`).
+  `GrpcDispatchOutcome` carries `matched`, `stub_name`, `messages` (rendered),
+  `status` (`(code, name)` from `parse_grpc_status`), and capture-missing
+  emissions. The dispatch core is importable and unit-testable without the
+  grpcio extra (the `tests/unit/test_mock_grpc_dispatch.py` AST test pins this).
+- **`MockGrpcServer` (lifecycle + grpc.Server):** construction resolves the
+  `DescriptorPool` ONCE (via the kernel or an injected pool — the test seam),
+  validates every stub's `(service, method)` against the pool (unknown →
+  `ConfigError` at `mocks.grpc.stubs.<name>`), validates response-shape-vs-call-type
+  (`server_stream` requires `response.messages`; others require `response.message`),
+  and precomputes `stubs_by_method` (dict-of-dicts keyed by `(service, method)`)
+  and `method_meta` (parallel `{(service, method): (input_desc, output_desc,
+  call_type)}`). Construction does NOT bind a port. `_build_server` (lazy
+  `import grpc` inside the method) registers one `method_handlers_generic_handler`
+  per service with the right `RpcMethodHandler` shape, each wired with the
+  kernel's `serialize`/`deserialize` for that method's input/output descriptors
+  and a per-call-type `_handle_*` behavior. Health (`grpc_health.v1.health`,
+  every configured service + the overall `""` key set to `SERVING`) and
+  Reflection (`grpc_reflection.v1alpha.reflection`, passing the resolved pool
+  so reflection answers symbol lookups against the fresh — not Default —
+  `DescriptorPool`) are auto-served when `health`/`reflection` are `true`.
+  `start()` calls `add_insecure_port` (EADDRINUSE → `ConfigError`),
+  `serve_forever(stop_event)` polls `wait_for_termination(timeout=0.2)` until
+  the engine's stop event fires, `shutdown()` calls `server.stop(grace=2)`.
+  `actual_listen()` reports the post-bind address (an ephemeral `:0` request
+  surfaces the actually-assigned port, mirroring HTTP bound-address reporting).
+
+**Engine wiring** — `MockEngine` gained a third engine: `run_grpc`, `grpc_listen`,
+`grpc_server_factory` (keyword-only, defaulted → backward-compat), and
+`top_level_descriptors` (the command layer threads `Config.grpc.descriptors`
+through so the server can fall back to it when `mocks.grpc.descriptors` is
+`None`). Step 2b constructs + binds the server after the HTTP bind so a grpc
+failure tears down the bound HTTP server via the outer try → `shutdown()`. The
+default factory lazy-imports `MockGrpcServer` inside the closure body so the
+engine module stays grpcio-free at import time. `started` gains a `grpc`
+block (`{listen, stubs, services, reflection, health}`); `summary` gains
+`grpc_hits`/`grpc_unmatched`/`grpc_errors`. `grpc.unmatched` and `grpc.error`
+set the runtime-error flag (fatal: the run exits `1` at shutdown).
+
+**Daemon taxonomy** (`mock/daemon.py`) — `pidfile_path`/`log_path` gained a
+keyword-only `engine=None` arg: `"grpc"` keys a gRPC-only daemon under
+`mock-grpc-<port>.{pid,log}` so it does not collide with an HTTP daemon on a
+different port. `RunningMock` gained `http_listen` and `grpc_listen` fields
+(recorded in the pidfile so a multi-engine daemon is addressable by any of its
+listen addresses). `resolve_target` matches `--listen` against any of
+`listen` / `http_listen` / `grpc_listen`. `EVENT_TO_COUNTER` and
+`FATAL_FAILURE_EVENTS` gained `grpc.hit`/`grpc.unmatched`/`grpc.error` (the
+last two are fatal at `mock stop`).
 
 ---
 
@@ -885,10 +1026,14 @@ and **skipped** — it never bricks the CLI, the registry, or driver discovery.
   cached. See §9.
 
 > **In-tree gRPC support:** The `grpc` command group is implemented in-tree
-> (`commands/grpc_commands.py` and `clients/grpc_client.py`) and does **not**
-> use the `agctl.plugins` entry point. Unlike protocol plugins (which add new
+> (`commands/grpc_commands.py`, `clients/grpc_client.py`, and the shared
+> `clients/grpc_descriptors.py` kernel) and does **not** use the
+> `agctl.plugins` entry point. Unlike protocol plugins (which add new
 > top-level groups via entry points), gRPC is a core transport and lives
-> alongside HTTP/Kafka/DB in the main module tree. The `grpc` extra
+> alongside HTTP/Kafka/DB in the main module tree. The gRPC mock server
+> (`mock/grpc_server.py`) is the third mock engine alongside HTTP and Kafka;
+> it shares the same descriptor/JSON↔protobuf kernel as the client so the two
+> paths agree on service/method resolution. The `grpc` extra
 > (`grpcio`, `grpcio-tools`, `grpcio-health-checking`, `grpcio-reflection`,
 > `protobuf`, `jq`) follows the same lazy-import pattern.
 
@@ -908,18 +1053,21 @@ extras, so a user installs only what they need and the package imports fast:
 | `kafka` | `confluent-kafka`, `jq` | `kafka *` |
 | `db` | `psycopg[binary]`, `jq` | `db *` |
 | `logs` | `jq` | `logs *` (`--match` on logs query/assert/tail) |
-| `grpc` | `grpcio`, `grpcio-tools`, `grpcio-health-checking`, `grpcio-reflection`, `protobuf`, `jq` | `grpc *` |
+| `grpc` | `grpcio`, `grpcio-tools`, `grpcio-health-checking`, `grpcio-reflection`, `protobuf`, `jq` | `grpc *`, `mock run --only grpc` / `mocks.grpc` engine |
 | `dev` | `pytest` | unit tests |
 | `integration` | `testcontainers`, `agctl[db,kafka,http,grpc]`, `pytest` | live integration tests |
 
 `jq` is bundled under `kafka`/`db`/`logs` (which always needed it) **and** exposed as a
 dedicated `jq` extra for HTTP-only users (response assertions) and HTTP-only-mock
 users (`match.jq`) — `pip install 'agctl[jq]'`. A mock with no `match.jq` and no
-reactor `match` imports nothing, preserving the zero-dep HTTP-only mock. At
-runtime the lazy-import convention (§8) keeps the error category correct: a
-missing library → `ConfigError` (exit 2) pointing at the right extra
-(`agctl[jq]` for http/mock, `agctl[logs]` for logs commands with `--match`),
-not an opaque `ModuleNotFoundError`.
+reactor `match` imports nothing, preserving the zero-dep HTTP-only mock. The
+gRPC mock needs the `grpc` extra regardless of whether `match.jq` is set
+(descriptor-driven encoding requires `grpcio`/`protobuf`); HTTP-only and Kafka-only
+mocks import no server-side gRPC code. At runtime the lazy-import convention (§8)
+keeps the error category correct: a missing library → `ConfigError` (exit 2)
+pointing at the right extra (`agctl[jq]` for http/mock, `agctl[grpc]` for the
+gRPC mock and `grpc *`, `agctl[logs]` for logs commands with `--match`), not an
+opaque `ModuleNotFoundError`.
 
 **Build & entry points:** hatchling backend, wheel target `agctl`; console
 scripts `agctl`/`agt` → `agctl.cli:cli`; entry-point groups `agctl.db_drivers`
@@ -949,14 +1097,27 @@ purpose:
   `stop_event`.
 - `mock_commands.new_mock_engine` — inject a fake `MockEngine`.
 - `KafkaClient.consume_loop` / `probe` — `consumer_factory` injects fakes.
-- `MockEngine` — `emit_fn` injects a fake writer; `run_id` is configurable.
+- `MockEngine` — `emit_fn` injects a fake writer; `run_id` is configurable;
+  `grpc_server_factory` injects a fake gRPC server (so the engine test suite
+  covers `run_grpc` lifecycle without grpcio installed).
+- `MockGrpcServer` — `descriptor_pool` constructor arg injects a prebuilt pool
+  (skips the slow protoc compile and isolates construction from the kernel's
+  source-resolution paths). The pure dispatch core
+  (`build_envelope`/`dispatch_grpc`/`GrpcDispatchOutcome`) is tested directly
+  without grpcio; an AST-parse test pins "no `import grpc` at module top" so
+  the dispatch brain stays grpcio-free.
+- `clients/grpc_descriptors.py` — pure functions over `DescriptorPool`; unit
+  tests cover `build_descriptor_pool`/`find_method`/`call_type_of`/
+  `serialize`/`deserialize` in isolation.
 - `mock/routing.py` — pure functions, tested directly.
 - `sys.setswitchinterval` single-writer test technique — forces thread switching to verify NDJSON emission doesn't interleave (tests the `threading.Lock` in `MockEngine.emit_event`).
 - `cli._entry_points` and `assertion_registry._entry_points` are
   monkeypatchable.
 
 Because clients lazy-import their libs, unit tests run **without** `httpx`,
-`confluent_kafka`, or `psycopg` installed.
+`confluent_kafka`, or `psycopg` installed; the gRPC mock dispatch suite runs
+without `grpcio` installed (only the integration test that actually serves a
+real `grpc.Server` needs the `grpc` extra).
 
 **Integration tests** are **self-skipping** — they never fail because a service
 is absent; they `pytest.skip()`. The machinery (`tests/integration/conftest.py`):
@@ -989,6 +1150,7 @@ Run: `pytest tests/unit`; live: `AGCTL_TEST_LIVE=1 pytest tests/integration`.
 **New mock-specific integration tests:**
 
 - `tests/integration/test_mock_commands.py` — tests `mock run` end-to-end with real HTTP server and Kafka reactors (self-skips under `AGCTL_TEST_LIVE=1`).
+- `tests/integration/test_mock_grpc.py` — exercises the gRPC mock end-to-end across all four call types (unary, server-stream, client-stream, bidi) plus Health and Reflection against a real `grpc.Server`. Self-skips when the `grpc` extra is absent.
 - `FakeKafkaClient` / `consumer_factory` seams for unit tests (avoid real broker).
 
 ---
@@ -1032,13 +1194,14 @@ divergence is introduced.
 
 | Area | Resolution |
 |---|---|
-| **Mocking non-goal reversed** | DESIGN §1 stated "No built-in mock server." The `agctl mock` command (HTTP stub server + Kafka reactors) reverses this non-goal — local testing is now self-contained. DESIGN §1 and §3.5 document the new command. ||
+| **Mocking non-goal reversed** | DESIGN §1 stated "No built-in mock server." The `agctl mock` command (HTTP stub server + Kafka reactors + gRPC mock server) reverses this non-goal — local testing is now self-contained. DESIGN §1 and §3.6 document the command; the gRPC engine is the third alongside HTTP and Kafka. ||
 | Dependencies | DESIGN §7 updated to the optional-extras model (`http`/`kafka`/`db`/…). |
 | Project structure | DESIGN §7 tree updated to the real layout (incl. `config/models.py`, top-level `command.py`/`errors.py`/…, `clients/db_drivers/`). |
 | One-emit enforcement | DESIGN §8 documents the `@envelope` mechanism. |
 | Env-override matching | DESIGN §5/§8 document case-/hyphen-insensitive matching + the ≥2-segment rule. |
 | `commands/config_commands.py` | Extracted from `cli.py` — every command group now has its own module. |
 | Assertion base | Already consistent; DESIGN §9.3 clarifies that built-in modes are registered by name but implemented in the command layer. |
+| **gRPC proto kernel extraction** | `clients/grpc_descriptors.py` is the single source of truth for descriptor resolution + JSON↔protobuf shared by `GrpcClient` (caller path) and `MockGrpcServer` (server path). `assertions.parse_grpc_status` is the single source of truth for name/code coercion, reused by the client, the config model (`GrpcResponse.status` validation), the dispatch core, and the CLI flag pre-check. The module map (§3) records both; DESIGN does not mention the kernel (its altitude is the user-facing contract). |
 
 ---
 
@@ -1078,9 +1241,18 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
 **Mock server MVP limitations** (see DESIGN §10 "Known-wrong-result / Not Covered" for the full list with failure-mode analysis):
 
 - **Stateful flows** (OAuth/token exchange, create-then-GET, idempotency-key replay, pagination) — static engine returns same canned response → false green.
-- **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** — cannot intercept HTTPS → integration untested → false green.
-- **Cross-transport sagas** (Kafka trigger → HTTP callback) — no causal linkage → false green.
+- **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** — cannot intercept HTTPS → integration untested → false green. The gRPC mock (`mocks.grpc`) is plaintext-only v1 — TLS-pinned gRPC SUT clients cannot connect either.
+- **Cross-transport sagas** (Kafka trigger → HTTP callback) — no causal linkage → false green. gRPC stub → Kafka reaction (and vice versa) is deferred alongside this.
 - **Non-JSON Kafka values** (Avro/Protobuf/schema-registry) — emitted as `kafka.skipped` → false green.
-- **`match` is envelope-rooted under dialect `"2"`+ (was: payload-rooted under `"1"`; unchanged by the v3 named-cluster schema lift). The five `match` eval sites (HTTP stub `match.jq`, Kafka reactor `match`, `kafka.patterns[].match`, `kafka assert/consume --match`, `http call`/`request --match`) feed the whole envelope; `capture.*.from` shares the same root. `match.body` / `--contains` / `--path` / `--jq-path`+`--equals` / `--status` remain payload-rooted. A v1/v2 config is rejected by `_check_version`; rewrite with `agctl config migrate`.
+- **`match` is envelope-rooted under dialect `"2"`+ (was: payload-rooted under `"1"`; unchanged by the v3 named-cluster schema lift). The five `match` eval sites (HTTP stub `match.jq`, Kafka reactor `match`, `kafka.patterns[].match`, `kafka assert/consume --match`, `http call`/`request --match`) feed the whole envelope; `capture.*.from` shares the same root. The gRPC mock adds a sixth site (gRPC stub `match.jq`) that feeds the per-call-type envelope from §8.1 — same rooting rule, same `capture.from` root. `match.body` / `--contains` / `--path` / `--jq-path`+`--equals` / `--status` remain payload-rooted. A v1/v2 config is rejected by `_check_version`; rewrite with `agctl config migrate`.
 - **Containerized SUT topology** — operator must target `host.docker.internal` / host LAN IP and avoid SUT that swallows connection errors → false green.
 - **Shared broker + pinned `consumer_group` reused across runs/devs** — partition split or resume-past-messages → silently missing/old reactions → false green (mitigated by unique-per-run default).
+
+**gRPC mock MVP limitations** (v1 boundaries of the third mock engine):
+
+- **Plaintext only** — `mocks.grpc` serves over h2c; no TLS on the mock listener. TLS-pinned SUT clients cannot connect.
+- **Bidi is request/response pairing** — one rendered response per matched incoming request, no conversation state and no server-push.
+- **Client-stream aggregates at close** — the `messages:[…]` envelope is matched once at request-stream close; per-message responding is not modeled.
+- **No mid-stream abort** — server-stream stubs stream their authored `messages` to completion or a terminal `status`; `RSTSTREAM` mid-stream is not modeled.
+- **Descriptors required** — `mocks.grpc` needs `proto`/`descriptor_set` sources to resolve service/method and encode responses. Server reflection is *served* (when `reflection: true`) but cannot *bootstrap* the mock itself; a config that expects reflection-only bootstrapping fails loud at server construction (exit 2).
+- **gRPC `SO_REUSEPORT` port-collision blind spot** — grpcio enables `SO_REUSEPORT`, so two gRPC servers can silently bind the same port. The port-in-use guard fires only when a non-grpc process holds the port. Pick unique ports across runs to avoid the SUT silently reaching a stale mock.

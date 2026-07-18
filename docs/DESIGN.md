@@ -40,7 +40,7 @@
 - **Orchestrating multi-step scenarios as a first-class primitive.** An agent can chain commands in a shell script or inline code; `agctl` does not need a built-in scenario runner to be useful. This is deferred (see §10).
 - **Managing infrastructure lifecycle.** Starting, stopping, or provisioning services is out of scope.
 
-> **Mocking support:** `agctl` now includes a built-in mock server for HTTP and Kafka (see `agctl mock` in §3.3 and the `mocks:` config section in §2.1). This supersedes the earlier non-goal — local testing no longer requires external tools like WireMock or LocalStack for common HTTP stubbing and Kafka reaction patterns.
+> **Mocking support:** `agctl` now includes a built-in mock server for HTTP, Kafka, and gRPC (see `agctl mock` in §3.6 and the `mocks:` config section in §2.1). This supersedes the earlier non-goal — local testing no longer requires external tools like WireMock or LocalStack for common HTTP stubbing, Kafka reaction, and gRPC stubbing patterns.
 
 > **Long-saga / high-volume capture:** `agctl kafka listen` runs a long-lived Kafka capture daemon that seeks to the latest offset at `start` (positioned at the head BEFORE the runbook trigger fires), records every matching message to disk, and evaluates attached expectations with no wall-clock deadline (see §3.2). This closes the three false-negative surfaces a windowed `kafka assert` can hit on long sagas or high-volume topics: scan-window misses, volume-induced timeout truncation, and broker retention cleanup.
 
@@ -140,9 +140,11 @@ kafka:
       match: '.value.eventType == "PAYMENT_FAILED"'
 
 # ---------------------------------------------------------------------------
-# mocks — HTTP mock server and Kafka reactors (DESIGN §3.3).
+# mocks — HTTP mock server, Kafka reactors, and gRPC mock server (DESIGN §3.6).
 #   HTTP: agctl serves stubs; the SUT's HTTP client points at `listen`.
 #   Kafka: agctl joins as a consumer on the SUT's real broker and reacts.
+#   gRPC: agctl serves stubs for all four call types; the SUT's gRPC client
+#         points at `listen`. Auto-serves Health + Reflection.
 #   Supports ${ENV} interpolation at load, {placeholder} substitution at
 #   match/react time, and jq predicates on stubs (match.jq) and reactors.
 # ---------------------------------------------------------------------------
@@ -214,6 +216,56 @@ mocks:
             eventType: "ORDER_CREATED"
             orderId: "{orderId}"
             status: "PENDING"
+
+  # ---------------------------------------------------------------------------
+  # mocks.grpc — gRPC mock server (DESIGN §3.6). agctl serves stubs for all
+  # four call types (unary / server-streaming / client-streaming / bidi) via a
+  # descriptor-driven generic servicer; the SUT's gRPC client points at
+  # `listen`. Auto-serves grpc.health.v1.Health (SERVING) + server reflection.
+  # Supports ${ENV} interpolation at load, {placeholder} substitution at match
+  # time, and jq predicates on stubs (match.jq). Requires the `grpc` extra
+  # (`pip install 'agctl[grpc]'`); a missing extra → ConfigError (exit 2).
+  # Call type is DERIVED from the descriptor (not configured); response-shape
+  # vs call type is validated at server construction.
+  # ---------------------------------------------------------------------------
+  grpc:
+    listen: "${AGCTL_MOCK_GRPC_HOST:-0.0.0.0}:${AGCTL_MOCK_GRPC_PORT:-50051}"
+    # descriptors: optional list of GrpcDescriptorSource (proto / descriptor_set);
+    #              omit to fall back to top-level grpc.descriptors.
+    # descriptors:
+    #   - proto: "/path/to/echo.proto"
+    #     include_paths: ["/path/to/protos"]
+    #   - descriptor_set: "/path/to/echo.pb"
+    reflection: true                     # serve ServerReflection (default true)
+    health: true                         # serve grpc.health.v1.Health (default true)
+    concurrency_cap: 64                  # max in-flight RPCs (ThreadPoolExecutor)
+    stubs:
+      echo-unary:
+        description: "Mock the Echo unary RPC"
+        service: "echo.EchoService"      # fully-qualified
+        method: "Unary"
+        match:                           # optional; both sub-fields AND-ed; omit = always match
+          body: { "msg": "hello" }       # json_subset on the deserialized request message
+          # jq: '.message.msg == "hello"' # jq predicate on the per-call-type envelope
+          #                                 (unary/server_stream/bidi = {service, method, metadata
+          #                                 (lowercased), message}; client_stream = {service, method,
+          #                                 metadata, messages:[…], count} matched once at stream close).
+          #                                 `match.body` is skipped for client_stream.
+        # capture: same CaptureSpec shape as HTTP/Kafka stubs; `from` shares the `match.jq`
+        # root — the per-call-type gRPC envelope. `metadata` keys are lowercased.
+        # capture:
+        #   msg: { from: ".message.msg" }
+        response:
+          status: OK                     # gRPC status name OR numeric code; default OK
+          message: { msg: "{msg}" }      # single response message (unary / client-stream / bidi)
+          # messages:                     # server-streaming: ordered list; one gRPC message per entry
+          #   - message: { chunk: "a" }
+          #     delay_ms: 0
+          #   - message: { chunk: "b" }
+          #     delay_ms: 100
+          metadata:                       # optional; initial metadata (and trailers on terminal status)
+            x-mock: "true"
+        delay_ms: 0
 
 # ---------------------------------------------------------------------------
 # database — named connection profiles and SQL query templates.
@@ -1299,37 +1351,38 @@ agctl check ready --all
 
 ---
 
-### 3.6 `agctl mock` — Mock Server (HTTP & Kafka)
+### 3.6 `agctl mock` — Mock Server (HTTP, Kafka & gRPC)
 
 The `agctl mock` command group provides two ways to run mock servers: foreground streaming (`mock run`) and managed daemon lifecycle (`mock start`/`stop`/`status`). Both share the same engine and configuration; choose the mode that fits your testing workflow.
 
 #### `agctl mock run`
 
-Run an HTTP mock server and/or Kafka reactors, streaming NDJSON events to stdout. The mock is SUT-facing: the real application's HTTP client points at the mock's `listen` address, and Kafka reactors join the SUT's real broker as consumers. The command blocks until stopped (foreground process, designed for backgrounding via `&` like `http ping`).
+Run an HTTP mock server and/or Kafka reactors and/or a gRPC mock server, streaming NDJSON events to stdout. The mock is SUT-facing: the real application's HTTP client points at the mock's `http listen`, the gRPC client points at the mock's `grpc listen`, and Kafka reactors join the SUT's real broker as consumers. The command blocks until stopped (foreground process, designed for backgrounding via `&` like `http ping`).
 
 ```
 agctl mock run
     [--config <path>]            # auto-discovered by default
     [--overlay <path>]           # repeatable; overlay config fragments to compose
     [--http-listen <host:port>]  # literal string (NO ${} interpolation); overrides mocks.http.listen
-    [--only http|kafka]          # run a single engine (HTTP-only needs no kafka extra)
+    [--grpc-listen <host:port>]  # literal string (NO ${} interpolation); overrides mocks.grpc.listen
+    [--only http|kafka|grpc]     # run a single engine (HTTP-only needs no kafka/grpc extra)
     [--fail-fast]                # exit non-zero on the FIRST runtime error (default: continue + summarize)
     [--duration <seconds>]       # stop after N s; mutually exclusive with --until-stopped
     [--until-stopped]            # default: run until SIGTERM/SIGINT
 ```
 
 **Lifecycle:**
-- `--http-listen` is a **literal** `host:port` string (CLI args are not `${}`-interpolated, only YAML values).
-- `--only` restricts to one engine; `kafka`-extra / per-reactor cluster `brokers` checks are gated on engines actually started.
+- `--http-listen` and `--grpc-listen` are **literal** `host:port` strings (CLI args are not `${}`-interpolated, only YAML values).
+- `--only` restricts to one engine; `kafka`-extra / per-reactor cluster `brokers` checks are gated on engines actually started, and gRPC requires the `grpc` extra.
 - **No `mocks` section** → emits `started` + `summary` with zero counts and exits `0` (idempotent no-op).
 - **`--only <engine>` with that engine absent** → `ConfigError` (exit 2).
 - **Startup hazard:** when backgrounding, wrap with `nohup`/`setsid` so the mock is not killed by `SIGHUP` when the launching shell exits, and capture the PID.
-- **Port-in-use guard:** at startup, refuses to bind if the port is already in use (emits a `ConfigError` envelope with a hint to kill the stale mock).
+- **Port-in-use guard:** at startup, refuses to bind if the HTTP or gRPC port is already in use (emits a `ConfigError` envelope with a hint to kill the stale mock). Note: grpcio enables `SO_REUSEPORT`, so two gRPC servers can silently bind the same port — the guard fires only when a non-grpc process holds the port.
 
 **NDJSON event stream (second streaming exception after `http ping`):**
 
 ```json
-{"event":"started","http":{"listen":"0.0.0.0:18080","stubs":2},"kafka":{"reactors":[{"name":"order-command-handler","topic":"orders.commands","consumer_group":"agctl-mock-order-handler-<runid>"}]},"timestamp":"…"}
+{"event":"started","http":{"listen":"0.0.0.0:18080","stubs":2},"kafka":{"reactors":[{"name":"order-command-handler","topic":"orders.commands","consumer_group":"agctl-mock-order-handler-<runid>"}]},"grpc":{"listen":"0.0.0.0:50051","stubs":2,"services":["echo.EchoService"],"reflection":true,"health":true},"timestamp":"…"}
 {"event":"http.hit","stub":"create-order","method":"POST","path":"/api/v1/orders","status":201,"duration_ms":3,"timestamp":"…"}
 {"event":"http.unmatched","method":"GET","path":"/api/v1/unknown","status":404,"timestamp":"…"}
 {"event":"http.body_parse_skipped","stub":"oauth-token","method":"POST","path":"/oauth/token","reason":"non-JSON body; response has unresolved placeholders","timestamp":"…"}
@@ -1337,17 +1390,20 @@ agctl mock run
 {"event":"kafka.reacted","reactor":"order-command-handler","topic":"orders.events","key":"ord-789","duration_ms":1,"timestamp":"…"}
 {"event":"kafka.skipped","reactor":"order-command-handler","topic":"orders.commands","reason":"non-object message value","count":3,"timestamp":"…"}
 {"event":"kafka.error","reactor":"order-command-handler","topic":"orders.commands","offset":1043,"partition":2,"error":"…","fatal":false,"timestamp":"…"}
-{"event":"summary","http_hits":7,"http_unmatched":1,"http_body_parse_skipped":0,"kafka_reactions":3,"kafka_skipped":3,"kafka_errors":0,"duration_ms":45213}
+{"event":"grpc.hit","stub":"echo-unary","service":"echo.EchoService","method":"Unary","call_type":"unary","status":"OK","duration_ms":1,"timestamp":"…"}
+{"event":"grpc.unmatched","service":"echo.EchoService","method":"Missing","call_type":"unary","timestamp":"…"}
+{"event":"grpc.error","stub":"echo-unary","service":"echo.EchoService","method":"Unary","error":"…","fatal":true,"timestamp":"…"}
+{"event":"summary","http_hits":7,"http_unmatched":1,"http_body_parse_skipped":0,"kafka_reactions":3,"kafka_skipped":3,"kafka_errors":0,"grpc_hits":2,"grpc_unmatched":1,"grpc_errors":0,"duration_ms":45213}
 ```
 
 **Agent failure-stream protocol (load-bearing):**
 
-The mock's failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`, `capture.missing`) live **only** on stdout, and the exit-1-at-shutdown escalation arrives only on a clean `SIGTERM`. The background `&`/`kill` pattern loses both by default. Agents must follow this protocol:
+The mock's failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`, `grpc.unmatched`, `grpc.error`, `capture.missing`) live **only** on stdout, and the exit-1-at-shutdown escalation arrives only on a clean `SIGTERM`. The background `&`/`kill` pattern loses both by default. Agents must follow this protocol:
 
 1. Redirect the mock's stdout to a log file: `agctl mock run > mock.log 2>&1 &`.
 2. **Poll** `mock.log` for the `started` line before running the SUT (do not sleep a fixed delay).
 3. Terminate with `SIGTERM` and `wait` — **never `SIGKILL`** (which skips shutdown/summary/exit-code).
-4. After the test, **grep the log for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` / `kafka.error` / `capture.missing`** regardless of the test result, and treat any hit as a failure. `capture.missing` is non-fatal (the mock substitutes empty string and continues), but it marks a likely-misconfigured `from` silently producing a plausible-but-wrong response — investigate rather than ignore.
+4. After the test, **grep the log for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` / `kafka.error` / `grpc.unmatched` / `grpc.error` / `capture.missing`** regardless of the test result, and treat any hit as a failure. `capture.missing` is non-fatal (the mock substitutes empty string and continues), but it marks a likely-misconfigured `from` silently producing a plausible-but-wrong response — investigate rather than ignore.
 
 **`--fail-fast` synchronous alternative:**
 
@@ -1356,7 +1412,7 @@ For foreground runs with `--duration`, `--fail-fast` exits `1` immediately on th
 **Examples:**
 
 ```bash
-# Start both HTTP and Kafka mocks in background
+# Start all configured engines (HTTP + Kafka + gRPC) in background
 agctl mock run &
 MOCK_PID=$!
 
@@ -1367,8 +1423,11 @@ kill $MOCK_PID
 wait $MOCK_PID
 EXIT_CODE=$?
 
-# HTTP-only mode (no kafka extra needed)
+# HTTP-only mode (no kafka/grpc extra needed)
 agctl mock run --only http --http-listen 127.0.0.1:18080
+
+# gRPC-only mode (needs the grpc extra)
+agctl mock run --only grpc --grpc-listen 127.0.0.1:50051
 
 # Fail-fast synchronous run with duration
 agctl mock run --duration 30 --fail-fast
@@ -1389,7 +1448,8 @@ agctl mock start
     [--config <path>]            # auto-discovered by default
     [--overlay <path>]           # repeatable; forwarded to the daemon
     [--http-listen <host:port>]  # literal (NO ${} interpolation); overrides mocks.http.listen
-    [--only http|kafka]          # run a single engine
+    [--grpc-listen <host:port>]  # literal (NO ${} interpolation); overrides mocks.grpc.listen
+    [--only http|kafka|grpc]     # run a single engine
     [--fail-fast]                # forwarded to the daemon
     [--duration <seconds>]       # forwarded; daemon self-stops after N s
     [--state-dir <path>]         # default ./.agctl
@@ -1409,17 +1469,24 @@ agctl mock start
     "log_path": "./.agctl/mock-18080.log",
     "stubs": 2,
     "reactors": ["order-command-handler"],
+    "grpc": {
+      "listen": "0.0.0.0:50051",
+      "stubs": 2,
+      "services": ["echo.EchoService"],
+      "reflection": true,
+      "health": true
+    },
     "started_at": "2026-07-05T09:00:00Z"
   },
   "duration_ms": 312
 }
 ```
 
-The daemon writes its pidfile to `<state-dir>/mock-<port>.pid` (or `mock-kafka.pid` for Kafka-only mocks) and its NDJSON log to `<state-dir>/mock-<port>.log`. If a mock is already running on the resolved port, `start` fails with `ConfigError` (exit 2).
+The `grpc` block is present only when the gRPC engine is running. `listen`/`stubs` are `null` when HTTP is not running; `reactors` is `[]` when Kafka is not running. The daemon writes its pidfile to `<state-dir>/mock-<port>.pid` (or `mock-kafka.pid` for Kafka-only mocks, or `mock-grpc-<port>.pid` for gRPC-only mocks) and its NDJSON log to the matching `.log` path. If a mock is already running on the resolved port, `start` fails with `ConfigError` (exit 2).
 
 #### `agctl mock stop` — managed daemon (stop)
 
-Stop a running mock daemon by signaling it, waiting for graceful shutdown, parsing the log for the final summary, and returning the verdict. If any fatal failure events are found (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`), `stop` surfaces them and exits 1 (the strict rule). `capture.missing` is included in the failure list but is non-fatal.
+Stop a running mock daemon by signaling it, waiting for graceful shutdown, parsing the log for the final summary, and returning the verdict. If any fatal failure events are found (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`, `grpc.unmatched`, `grpc.error`), `stop` surfaces them and exits 1 (the strict rule). `capture.missing` is included in the failure list but is non-fatal.
 
 ```
 agctl mock stop
@@ -1449,6 +1516,9 @@ Selector resolution: no-arg works when exactly one mock is running in `--state-d
       "kafka_reactions": 3,
       "kafka_skipped": 0,
       "kafka_errors": 0,
+      "grpc_hits": 2,
+      "grpc_unmatched": 0,
+      "grpc_errors": 0,
       "duration_ms": 45213
     },
     "failures": []
@@ -1480,11 +1550,15 @@ When fatal failures are detected, `stop` raises `AssertionFailure` (exit 1) and 
         "kafka_reactions": 3,
         "kafka_skipped": 0,
         "kafka_errors": 1,
+        "grpc_hits": 2,
+        "grpc_unmatched": 1,
+        "grpc_errors": 0,
         "duration_ms": 45213
       },
       "failures": [
         {"event": "http.unmatched", "method": "GET", "path": "/x", "timestamp": "..."},
-        {"event": "kafka.error", "reactor": "order-command-handler", "error": "...", "timestamp": "..."}
+        {"event": "kafka.error", "reactor": "order-command-handler", "error": "...", "timestamp": "..."},
+        {"event": "grpc.unmatched", "service": "echo.EchoService", "method": "Missing", "call_type": "unary", "timestamp": "..."}
       ]
     }
   },
@@ -1523,7 +1597,10 @@ agctl mock status
       "http_body_parse_skipped": 0,
       "kafka_reactions": 1,
       "kafka_skipped": 0,
-      "kafka_errors": 0
+      "kafka_errors": 0,
+      "grpc_hits": 1,
+      "grpc_unmatched": 0,
+      "grpc_errors": 0
     },
     "failures_so_far": []
   },
@@ -1555,7 +1632,7 @@ The old protocol (redirect log → poll `started` → SIGTERM+wait → grep log)
 
 #### `agctl config validate`
 
-Parse and validate `agctl.yaml`. Reports schema errors, unresolvable required env vars, dangling service/connection references in templates, malformed jq expressions in `mocks` (stub `match.jq` / reactor `match`), and major-version mismatches. Exits 2 on any error.
+Parse and validate `agctl.yaml`. Reports schema errors, unresolvable required env vars, dangling service/connection references in templates, malformed jq expressions in `mocks` (HTTP stub `match.jq`, Kafka reactor `match`, gRPC stub `match.jq`/capture placement), invalid gRPC `response.status`, structural response-shape violations (exactly-one-of `response.message`/`response.messages`), and major-version mismatches. Exits 2 on any error. gRPC service/method resolution against the descriptor pool is deferred to `mock run`/`mock start` startup (server construction) — `config validate` cannot load the pool offline.
 
 ```
 agctl config validate
@@ -1768,7 +1845,8 @@ agctl discover
     "log_sources": 2,
     "grpc_targets": 2,
     "grpc_templates": 3,
-    "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates, mock-http-stubs, mock-kafka-reactors, log-sources, grpc-services, grpc-methods"
+    "grpc_mock_stubs": 2,
+    "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates, mock-http-stubs, mock-kafka-reactors, log-sources, grpc-services, grpc-methods, mock-grpc-stubs"
   },
   "duration_ms": 1
 }
@@ -1780,7 +1858,7 @@ Returns names and one-line descriptions for all items in a category. No params, 
 
 ```bash
 agctl discover --category <name> [--overlay <path>]
-# <name>: services | http-templates | kafka-patterns | db-templates | mock-http-stubs | mock-kafka-reactors | log-sources | grpc-services | grpc-methods
+# <name>: services | http-templates | kafka-patterns | db-templates | mock-http-stubs | mock-kafka-reactors | log-sources | grpc-services | grpc-methods | mock-grpc-stubs
 ```
 
 **Example — `agctl discover --category http-templates`:**
@@ -1888,6 +1966,28 @@ agctl discover --category <name> --name <item-name> [--overlay <path>]
   "duration_ms": 1
 }
 ```
+
+**Example — `agctl discover --category mock-grpc-stubs --name echo-unary`:**
+
+```json
+{
+  "ok": true,
+  "command": "discover.item",
+  "result": {
+    "category": "mock-grpc-stubs",
+    "name": "echo-unary",
+    "description": "Mock the Echo unary RPC",
+    "service": "echo.EchoService",
+    "method": "Unary",
+    "params": ["msg"],
+    "example": "grpcurl -plaintext localhost:50051 echo.EchoService/Unary",
+    "note": "Active only while `agctl mock run` (grpc engine) is running."
+  },
+  "duration_ms": 1
+}
+```
+
+The `example` for a mock stub is the **external** command to exercise the mock (`grpcurl` for gRPC, `curl` for HTTP) against the mock's `listen` address — these are MOCK stubs, not call templates, so `agctl grpc call` / `agctl http call` are the wrong hint.
 
 #### `--search` — Cross-category keyword search
 
@@ -2246,7 +2346,10 @@ Every service entry always includes `response_time_ms` (an integer on success, `
   "http_templates": 12,
   "kafka_patterns": 5,
   "db_templates": 8,
-  "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates, mock-http-stubs, mock-kafka-reactors"
+  "mock_http_stubs": 2,
+  "mock_kafka_reactors": 1,
+  "grpc_mock_stubs": 2,
+  "hint": "Run 'agctl discover --category <name>' to list items. Categories: services, http-templates, kafka-patterns, db-templates, mock-http-stubs, mock-kafka-reactors, log-sources, grpc-services, grpc-methods, mock-grpc-stubs"
 }
 ```
 
@@ -2403,15 +2506,18 @@ Refused to overwrite (without `--force`):
 
 | Event | Description |
 |---|---|
-| `started` | Emitted once at startup after HTTP bind and Kafka probe succeed. Includes `http.listen`/`stubs` and `kafka.reactors[]`. |
+| `started` | Emitted once at startup after HTTP bind and Kafka probe succeed. Includes `http.listen`/`stubs`, `kafka.reactors[]`, and (when the gRPC engine runs) `grpc.{listen,stubs,services,reflection,health}`. Engines not running are emitted as `null`. |
 | `http.hit` | Emitted per matching HTTP stub hit. Includes `stub`, `method`, `path`, `status`, `duration_ms`. |
 | `http.unmatched` | Emitted per HTTP request that matched no stub (returned 404). Includes `method`, `path`, `status`. |
 | `http.body_parse_skipped` | Emitted when a stub matches but the request body doesn't parse as JSON and the response has unresolved placeholders. Includes `stub`, `method`, `path`, `reason`. |
 | `kafka.reacted` | Emitted per Kafka message that matched a reactor and produced a reaction. Includes `reactor`, `topic`, `key`, `duration_ms`. |
 | `kafka.skipped` | Emitted when messages are consumed but not matched (e.g., non-object value). Includes `reactor`, `topic`, `reason`, `count`. |
 | `kafka.error` | Emitted on a reaction produce failure or reactor error. Includes `reactor`, `topic`, `error`, `fatal`. Under `--fail-fast`, the run exits `1` immediately after a fatal error. |
-| `capture.missing` | Emitted when an explicit `capture.<name>.from` resolves to `null`/missing at runtime (HTTP stub or Kafka reactor). Includes `stub` *or* `reactor`, `name`, `from`. Non-fatal: the mock substitutes empty string and continues; investigate as a likely-misconfigured `from`. |
-| `summary` | Emitted once at shutdown. Includes `http_hits`, `http_unmatched`, `http_body_parse_skipped`, `kafka_reactions`, `kafka_skipped`, `kafka_errors`, `duration_ms`. |
+| `grpc.hit` | Emitted per response message sent (one for unary; one per streamed message; one per matched request for client-stream / bidi). Includes `stub`, `service`, `method`, `call_type`, `status`, `duration_ms`. |
+| `grpc.unmatched` | Emitted when no stub matches `service/method`, or every predicate fails (returned `UNIMPLEMENTED`). Includes `service`, `method`, `call_type`. **Fatal** — sets the runtime-error flag so the run exits `1` at shutdown. |
+| `grpc.error` | Emitted on a handler deserialize/serialize/runtime failure. Includes `stub` (may be `null`), `service`, `method`, `error`, `fatal: true`. **Fatal.** |
+| `capture.missing` | Emitted when an explicit `capture.<name>.from` resolves to `null`/missing at runtime (HTTP stub, Kafka reactor, or gRPC stub). Includes `stub` *or* `reactor`, `name`, `from`. Non-fatal: the mock substitutes empty string and continues; investigate as a likely-misconfigured `from`. |
+| `summary` | Emitted once at shutdown. Includes `http_hits`, `http_unmatched`, `http_body_parse_skipped`, `kafka_reactions`, `kafka_skipped`, `kafka_errors`, `grpc_hits`, `grpc_unmatched`, `grpc_errors`, `duration_ms`. |
 
 **Agent protocol (load-bearing):** See `agctl mock` §3.5 for the background lifecycle protocol (redirect stdout → log, poll for `started`, SIGTERM+wait, grep log for errors). Without this, "fail loudly" is aspirational — a silent false-positive is possible.
 
@@ -2419,8 +2525,8 @@ Refused to overwrite (without `--force`):
 
 **Exit codes:**
 - `0` — clean shutdown, no runtime errors.
-- `1` — runtime errors occurred (`kafka_errors > 0` or fatal reactor failure) or `--fail-fast` triggered.
-- `2` — startup error (config, bind, broker probe, or missing `kafka` extra).
+- `1` — runtime errors occurred (`kafka_errors > 0`, fatal reactor failure, any `grpc.unmatched`/`grpc.error` event, or `--fail-fast` triggered).
+- `2` — startup error (config, bind, broker probe, missing `kafka` extra, or missing `grpc` extra when the gRPC engine is selected).
 
 #### `kafka.listen.run` streaming output
 
@@ -3023,8 +3129,12 @@ These items are intentionally deferred. Do not implement them until the core des
 | **Mock: control socket / runtime RPC** | A control socket for live runtime control (add stub at runtime, live counter queries) is deferred. The current daemon model uses signal + log-file parsing for observation only (start/stop/status). |
 | **Mock: record / replay** | Record real traffic into stubs for later replay. |
 | **Mock: exactly-once reactor delivery** | Reaction retry/backoff on broker errors (today: at-least-once with idempotent reactions). |
-| **Mock: TLS / HTTPS mock** | Cert-pinned SUT clients cannot connect to a plaintext mock. |
+| **Mock: TLS / HTTPS mock** | Cert-pinned SUT clients cannot connect to a plaintext mock. Applies to the HTTP and gRPC mock (`mocks.grpc` is plaintext-only v1). |
 | **Mock: multiple HTTP servers / ports** | One server, many stubs (path-routed) is the only model today. |
+| **Mock: stateful / server-push gRPC bidi** | The gRPC mock's bidi support is request/response pairing (one rendered response per matched incoming request). Stateful conversation, server-push, and per-message client-stream aggregation are deferred. |
+| **Mock: mid-stream abort (gRPC)** | `RSTSTREAM` mid-server-stream is not modeled; a gRPC stub streams its authored `messages` to completion or a terminal `status`. |
+| **Mock: reflection-bootstrapped gRPC stubs** | The gRPC mock requires `proto`/`descriptor_set` sources to resolve service/method and encode responses — reflection is *served* but cannot *bootstrap* the mock itself. |
+| **Mock: cross-transport gRPC sagas** | gRPC stub → Kafka reaction (or vice versa) linkage is deferred alongside the HTTP↔Kafka cross-transport item above. |
 
 ### Known-wrong-result / Not Covered (Mock MVP Limitations)
 
@@ -3038,6 +3148,11 @@ The mock MVP covers **stateless, single-consumer, value-keyed, plaintext** flows
 | **Non-JSON Kafka values** (Avro/Protobuf/schema-registry-backed topics) | Emitted as `kafka.skipped` (visible), but topic is effectively un-mockable until decoding lands. | Topic appears idle → false green if consumer expects a reaction. |
 | **Containerized SUT topology** (docker-compose) | `0.0.0.0` bind works, but operator must target `host.docker.internal` / host LAN IP and avoid a SUT that swallows connection errors. | SUT may silently fail to connect → false green if it treats network errors as "fallback worked." |
 | **Shared broker + pinned `consumer_group` reused across runs/devs** | Partition split or resume-past-messages. | Silently missing/old reactions → false green. (Mitigated by unique-per-run default.) |
+| **TLS / TLS-pinned gRPC SUT clients** | `mocks.grpc` is plaintext-only v1 (no TLS on the mock listener). | TLS-pinned SUT clients cannot connect → integration untested → false green. |
+| **Stateful / server-push gRPC bidi** | The gRPC mock's bidi is request/response pairing (one rendered response per matched request); conversation state and server-push are not modeled. | State-machine coverage gaps → false green. |
+| **Per-message-responds client-stream gRPC** | Client-stream aggregates `messages` at stream close and emits one rendered response; per-message responding is not modeled. | Incremental-response code paths go unexercised → false green. |
+| **gRPC mock from reflection alone** | `mocks.grpc` requires `proto`/`descriptor_set` sources to resolve service/method and encode responses; server reflection is *served* but cannot *bootstrap* the mock. | A config that expects reflection-only bootstrapping fails at startup (exit 2) — fail-loud, not silent. |
+| **gRPC port collision via `SO_REUSEPORT`** | grpcio enables `SO_REUSEPORT`; two gRPC servers can bind the same port silently. The port-in-use guard fires only when a non-grpc process holds the port. | The SUT may reach a stale mock → silently stale responses → false green. Pick unique ports across runs. |
 
 ---
 

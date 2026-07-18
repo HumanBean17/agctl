@@ -27,7 +27,7 @@ commands. Don't conflate them: `agctl` drives the CLI; `agctl-config` writes its
 | `kafka` | producer / emitter / event class | `kafka.patterns:` |
 | `db` | SQL query / repo method | `database.templates:` (+ a `database.connections:` entry if new) |
 | `db` (write) | INSERT/UPDATE/DELETE / mutating repo method | `database.templates:` with `mode: write` (requires `writable: true` connection) |
-| `mock` | downstream HTTP API contract / Kafka consumer+event to impersonate | `mocks:` (HTTP stubs under `mocks.http.stubs:`, Kafka reactors under `mocks.kafka.reactors:`) |
+| `mock` | downstream HTTP API contract / Kafka consumer+event / gRPC service to impersonate | `mocks:` (HTTP stubs under `mocks.http.stubs:`, Kafka reactors under `mocks.kafka.reactors:`, gRPC stubs under `mocks.grpc.stubs:`) |
 | `init` | the whole repo | a full `agctl.yaml` + `.env.example` |
 
 Then read the matching `reference/<mode>.md` in this skill's directory for extraction
@@ -102,7 +102,7 @@ Every edit ends with these two commands (the config must stay valid):
 
 ```bash
 agctl config validate                                                       # ok:true, exit 0 (warnings fine; errors are not)
-agctl discover --category <http-templates|kafka-patterns|db-templates|mock-http-stubs|mock-kafka-reactors> --name <new-key>   # must list expected params
+agctl discover --category <http-templates|kafka-patterns|db-templates|mock-http-stubs|mock-kafka-reactors|mock-grpc-stubs> --name <new-key>   # must list expected params
 ```
 
 **When editing a sidecar** (`.agctl.yaml` layered via `--overlay`), verify with:
@@ -112,17 +112,18 @@ agctl discover --overlay <sidecar> --name <new-key>                        # mus
 ```
 The base-only close-out above is the default for main `agctl.yaml` edits.
 
-**Mocks are discoverable** via `agctl discover --category <mock-http-stubs|mock-kafka-reactors>`
+**Mocks are discoverable** via `agctl discover --category <mock-http-stubs|mock-kafka-reactors|mock-grpc-stubs>`
 (and `--name <stub-or-reactor>` for full detail). For a `mock` edit, confirm the new/changed
 item appears in `discover`, then verify with `agctl config validate` and a smoke run
 (`agctl mock run --duration 5`, checking the `started` line and that no `http.unmatched` /
-`kafka.error` appears) — see the `agctl` skill.
+`kafka.error` / `grpc.unmatched` / `grpc.error` appears) — see the `agctl` skill.
 
 **Mock daemon state directory:** The managed daemon commands (`mock start`/`stop`/`status`)
-write a pidfile (`mock-<port>.pid`) and NDJSON log (`mock-<port>.log`) under `<state-dir>/`
-(default `./.agctl/`). This is on-disk state in `agctl`, confined to the daemon lifecycle
-(the `kafka listen` daemon writes its own run dir under the same `<state-dir>/`; see the
-`agctl` skill). Clean up with `rm -rf .agctl`.
+write a pidfile and NDJSON log keyed by engine under `<state-dir>/` (default `./.agctl/`):
+`mock-<port>.{pid,log}` (HTTP or multi-engine), `mock-kafka.pid` (Kafka-only), or
+`mock-grpc-<port>.{pid,log}` (gRPC-only). This is on-disk state in `agctl`, confined to the
+daemon lifecycle (the `kafka listen` daemon writes its own run dir under the same
+`<state-dir>/`; see the `agctl` skill). Clean up with `rm -rf .agctl`.
 
 If `agctl` isn't installed, run the **structural checklist** below instead and tell the user
 live validation was skipped. **Never** declare done on config that doesn't validate.
@@ -139,7 +140,18 @@ live validation was skipped. **Never** declare done on config that doesn't valid
 - [ ] Every `templates` / `database.templates` / `kafka.patterns` entry has a non-empty `description`.
 - [ ] If `mocks.kafka.reactors` is set, each reactor's resolved cluster (`reactor.cluster` → `default_cluster` → single-cluster auto-default) has non-empty `kafka.clusters.<name>.brokers` (required at `mock run` startup).
 - [ ] `mocks.http.listen` (if set) parses as `host:port` (IPv6 hosts bracketed, e.g. `[::1]:18080`).
-- [ ] Every `mocks.http.stubs` / `mocks.kafka.reactors` entry has a non-empty `description`.
+- [ ] `mocks.grpc.listen` (if set) parses as `host:port` (same rules as `mocks.http.listen`).
+- [ ] Every `mocks.grpc.stubs.<name>` resolves `service`/`method` against the configured
+      descriptors (`mocks.grpc.descriptors` → top-level `grpc.descriptors`). Unknown
+      service/method is a `ConfigError` at `mocks.grpc.stubs.<name>` at server construction
+      (offline `config validate` cannot catch this without the descriptor pool, but it IS
+      caught at `mock run`/`mock start` startup before any RPC is served).
+- [ ] Every `mocks.grpc.stubs.<name>.response` sets **exactly one** of `message` or
+      `messages`; `messages` is required for server-streaming methods, `message` for the
+      other three call types (call type is DERIVED from the descriptor, not configured).
+- [ ] Every `mocks.grpc.stubs.<name>.response.status` (if set) is a valid gRPC status name
+      (`OK`, `NOT_FOUND`, … — case-sensitive) or numeric code (0–16); `OK` is the default.
+- [ ] Every `mocks.http.stubs` / `mocks.kafka.reactors` / `mocks.grpc.stubs` entry has a non-empty `description`.
 - [ ] Every `mocks.kafka.reactors.*.reaction.headers` value (if set) is a string.
 - [ ] `mock start`/`stop`/`status` daemon state (pidfile + log under `<state-dir>/`) is scoped to `.agctl/` by default; verify `--state-dir` if a custom location is used.
 

@@ -33,8 +33,8 @@ env that runs it (`pip install -U 'agctl[jq]'`) so `--help` and behavior match.
 
 `discover` is a map, not a dump — look up template/topic names, don't guess.
 Categories: `services`, `http-templates`, `kafka-patterns`, `db-templates`,
-`mock-http-stubs`, `mock-kafka-reactors`. (`--category` / `--name` / `--search`
-flags: see `--help`.)
+`mock-http-stubs`, `mock-kafka-reactors`, `mock-grpc-stubs`. (`--category` /
+`--name` / `--search` flags: see `--help`.)
 
 ## Intent → command
 
@@ -80,7 +80,10 @@ cluster.
    (one entry per line + `summary`), `grpc call` server-stream/bidi (one message
    per line + `summary`), and `kafka listen run` (one NDJSON event per line +
    `summary`). Background with `&`, `kill` when done; exit 0 (all ok) / 1 (any
-   failed). The managed daemons (`mock start`/`stop`/`status`, `kafka listen
+   failed). `mock run` may serve HTTP, Kafka, **and** gRPC engines in one
+   process — the gRPC engine adds `grpc.hit`/`grpc.unmatched`/`grpc.error`
+   events (the last two are **fatal**) but is not a separate streaming command.
+   The managed daemons (`mock start`/`stop`/`status`, `kafka listen
    start`/`stop`/`status`) are **not** streaming — each emits one object. Every
    other command emits exactly one object.
 2. **A 4xx/5xx HTTP response is `ok:true` — unless you assert.** Status is a
@@ -145,25 +148,32 @@ cluster.
     correct a mis-rooted jq path (e.g. `.data.operator` → `.body.data.operator`)
     without dropping the flag and re-running raw.
 13. **`mock stop` uses the strict failure rule.** Unlike `mock run` (exit 1 only
-    when `kafka_errors > 0`), `mock stop` treats **any** of `http.unmatched`,
-    `http.body_parse_skipped`, `kafka.skipped`, or `kafka.error` as fatal ⇒ exit 1
-    (verdict in `error.detail`); `capture.missing` is non-fatal but surfaced. On a
-    clean stop the verdict travels in `result`.
+    when `kafka_errors > 0` or a `grpc.unmatched`/`grpc.error` event fires),
+    `mock stop` treats **any** of `http.unmatched`, `http.body_parse_skipped`,
+    `kafka.skipped`, `kafka.error`, `grpc.unmatched`, or `grpc.error` as fatal ⇒
+    exit 1 (verdict in `error.detail`); `capture.missing` is non-fatal but
+    surfaced. On a clean stop the verdict travels in `result`.
 14. **`mock stop --all` returns an array of verdicts.** `--all` iterates every
     running mock in `--state-dir`; `result.stopped` is an **array** (one entry per
     mock). If any mock was fatal, exit 1 carries the array in `error.detail.stopped`.
     A single selector (`--listen`/`--pid`/no-arg) returns a boolean.
 15. **`mock start` is the readiness gate.** Blocks until the daemon's `started`
     line appears (or a startup error/timeout), then returns — no separate polling.
+    The `started` line carries an `http`/`kafka`/`grpc` block (each `null` when
+    that engine isn't running); the result envelope exposes the running engines.
     The old four-step protocol is now `mock start` → `mock stop`.
 16. **Daemon state under `.agctl/` is the only on-disk state.** Managed daemons
     write per-run state under `<state-dir>/` (default `./.agctl/`): `mock` writes a
-    pidfile (`mock-<port>.pid`) + log (`mock-<port>.log`); `kafka listen` writes a
-    pidfile (`listen-<run_id>.pid`) + run dir (`listen-<run_id>/` holding `meta.json`,
-    `asserts.jsonl`, per-topic `<topic>.ndjson`, `events.log`). Sole exception to the
-    stateless-invocation principle, scoped to the daemon lifecycle. Clean up with
-    `rm -rf .agctl`. `kafka listen stop` deletes its run dir on every path (fatal or
-    clean) — `results` not run first ⇒ the expectation is silently dropped.
+    pidfile + log keyed by engine — `mock-<port>.{pid,log}` (HTTP or multi-engine),
+    `mock-kafka.pid` (Kafka-only), or `mock-grpc-<port>.{pid,log}` (gRPC-only);
+    `kafka listen` writes a pidfile (`listen-<run_id>.pid`) + run dir
+    (`listen-<run_id>/` holding `meta.json`, `asserts.jsonl`, per-topic
+    `<topic>.ndjson`, `events.log`). Sole exception to the stateless-invocation
+    principle, scoped to the daemon lifecycle. Clean up with `rm -rf .agctl`.
+    `kafka listen stop` deletes its run dir on every path (fatal or clean) —
+    `results` not run first ⇒ the expectation is silently dropped.
+    `mock stop --listen <X>` matches `X` against any of the daemon's listen
+    addresses (HTTP, Kafka implicit, or gRPC).
 
 ## Discover live schema before authoring SQL
 
@@ -193,11 +203,15 @@ default, generated, …}], primary_key, foreign_keys, unique_constraints, hint}`
 
 ## `agctl mock` — impersonate a dependency
 
-Stands in for the SUT's **external** deps — an HTTP API the SUT calls, or the
-downstream Kafka consumer expected to react to its events. **SUT-facing:** the
-app's HTTP client points at the mock's `listen`; Kafka reactors join the SUT's
-*real* broker as consumers (the mock is not a broker). Stubs/reactors are authored
-in the `mocks:` config section (see the `agctl-config` skill).
+Stands in for the SUT's **external** deps — an HTTP API the SUT calls, the
+downstream Kafka consumer expected to react to its events, or a gRPC service
+the SUT's gRPC client targets. **SUT-facing:** the app's HTTP client points at
+the mock's `http listen`; the gRPC client points at the mock's `grpc listen`;
+Kafka reactors join the SUT's *real* broker as consumers (the mock is not a
+broker). Stubs/reactors are authored in the `mocks:` config section (see the
+`agctl-config` skill). `--only http|kafka|grpc` restricts to one engine;
+`--http-listen` / `--grpc-listen` are literal `host:port` overrides (CLI args
+are NOT `${}`-interpolated).
 
 Two modes: **foreground streaming** (`mock run`) and **managed daemon**
 (`mock start`/`stop`/`status`). **Prefer the daemon mode for new tests** — it
@@ -211,16 +225,16 @@ with a `ConfigError` pointing at `mock run`/WSL) — use `agctl mock run`
 ### Using `mock run` directly — background lifecycle (load-bearing)
 
 The failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`,
-`kafka.error`, `capture.missing`) live **only on stdout**, and the exit-1
-escalation arrives only on a clean `SIGTERM`. The plain `&`/`kill` pattern loses
-both and silently produces a **false green**. Always:
+`kafka.error`, `grpc.unmatched`, `grpc.error`, `capture.missing`) live **only on
+stdout**, and the exit-1 escalation arrives only on a clean `SIGTERM`. The plain
+`&`/`kill` pattern loses both and silently produces a **false green**. Always:
 
 1. Redirect stdout to a log: `agctl mock run > mock.log 2>&1 &` (capture the PID).
 2. Poll `mock.log` for the `started` line **before** running the SUT — don't sleep
    a fixed delay.
 3. Stop with `SIGTERM` + `wait` — **never `SIGKILL`** (skips the shutdown handler,
    the `summary` line, and the exit code).
-4. Grep the log for `http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error|capture.missing`
+4. Grep the log for `http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error|grpc.unmatched|grpc.error|capture.missing`
    **regardless of the test result** — any hit is a failure, even if assertions
    passed. `capture.missing` is non-fatal at runtime (the mock substitutes empty
    string and continues), but it marks a `capture.from` that resolved to nothing —
@@ -231,9 +245,9 @@ both and silently produces a **false green**. Always:
 nohup agctl mock run > mock.log 2>&1 &
 MOCK_PID=$!
 until grep -q '"event":"started"' mock.log; do sleep 0.1; done    # poll, don't guess
-# … run the SUT / assertions, pointing the SUT at the mock's listen address …
+# … run the SUT / assertions, pointing the SUT at the mock's listen address(es) …
 kill -TERM "$MOCK_PID"; wait "$MOCK_PID"                            # SIGTERM + wait, never SIGKILL
-grep -E 'http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error|capture.missing' mock.log && exit 1
+grep -E 'http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error|grpc.unmatched|grpc.error|capture.missing' mock.log && exit 1
 ```
 
 ## `agctl kafka listen` — long-lived Kafka capture
