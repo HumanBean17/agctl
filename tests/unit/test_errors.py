@@ -8,6 +8,7 @@ from agctl.errors import (
     ConfigError as ConfigErrorFromErrors,
     ConnectionFailure,
     OperationTimeout,
+    SerializationError,
     TemplateNotFound,
 )
 from agctl.config import ConfigError as ConfigErrorFromConfig
@@ -22,6 +23,7 @@ from agctl.config import ConfigError as ConfigErrorFromConfig
         (ConfigErrorFromErrors, "ConfigError", 2),
         (ConnectionFailure, "ConnectionError", 2),
         (OperationTimeout, "TimeoutError", 1),
+        (SerializationError, "SerializationError", 2),
         (TemplateNotFound, "TemplateNotFound", 2),
     ],
 )
@@ -67,6 +69,7 @@ def test_instance_exit_codes():
     assert ConfigErrorFromErrors("y").exit_code == 2
     assert ConnectionFailure("z").exit_code == 2
     assert OperationTimeout("w").exit_code == 1
+    assert SerializationError("x").exit_code == 2
     assert TemplateNotFound("v").exit_code == 2
 
 
@@ -78,3 +81,23 @@ def test_assertion_failure_is_agctl_error():
 
 def test_config_error_identity_across_import_paths():
     assert ConfigErrorFromConfig is ConfigErrorFromErrors
+
+
+# --- SerializationError-specific tests -----------------------------------------
+
+def test_serialization_error_to_dict_with_detail():
+    """Test SerializationError.to_dict() with subject/topic detail (task brief requirement)."""
+    err = SerializationError(
+        "payload does not conform",
+        {"subject": "orders.created-value", "topic": "orders.created"},
+    )
+    assert err.to_dict() == {
+        "type": "SerializationError",
+        "message": "payload does not conform",
+        "detail": {"subject": "orders.created-value", "topic": "orders.created"},
+    }
+
+
+def test_serialization_error_exit_code():
+    """Test SerializationError.exit_code == 2 (task brief requirement)."""
+    assert SerializationError("x").exit_code == 2
