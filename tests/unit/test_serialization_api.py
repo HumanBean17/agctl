@@ -51,6 +51,14 @@ class _FakeSR:
     touch: ``get_schema(id) -> (type, str)`` and
     ``get_latest_schema(subject) -> (type, str, id)``. Pre-seed
     :attr:`by_id` / :attr:`latest` before calling the api.
+
+    A ``register_schema`` spy is also exposed — NOT because the v1 api
+    should call it, but so tests can pin the no-auto-registration encode
+    contract by asserting ``register_schema_calls == 0``. The
+    :attr:`get_schema_calls` / :attr:`get_latest_schema_calls` /
+    :attr:`register_schema_calls` counters record every call (including
+    ones that raise) so a regression that swaps the resolved method, or
+    silently auto-registers, trips an assertion.
     """
 
     def __init__(self):
@@ -60,12 +68,25 @@ class _FakeSR:
         self.latest: dict[str, tuple[str, str, int]] = {
             "t-value": ("AVRO", SCHEMA_STR, SCHEMA_ID),
         }
+        self.get_schema_calls = 0
+        self.get_latest_schema_calls = 0
+        self.register_schema_calls = 0
 
     def get_schema(self, schema_id):
+        self.get_schema_calls += 1
         return self.by_id[schema_id]
 
     def get_latest_schema(self, subject):
+        self.get_latest_schema_calls += 1
         return self.latest[subject]
+
+    def register_schema(self, *args, **kwargs):
+        # Present so tests can assert it is NEVER called on the encode
+        # path (v1 contract: no auto-registration). A real SR client has
+        # this method; a regression that silently auto-registers would
+        # land here and trip ``register_schema_calls == 0``.
+        self.register_schema_calls += 1
+        return SCHEMA_ID
 
 
 # --- (g) Format enum --------------------------------------------------------
@@ -177,6 +198,24 @@ def test_encode_payload_avro_uses_get_latest_schema():
         # ConfigError (covered in test_serialization_registry). Either way,
         # encode does NOT silently succeed.
         encode_payload({"id": "x"}, Format.AVRO, fake, subject="t-value")
+    # Even on the missing-subject path, encode MUST attempt
+    # get_latest_schema exactly once and MUST NOT silently fall back to
+    # register_schema (v1: no auto-registration).
+    assert fake.get_latest_schema_calls == 1
+    assert fake.register_schema_calls == 0
+
+
+def test_encode_payload_avro_resolves_via_get_latest_schema_no_auto_register():
+    # v1 encode contract (pinned on the happy path via call counters):
+    # encode_payload resolves the schema via get_latest_schema(subject)
+    # exactly once and NEVER calls register_schema (or get_schema). A
+    # regression that silently auto-registers, or resolves via the wrong
+    # SR method, would trip these counts.
+    pytest.importorskip("fastavro")
+    fake = _FakeSR()
+    encode_payload({"id": "x"}, Format.AVRO, fake, subject="t-value")
+    assert fake.get_latest_schema_calls == 1
+    assert fake.register_schema_calls == 0
 
 
 # --- (e) AVRO encode schema-violation -> SerializationError -----------------
@@ -224,13 +263,16 @@ def test_encode_payload_protobuf_raises_config_error():
 
 
 def test_decode_payload_avro_without_sr_raises_config_error():
-    pytest.importorskip("fastavro")
+    # The `sr is None` -> ConfigError path fires BEFORE any codec call,
+    # so this test deliberately does NOT importorskip("fastavro"): it
+    # must run on fastavro-less CI to cover the config-error branch.
     with pytest.raises(ConfigError):
         decode_payload(b"\x00\x00\x00\x00\x00x", Format.AVRO, None)
 
 
 def test_encode_payload_avro_without_sr_raises_config_error():
-    pytest.importorskip("fastavro")
+    # As above: no fastavro needed — ConfigError is raised before the
+    # codec/SR resolution path is entered.
     with pytest.raises(ConfigError):
         encode_payload({"id": "x"}, Format.AVRO, None, subject="t-value")
 
