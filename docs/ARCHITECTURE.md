@@ -401,6 +401,19 @@ catching what Pydantic cannot:
   `…reactors.<name>.cluster`, and a resolved cluster with empty `brokers` →
   **error** at `…reactors.<name>`. (Inlined in the validator so `config/` stays
   free of a `commands/` import.)
+- Each `kafka.topics.<t>` resolves its cluster with the same precedence
+  (`topic.cluster` → `kafka.default_cluster` → single-cluster auto-default);
+  a dangling `topic.cluster` → **error** at `…topics.<t>.cluster`. A topic
+  resolving to `avro`/`protobuf` (override or cluster default) whose cluster
+  has no `schema_registry_url` → **error** at `…topics.<t>` (when an override
+  drove the need) or `…clusters.<c>` (when a cluster default did). A
+  `subject_strategy` set on a topic whose resolved `value_format` is `json` →
+  **warning** at `…topics.<t>.subject_strategy`. (Same inline-resolution
+  rationale as the reactor check.)
+- `kafka.clusters.<c>.schema_registry.auth` shape: `basic` without `basic_auth`
+  → **error**, and `mtls` without `ssl` → **error** (both at
+  `…clusters.<c>.schema_registry.auth`). Out-of-enum `auth` is a defensive
+  guard — Pydantic's `Literal` rejects it at parse time first.
 - Path-template shadowing: a `{name}` segment ahead of a literal at the same
   position (`/orders/{id}` before `/orders/bulk`) → **warning** (first-match-wins;
   the literal stub silently never fires). Method-agnostic — known limitation.
