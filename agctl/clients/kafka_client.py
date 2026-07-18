@@ -81,6 +81,80 @@ def _import_serialization():
     return Format, decode_payload, encode_payload, resolve_subject
 
 
+def _encode_payload_with_codec(codec, topic, value, key):
+    """Encode ``value`` + ``key`` to bytes per ``codec`` (or legacy JSON).
+
+    Single source of truth for the produce-side encode, shared by
+    :meth:`KafkaClient._encode_payload` (the produce path) and
+    :meth:`agctl.mock.kafka_reactor.KafkaReactor._encode_reaction`
+    (the reactor path). Centralizing the logic prevents the class of
+    copy-paste divergence that previously bit the key-side
+    :func:`resolve_subject` call (a duplicate in ``kafka_reactor.py``
+    passed ``value`` instead of ``key`` — dormant under the default
+    ``"topic"`` strategy but LIVE under ``"record"``/``"topic_record"``,
+    where it resolved the wrong subject for non-string KEY formats).
+
+    Returns ``(value_bytes, key_bytes)`` ready for ``producer.produce``.
+    When ``codec is None`` (or a side's config is absent / JSON /
+    KEY_STRING) the legacy path applies byte-for-byte — json.dumps for
+    the value, utf-8 for a string key. Only non-JSON value formats and
+    non-string key formats route through :func:`encode_payload`.
+
+    Per-side subject resolution: the VALUE side resolves from ``value``
+    and the KEY side resolves from ``key`` (so a ``"record"``-strategy
+    KEY reads ``__record_name__`` off the key, not the value).
+
+    :class:`SerializationError` from the codec propagates unchanged
+    (produce is the write path — a schema-violating record is a fatal
+    contract/config bug, not a per-message skip).
+    """
+    if codec is None:
+        return json.dumps(value).encode("utf-8"), (
+            key.encode("utf-8") if isinstance(key, str) else key
+        )
+
+    Format, _decode, encode_payload, resolve_subject = _import_serialization()
+    sr = codec.get("sr")
+    value_cfg = codec.get("value") or {}
+    key_cfg = codec.get("key") or {}
+    value_fmt = value_cfg.get("fmt", Format.JSON)
+    key_fmt = key_cfg.get("fmt", Format.KEY_STRING)
+
+    # Value: JSON / unset fmt -> legacy json.dumps (byte-identical). Any
+    # other fmt routes through encode_payload against the resolved subject
+    # (resolved from the VALUE payload under "record"/"topic_record").
+    if value_fmt == Format.JSON:
+        value_bytes = json.dumps(value).encode("utf-8")
+    else:
+        subject = resolve_subject(
+            topic,
+            "value",
+            value_cfg.get("subject_strategy") or _DEFAULT_SUBJECT_STRATEGY,
+            value,
+        )
+        value_bytes = encode_payload(value, value_fmt, sr, subject=subject)
+
+    # Key: None -> None (real Kafka null key). KEY_STRING / unset -> legacy
+    # utf-8 (byte-identical). Other fmts -> encode_payload. The subject is
+    # resolved from the KEY payload (not the value) under "record"/
+    # "topic_record" — this is the divergence the previous reactor-side
+    # copy had (it passed ``value`` instead of ``key``).
+    if key is None:
+        key_bytes = None
+    elif key_fmt == Format.KEY_STRING:
+        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
+    else:
+        subject = resolve_subject(
+            topic,
+            "key",
+            key_cfg.get("subject_strategy") or _DEFAULT_SUBJECT_STRATEGY,
+            key,
+        )
+        key_bytes = encode_payload(key, key_fmt, sr, subject=subject)
+
+    return value_bytes, key_bytes
+
+
 def _ms_to_iso8601z(ts_ms):
     """Convert a Kafka timestamp (ms since epoch) to an ISO8601Z string."""
     if ts_ms is None or ts_ms < 0:
@@ -250,6 +324,11 @@ class KafkaClient:
     def _encode_payload(self, topic, value, key):
         """Encode value+key bytes per the configured codec (or legacy JSON).
 
+        Thin delegate over the module-level :func:`_encode_payload_with_codec`
+        so the produce path and the reactor's reaction path share ONE
+        implementation (a previous duplicate in ``kafka_reactor.py``
+        diverged on the key-side ``resolve_subject`` argument).
+
         Returns ``(value_bytes, key_bytes)`` ready for ``producer.produce``.
         When ``self._codec is None`` (or a side's config is absent / JSON /
         KEY_STRING) the legacy path applies byte-for-byte — json.dumps for
@@ -260,47 +339,7 @@ class KafkaClient:
         is the write path — a schema-violating record is a fatal
         contract/config bug, not a per-message skip).
         """
-        if self._codec is None:
-            return json.dumps(value).encode("utf-8"), (
-                key.encode("utf-8") if isinstance(key, str) else key
-            )
-
-        Format, _decode, encode_payload, resolve_subject = _import_serialization()
-        sr = self._codec.get("sr")
-        value_cfg = self._codec.get("value") or {}
-        key_cfg = self._codec.get("key") or {}
-        value_fmt = value_cfg.get("fmt", Format.JSON)
-        key_fmt = key_cfg.get("fmt", Format.KEY_STRING)
-
-        # Value: JSON / unset fmt -> legacy json.dumps (byte-identical). Any
-        # other fmt routes through encode_payload against the resolved subject.
-        if value_fmt == Format.JSON:
-            value_bytes = json.dumps(value).encode("utf-8")
-        else:
-            subject = resolve_subject(
-                topic,
-                "value",
-                value_cfg.get("subject_strategy") or _DEFAULT_SUBJECT_STRATEGY,
-                value,
-            )
-            value_bytes = encode_payload(value, value_fmt, sr, subject=subject)
-
-        # Key: None -> None (real Kafka null key). KEY_STRING / unset -> legacy
-        # utf-8 (byte-identical). Other fmts -> encode_payload.
-        if key is None:
-            key_bytes = None
-        elif key_fmt == Format.KEY_STRING:
-            key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        else:
-            subject = resolve_subject(
-                topic,
-                "key",
-                key_cfg.get("subject_strategy") or _DEFAULT_SUBJECT_STRATEGY,
-                key,
-            )
-            key_bytes = encode_payload(key, key_fmt, sr, subject=subject)
-
-        return value_bytes, key_bytes
+        return _encode_payload_with_codec(self._codec, topic, value, key)
 
     # ------------------------------------------------------------------
     # consume_window

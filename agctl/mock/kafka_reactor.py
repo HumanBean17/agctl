@@ -12,7 +12,11 @@ import time
 from typing import Callable
 
 from ..assertions import jq_bool
-from ..clients.kafka_client import KafkaClient, ReactionResult
+from ..clients.kafka_client import (
+    KafkaClient,
+    ReactionResult,
+    _encode_payload_with_codec,
+)
 from ..config.models import KafkaReactor as KafkaReactorConfig
 from ..resolution import CaptureValue, render_typed
 from .capture import resolve_captures
@@ -341,11 +345,20 @@ class KafkaReactor:
     def _encode_reaction(self, value, key):
         """Encode the rendered reaction value/key per ``self._reaction_codec``.
 
-        Mirrors :meth:`KafkaClient._encode_payload` but runs against the
-        REACTION codec (not the trigger client's own codec, which is the
-        trigger topic's format used for DECODE only). The two formats
-        resolve INDEPENDENTLY per direction: a reactor may decode a JSON
-        trigger and emit an Avro reaction, or any other combination.
+        Thin delegate over the shared module-level
+        :func:`_encode_payload_with_codec` (the same implementation
+        :meth:`KafkaClient._encode_payload` uses), scoped to the REACTION
+        codec and reaction topic. Centralizing the encode logic prevents
+        the class of copy-paste divergence that previously bit the
+        key-side :func:`resolve_subject` call here (a duplicate passed
+        ``value`` instead of ``key`` — dormant under the default
+        ``"topic"`` strategy but LIVE under ``"record"``/``"topic_record"``,
+        where it resolved the wrong subject for non-string KEY formats).
+
+        The REACTION codec is independent of the trigger client's own
+        codec (which is the trigger topic's format used for DECODE only):
+        a reactor may decode a JSON trigger and emit an Avro reaction,
+        or any other combination.
 
         Returns ``(value_bytes, key_bytes)`` ready for
         ``client.produce(..., _raw=True)``. JSON / unset value formats and
@@ -360,43 +373,8 @@ class KafkaReactor:
         ``except Exception`` arm retries per the existing flow and emits
         ``kafka.error`` on the final attempt.
         """
-        from ..serialization import Format, encode_payload, resolve_subject
-
-        sr = self._reaction_codec.get("sr")
-        value_cfg = self._reaction_codec.get("value") or {}
-        key_cfg = self._reaction_codec.get("key") or {}
-        value_fmt = value_cfg.get("fmt", Format.JSON)
-        key_fmt = key_cfg.get("fmt", Format.KEY_STRING)
-        reaction_topic = self._config.reaction.topic
-
-        # Value: JSON / unset fmt -> legacy json.dumps (byte-identical). Any
-        # other fmt -> encode_payload against the resolved reaction subject.
-        if value_fmt == Format.JSON:
-            import json
-
-            value_bytes = json.dumps(value).encode("utf-8")
-        else:
-            subject = resolve_subject(
-                reaction_topic,
-                "value",
-                value_cfg.get("subject_strategy") or "topic",
-                value,
-            )
-            value_bytes = encode_payload(value, value_fmt, sr, subject=subject)
-
-        # Key: None -> None (real Kafka null key). KEY_STRING / unset ->
-        # legacy utf-8 (byte-identical). Other fmts -> encode_payload.
-        if key is None:
-            key_bytes = None
-        elif key_fmt == Format.KEY_STRING:
-            key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        else:
-            subject = resolve_subject(
-                reaction_topic,
-                "key",
-                key_cfg.get("subject_strategy") or "topic",
-                value,
-            )
-            key_bytes = encode_payload(key, key_fmt, sr, subject=subject)
+        return _encode_payload_with_codec(
+            self._reaction_codec, self._config.reaction.topic, value, key
+        )
 
         return value_bytes, key_bytes

@@ -519,3 +519,161 @@ def test_reaction_encode_failure_emits_kafka_error_with_fatal_set(
 
     # fail_fast + STOP -> stop_event set by the reactor's return value.
     assert stop_event.is_set()
+
+
+# ===========================================================================
+# (e) regression: key-side resolve_subject must receive the KEY (not value)
+# ===========================================================================
+
+
+def test_reaction_avro_key_resolves_record_subject_from_key_payload(
+    emit_event, stop_event
+):
+    """(e) Regression: a non-string KEY format under ``subject_strategy="record"``
+    resolves the key subject from the KEY's ``__record_name__`` (not the value's).
+
+    A previous copy of the encode logic in ``KafkaReactor._encode_reaction``
+    duplicated ~30 lines from ``KafkaClient._encode_payload`` and the copy
+    diverged: the key-side ``resolve_subject(...)`` call passed ``value`` as
+    the 4th argument instead of ``key``. The bug was dormant under the
+    default ``"topic"`` strategy (which ignores the payload) but LIVE under
+    ``"record"``/``"topic_record"``: a reactor whose reaction KEY uses a
+    non-string format (Avro) would resolve the wrong subject (reading
+    ``__record_name__`` off the VALUE instead of the KEY, falling back to
+    the topic-name subject when the value has no record name).
+
+    This pins the post-fix behavior via the full reactor flow: an
+    object-typed capture injects a dict KEY carrying
+    ``__record_name__="OrderKey"``; the VALUE has NO ``__record_name__``.
+    The fake SR records every ``get_latest_schema`` query — the key encode
+    MUST hit ``"OrderKey"`` (the key's record-name subject), not
+    ``"events-key"`` (the fallback the bug produced by reading the value,
+    which lacks a record name — and which the SR does NOT have, so the
+    encode would have raised).
+    """
+    pytest.importorskip("fastavro")
+    from agctl.config.models import CaptureSpec
+    from agctl.serialization import Format
+
+    # Key schema's record name is "OrderKey"; ``__record_name__`` is included
+    # as a field so fastavro's strict=True accepts the rendered key datum
+    # (which carries the reserved key to drive subject resolution). The value
+    # schema reuses the module-level SCHEMA_STR (record name "E").
+    KEY_SCHEMA_STR = (
+        '{"type":"record","name":"OrderKey",'
+        '"fields":[{"name":"orderId","type":"string"},'
+        '{"name":"__record_name__","type":"string"}]}'
+    )
+    KEY_SCHEMA_ID = 23
+
+    class _RecordSubjectSR(_FakeSR):
+        """Extends the value-only fake with a separate key-record schema.
+
+        Records every queried subject so the test can assert the key encode
+        hit the key's record-name subject (not the value's, not the
+        topic-name fallback).
+        """
+
+        def __init__(self):
+            super().__init__()  # registers events-value -> value schema (E)
+            self.by_id[KEY_SCHEMA_ID] = ("AVRO", KEY_SCHEMA_STR)
+            self.latest["OrderKey"] = ("AVRO", KEY_SCHEMA_STR, KEY_SCHEMA_ID)
+            self.queries: list[str] = []
+
+        def get_latest_schema(self, subject):
+            self.queries.append(subject)
+            return self.latest[subject]
+
+    sr = _RecordSubjectSR()
+    codec = {
+        "value": {"fmt": Format.AVRO, "subject_strategy": "record"},
+        "key": {"fmt": Format.AVRO, "subject_strategy": "record"},
+        "sr": sr,
+    }
+
+    # Object-typed capture injects the dict KEY (carrying its own record
+    # name) into the reaction; the rendered VALUE has no __record_name__,
+    # so a value-derived resolution would fall back to "events-key".
+    config = KafkaReactor(
+        topic="commands",
+        match='.value.command == "CREATE_ORDER"',
+        capture={
+            "keyPayload": CaptureSpec(from_=".value.keyPayload", type="object"),
+        },
+        reaction=KafkaReaction(
+            topic="events",
+            key="{keyPayload}",  # whole-field object substitution -> dict
+            value={"id": "{orderId}", "qty": 1},
+        ),
+    )
+    client = FakeKafkaClient(
+        script=[
+            _GoodMsg(
+                _msg(
+                    {
+                        "orderId": "ord-1",
+                        "command": "CREATE_ORDER",
+                        "keyPayload": {
+                            "orderId": "ord-1",
+                            "__record_name__": "OrderKey",
+                        },
+                    },
+                    key="ord-1",
+                )
+            ),
+        ]
+    )
+    reactor = Reactor(
+        name="record-key-reactor",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+        reaction_codec=codec,
+    )
+
+    reactor.run()
+
+    # The key encode queried the SR at the KEY's record-name subject.
+    assert "OrderKey" in sr.queries
+    # The value (no __record_name__) fell back to the topic-name subject.
+    assert "events-value" in sr.queries
+    # The bug would have queried "events-key" (value has no record name so
+    # resolve_subject("record") falls back to topic-name for the key) — the
+    # SR does not have that subject, so the encode would have raised.
+    assert "events-key" not in sr.queries
+
+    # One produce call with both sides encoded as Confluent-framed bytes.
+    assert len(client.produce_calls) == 1
+    prod = client.produce_calls[0]
+    assert prod["topic"] == "events"
+    assert prod["_raw"] is True
+
+    # The key bytes carry the KEY schema id (encoded against the OrderKey
+    # subject's schema, not the value schema).
+    key_bytes = prod["key"]
+    assert isinstance(key_bytes, (bytes, bytearray))
+    assert key_bytes[0] == 0
+    key_schema_id = struct.unpack(">I", bytes(key_bytes[1:5]))[0]
+    assert key_schema_id == KEY_SCHEMA_ID
+
+    # The value bytes carry the VALUE schema id (events-value -> E schema).
+    value_bytes = prod["value"]
+    assert value_bytes[0] == 0
+    value_schema_id = struct.unpack(">I", bytes(value_bytes[1:5]))[0]
+    assert value_schema_id == SCHEMA_ID
+
+    # Round-trip the key bytes to confirm the encoded datum is the rendered
+    # key record (schema_id in the wire frame selects the key schema).
+    from agctl.serialization import decode_payload
+
+    decoded_key = decode_payload(bytes(key_bytes), Format.AVRO, sr)
+    assert decoded_key == {"orderId": "ord-1", "__record_name__": "OrderKey"}
+
+    reacted = [e for e in emit_event.events if e["event"] == "kafka.reacted"]
+    assert len(reacted) == 1
+    assert reacted[0]["reactor"] == "record-key-reactor"
+    assert not any(e["event"] == "kafka.error" for e in emit_event.events)
+
