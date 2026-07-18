@@ -435,7 +435,9 @@ class MockGrpcServer:
     ) -> None:
         """Response-shape vs derived call type.
 
-        - ``server_stream`` -> ``response.messages`` set (``message`` unset).
+        - ``server_stream`` -> ``response.messages`` set (``message`` unset) and
+          non-empty (an empty sequence is almost certainly an authoring
+          mistake — fail loud rather than silently streaming nothing).
         - ``unary``/``client_stream``/``bidi`` -> ``response.message`` set
           (``messages`` unset).
 
@@ -452,6 +454,19 @@ class MockGrpcServer:
                 raise ConfigError(
                     f"{path}: server_stream method {method_loc} requires "
                     f"'response.messages' (got 'response.message')",
+                    {
+                        "stub": name,
+                        "call_type": call_type,
+                        "service": stub.service,
+                        "method": stub.method,
+                        "path": path,
+                    },
+                )
+            if len(response.messages) == 0:
+                raise ConfigError(
+                    f"{path}: server_stream method {method_loc} requires at "
+                    f"least one entry in 'response.messages' "
+                    f"(got an empty list)",
                     {
                         "stub": name,
                         "call_type": call_type,
@@ -1070,6 +1085,11 @@ class MockGrpcServer:
         try:
             bound_port = self._server.add_insecure_port(self.listen_address)
         except (OSError, RuntimeError) as exc:
+            # Explicitly tear down the C-core grpc.Server we just built.
+            # ``server.start()`` hasn't run, so the ThreadPoolExecutor has no
+            # live workers — but the underlying C core still owns a Server
+            # object whose cleanup we shouldn't defer to GC.
+            self._server.stop(grace=0)
             self._server = None
             raise ConfigError(
                 f"grpc listen address {self.listen_address} already in use; "

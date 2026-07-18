@@ -248,6 +248,29 @@ class TestResponseShapeVsCallType:
         assert key in server.stubs_by_method
         assert server.method_meta[key][2] == "server_stream"
 
+    def test_server_stream_empty_messages_raises_config_error(
+        self, mock_grpc_echo_pool
+    ):
+        """server_stream stub with ``response.messages: []`` -> ConfigError.
+
+        An empty streaming sequence is almost always an authoring mistake
+        (the model validator only enforces exactly-one-of message/messages,
+        and ``[] is not None`` so it slips through); ``_check_response_shape``
+        fails loud at construction so the operator fixes the stub instead of
+        silently streaming nothing at runtime.
+        """
+        bad = GrpcStub(
+            service=SERVICE,
+            method="ServerStream",
+            response=GrpcResponse(messages=[]),
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            _build({"ss_empty": bad}, mock_grpc_echo_pool)
+        msg = str(exc_info.value)
+        assert "mocks.grpc.stubs.ss_empty.response" in msg
+        assert "server_stream" in msg
+        assert "at least one" in msg.lower()
+
     def test_client_stream_requires_message(self, mock_grpc_echo_pool):
         """client_stream is response.message-shaped (single aggregated reply)."""
         # Correct shape -> ok

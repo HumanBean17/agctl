@@ -211,9 +211,9 @@ def _grpc_mock_params(stub) -> list[str]:
     Mirrors the mock-http-stubs philosophy (surface what the operator can
     parameterize), but folds capture *names* into ``params`` rather than
     exposing the structured ``capture`` dict (per Task 11 brief). The
-    ``{placeholder}`` scan covers both ``response.message`` (unary/
-    server-streaming single payload) and each entry of ``response.messages``
-    (client/bidi streaming sequence).
+    ``{placeholder}`` scan covers both ``response.message`` (unary /
+    client-stream / bidi single payload) and each entry of
+    ``response.messages`` (server-stream sequence).
     """
     tokens: set[str] = set()
     if stub.capture:

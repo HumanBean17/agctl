@@ -405,8 +405,9 @@ class GrpcResponseMessage(BaseModel):
 class GrpcResponse(BaseModel):
     """gRPC response definition for a mock stub.
 
-    Exactly one of ``message`` (unary/server-streaming single authored payload)
-    or ``messages`` (client/bidi streaming sequence) must be set. ``status`` is
+    Exactly one of ``message`` (unary / client_stream / bidi single authored
+    payload) or ``messages`` (server_stream sequence, one entry per streamed
+    response message) must be set. ``status`` is
     validated here against the gRPC status enum via :func:`parse_grpc_status`,
     but stored verbatim (name or int as authored) — ``(code, name)`` resolution
     happens at render time (Task 5). Response-shape-vs-call-type (e.g.

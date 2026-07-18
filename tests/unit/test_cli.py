@@ -222,6 +222,7 @@ def test_mock_run_help_exits_zero():
     assert "--http-listen" in result.output
     assert "--duration" in result.output
     assert "--until-stopped" in result.output
+    assert "--grpc-listen" in result.output
 
 
 def test_version_flag():
