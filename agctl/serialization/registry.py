@@ -5,9 +5,10 @@ shipped with the optional ``kafka`` extra and is lazy-imported INSIDE
 :meth:`SchemaRegistryClient.__init__`. Module top imports only stdlib plus
 the local config models and the error hierarchy, so this module imports
 cleanly even when the ``kafka`` extra is absent — only *constructing* a
-client requires the extra. A missing extra surfaces as a
-:class:`ConfigError` pointing at ``pip install 'agctl[kafka]'``, never a bare
-``ImportError``.
+client requires the extra. A missing extra (or a missing transitive dep the
+SR submodule itself imports, e.g. ``authlib``) surfaces as a
+:class:`ConfigError` whose message echoes the underlying import error text
+AND points at ``pip install 'agctl[kafka]'``, never a bare ``ImportError``.
 
 This wrapper adds two things the raw client does not:
 
@@ -109,7 +110,12 @@ class SchemaRegistryClient:
             return
 
         # Lazy import the heavy module INSIDE __init__: a missing ``kafka``
-        # extra must surface as ConfigError, never a bare ImportError.
+        # extra must surface as ConfigError, never a bare ImportError. We
+        # also surface the underlying error text in the message because the
+        # SR submodule pulls transitive deps (e.g. ``authlib``) that the
+        # ``kafka`` extra does not pin; in that case the generic install
+        # hint is misleading (the extra IS installed) and the operator
+        # needs the missing-module name to act.
         try:
             from confluent_kafka.schema_registry import (
                 Schema as _Schema,
@@ -117,8 +123,10 @@ class SchemaRegistryClient:
             )
         except ImportError as exc:  # pragma: no cover - env-dependent
             raise ConfigError(
-                "Schema Registry support requires the 'kafka' extra: "
-                "pip install 'agctl[kafka]'"
+                "Schema Registry support could not be loaded: "
+                f"{exc}. Install the 'kafka' extra (pip install 'agctl[kafka]'); "
+                "if it is already installed, the error above names the missing "
+                "dependency."
             ) from exc
 
         self._Schema = _Schema

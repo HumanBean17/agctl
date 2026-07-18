@@ -292,6 +292,45 @@ def test_missing_kafka_extra_raises_config_error(monkeypatch):
     assert "agctl[kafka]" in str(exc_info.value)
 
 
+def test_missing_transitive_dep_surfaces_in_config_error_message(monkeypatch):
+    """A missing *transitive* dependency (e.g. ``authlib``, pulled by
+    ``confluent_kafka.schema_registry`` itself) must surface in the ConfigError
+    message — not just the generic ``agctl[kafka]`` install hint.
+
+    The ``kafka`` extra installs ``confluent-kafka`` but does NOT pin
+    ``authlib``; when the SR submodule's own ``import authlib`` fails, the
+    resulting ``ModuleNotFoundError`` is an ``ImportError`` subclass, so the
+    wrapper's ``except ImportError`` catches it. Without echoing the underlying
+    error text, an operator sees only "install agctl[kafka]" — wrong remedy,
+    since the kafka extra IS already installed. This test locks the cause into
+    the surfaced message so a future refactor that swallows it again fails here.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "confluent_kafka.schema_registry":
+            raise ModuleNotFoundError("No module named 'authlib'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    # Ensure the lazy import actually re-enters our patched __import__ rather
+    # than short-circuiting on a previously-cached module entry.
+    monkeypatch.delitem(sys.modules, "confluent_kafka.schema_registry", raising=False)
+
+    with pytest.raises(ConfigError) as exc_info:
+        SchemaRegistryClient("http://sr:8081")  # no client_factory -> real path
+
+    message = str(exc_info.value)
+    # The missing transitive dependency MUST be named in the surfaced message
+    # — this is the assertion that locks the behavior and would fail if a
+    # future refactor swallowed the cause again.
+    assert "authlib" in message
+    # The spec-mandated install pointer is retained as a recovery hint.
+    assert "agctl[kafka]" in message
+
+
 # --- (g) real-path construction --------------------------------------------
 
 
