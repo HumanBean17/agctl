@@ -70,8 +70,14 @@ def parse_grpc_status(status: str | int) -> tuple[int, str]:
     # declares --status as type=str) to int BEFORE the lookup — otherwise the
     # int branch below is unreachable from the CLI and --status 5 is rejected.
     # gRPC codes are 0-16 (non-negative); ``isdigit`` suffices and also rejects
-    # negatives ("-1".isdigit() is False) and floats.
-    if isinstance(status, str) and status.isdigit():
+    # negatives ("-1".isdigit() is False) and floats. The ``isascii()`` guard is
+    # load-bearing: ``str.isdigit()`` is True for Unicode digit-strings like
+    # ``"²"`` / ``"٥"`` but ``int("²")`` raises ``ValueError`` — which would
+    # escape this helper (whose contract is ``ConfigError``, never ``ValueError``)
+    # as an uncaught traceback on the CLI assertion path. Restrict the coercion
+    # to plain ASCII digit-strings; anything else falls through to name lookup
+    # and the documented ``ConfigError``.
+    if isinstance(status, str) and status.isascii() and status.isdigit():
         status = int(status)
     # Name lookup (case-sensitive — see docstring)
     if isinstance(status, str):

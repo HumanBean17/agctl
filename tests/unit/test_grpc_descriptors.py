@@ -146,7 +146,9 @@ def test_serialize_deserialize_round_trip_is_stable(mock_grpc_echo_pool):
     assert isinstance(encoded, bytes)
 
     decoded = deser(encoded)
-    assert decoded == {"msg": "hi"}  # n defaults to 0 and is omitted
+    # ``deserialize`` preserves default-valued scalars (Fix 1): ``n`` defaults
+    # to 0 and is now PRESENT in the envelope (always_print_fields_with_no_presence).
+    assert decoded == {"msg": "hi", "n": 0}
 
     # bytes -> dict -> bytes is stable
     re_encoded = ser(decoded)
@@ -178,3 +180,125 @@ def test_message_class_returns_protobuf_class(mock_grpc_echo_pool):
     instance = cls()
     instance.msg = "hello"
     assert instance.SerializeToString() == b"\x0a\x05hello"
+
+
+# --- deserialize: snake_case + default-preserving contract (Fix 1) -----------
+#
+# ``MessageToDict`` defaults to lowerCamelCase + dropping scalar defaults, which
+# silently broke ``match.body`` (a stub authored ``user_id`` never matched) and
+# ``capture.from`` (``.message.user_id`` resolved to null). The fix passes
+# ``preserving_proto_field_name=True`` + ``always_print_fields_with_no_presence=True``.
+# These tests use ``echo.UserService/UserRequest`` (a snake_case ``user_id`` field
+# + a scalar int ``n``) added to echo.proto for exactly this regression.
+
+
+USER_REQUEST = "echo.UserRequest"
+USER_SERVICE = "echo.UserService"
+
+
+def test_deserialize_preserves_snake_case_field_names(mock_grpc_echo_pool):
+    """(Fix 1) ``user_id`` round-trips as ``user_id`` — NOT lowerCamelCase ``userId``.
+
+    Without ``preserving_proto_field_name=True`` the deserialized dict would key
+    the field as ``userId``, silently breaking ``match.body``/``capture.from``
+    authored against the proto's field names.
+    """
+    msg_desc = mock_grpc_echo_pool.FindMessageTypeByName(USER_REQUEST)
+    ser = grpc_descriptors.serialize(msg_desc)
+    deser = grpc_descriptors.deserialize(msg_desc)
+
+    encoded = ser({"user_id": "u-123", "n": 7})
+    decoded = deser(encoded)
+    assert decoded["user_id"] == "u-123", (
+        "snake_case field must be preserved (would be 'userId' without the fix)"
+    )
+    assert "userId" not in decoded
+
+
+def test_deserialize_preserves_zero_valued_int(mock_grpc_echo_pool):
+    """(Fix 1) a scalar int equal to its default (n=0) is PRESENT in the envelope.
+
+    Without ``always_print_fields_with_no_presence=True`` the zero-valued ``n``
+    is dropped, so a ``match.body: {n: 0}`` stub never matches it.
+    """
+    msg_desc = mock_grpc_echo_pool.FindMessageTypeByName(USER_REQUEST)
+    ser = grpc_descriptors.serialize(msg_desc)
+    deser = grpc_descriptors.deserialize(msg_desc)
+
+    # n omitted on the wire == default 0; deserializer must surface it.
+    encoded = ser({"user_id": "u-1"})
+    decoded = deser(encoded)
+    assert decoded == {"user_id": "u-1", "n": 0}, (
+        "zero-valued int must be present (would be dropped without the fix)"
+    )
+
+    # Explicit n=0 round-trips identically.
+    encoded0 = ser({"user_id": "u-2", "n": 0})
+    assert deser(encoded0) == {"user_id": "u-2", "n": 0}
+
+
+def test_deserialize_envelope_is_matchable_on_snake_case_and_zero_int(
+    mock_grpc_echo_pool,
+):
+    """(Fix 1, (a)+(c)) a deserialized request is matchable by ``match.body``
+    using the snake_case key AND a zero-valued int.
+
+    Proves the full match path: serialize -> deserialize -> json_subset (the
+    predicate ``match.body`` uses). On the pre-fix dict (``{userId: ...}``,
+    ``n`` dropped) BOTH subset checks would fail — a silent correctness miss.
+    """
+    from agctl.assertions import json_subset
+
+    msg_desc = mock_grpc_echo_pool.FindMessageTypeByName(USER_REQUEST)
+    ser = grpc_descriptors.serialize(msg_desc)
+    deser = grpc_descriptors.deserialize(msg_desc)
+
+    decoded = deser(ser({"user_id": "u-42", "n": 0}))
+
+    # (a) snake_case key subset-matches the deserialized message.
+    assert json_subset({"user_id": "u-42"}, decoded)
+    # (c) a zero-valued int field is present and matchable.
+    assert json_subset({"n": 0}, decoded)
+    # Both together still subset-match.
+    assert json_subset({"user_id": "u-42", "n": 0}, decoded)
+
+
+def test_deserialize_capture_resolves_snake_case_via_dispatch(mock_grpc_echo_pool):
+    """(Fix 1, (b)) ``capture.from: .message.user_id`` resolves off a REAL
+    deserialized message (not a hand-built dict).
+
+    Builds the envelope ``message`` from the deserializer's output, then runs
+    ``dispatch_grpc`` with a capture rooted at the snake_case field. On the
+    pre-fix lowerCamelCase dict the capture resolves to null → ``capture.missing``
+    + empty substitution. With the fix the capture resolves and the rendered
+    response substitutes the captured value.
+    """
+    pytest.importorskip("jq")
+    from agctl.config.models import CaptureSpec, GrpcResponse, GrpcStub
+    from agctl.mock.grpc_server import build_envelope, dispatch_grpc
+
+    msg_desc = mock_grpc_echo_pool.FindMessageTypeByName(USER_REQUEST)
+    ser = grpc_descriptors.serialize(msg_desc)
+    deser = grpc_descriptors.deserialize(msg_desc)
+
+    # Real deserialize path produces the envelope message.
+    decoded_message = deser(ser({"user_id": "u-99", "n": 3}))
+
+    stub = GrpcStub(
+        service=USER_SERVICE,
+        method="GetUser",
+        capture={"uid": CaptureSpec(from_=".message.user_id")},
+        response=GrpcResponse(message={"echo": "got-{uid}"}),
+    )
+    env = build_envelope(USER_SERVICE, "GetUser", {}, message=decoded_message)
+    missing: list[tuple[str, str]] = []
+
+    def cb(stub_name, cap_name, from_path):
+        missing.append((cap_name, from_path))
+
+    outcome = dispatch_grpc({"u": stub}, env, "unary", emit_capture_missing=cb)
+
+    assert outcome.matched is True
+    assert missing == [], "capture.from .message.user_id must resolve (non-null)"
+    assert outcome.messages == [{"echo": "got-u-99"}]
+

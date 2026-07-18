@@ -739,6 +739,28 @@ class MockGrpcServer:
         """Resolve a status NAME (e.g. 'NOT_FOUND') to a grpc.StatusCode member."""
         return getattr(grpc_module.StatusCode, name)
 
+    @staticmethod
+    def _apply_matched_metadata(context, metadata) -> None:
+        """Send initial + set trailing metadata for a matched stub's
+        ``response.metadata`` (Fix 4).
+
+        - ``send_initial_metadata`` is valid at most once per RPC and must
+          precede the first response (return / yield); callers guarantee the
+          once-per-RPC contract (unary/client_stream/server_stream match once;
+          bidi guards its repeat turns inline).
+        - ``set_trailing_metadata`` applies on the terminal status; setting it
+          here (before the non-OK ``abort`` and before the normal return/stream
+          end) means both OK and error terminals carry it.
+        - No-op when ``metadata`` is empty/None: stubs without
+          ``response.metadata`` and the unmatched path (which never reaches a
+          match) send nothing — UNIMPLEMENTED stays metadata-free.
+        """
+        if not metadata:
+            return
+        items = tuple(metadata.items())
+        context.send_initial_metadata(items)
+        context.set_trailing_metadata(items)
+
     def _handle_unary(
         self,
         grpc_module,
@@ -807,6 +829,13 @@ class MockGrpcServer:
                 "status": outcome.status[1] if outcome.status else "OK",
                 "duration_ms": duration_ms,
             }
+        )
+
+        # Apply matched response metadata (initial + trailing) BEFORE the
+        # response/abort so both OK and non-OK terminals carry it (Fix 4). No-op
+        # when the matched stub has no response.metadata.
+        self._apply_matched_metadata(
+            context, stub.response.metadata if stub is not None else None
         )
 
         if outcome.status is not None and outcome.status[0] != 0:
@@ -878,6 +907,13 @@ class MockGrpcServer:
             [entry.delay_ms for entry in (stub.response.messages or [])]
             if stub is not None
             else []
+        )
+
+        # Apply matched response metadata BEFORE the first yield so initial
+        # metadata precedes the stream and trailing metadata lands on the
+        # terminal status (OK stream-end or the non-OK abort below) (Fix 4).
+        self._apply_matched_metadata(
+            context, stub.response.metadata if stub is not None else None
         )
 
         for idx, rendered in enumerate(outcome.messages):
@@ -979,6 +1015,11 @@ class MockGrpcServer:
             }
         )
 
+        # Apply matched response metadata before the single reply / abort (Fix 4).
+        self._apply_matched_metadata(
+            context, stub.response.metadata if stub is not None else None
+        )
+
         if outcome.status is not None and outcome.status[0] != 0:
             context.abort(
                 self._grpc_status_code(grpc_module, outcome.status[1]),
@@ -1001,6 +1042,10 @@ class MockGrpcServer:
         # Per-turn start time; duration_ms is measured per yielded response.
         metadata = self._metadata_to_dict(context)
         stubs = self.stubs_by_method.get((svc, mtd), {})
+        # send_initial_metadata is valid at most once per RPC; track whether the
+        # first matched turn has already sent it so later turns only refresh the
+        # trailing metadata (Fix 4).
+        initial_metadata_sent = False
         for request in request_iterator:
             start = time.time()
             envelope = build_envelope(svc, mtd, metadata, message=request)
@@ -1040,6 +1085,17 @@ class MockGrpcServer:
                 continue
 
             stub = stubs.get(outcome.stub_name)
+            # Apply matched response metadata (Fix 4): send_initial_metadata
+            # once-per-RPC before the first matched turn's yield; refresh
+            # trailing metadata each matched turn so the terminal carries the
+            # last matched stub's metadata. No-op for stubs without it.
+            if stub is not None and stub.response.metadata:
+                md_items = tuple(stub.response.metadata.items())
+                if not initial_metadata_sent:
+                    context.send_initial_metadata(md_items)
+                    initial_metadata_sent = True
+                context.set_trailing_metadata(md_items)
+
             if stub is not None and stub.delay_ms > 0:
                 time.sleep(stub.delay_ms / 1000.0)
 

@@ -1530,6 +1530,126 @@ def test_grpc_shutdown_calls_fake_shutdown():
     assert record[0].shutdown_called is True
 
 
+def test_grpc_winddown_error_during_shutdown_drain_yields_exit_1():
+    """(Fix 3) Regression: an in-flight gRPC handler emitting ``grpc.error``
+    during the shutdown drain (after stop is set) must yield exit 1, not 0.
+
+    Mirrors the kafka wind-down regression (``test_winddown_kafka_error_after_stop_yields_exit_1``):
+    ``run()`` must drain the gRPC server (call ``shutdown()`` → ``server.stop(grace=2)``
+    → in-flight handlers finish) BEFORE reading the exit-code snapshot, so a
+    fatal ``grpc.error`` emitted during the drain is counted. Without the
+    drain-before-snapshot, ``run()`` reads counters before the late error lands
+    → exit 0 while the summary shows ``grpc_errors=1`` — a false green. The fake
+    server's ``shutdown()`` emits the ``grpc.error`` (idempotently — only once)
+    to deterministically model the in-flight-during-drain race.
+    """
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    class WinddownErrorGrpc(FakeGrpcServer):
+        """Fake whose ``shutdown()`` emits a fatal grpc.error exactly once.
+
+        Models an in-flight handler erroring during ``server.stop(grace=2)``'s
+        drain window, and the real server's idempotent shutdown (guard on
+        ``self._server is not None``) — the second call (from ``engine.shutdown()``)
+        must NOT re-emit / double-count.
+        """
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._drained = False
+
+        def shutdown(self):
+            if not self._drained:
+                self._drained = True
+                # In-flight handler aborts during the grace drain.
+                self._emit_event(
+                    {
+                        "event": "grpc.error",
+                        "service": "pkg.Svc",
+                        "method": "Echo",
+                        "call_type": "unary",
+                        "error": "handler aborted during drain",
+                        "fatal": True,
+                    }
+                )
+            self.shutdown_called = True
+
+    def factory(*, config, top_level_descriptors, emit_event):
+        return WinddownErrorGrpc(
+            config=config,
+            top_level_descriptors=top_level_descriptors,
+            emit_event=emit_event,
+        )
+
+    engine = MockEngine(
+        mocks=_grpc_mocks(),
+        run_http=False,
+        run_kafka=False,
+        run_grpc=True,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        grpc_server_factory=factory,
+        emit_fn=capture_emit,
+        run_id="test-grpc-winddown",
+    )
+    engine.start()
+    # Pre-set stop so run()'s loop exits immediately; the gRPC drain still runs
+    # (after the loop, before the snapshot) — that is the code path under test.
+    # (The gRPC serve thread does not set stop itself, unlike the kafka wind-down
+    # fake, so the loop would block forever without this pre-set.)
+    engine._stop.set()
+    exit_code = engine.run()
+
+    # Exit code must be 1 (a runtime error occurred during the drain), matching
+    # the summary's grpc_errors count — not a false-green 0.
+    assert exit_code == 1, (
+        f"expected exit 1 after wind-down grpc.error, got {exit_code}"
+    )
+    engine.shutdown()
+
+    errors = [l for l in captured_lines if l.get("event") == "grpc.error"]
+    assert len(errors) == 1, "the idempotent drain must emit exactly one grpc.error"
+    summary = [l for l in captured_lines if l.get("event") == "summary"][0]
+    assert summary["grpc_errors"] == 1
+
+
+def test_grpc_drain_shutdown_called_inside_run_before_engine_shutdown():
+    """(Fix 3) ``run()`` itself calls ``server.shutdown()`` before returning the
+    exit code (the drain is not deferred to ``engine.shutdown()``).
+
+    The drain must run inside ``run()`` so the exit-code snapshot (taken in
+    ``run()``) observes the drained counters. Verified by setting ``_stop``
+    before ``run()`` (so the loop exits immediately) and asserting the fake's
+    ``shutdown_called`` is True right after ``run()`` returns — BEFORE
+    ``engine.shutdown()`` is invoked.
+    """
+    record = [None]
+    engine = MockEngine(
+        mocks=_grpc_mocks(),
+        run_http=False,
+        run_kafka=False,
+        run_grpc=True,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        grpc_server_factory=_make_fake_grpc_factory(record),
+        emit_fn=lambda _line: None,
+        run_id="test-grpc-drain-ordering",
+    )
+    engine.start()
+    engine._stop.set()  # loop exits immediately; drain still runs
+    engine.run()
+
+    # The drain happened INSIDE run(), before engine.shutdown() is even called.
+    assert record[0] is not None
+    assert record[0].shutdown_called is True, (
+        "run() must drain the gRPC server before returning the exit code"
+    )
+    engine.shutdown()
+
+
 def test_grpc_events_tally_and_set_runtime_error_exit_1():
     """(d) ``grpc.hit`` tallies; ``grpc.unmatched``/``grpc.error`` tally AND set
     the runtime-error flag (→ exit code 1 + summary counters)."""

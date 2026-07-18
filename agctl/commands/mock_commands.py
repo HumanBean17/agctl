@@ -332,7 +332,16 @@ def _mock_start_core(
                 error = parsed.startup_error.get("error", {})
                 message = error.get("message", "startup failed")
                 detail = error.get("detail", {})
-                detail["listen"] = http_listen
+                # Point detail.listen at the engine that actually failed: the
+                # HTTP address when run_http, else the gRPC address when run_grpc,
+                # else None (kafka-only). For a grpc-only daemon http_listen
+                # defaults to 0.0.0.0:18080 (the HTTP default), so the previous
+                # unconditional ``detail["listen"] = http_listen`` pointed a
+                # gRPC startup error at the wrong address (the message text still
+                # named the gRPC port). (Fix 5)
+                detail["listen"] = (
+                    http_listen if run_http else (grpc_listen if run_grpc else None)
+                )
                 raise ConfigError(message, detail)
 
             # Sleep briefly before next poll

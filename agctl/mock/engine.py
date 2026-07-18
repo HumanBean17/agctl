@@ -499,6 +499,22 @@ class MockEngine:
             for t in self._reactor_threads:
                 t.join(timeout=2.0)
 
+            # Drain the gRPC server's in-flight handlers BEFORE the exit-code
+            # snapshot, mirroring the kafka "join before snapshot" pattern above.
+            # ``MockGrpcServer.shutdown()`` does ``server.stop(grace=2)`` — it
+            # lets in-flight handlers finish so a handler emitting
+            # ``grpc.unmatched``/``grpc.error`` during the grace window is
+            # counted BEFORE the exit code is read. Without this drain the
+            # shutdown runs later (in ``engine.shutdown()``, from ``mock_run``'s
+            # ``finally``, AFTER ``run()`` returned), so a late fatal gRPC event
+            # sets ``_runtime_error`` + counters that the SUMMARY reflects but
+            # the EXIT CODE does not → a false-green exit 0. The later
+            # ``shutdown()`` call is idempotent (``MockGrpcServer.shutdown``
+            # guards on ``self._server is not None``), so this pre-snapshot drain
+            # turns it into a no-op. Only the gRPC path is touched here.
+            if self._grpc_server is not None:
+                self._grpc_server.shutdown()
+
             # Determine exit code (DESIGN §11): exit 1 if ANY runtime error
             # occurred (any kafka.error, fatal or not) or a fatal/fail-fast
             # stop was triggered; else 0. Read under _emit_lock to share the

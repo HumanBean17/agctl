@@ -140,3 +140,29 @@ def test_parse_status_error_detail_is_empty_dict():
     with pytest.raises(ConfigError) as exc_info:
         parse_grpc_status("FOO")
     assert exc_info.value.detail == {}
+
+
+def test_parse_status_unicode_digit_string_raises_config_error_not_value_error():
+    """(Fix 2) Unicode digit-strings like ``"²"`` satisfy ``str.isdigit()`` but
+    ``int("²")`` raises ``ValueError``.
+
+    On the CLI assertion path (``validate_grpc_assertion_args`` catches only
+    ``ConfigError``) a bare ``ValueError`` would escape as an uncaught traceback
+    instead of the documented ``ConfigError``. The helper now restricts the
+    digit-string coercion to ASCII (``isascii()``) so Unicode digits fall
+    through to name lookup → ``ConfigError``. This pins the contract: the helper
+    NEVER raises ``ValueError``.
+    """
+    with pytest.raises(ConfigError) as exc_info:
+        parse_grpc_status("²")
+    assert "status must be a gRPC code name or number 0-16" in str(exc_info.value)
+    # The crucial assertion: it MUST be ConfigError, not the ValueError that
+    # ``int("²")`` would raise on the pre-fix path.
+    assert not isinstance(exc_info.value, ValueError)
+
+
+def test_parse_status_arabic_digit_string_raises_config_error():
+    """(Fix 2) Arabic-Indic digit-string ``"٥"`` (U+0665) is also ``isdigit()``
+    True but not ``isascii()`` — same regression class as ``"²"``."""
+    with pytest.raises(ConfigError):
+        parse_grpc_status("٥")

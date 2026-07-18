@@ -272,13 +272,28 @@ def serialize(message_desc) -> Callable[[dict | bytes], bytes]:
 
 
 def deserialize(message_desc) -> Callable[[bytes], dict]:
-    """Build a deserializer callable: ``bytes -> dict``."""
+    """Build a deserializer callable: ``bytes -> dict``.
+
+    ``MessageToDict`` is called with ``preserving_proto_field_name=True`` (so
+    snake_case fields stay snake_case — the default lowerCamelCase conversion
+    would silently break ``match.body``/``capture.from`` authored against the
+    proto's field names) and ``always_print_fields_with_no_presence=True`` (so
+    scalar fields equal to their default, e.g. an ``int32 n = 0``, are PRESENT
+    in the envelope — without this a zero-valued field is omitted and a
+    ``match.body``/``capture.from`` keyed on it silently misses). The response
+    path (:func:`serialize`) uses ``ParseDict`` which accepts both casings, so
+    this restores symmetry: both directions speak proto-field-name JSON.
+    """
 
     def deserializer(b: bytes) -> dict:
         json_format = _require("google.protobuf.json_format")
 
         cls = message_class(message_desc)
         msg = cls.FromString(b)
-        return json_format.MessageToDict(msg)
+        return json_format.MessageToDict(
+            msg,
+            preserving_proto_field_name=True,
+            always_print_fields_with_no_presence=True,
+        )
 
     return deserializer

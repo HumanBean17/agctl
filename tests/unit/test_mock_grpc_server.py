@@ -928,6 +928,170 @@ class TestBidiDispatch:
 
 
 # ---------------------------------------------------------------------------
+# Response metadata (Fix 4): stub.response.metadata -> initial + trailing
+# metadata on matched RPCs; nothing on the unmatched path.
+# ---------------------------------------------------------------------------
+
+
+class TestResponseMetadata:
+    """``stub.response.metadata`` is honored across all 4 call types.
+
+    Pins the contract that was previously a silent no-op: a matched stub with
+    ``response.metadata`` sends initial metadata before the first response and
+    sets trailing metadata so both OK and non-OK terminals carry it. The
+    unmatched path (no stub → UNIMPLEMENTED) sends NO authored metadata.
+    """
+
+    def test_unary_matched_stub_sends_initial_and_trailing_metadata(
+        self, mock_grpc_echo_pool
+    ):
+        """(a) A matched unary stub with ``response.metadata`` → the client
+        receives the initial metadata (before the response) AND the trailing
+        metadata (on the OK terminal)."""
+        stub = GrpcStub(
+            service=SERVICE,
+            method="Unary",
+            match=GrpcMatch(body={"msg": "hi"}),
+            response=GrpcResponse(
+                message={"msg": "hi"},
+                metadata={"x-trace-id": "t-1", "x-region": "eu"},
+            ),
+        )
+        with _running_server({"meta": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            unary, _, _, _ = _make_invoker(
+                mock_grpc_echo_pool, channel, SERVICE, "Unary"
+            )
+            resp, call = unary.with_call({"msg": "hi"})
+            assert resp == {"msg": "hi"}
+
+            init = dict(call.initial_metadata())
+            assert init["x-trace-id"] == "t-1"
+            assert init["x-region"] == "eu"
+
+            trail = dict(call.trailing_metadata())
+            assert trail["x-trace-id"] == "t-1"
+            assert trail["x-region"] == "eu"
+
+    def test_unary_non_ok_stub_sends_trailing_metadata(self, mock_grpc_echo_pool):
+        """(b) A matched non-OK stub with metadata → the client receives the
+        trailing metadata on the error terminal."""
+        stub = GrpcStub(
+            service=SERVICE,
+            method="Unary",
+            match=GrpcMatch(body={"msg": "boom"}),
+            response=GrpcResponse(
+                message={},
+                status="NOT_FOUND",
+                metadata={"x-trace-id": "err-1"},
+            ),
+        )
+        with _running_server({"nf": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            unary, _, _, _ = _make_invoker(
+                mock_grpc_echo_pool, channel, SERVICE, "Unary"
+            )
+            with pytest.raises(grpc.RpcError) as exc_info:
+                unary({"msg": "boom"})
+            assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+            trail = dict(exc_info.value.trailing_metadata())
+            assert trail["x-trace-id"] == "err-1"
+
+    def test_unmatched_rpc_sends_no_authored_metadata(self, mock_grpc_echo_pool):
+        """The unmatched path (→ UNIMPLEMENTED) does NOT send the authored
+        ``response.metadata`` — only a MATCHED stub's metadata is sent."""
+        stub = GrpcStub(
+            service=SERVICE,
+            method="Unary",
+            match=GrpcMatch(body={"msg": "match-me"}),
+            response=GrpcResponse(
+                message={},
+                metadata={"x-authored": "should-not-leak"},
+            ),
+        )
+        with _running_server({"guarded": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            unary, _, _, _ = _make_invoker(
+                mock_grpc_echo_pool, channel, SERVICE, "Unary"
+            )
+            with pytest.raises(grpc.RpcError) as exc_info:
+                unary({"msg": "no-match"})  # matches no stub → UNIMPLEMENTED
+            assert exc_info.value.code() == grpc.StatusCode.UNIMPLEMENTED
+            trail = dict(exc_info.value.trailing_metadata())
+            assert "x-authored" not in trail
+
+    def test_server_stream_matched_stub_sends_initial_metadata(
+        self, mock_grpc_echo_pool
+    ):
+        """server_stream: initial metadata precedes the first yield; trailing
+        metadata lands on the OK stream-end."""
+        stub = GrpcStub(
+            service=SERVICE,
+            method="ServerStream",
+            response=GrpcResponse(
+                messages=[
+                    GrpcResponseMessage(message={"msg": "one"}),
+                    GrpcResponseMessage(message={"msg": "two"}),
+                ],
+                metadata={"x-stream-trace": "s-1"},
+            ),
+        )
+        with _running_server({"ss": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            _, server_stream, _, _ = _make_invoker(
+                mock_grpc_echo_pool, channel, SERVICE, "ServerStream"
+            )
+            # server_stream is a unary_stream callable; the returned call object
+            # exposes initial/trailing metadata after iteration completes.
+            call = server_stream({"msg": "go"})
+            msgs = list(call)
+            assert [m["msg"] for m in msgs] == ["one", "two"]
+            init = dict(call.initial_metadata())
+            assert init["x-stream-trace"] == "s-1"
+            trail = dict(call.trailing_metadata())
+            assert trail["x-stream-trace"] == "s-1"
+
+    def test_bidi_matched_turn_sends_initial_metadata(self, mock_grpc_echo_pool):
+        """bidi: initial metadata is sent once-per-RPC before the first matched
+        turn's yield, even with multiple turns."""
+        stub = GrpcStub(
+            service=SERVICE,
+            method="Bidi",
+            response=GrpcResponse(
+                message={"msg": "ok"},
+                metadata={"x-bidi": "b-1"},
+            ),
+        )
+        with _running_server({"bd": stub}, mock_grpc_echo_pool) as (
+            server,
+            events,
+            channel,
+        ):
+            _, _, _, bidi = _make_invoker(
+                mock_grpc_echo_pool, channel, SERVICE, "Bidi"
+            )
+            call = bidi(iter([{"msg": "a"}, {"msg": "b"}]))
+            replies = list(call)
+            assert [r["msg"] for r in replies] == ["ok", "ok"]
+            init = dict(call.initial_metadata())
+            assert init["x-bidi"] == "b-1"
+            trail = dict(call.trailing_metadata())
+            assert trail["x-bidi"] == "b-1"
+
+
+# ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
 

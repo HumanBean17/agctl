@@ -1423,3 +1423,66 @@ mocks:
         payload = json.loads(result.output)
         assert "grpc" not in payload["result"]
         assert payload["result"]["listen"] == "127.0.0.1:18080"
+
+    def test_start_grpc_only_startup_error_detail_listen_is_grpc(
+        self, temp_config, monkeypatch, tmp_path
+    ):
+        """(Fix 5) A grpc-only startup error's ``detail.listen`` points at the
+        gRPC address, NOT the HTTP default (0.0.0.0:18080).
+
+        Regression: the previous unconditional ``detail["listen"] = http_listen``
+        set a grpc-only startup error's structured ``detail.listen`` to the HTTP
+        default address even though the message text named the gRPC port.
+        """
+        temp_config.write_text(GRPC_ONLY_CONFIG)
+
+        # Patch the spawn + readiness seams; reach the startup_error branch.
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.spawn_daemon",
+            lambda argv, log_path, env=None: 12345,
+        )
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.is_alive", lambda pid: True
+        )
+        # _terminate/remove_pidfile run in the startup_error cleanup path; stub
+        # them so the test never signals a real pid or touches the filesystem.
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands._terminate",
+            lambda pid, grace: "SIGTERM",
+        )
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.remove_pidfile", lambda pidfile: None
+        )
+        fake_parsed = MagicMock()
+        fake_parsed.started = None
+        fake_parsed.startup_error = {
+            "error": {
+                "message": "grpc listen address 127.0.0.1:50051 already in use",
+                "detail": {"listen": "127.0.0.1:50051"},
+            }
+        }
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.parse_log", lambda log_path: fake_parsed
+        )
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.read_pidfile", lambda pidfile: None
+        )
+
+        state_dir = tmp_path / "state"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", str(temp_config),
+                "mock", "start",
+                "--only", "grpc",
+                "--grpc-listen", "127.0.0.1:50051",
+                "--state-dir", str(state_dir),
+            ],
+        )
+        # Startup error -> exit 2 (ConfigError envelope).
+        assert result.exit_code == 2, result.output
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        # detail.listen MUST be the gRPC address (not the HTTP default).
+        assert payload["error"]["detail"]["listen"] == "127.0.0.1:50051"
+        assert payload["error"]["detail"]["listen"] != "0.0.0.0:18080"

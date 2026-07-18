@@ -16,3 +16,21 @@ message EchoRequest {
 message EchoResponse {
   string msg = 1;
 }
+
+// A second service/message pair carrying multi-word snake_case fields + a
+// scalar int, used to pin the deserializer's snake_case + default-preserving
+// contract (Fix 1): ``user_id`` must NOT be lowerCamelCased to ``userId`` and a
+// zero-valued ``n`` must NOT be dropped from the envelope.
+service UserService {
+  rpc GetUser(UserRequest) returns (UserResponse);
+}
+
+message UserRequest {
+  string user_id = 1;
+  int32 n = 2;
+}
+
+message UserResponse {
+  string user_id = 1;
+  int32 n = 2;
+}
