@@ -188,7 +188,7 @@ def test_clean_lifecycle_emits_started_then_summary_and_run_returns_0(tmp_path):
     summary = [e for e in emitted if e.get("event") == "summary"]
     assert len(summary) == 1
     assert summary[0]["topics"] == [
-        {"topic": "orders", "captured": 1, "overflowed": False}
+        {"topic": "orders", "captured": 1, "overflowed": False, "decode_errors": 0}
     ]
     assert summary[0]["errors"] == 0
     assert summary[0]["duration_ms"] >= 0
@@ -306,9 +306,11 @@ def test_emit_event_tallies_overflow_and_multi_topic_summary(tmp_path):
         "topic": "orders",
         "captured": 1,
         "overflowed": True,
+        "decode_errors": 0,
     }
     assert topics_by_name["payments"] == {
         "topic": "payments",
         "captured": 1,
         "overflowed": False,
+        "decode_errors": 0,
     }

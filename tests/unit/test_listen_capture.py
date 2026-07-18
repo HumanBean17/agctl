@@ -95,6 +95,7 @@ class _FakeKafkaClient:
         max_retries=3,
         on_assign=None,
         on_revoke=None,
+        on_decode_error=None,
     ):
         self.consume_calls.append(
             {

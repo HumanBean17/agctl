@@ -59,6 +59,14 @@ class ListenEngine:
     # how MockEngine reactor tests inject fakes.
     capture_loop_factory = CaptureLoop
 
+    # Test seam: callable ``(cfg, cluster_name, codec) -> KafkaClient`` invoked
+    # once per non-JSON topic to build its codec-aware client. ``None`` (the
+    # default) means build a real :class:`KafkaClient` via
+    # :func:`new_kafka_client` from the resolved cluster config + codec dict.
+    # Tests assign a factory returning a fake client to exercise the
+    # format/SR resolution path without a real broker.
+    kafka_client_factory: Callable[..., Any] | None = None
+
     # Test seam: startup ready-wait budget (seconds). 30s in production; tests
     # shrink it to assert the never-ready ConnectionFailure path quickly.
     _startup_budget: float = 30.0
@@ -76,12 +84,20 @@ class ListenEngine:
         max_bytes: int,
         duration: float | None,
         emit_fn: Callable[[dict], None] = emit_ndjson_line,
+        cfg: Any = None,
+        value_format: str | None = None,
+        key_format: str | None = None,
     ) -> None:
         """Initialize the listen engine.
 
         Args:
             topics: Kafka topics to capture (one CaptureLoop thread per topic).
-            client: KafkaClient (or fake) exposing ``consume_loop``.
+            client: KafkaClient (or fake) exposing ``consume_loop``. Used
+                directly for every topic when ``cfg`` is None (legacy JSON-only
+                path). When ``cfg`` is set and a topic resolves to a non-JSON
+                format, the engine builds a codec-aware client per topic via
+                :attr:`kafka_client_factory` (or :func:`new_kafka_client`) and
+                uses that client for the topic's CaptureLoop instead.
             run_id: Run identifier (keys the run dir + consumer group).
             group: Consumer group string for this listener.
             cluster: Cluster name the listener connected to (reported in
@@ -92,6 +108,20 @@ class ListenEngine:
                 overflow valve).
             duration: If set, stop after this many seconds.
             emit_fn: Callable to emit one NDJSON line (default: stdout).
+            cfg: Optional :class:`Config`. When set, :meth:`start` resolves
+                each topic's value/key :class:`Format` via the Task 9 resolvers
+                (topic-level → cluster-level → default), resolves the cluster's
+                :class:`SchemaRegistryClient` once, and — if any topic resolves
+                to a non-JSON format AND an SR client exists — runs
+                :func:`probe_schema_registry` once before any capture begins.
+                A probe failure raises :class:`ConnectionFailure` before the
+                ``started`` line is emitted. When ``cfg`` is None the engine
+                uses ``client`` unchanged for every topic (the legacy
+                byte-identical JSON path — same guidance as Task 9).
+            value_format: Optional CLI override forwarded to the resolver
+                (Level 1 precedence; ``"json"``/``"avro"``/``"protobuf"``).
+            key_format: Optional CLI override for the key format
+                (``"string"``/``"avro"``/``"protobuf"``).
         """
         self._topics = list(topics)
         self._client = client
@@ -103,6 +133,14 @@ class ListenEngine:
         self._max_bytes = max_bytes
         self._duration = duration
         self._emit_fn = emit_fn
+        self._cfg = cfg
+        self._cli_value_format = value_format
+        self._cli_key_format = key_format
+
+        # Per-topic codec-aware clients, populated by start() when cfg is set
+        # and a topic resolves to a non-JSON format. Topics absent from this
+        # map fall back to self._client (legacy JSON path).
+        self._clients_by_topic: dict[str, Any] = {}
 
         # Shutdown coordination.
         self._stop = threading.Event()
@@ -164,6 +202,122 @@ class ListenEngine:
             self._emit_fn(line)
 
     # ------------------------------------------------------------------
+    # Task 11: format / Schema-Registry resolution (cfg-aware path)
+    # ------------------------------------------------------------------
+
+    def _resolve_formats_and_probe(self) -> None:
+        """Resolve per-topic formats + SR client; probe SR; build codec clients.
+
+        No-op when ``cfg`` is None (legacy JSON-only path: every topic uses
+        ``self._client`` unchanged). When ``cfg`` is set:
+
+        1. Resolve the cluster's :class:`SchemaRegistryClient` ONCE (memoized
+           by Task 9's ``_sr_client_cache``).
+        2. Resolve each topic's value/key :class:`Format` (CLI override →
+           topic-level → cluster-level → default). Track whether any topic
+           resolves to a non-default format.
+        3. If any topic is non-JSON AND an SR client exists, call
+           :func:`probe_schema_registry` exactly once BEFORE any CaptureLoop
+           starts. A probe failure raises :class:`ConnectionFailure` from
+           :meth:`start` (before the ``started`` line).
+        4. Build a codec-aware :class:`KafkaClient` per non-JSON topic (via
+           :attr:`kafka_client_factory` when set, else :func:`new_kafka_client`).
+           Pure-JSON topics use ``self._client`` (codec=None → legacy
+           byte-identical decode path, per Task 9 guidance).
+
+        Raises:
+            ConnectionFailure: SR probe failed (raised before any started line).
+            ConfigError: a non-JSON format was resolved but the cluster has no
+                ``schema_registry_url`` (defense-in-depth; the validator should
+                have caught this earlier).
+        """
+        if self._cfg is None:
+            return  # Legacy path: every topic uses self._client unchanged.
+
+        # Lazy import: avoids a circular dependency at module load (commands
+        # import from listen) and keeps the no-codec path import-free.
+        from ..commands.kafka_commands import (
+            new_kafka_client,
+            probe_schema_registry,
+            resolve_schema_registry_client,
+            resolve_subject_strategy,
+            resolve_topic_format,
+        )
+        from ..serialization import Format
+
+        sr = resolve_schema_registry_client(self._cfg, self._cluster)
+
+        any_non_json = False
+        topic_codecs: dict[str, dict | None] = {}
+        for topic in self._topics:
+            value_fmt = (
+                Format(self._cli_value_format)
+                if self._cli_value_format is not None
+                else resolve_topic_format(self._cfg, topic, self._cluster, "value")
+            )
+            key_fmt = (
+                Format(self._cli_key_format)
+                if self._cli_key_format is not None
+                else resolve_topic_format(self._cfg, topic, self._cluster, "key")
+            )
+            # Pure-JSON/string: no codec (legacy byte-identical decode path,
+            # per Task 9's _resolve_codec guidance: a Format.JSON codec would
+            # diverge from json.loads-with-fallback on non-JSON bytes).
+            if value_fmt == Format.JSON and key_fmt == Format.KEY_STRING:
+                topic_codecs[topic] = None
+                continue
+
+            any_non_json = True
+            subject_strategy = resolve_subject_strategy(
+                self._cfg, topic, self._cluster
+            )
+            topic_codecs[topic] = {
+                "value": {"fmt": value_fmt, "subject_strategy": subject_strategy},
+                "key": {"fmt": key_fmt, "subject_strategy": subject_strategy},
+                "sr": sr,
+            }
+
+        # Probe once when a non-JSON format is in play. The validator (Task 2)
+        # should already have flagged a non-JSON format without an SR URL; the
+        # ConfigError here is defense-in-depth for in-code configs.
+        if any_non_json:
+            if sr is None:
+                from ..errors import ConfigError
+
+                raise ConfigError(
+                    f"Cluster {self._cluster!r} requires a Schema Registry for "
+                    f"non-JSON listen topics but has no schema_registry_url",
+                    {"cluster": self._cluster},
+                )
+            probe_schema_registry(sr, self._cluster)
+
+        # Build per-topic codec-aware clients (only for non-JSON topics). Pure
+        # JSON topics fall back to self._client via _client_for_topic.
+        for topic, codec in topic_codecs.items():
+            if codec is None:
+                continue
+            if self.kafka_client_factory is not None:
+                self._clients_by_topic[topic] = self.kafka_client_factory(
+                    self._cfg, self._cluster, codec
+                )
+            else:
+                cluster_cfg = self._cfg.kafka.clusters[self._cluster]
+                self._clients_by_topic[topic] = new_kafka_client(
+                    cluster_cfg, codec=codec
+                )
+
+    def _client_for_topic(self, topic: str) -> Any:
+        """Return the per-topic codec-aware client, or ``self._client``.
+
+        Topics that resolved to pure JSON (or the legacy no-cfg path) have no
+        entry in :attr:`_clients_by_topic` and use the shared ``self._client``
+        — the byte-identical JSON decode path. Topics that resolved to a
+        non-JSON format get a codec-aware client built during
+        :meth:`_resolve_formats_and_probe`.
+        """
+        return self._clients_by_topic.get(topic, self._client)
+
+    # ------------------------------------------------------------------
     # startup: spawn capture threads, wait for ready, emit started
     # ------------------------------------------------------------------
 
@@ -181,16 +335,31 @@ class ListenEngine:
         which would let the except handler's ``shutdown()`` emit a spurious
         ``summary`` for a stream that never received a started line).
 
+        When ``cfg`` was supplied (Task 11), the first step is
+        :meth:`_resolve_formats_and_probe`: resolve each topic's value/key
+        format via the Task 9 resolvers, resolve the cluster's SR client once,
+        and — if any topic resolves to a non-JSON format AND an SR client
+        exists — call :func:`probe_schema_registry` BEFORE any capture begins.
+        A probe failure raises :class:`ConnectionFailure` from ``start()``
+        before the ``started`` line is emitted (the engine's except arm runs
+        ``shutdown`` and re-raises, so the surrounding CLI emits its
+        startup-error envelope; see ``kafka listen run``).
+
         On any exception, run :meth:`shutdown` to release threads, then re-raise.
         """
         try:
+            # Task 11: resolve per-topic formats + SR client; probe SR once if
+            # any topic is non-JSON. Raises ConnectionFailure on a probe
+            # failure BEFORE any CaptureLoop is built (so no started line).
+            self._resolve_formats_and_probe()
+
             for topic in self._topics:
                 ready_event = threading.Event()
                 self._ready_events[topic] = ready_event
 
                 loop = self.capture_loop_factory(
                     topic=topic,
-                    client=self._client,
+                    client=self._client_for_topic(topic),
                     group_id=self._group,
                     capture_path=capture_path(self._run_dir, topic),
                     capture_match=self._capture_match,
@@ -393,11 +562,20 @@ class ListenEngine:
             except OSError:
                 # Missing capture file → 0 (e.g. no messages arrived).
                 captured = 0
+            # Task 11: per-topic decode-error counter. The CaptureLoop
+            # accumulates this from the codec seam's ``on_decode_error``
+            # callback; default 0 for tests injecting a non-CaptureLoop fake.
+            decode_errors = 0
+            for loop in self._capture_loops:
+                if getattr(loop, "_topic", None) == topic:
+                    decode_errors = getattr(loop, "decode_errors", 0)
+                    break
             topics_summary.append(
                 {
                     "topic": topic,
                     "captured": captured,
                     "overflowed": topic in overflowed,
+                    "decode_errors": decode_errors,
                 }
             )
 
