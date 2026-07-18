@@ -101,9 +101,11 @@ class SchemaRegistryClient:
         self._url = url
         self._conf = build_schema_registry_conf(url, sr_config)
         # Per-instance caches (DESIGN §6.1): decode hot path hits the
-        # by-id cache; encode hot path hits the by-subject cache.
+        # by-id cache; encode hot path hits the by-subject cache; the
+        # latest-version cache backs encode_payload (Task 7).
         self._by_id: dict[int, tuple[str, str]] = {}
         self._by_subject: dict[tuple[str, str], int] = {}
+        self._by_latest: dict[str, tuple[str, str, int]] = {}
 
         if client_factory is not None:
             self._client = client_factory(self._conf)
@@ -190,6 +192,54 @@ class SchemaRegistryClient:
 
         self._by_subject[key] = schema_id
         return schema_id
+
+    def get_latest_schema(self, subject: str) -> tuple[str, str, int]:
+        """Return ``(schema_type, schema_str, schema_id)`` for ``subject``'s latest version.
+
+        The encode hot path: ``encode_payload`` calls this to resolve the
+        schema to encode against (the value alone carries no Avro schema).
+        Cached by subject so repeated encode of the same subject's latest
+        version does not round-trip the registry. v1 contract: no
+        auto-registration — if the subject does not exist, the underlying
+        call raises (``SchemaRegistryError`` 40404) and this surfaces as
+        :class:`ConfigError` with a clear "register it before producing"
+        message; any other failure (HTTP 5xx, auth, connectivity) surfaces
+        as :class:`ConnectionFailure` naming the URL, matching the other
+        I/O methods.
+
+        The underlying ``get_latest_version(subject)`` returns the modern
+        confluent shape ``(subject, version, schema, id)`` where ``schema``
+        is a ``Schema`` object exposing ``.schema_type`` / ``.schema_str``.
+        """
+        cached = self._by_latest.get(subject)
+        if cached is not None:
+            return cached
+
+        try:
+            _subject, _version, schema, schema_id = self._client.get_latest_version(
+                subject
+            )
+        except Exception as exc:  # noqa: BLE001 - I/O boundary
+            # 40404 SUBJECT_NOT_FOUND is a config/contract bug (the subject
+            # has no schema yet), NOT a connectivity problem. Detect by
+            # duck-typing on ``error_code`` to avoid importing the heavy
+            # ``confluent_kafka.schema_registry.error`` module here.
+            if getattr(exc, "error_code", None) == 40404:
+                raise ConfigError(
+                    f"subject '{subject}' has no registered schema; "
+                    "register it before producing",
+                    {"subject": subject},
+                ) from exc
+            raise ConnectionFailure(
+                message=(
+                    f"Schema Registry get_latest_version(subject={subject!r}) "
+                    f"failed at {self._url}: {exc}"
+                )
+            ) from exc
+
+        result = (schema.schema_type, schema.schema_str, schema_id)
+        self._by_latest[subject] = result
+        return result
 
     # -- startup probe (Task 9) ---------------------------------------------
 

@@ -36,6 +36,19 @@ class _FakeSchema:
         self.schema_str = schema_str
 
 
+class _FakeSchemaRegistryError(Exception):
+    """Stand-in for ``confluent_kafka.schema_registry.error.SchemaRegistryError``.
+
+    Carries an ``error_code`` (40404 = SUBJECT_NOT_FOUND, etc.) so the
+    wrapper can distinguish missing-subject from network errors without
+    importing the heavy ``kafka`` extra.
+    """
+
+    def __init__(self, error_code, message):
+        super().__init__(message)
+        self.error_code = error_code
+
+
 class _FakeSRClient:
     """Records every call so cache-hit tests can assert non-recall.
 
@@ -49,12 +62,25 @@ class _FakeSRClient:
         self.get_schema_calls = 0
         self.register_schema_calls = 0
         self.subjects_calls = 0
+        self.get_latest_version_calls = 0
         self.raise_on_subjects = False
         # Return values a test can override after construction.
         self._schema_for_id = {
             7: _FakeSchema("AVRO", '{"type":"record","name":"X"}'),
         }
         self._id_for_subject = 42
+        # subject -> (version, schema, id); get_latest_version returns
+        # the confluent shape (subject, version, schema, id).
+        self._latest_for_subject: dict[str, tuple[int, _FakeSchema, int]] = {
+            "t-value": (
+                3,
+                _FakeSchema("AVRO", '{"type":"record","name":"X"}'),
+                7,
+            ),
+        }
+        # When set, get_latest_version(subject) raises this (used to
+        # simulate the missing-subject and network-error paths).
+        self._latest_exception: dict[str, Exception] = {}
 
     def get_schema(self, schema_id):
         self.get_schema_calls += 1
@@ -73,6 +99,17 @@ class _FakeSRClient:
         if self.raise_on_subjects:
             raise RuntimeError("registry unreachable")
         return ["t-value"]
+
+    def get_latest_version(self, subject):
+        # Mirrors the modern confluent_kafka shape:
+        # (subject, version, schema, id).
+        self.get_latest_version_calls += 1
+        if subject in self._latest_exception:
+            raise self._latest_exception[subject]
+        if subject not in self._latest_for_subject:
+            raise _FakeSchemaRegistryError(40404, f"Subject '{subject}' not found.")
+        version, schema, schema_id = self._latest_for_subject[subject]
+        return (subject, version, schema, schema_id)
 
 
 def _factory(fake):
@@ -236,6 +273,82 @@ def test_register_schema_cache_keyed_on_subject_and_schema_str():
     client.register_schema("t-value", "{}", "AVRO")  # cached
 
     assert fake.register_schema_calls == 3
+
+
+# --- get_latest_schema (Task 7 encode path) ---------------------------------
+
+
+def test_get_latest_schema_returns_tuple_and_caches():
+    # Success: returns (schema_type, schema_str, schema_id) for the
+    # subject's latest version AND a second call does NOT re-hit the fake.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake._latest_for_subject["t-value"] = (
+        3,
+        _FakeSchema("AVRO", '{"type":"record","name":"E"}'),
+        17,
+    )
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    first = client.get_latest_schema("t-value")
+    assert first == ("AVRO", '{"type":"record","name":"E"}', 17)
+    assert fake.get_latest_version_calls == 1
+
+    second = client.get_latest_schema("t-value")
+    assert second == first
+    # Cache hit: the underlying fake was NOT called again.
+    assert fake.get_latest_version_calls == 1
+
+
+def test_get_latest_schema_distinct_subjects_each_hit_once():
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake._latest_for_subject["t-value"] = (
+        1,
+        _FakeSchema("AVRO", '{"type":"record","name":"V"}'),
+        7,
+    )
+    fake._latest_for_subject["t-key"] = (
+        2,
+        _FakeSchema("AVRO", '{"type":"record","name":"K"}'),
+        9,
+    )
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    client.get_latest_schema("t-value")
+    client.get_latest_schema("t-key")
+    client.get_latest_schema("t-value")  # cached
+    client.get_latest_schema("t-key")  # cached
+
+    assert fake.get_latest_version_calls == 2
+
+
+def test_get_latest_schema_missing_subject_raises_config_error():
+    # If the subject does not exist (SR returns 40404 SUBJECT_NOT_FOUND),
+    # surface ConfigError with a clear message — NOT ConnectionFailure.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake._latest_exception["t-value"] = _FakeSchemaRegistryError(
+        40404, "Subject 't-value' not found."
+    )
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    with pytest.raises(ConfigError) as exc_info:
+        client.get_latest_schema("t-value")
+    message = str(exc_info.value)
+    assert "t-value" in message
+    assert "register" in message.lower()
+    # Must NOT be a ConnectionFailure — a missing subject is a config bug.
+    assert not isinstance(exc_info.value, ConnectionFailure)
+
+
+def test_get_latest_schema_network_error_raises_connection_failure():
+    # A non-40404 error (HTTP 5xx, connectivity, auth) surfaces as
+    # ConnectionFailure naming the URL.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake._latest_exception["t-value"] = RuntimeError("registry unreachable")
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    with pytest.raises(ConnectionFailure) as exc_info:
+        client.get_latest_schema("t-value")
+    assert "http://sr:8081" in exc_info.value.message
 
 
 # --- (f) check_reachable ----------------------------------------------------
