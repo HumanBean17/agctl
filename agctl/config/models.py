@@ -82,6 +82,24 @@ class KafkaPattern(BaseModel):
     cluster: str | None = None
 
 
+class KafkaTopicConfig(BaseModel):
+    """Per-topic serialization contract under ``kafka.topics.<name>`` (DESIGN §6.2).
+
+    Any field left ``None`` falls back to the resolved cluster's default
+    (:attr:`KafkaCluster.value_format` / :attr:`KafkaCluster.key_format`) and
+    ultimately to today's ``json`` / ``string`` defaults. ``subject_strategy``
+    governs only the *encode* subject; decode reads the embedded schema id and is
+    strategy-independent. Cross-field semantics (cluster must exist,
+    format-requires-SR, strategy-vs-format warnings) are enforced in
+    ``config/validator.py`` (Task 2), not here.
+    """
+
+    cluster: str | None = None
+    value_format: Literal["json", "avro", "protobuf"] | None = None
+    key_format: Literal["string", "avro", "protobuf"] | None = None
+    subject_strategy: Literal["topic", "record", "topic_record"] | None = None
+
+
 class KafkaSSL(BaseModel):
     """TLS/mTLS settings for a Kafka connection (DESIGN §2.1).
 
@@ -116,13 +134,44 @@ class KafkaSSL(BaseModel):
         return upper
 
 
+class BasicAuth(BaseModel):
+    """Username/password credentials for HTTP Basic auth.
+
+    For Confluent Cloud these are the API key / API secret pair.
+    """
+
+    username: str | None = None
+    password: str | None = None
+
+
+class SchemaRegistryConfig(BaseModel):
+    """Schema Registry auth/TLS settings (DESIGN §6.1).
+
+    The URL itself lives on the existing bare :attr:`KafkaCluster.schema_registry_url`
+    field — this block holds only auth/TLS, so there is no nested ``url`` to alias
+    or conflict with the bare field. ``auth`` is auto-inferred by the resolver
+    when omitted (``basic_auth`` present -> ``basic``; ``ssl`` present ->
+    ``mtls``; else ``plaintext``); the inference rule and auth-shape checks
+    (basic-requires-basic_auth, mtls-requires-ssl) are enforced in
+    ``config/validator.py`` (Task 2), not here — Pydantic ``Literal`` types
+    reject only out-of-enum ``auth`` values at parse time.
+    """
+
+    auth: Literal["plaintext", "basic", "mtls"] | None = None
+    basic_auth: BasicAuth | None = None
+    ssl: KafkaSSL | None = None
+
+
 class KafkaCluster(BaseModel):
     """A named Kafka cluster's broker configuration (DESIGN §6, v3 schema).
 
     Holds the per-cluster knobs formerly on ``KafkaConfig`` (brokers / TLS /
     timeout / consumer group / schema registry). Mirrors
     :class:`DatabaseConnection`: a named entry in ``kafka.clusters.<name>``,
-    selected by name via ``resolve_cluster_name``.
+    selected by name via ``resolve_cluster_name``. The
+    :attr:`schema_registry` sub-block carries auth/TLS for the registry;
+    :attr:`value_format` / :attr:`key_format` are cluster-level format defaults
+    (overridable per topic via :attr:`KafkaTopicConfig`).
     """
 
     brokers: list[str] = Field(default_factory=list)
@@ -130,6 +179,9 @@ class KafkaCluster(BaseModel):
     timeout_seconds: int | None = None
     default_consumer_group: str | None = None
     schema_registry_url: str | None = None
+    schema_registry: SchemaRegistryConfig | None = None
+    value_format: Literal["json", "avro", "protobuf"] = "json"
+    key_format: Literal["string", "avro", "protobuf"] = "string"
 
 
 class KafkaConfig(BaseModel):
@@ -138,12 +190,14 @@ class KafkaConfig(BaseModel):
     ``clusters`` is a named map (mirroring ``database.connections``);
     ``default_cluster`` names the cluster used when no flag/binding selects one
     (required only when >1 cluster is defined, per single-cluster auto-default);
-    ``patterns`` is a global cluster-aware map.
+    ``patterns`` is a global cluster-aware map; ``topics`` is a per-topic
+    serialization-contract map (DESIGN §6.2, consumed by the format resolver).
     """
 
     clusters: dict[str, KafkaCluster] = Field(default_factory=dict)
     default_cluster: str | None = None
     patterns: dict[str, KafkaPattern] = Field(default_factory=dict)
+    topics: dict[str, KafkaTopicConfig] = Field(default_factory=dict)
 
 
 class DatabaseConnection(BaseModel):
