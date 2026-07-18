@@ -67,6 +67,23 @@ class TestPathNaming:
         assert result.name == "mock-kafka.log"
         assert result.parent == tmp_path
 
+    def test_pidfile_path_grpc_engine(self, tmp_path):
+        """pidfile_path(d, 50051, engine='grpc') ends with mock-grpc-50051.pid."""
+        result = pidfile_path(tmp_path, 50051, engine="grpc")
+        assert result.name == "mock-grpc-50051.pid"
+        assert result.parent == tmp_path
+
+    def test_log_path_grpc_engine(self, tmp_path):
+        """log_path(d, 50051, engine='grpc') ends with mock-grpc-50051.log."""
+        result = log_path(tmp_path, 50051, engine="grpc")
+        assert result.name == "mock-grpc-50051.log"
+        assert result.parent == tmp_path
+
+    def test_pidfile_path_engine_defaults_none(self, tmp_path):
+        """engine kwarg defaults to None: explicit engine=None is HTTP-style."""
+        assert pidfile_path(tmp_path, 18080, engine=None).name == "mock-18080.pid"
+        assert log_path(tmp_path, 18080, engine=None).name == "mock-18080.log"
+
 
 class TestPidfileRoundTrip:
     """Tests for pidfile read/write/remove operations."""
@@ -198,6 +215,54 @@ class TestListRunningMocks:
         assert len(result) == 1
         assert result[0].port == 18080
 
+    def test_list_running_mocks_round_trips_http_and_grpc_listen(self, tmp_path):
+        """list_running_mocks reads http_listen/grpc_listen off the pidfile JSON.
+
+        A multi-engine (HTTP+gRPC) daemon records both listen addresses in the
+        pidfile; RunningMock must surface them so resolve_target can match either.
+        """
+        multi_data = {
+            "pid": os.getpid(),
+            "listen": "127.0.0.1:18080",  # legacy field — primary identity
+            "port": 18080,
+            "log_path": "/path/to/log.log",
+            "config_path": "/path/to/config.yaml",
+            "started_at": "2026-07-05T12:00:00Z",
+            "run_id": "run-multi",
+            "http_listen": "127.0.0.1:18080",
+            "grpc_listen": "127.0.0.1:50051",
+        }
+        write_pidfile(pidfile_path(tmp_path, 18080), multi_data)
+
+        result = list_running_mocks(tmp_path)
+
+        assert len(result) == 1
+        mock = result[0]
+        assert mock.http_listen == "127.0.0.1:18080"
+        assert mock.grpc_listen == "127.0.0.1:50051"
+        # Legacy identity fields unchanged
+        assert mock.listen == "127.0.0.1:18080"
+        assert mock.port == 18080
+
+    def test_list_running_mocks_http_grpc_listen_default_none(self, tmp_path):
+        """Old pidfiles without http_listen/grpc_listen default to None."""
+        legacy_data = {
+            "pid": os.getpid(),
+            "listen": "127.0.0.1:18080",
+            "port": 18080,
+            "log_path": "/path/to/log.log",
+            "config_path": "/path/to/config.yaml",
+            "started_at": "2026-07-05T12:00:00Z",
+            "run_id": "run-legacy",
+        }
+        write_pidfile(pidfile_path(tmp_path, 18080), legacy_data)
+
+        result = list_running_mocks(tmp_path)
+
+        assert len(result) == 1
+        assert result[0].http_listen is None
+        assert result[0].grpc_listen is None
+
 
 class TestResolveTarget:
     """Tests for resolve_target with the full matrix."""
@@ -305,12 +370,68 @@ class TestResolveTarget:
         assert len(result) == 2
         assert {r.port for r in result} == {18080, 18081}
 
+    def test_resolve_target_listen_matches_grpc_listen(self, tmp_path):
+        """--listen matches a RunningMock by its grpc_listen field.
+
+        A gRPC-only or HTTP+gRPC daemon records grpc_listen in the pidfile;
+        resolve_target must match --listen against grpc_listen (not just the
+        legacy listen field) so users can stop/status by the gRPC address.
+        """
+        # Daemon with grpc_listen set, legacy listen pointed at the grpc address
+        # (simulates a grpc-only daemon keyed by mock-grpc-<port>.pid).
+        data = {
+            "pid": os.getpid(),
+            "listen": None,
+            "port": 50051,
+            "log_path": "/path/to/log.log",
+            "config_path": "/path/to/config.yaml",
+            "started_at": "2026-07-05T12:00:00Z",
+            "run_id": "run-grpc",
+            "grpc_listen": "127.0.0.1:50051",
+        }
+        write_pidfile(pidfile_path(tmp_path, 50051, engine="grpc"), data)
+
+        result = resolve_target(
+            tmp_path, listen="127.0.0.1:50051", pid=None, all_=False
+        )
+
+        assert len(result) == 1
+        assert result[0].grpc_listen == "127.0.0.1:50051"
+
+    def test_resolve_target_listen_matches_http_listen(self, tmp_path):
+        """--listen matches a RunningMock by its http_listen field.
+
+        Legacy ``listen`` is set to a DIFFERENT address than the lookup (and
+        grpc_listen to yet another), so the match can only succeed through
+        ``http_listen`` — isolating that branch of the membership check.
+        """
+        data = {
+            "pid": os.getpid(),
+            "listen": "127.0.0.1:19090",
+            "port": 18080,
+            "log_path": "/path/to/log.log",
+            "config_path": "/path/to/config.yaml",
+            "started_at": "2026-07-05T12:00:00Z",
+            "run_id": "run-multi",
+            "http_listen": "127.0.0.1:18080",
+            "grpc_listen": "127.0.0.1:50051",
+        }
+        write_pidfile(pidfile_path(tmp_path, 18080), data)
+
+        # Match by http_listen explicitly — legacy listen and grpc_listen differ.
+        result = resolve_target(
+            tmp_path, listen="127.0.0.1:18080", pid=None, all_=False
+        )
+        assert len(result) == 1
+        assert result[0].port == 18080
+        assert result[0].http_listen == "127.0.0.1:18080"
+
 
 class TestTaxonomyConstants:
     """Tests for failure-event taxonomy constants."""
 
-    def test_fatal_failure_events_has_exact_four_names(self):
-        """FATAL_FAILURE_EVENTS contains exactly the four fatal names."""
+    def test_fatal_failure_events_has_six_names_with_grpc(self):
+        """FATAL_FAILURE_EVENTS contains the four HTTP/Kafka names plus grpc.*."""
         from agctl.mock.daemon import FATAL_FAILURE_EVENTS
 
         assert FATAL_FAILURE_EVENTS == {
@@ -318,14 +439,31 @@ class TestTaxonomyConstants:
             "http.body_parse_skipped",
             "kafka.skipped",
             "kafka.error",
+            "grpc.unmatched",
+            "grpc.error",
         }
 
     def test_all_failure_events_includes_capture_missing(self):
-        """ALL_FAILURE_EVENTS equals the four plus capture.missing."""
+        """ALL_FAILURE_EVENTS equals the fatal set plus capture.missing."""
         from agctl.mock.daemon import ALL_FAILURE_EVENTS, FATAL_FAILURE_EVENTS
 
         expected = FATAL_FAILURE_EVENTS | {"capture.missing"}
         assert ALL_FAILURE_EVENTS == expected
+
+    def test_all_failure_events_excludes_capture_missing_from_fatal(self):
+        """capture.missing is in ALL_FAILURE_EVENTS but NOT in FATAL_FAILURE_EVENTS."""
+        from agctl.mock.daemon import ALL_FAILURE_EVENTS, FATAL_FAILURE_EVENTS
+
+        assert "capture.missing" in ALL_FAILURE_EVENTS
+        assert "capture.missing" not in FATAL_FAILURE_EVENTS
+
+    def test_event_to_counter_has_grpc_entries(self):
+        """EVENT_TO_COUNTER maps grpc.hit/unmatched/error to summary counters."""
+        from agctl.mock.daemon import EVENT_TO_COUNTER
+
+        assert EVENT_TO_COUNTER["grpc.hit"] == "grpc_hits"
+        assert EVENT_TO_COUNTER["grpc.unmatched"] == "grpc_unmatched"
+        assert EVENT_TO_COUNTER["grpc.error"] == "grpc_errors"
 
 
 class TestParseLog:
@@ -377,6 +515,9 @@ class TestParseLog:
             "kafka_reactions": 0,
             "kafka_skipped": 0,
             "kafka_errors": 1,
+            "grpc_hits": 0,
+            "grpc_unmatched": 0,
+            "grpc_errors": 0,
         }
 
         # Check failures - should have 3 entries (unmatched, kafka.error, capture.missing)
@@ -384,6 +525,40 @@ class TestParseLog:
         assert parsed.failures[0]["event"] == "http.unmatched"
         assert parsed.failures[1]["event"] == "kafka.error"
         assert parsed.failures[2]["event"] == "capture.missing"
+
+    def test_parse_log_accumulates_grpc_counters(self, tmp_path):
+        """parse_log accumulates grpc_hits/grpc_unmatched/grpc_errors from grpc.* events."""
+        log_file = tmp_path / "grpc.log"
+
+        lines = [
+            '{"event":"started","http":null,"grpc":{"listen":"127.0.0.1:50051","stubs":2}}',
+            '{"event":"grpc.hit","method":"/pkg.Svc/Method","status":"OK"}',
+            '{"event":"grpc.hit","method":"/pkg.Svc/Other","status":"OK"}',
+            '{"event":"grpc.unmatched","method":"/pkg.Svc/Unknown"}',
+            '{"event":"grpc.error","method":"/pkg.Svc/Broken","message":"boom"}',
+            '{"event":"capture.missing","type":"grpc","key":"req"}',
+        ]
+        log_file.write_text("\n".join(lines))
+
+        from agctl.mock.daemon import parse_log
+
+        parsed = parse_log(log_file)
+
+        # Counters accumulated
+        assert parsed.summary_so_far["grpc_hits"] == 2
+        assert parsed.summary_so_far["grpc_unmatched"] == 1
+        assert parsed.summary_so_far["grpc_errors"] == 1
+        # HTTP/Kafka counters untouched
+        assert parsed.summary_so_far["http_hits"] == 0
+        assert parsed.summary_so_far["kafka_errors"] == 0
+
+        # grpc.unmatched + grpc.error are failures; capture.missing is a failure
+        # (but not fatal). grpc.hit is NOT a failure.
+        failure_events = [f["event"] for f in parsed.failures]
+        assert "grpc.unmatched" in failure_events
+        assert "grpc.error" in failure_events
+        assert "capture.missing" in failure_events
+        assert "grpc.hit" not in failure_events
 
     def test_parse_log_startup_error_path(self, tmp_path):
         """parse_log handles startup-error envelope (no event key)."""
@@ -425,6 +600,9 @@ class TestParseLog:
             "kafka_reactions": 0,
             "kafka_skipped": 0,
             "kafka_errors": 0,
+            "grpc_hits": 0,
+            "grpc_unmatched": 0,
+            "grpc_errors": 0,
         }
         assert parsed.failures == []
 
@@ -445,6 +623,9 @@ class TestParseLog:
             "kafka_reactions": 0,
             "kafka_skipped": 0,
             "kafka_errors": 0,
+            "grpc_hits": 0,
+            "grpc_unmatched": 0,
+            "grpc_errors": 0,
         }
         assert parsed.failures == []
 
@@ -482,3 +663,62 @@ class TestHasFatalFailure:
         )
 
         assert has_fatal_failure(parsed) is True
+
+    def test_has_fatal_failure_with_grpc_unmatched_returns_true(self):
+        """grpc.unmatched is fatal."""
+        from agctl.mock.daemon import ParsedLog, has_fatal_failure
+
+        parsed = ParsedLog(
+            started=None,
+            startup_error=None,
+            summary=None,
+            summary_so_far={},
+            failures=[{"event": "grpc.unmatched", "method": "/pkg.Svc/X"}],
+        )
+
+        assert has_fatal_failure(parsed) is True
+
+    def test_has_fatal_failure_with_grpc_error_returns_true(self):
+        """grpc.error is fatal."""
+        from agctl.mock.daemon import ParsedLog, has_fatal_failure
+
+        parsed = ParsedLog(
+            started=None,
+            startup_error=None,
+            summary=None,
+            summary_so_far={},
+            failures=[{"event": "grpc.error", "message": "boom"}],
+        )
+
+        assert has_fatal_failure(parsed) is True
+
+    def test_has_fatal_failure_with_only_grpc_hit_returns_false(self):
+        """grpc.hit is not a failure event at all, let alone fatal."""
+        from agctl.mock.daemon import ParsedLog, has_fatal_failure
+
+        parsed = ParsedLog(
+            started=None,
+            startup_error=None,
+            summary=None,
+            summary_so_far={},
+            failures=[{"event": "grpc.hit", "method": "/pkg.Svc/X"}],
+        )
+
+        assert has_fatal_failure(parsed) is False
+
+    def test_has_fatal_failure_with_capture_missing_and_grpc_hit_returns_false(self):
+        """capture.missing (non-fatal) plus grpc.hit (non-failure) returns False."""
+        from agctl.mock.daemon import ParsedLog, has_fatal_failure
+
+        parsed = ParsedLog(
+            started=None,
+            startup_error=None,
+            summary=None,
+            summary_so_far={},
+            failures=[
+                {"event": "capture.missing", "type": "grpc"},
+                {"event": "grpc.hit", "method": "/pkg.Svc/X"},
+            ],
+        )
+
+        assert has_fatal_failure(parsed) is False

@@ -16,6 +16,10 @@ Mirrors :func:`collect_jq_compile_errors` in shape so ``config validate`` and
 
 from agctl.config.models import (
     CaptureSpec,
+    GrpcMockConfig,
+    GrpcResponse,
+    GrpcResponseMessage,
+    GrpcStub,
     HttpMockConfig,
     HttpResponse,
     HttpStub,
@@ -199,6 +203,133 @@ def test_http_stub_without_capture_is_skipped():
                     method="GET",
                     path="/x",
                     response=HttpResponse(body={"msg": "{ctx}"}),
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+# --- gRPC: whole-field object capture in response.message is valid ----------
+def test_grpc_object_whole_field_in_message_is_valid():
+    """A grpc object capture occupying a whole response.message field ('{ctx}'
+    alone) is valid — no error (mirrors HTTP response.body whole-field rule)."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    capture={"ctx": _obj_cap(".msg.ctx")},
+                    response=GrpcResponse(message={"context": "{ctx}"}),
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+# --- gRPC: inline object capture in response.message is a violation ---------
+def test_grpc_object_inline_in_message_is_flagged():
+    """A grpc object capture used inline within a larger response.message string
+    ('pre={ctx}') -> one error whose path is the grpc stub label."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    capture={"ctx": _obj_cap(".msg.ctx")},
+                    response=GrpcResponse(message={"msg": "pre={ctx}"}),
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.grpc.stubs.s"
+    assert "{ctx}" in errors[0]["message"]
+    assert set(errors[0].keys()) == {"path", "message"}
+
+
+# --- gRPC: inline object capture in streaming messages[*].message ----------
+def test_grpc_object_inline_in_streaming_message_is_flagged():
+    """A grpc object capture used inline inside a streaming
+    response.messages[*].message string -> one error (the streaming tree is
+    walked just like the unary response.message tree)."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    capture={"ctx": _obj_cap(".msg.ctx")},
+                    response=GrpcResponse(
+                        messages=[
+                            GrpcResponseMessage(message={"ok": "{ctx}"}),
+                            GrpcResponseMessage(message={"bad": "pre={ctx}"}),
+                        ],
+                    ),
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.grpc.stubs.s"
+
+
+def test_grpc_object_whole_field_in_streaming_message_is_valid():
+    """A grpc object capture occupying a whole field in EVERY streaming message
+    is valid — no error."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    capture={"ctx": _obj_cap(".msg.ctx")},
+                    response=GrpcResponse(
+                        messages=[
+                            GrpcResponseMessage(message={"context": "{ctx}"}),
+                            GrpcResponseMessage(message={"ctx": "{ctx}"}),
+                        ],
+                    ),
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+# --- gRPC: scalar/json captures never flagged; no capture -> no error -------
+def test_grpc_scalar_capture_inline_is_not_flagged():
+    """A scalar-typed grpc capture used inline is fine — only object captures
+    are subject to the whole-field rule."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    capture={"id": CaptureSpec(from_=".msg.id", type="scalar")},
+                    response=GrpcResponse(message={"msg": "pre={id}"}),
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+def test_grpc_stub_without_capture_is_skipped():
+    """A grpc stub with capture=None contributes no errors (nothing to check)."""
+    mocks = MocksConfig(
+        grpc=GrpcMockConfig(
+            stubs={
+                "s": GrpcStub(
+                    service="pkg.Svc",
+                    method="Do",
+                    response=GrpcResponse(message={"msg": "{ctx}"}),
                 ),
             },
         ),

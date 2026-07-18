@@ -26,8 +26,9 @@ from ..errors import AgctlError, AssertionFailure, ConfigError, ConnectionFailur
 from ..output import emit
 
 if TYPE_CHECKING:
-    from ..config.models import KafkaConfig
+    from ..config.models import GrpcDescriptorSource, KafkaConfig
     from ..clients.kafka_client import KafkaClient
+    from typing import Any, Callable
 
 __all__ = ["mock_run", "new_mock_engine", "mock_start", "mock_stop", "mock_status"]
 
@@ -65,8 +66,18 @@ def new_mock_engine(
     fail_fast: bool = False,
     duration: float | None = None,
     until_stopped: bool = True,
+    run_grpc: bool = False,
+    grpc_listen: str | None = None,
+    grpc_server_factory: "Callable[..., Any] | None" = None,
+    top_level_descriptors: "list[GrpcDescriptorSource] | None" = None,
 ):
-    """Build a MockEngine (test seam — monkeypatched in tests)."""
+    """Build a MockEngine (test seam — monkeypatched in tests).
+
+    Forwards the gRPC engine knobs (Task 8) and the top-level descriptor
+    fallback (Task 10 obligation) to MockEngine. ``grpc_server_factory`` and
+    ``top_level_descriptors`` default to None so pre-Task-10 callers keep
+    working; production passes the real descriptors list, tests inject a fake.
+    """
     from ..mock.engine import MockEngine
 
     return MockEngine(
@@ -78,39 +89,54 @@ def new_mock_engine(
         fail_fast=fail_fast,
         duration=duration,
         until_stopped=until_stopped,
+        run_grpc=run_grpc,
+        grpc_listen=grpc_listen,
+        grpc_server_factory=grpc_server_factory,
+        top_level_descriptors=top_level_descriptors,
     )
 
 
 def _resolve_engines(
     only: str | None,
     mocks: MocksConfig | None,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, bool]:
     """Resolve which engines to run based on --only and config presence.
 
-    Returns (run_http, run_kafka).
+    Returns (run_http, run_kafka, run_grpc).
 
     Runtime guards (from brief):
-    - --only http ⇒ run_http=mocks.http present, run_kafka=False
-    - --only kafka ⇒ run_kafka=mocks.kafka.reactors non-empty, run_http=False
+    - --only http ⇒ run_http=mocks.http present, run_kafka/run_grpc=False
+    - --only kafka ⇒ run_kafka=mocks.kafka.reactors non-empty, run_http/run_grpc=False
+    - --only grpc ⇒ run_grpc=mocks.grpc.stubs non-empty, run_http/run_kafka=False
     - neither ⇒ run_http = mocks and mocks.http is not None
                run_kafka = mocks and mocks.kafka is not None and bool(mocks.kafka.reactors)
+               run_grpc = mocks and mocks.grpc is not None and bool(mocks.grpc.stubs)
     """
     if only == "http":
         # Guard: --only http with no mocks.http → ConfigError
         if mocks is None or mocks.http is None:
             raise ConfigError("--only http but no mocks.http configured", {})
-        return True, False
+        return True, False, False
 
     if only == "kafka":
         # Guard: --only kafka with no mocks.kafka.reactors → ConfigError
         if mocks is None or mocks.kafka is None or not mocks.kafka.reactors:
             raise ConfigError("--only kafka but no mocks.kafka.reactors configured", {})
-        return False, True
+        return False, True, False
+
+    if only == "grpc":
+        # Guard: --only grpc with no mocks.grpc.stubs → ConfigError. An empty
+        # ``stubs`` dict is the same as missing (a grpc server with no stubs
+        # has nothing to serve); the truthiness check covers both.
+        if mocks is None or mocks.grpc is None or not mocks.grpc.stubs:
+            raise ConfigError("--only grpc but no mocks.grpc.stubs configured", {})
+        return False, False, True
 
     # No --only: resolve from mocks presence
     run_http = mocks is not None and mocks.http is not None
     run_kafka = mocks is not None and mocks.kafka is not None and bool(mocks.kafka.reactors)
-    return run_http, run_kafka
+    run_grpc = mocks is not None and mocks.grpc is not None and bool(mocks.grpc.stubs)
+    return run_http, run_kafka, run_grpc
 
 
 def _mock_start_core(
@@ -122,13 +148,17 @@ def _mock_start_core(
     state_dir: str,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
+    grpc_listen: str | None = None,
 ) -> dict:
     """Core logic for `mock start` (Task 4).
 
     Spawns a detached mock daemon, writes a pidfile, and polls for readiness.
 
     Returns:
-        Dict with keys: pid, listen, log_path, stubs, reactors, started_at.
+        Dict with keys: pid, listen, log_path, stubs, reactors, started_at,
+        and (when run_grpc) grpc. HTTP listen/stubs are None when HTTP is not
+        running; the grpc block carries {listen, stubs, services, reflection,
+        health}.
 
     Raises:
         ConfigError: If already running, startup error, or timeout.
@@ -138,9 +168,11 @@ def _mock_start_core(
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
 
     # Step 2: Resolve which engines to run
-    run_http, run_kafka = _resolve_engines(only, cfg.mocks)
+    run_http, run_kafka, run_grpc = _resolve_engines(only, cfg.mocks)
 
-    # Step 3: Resolve http_listen
+    # Step 3: Resolve http_listen (still parsed even when run_http=False so a
+    # bad override surfaces as a ConfigError — the daemon's child re-loads the
+    # flag and would reject it anyway; better to fail fast in the parent).
     if http_listen is not None:
         # Parse the CLI override
         try:
@@ -155,8 +187,24 @@ def _mock_start_core(
         http_listen = "0.0.0.0:18080"
         parsed_listen = parse_listen(http_listen)
 
-    # Extract port for pidfile keying (None when not running HTTP)
+    # Step 3b: Resolve grpc_listen (--grpc-listen overrides mocks.grpc.listen).
+    # Parsed even when run_grpc=False so a malformed override fails fast in the
+    # parent rather than disappearing into the daemon child.
+    if grpc_listen is not None:
+        try:
+            parse_listen(grpc_listen)
+        except ValueError as e:
+            raise ConfigError(f"Invalid --grpc-listen: {e}", {})
+    elif cfg.mocks and cfg.mocks.grpc:
+        grpc_listen = cfg.mocks.grpc.listen
+
+    # Extract port for pidfile keying. HTTP drives the legacy mock-<port>.pid
+    # naming when present. A grpc-ONLY daemon (no HTTP) keys off the grpc port
+    # under mock-grpc-<port>.pid (Task 9's ``engine="grpc"`` kwarg) so it
+    # doesn't collide with an HTTP daemon on the same numeric port. Kafka-only
+    # daemons still fall through to mock-kafka.pid (port None, no engine hint).
     port = None
+    engine_hint: str | None = None
     if run_http:
         host, port = parsed_listen
         if port <= 0:
@@ -164,13 +212,22 @@ def _mock_start_core(
                 "start requires a concrete --http-listen port (got 0)",
                 {},
             )
+    elif run_grpc and grpc_listen is not None:
+        # grpc-only daemon: derive port from grpc_listen, key via engine="grpc".
+        _gh, port = parse_listen(grpc_listen)
+        if port <= 0:
+            raise ConfigError(
+                "start requires a concrete --grpc-listen port (got 0)",
+                {},
+            )
+        engine_hint = "grpc"
     else:
         port = None
 
     # Step 4: Compute pidfile and log paths
     state_path = Path(state_dir)
-    pid = pidfile_path(state_path, port)
-    logp = log_path(state_path, port)
+    pid = pidfile_path(state_path, port, engine=engine_hint)
+    logp = log_path(state_path, port, engine=engine_hint)
 
     # Step 5: Already-running pre-check
     existing = read_pidfile(pid)
@@ -182,6 +239,12 @@ def _mock_start_core(
                     f"mock already running on {http_listen} (pid {existing_pid}); "
                     "run 'agctl mock stop' first or use a different --http-listen",
                     {"pid": existing_pid, "listen": http_listen},
+                )
+            elif run_grpc:
+                raise ConfigError(
+                    f"mock already running on {grpc_listen} (pid {existing_pid}); "
+                    "run 'agctl mock stop' first or use a different --grpc-listen",
+                    {"pid": existing_pid, "listen": grpc_listen},
                 )
             else:
                 raise ConfigError(
@@ -209,6 +272,8 @@ def _mock_start_core(
     daemon_argv.extend(["mock", "run"])
     if run_http:
         daemon_argv.extend(["--http-listen", http_listen])
+    if run_grpc:
+        daemon_argv.extend(["--grpc-listen", grpc_listen])
     if only is not None:
         daemon_argv.extend(["--only", only])
     if fail_fast:
@@ -219,7 +284,11 @@ def _mock_start_core(
     # Step 7: Spawn the daemon
     child_pid = spawn_daemon(daemon_argv, str(logp))
 
-    # Step 8: Write pidfile
+    # Step 8: Write pidfile. ``listen`` stays the legacy primary identity
+    # (HTTP address when present, else None for kafka/grpc-only daemons).
+    # ``http_listen``/``grpc_listen`` are the engine-specific addresses recorded
+    # so ``mock status``/``mock stop`` selection by EITHER listen works
+    # end-to-end (Task 9 obligation discharged here).
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     write_pidfile(
         pid,
@@ -231,6 +300,8 @@ def _mock_start_core(
             "config_path": config_path,
             "started_at": started_at,
             "run_id": str(child_pid),
+            "http_listen": http_listen if run_http else None,
+            "grpc_listen": grpc_listen if run_grpc else None,
         },
     )
 
@@ -261,7 +332,16 @@ def _mock_start_core(
                 error = parsed.startup_error.get("error", {})
                 message = error.get("message", "startup failed")
                 detail = error.get("detail", {})
-                detail["listen"] = http_listen
+                # Point detail.listen at the engine that actually failed: the
+                # HTTP address when run_http, else the gRPC address when run_grpc,
+                # else None (kafka-only). For a grpc-only daemon http_listen
+                # defaults to 0.0.0.0:18080 (the HTTP default), so the previous
+                # unconditional ``detail["listen"] = http_listen`` pointed a
+                # gRPC startup error at the wrong address (the message text still
+                # named the gRPC port). (Fix 5)
+                detail["listen"] = (
+                    http_listen if run_http else (grpc_listen if run_grpc else None)
+                )
                 raise ConfigError(message, detail)
 
             # Sleep briefly before next poll
@@ -273,7 +353,9 @@ def _mock_start_core(
         remove_pidfile(pid)
         raise
 
-    # Step 10: Build result
+    # Step 10: Build result. HTTP listen/stubs stay as HTTP values (None when
+    # HTTP not running, as before). A grpc block is added ONLY when run_grpc
+    # so HTTP-only/kafka-only results stay unchanged.
     stubs = None
     reactors = []
     if started.get("http") is not None:
@@ -281,7 +363,7 @@ def _mock_start_core(
     if started.get("kafka") is not None:
         reactors = [r["name"] for r in started["kafka"].get("reactors", [])]
 
-    return {
+    result = {
         "pid": child_pid,
         "listen": http_listen if run_http else None,
         "log_path": str(logp),
@@ -289,17 +371,30 @@ def _mock_start_core(
         "reactors": reactors,
         "started_at": started_at,
     }
+    if run_grpc:
+        # ``started["grpc"]`` is emitted by MockEngine (Task 8) as
+        # {listen, stubs, services, reflection, health}; pass through verbatim.
+        grpc_started = started.get("grpc")
+        if grpc_started is not None:
+            result["grpc"] = grpc_started
+        else:
+            # Defensive: daemon declared run_grpc but emitted no grpc block —
+            # surface an explicit None rather than dropping the key so consumers
+            # can distinguish "grpc ran, no data" from "grpc not running".
+            result["grpc"] = None
+    return result
 
 
 @click.command("start")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
 @click.option("--http-listen", "http_listen", default=None, help="HTTP listen address (host:port)")
+@click.option("--grpc-listen", "grpc_listen", default=None, help="gRPC listen address (host:port)")
 @click.option(
     "--only",
     "only",
-    type=click.Choice(["http", "kafka"]),
+    type=click.Choice(["http", "kafka", "grpc"]),
     default=None,
-    help="Run only HTTP or Kafka mock engine",
+    help="Run only HTTP, Kafka, or gRPC mock engine",
 )
 @click.option("--fail-fast", "fail_fast", is_flag=True, default=False, help="Exit on first reactor error")
 @click.option("--duration", "duration", type=float, default=None, help="Stop after N seconds")
@@ -311,19 +406,20 @@ def mock_start(
     env_file: str | None,
     config_path: str | None,
     http_listen: str | None,
+    grpc_listen: str | None,
     only: str | None,
     fail_fast: bool,
     duration: float | None,
     state_dir: str,
 ) -> None:
-    """Start a detached mock daemon with HTTP server and/or Kafka reactors."""
+    """Start a detached mock daemon with HTTP server, Kafka reactors, and/or gRPC server."""
     # Fall back to ctx.obj["config_path"] if --config not provided
     if config_path is None:
         config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
 
-    _mock_start_envelope(config_path, http_listen, only, fail_fast, duration, state_dir, overlay_paths=list(ovs) if ovs else None, env_file=env_file)
+    _mock_start_envelope(config_path, http_listen, only, fail_fast, duration, state_dir, overlay_paths=list(ovs) if ovs else None, env_file=env_file, grpc_listen=grpc_listen)
 
 
 _mock_start_envelope = envelope("mock.start")(_mock_start_core)
@@ -332,12 +428,13 @@ _mock_start_envelope = envelope("mock.start")(_mock_start_core)
 @click.command("run")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
 @click.option("--http-listen", "http_listen", default=None, help="HTTP listen address (host:port)")
+@click.option("--grpc-listen", "grpc_listen", default=None, help="gRPC listen address (host:port)")
 @click.option(
     "--only",
     "only",
-    type=click.Choice(["http", "kafka"]),
+    type=click.Choice(["http", "kafka", "grpc"]),
     default=None,
-    help="Run only HTTP or Kafka mock engine",
+    help="Run only HTTP, Kafka, or gRPC mock engine",
 )
 @click.option("--fail-fast", "fail_fast", is_flag=True, default=False, help="Exit on first reactor error")
 @click.option("--duration", "duration", type=float, default=None, help="Stop after N seconds")
@@ -349,12 +446,13 @@ def mock_run(
     env_file: str | None,
     config_path: str | None,
     http_listen: str | None,
+    grpc_listen: str | None,
     only: str | None,
     fail_fast: bool,
     duration: float | None,
     until_stopped: bool,
 ) -> None:
-    """Run HTTP mock server and/or Kafka reactors, streaming NDJSON events."""
+    """Run HTTP mock server, Kafka reactors, and/or gRPC server, streaming NDJSON events."""
     # Fall back to ctx.obj["config_path"] if --config not provided
     if config_path is None:
         config_path = ctx.obj.get("config_path") if ctx.obj else None
@@ -382,7 +480,7 @@ def mock_run(
         cfg = load_config_or_raise(config_path, overlay_paths=list(ovs) if ovs else None, env_file=env_file)
 
         # Guard 2+3: Resolve engines to run
-        run_http, run_kafka = _resolve_engines(only, cfg.mocks)
+        run_http, run_kafka, run_grpc = _resolve_engines(only, cfg.mocks)
 
         # Guard 5: If run_kafka, resolve each reactor's cluster and build one
         # KafkaClient per DISTINCT cluster (reactors sharing a cluster reuse the
@@ -433,7 +531,23 @@ def mock_run(
             # Default if no HTTP config and no override
             http_listen = "0.0.0.0:18080"
 
-        # Build the engine (via the test seam)
+        # Guard 7: Resolve grpc_listen (--grpc-listen overrides mocks.grpc.listen).
+        # Parsed even when run_grpc=False so a malformed override fails loudly
+        # instead of being silently dropped (mirrors --http-listen's discipline).
+        if grpc_listen is not None:
+            try:
+                parse_listen(grpc_listen)
+            except ValueError as e:
+                raise ConfigError(f"Invalid --grpc-listen: {e}", {})
+        elif cfg.mocks and cfg.mocks.grpc:
+            grpc_listen = cfg.mocks.grpc.listen
+
+        # Build the engine (via the test seam). Threads the top-level
+        # Config.grpc.descriptors fallback (Task 8 obligation) so MockGrpcServer
+        # can fall back from mocks.grpc.descriptors to grpc.descriptors when the
+        # per-mock list is None. ``grpc_server_factory`` is left to its default
+        # (None) — MockEngine lazy-imports the real factory on demand.
+        descriptors = cfg.grpc.descriptors if cfg.grpc.descriptors else None
         engine = new_mock_engine(
             mocks=cfg.mocks,
             run_http=run_http,
@@ -443,6 +557,9 @@ def mock_run(
             fail_fast=fail_fast,
             duration=duration,
             until_stopped=until_stopped,
+            run_grpc=run_grpc,
+            grpc_listen=grpc_listen,
+            top_level_descriptors=descriptors,
         )
 
         # Start the engine (probes + binds — may raise ConfigError/ConnectionFailure)

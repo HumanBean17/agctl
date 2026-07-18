@@ -35,6 +35,66 @@ _GRPC_STATUS_BY_NAME: dict[str, int] = {
 
 _GRPC_STATUS_BY_CODE: dict[int, str] = {v: k for k, v in _GRPC_STATUS_BY_NAME.items()}
 
+
+def parse_grpc_status(status: str | int) -> tuple[int, str]:
+    """Resolve a gRPC status arg to a ``(code, name)`` tuple.
+
+    Single source of truth for name-or-code status parsing; reused by
+    ``validate_grpc_assertion_args`` (CLI flag pre-check),
+    ``evaluate_grpc_assertions`` (post-call evaluation), the config model
+    (``response.status`` validation), and the mock server (dispatch).
+
+    Resolution order:
+      1. Digit-string (e.g. ``"5"`` arriving from the Click CLI, which declares
+         ``--status`` as ``type=str``) is coerced to ``int`` BEFORE the lookup
+         so the int branch is reachable from the CLI.
+      2. Upper-case name in ``_GRPC_STATUS_BY_NAME`` -> ``(code, name)``.
+         Lookup is case-SENSITIVE (``"NOT_FOUND"`` matches, ``"not_found"``
+         does NOT) -- this faithfully preserves the pre-refactor inline
+         behavior. Callers wanting case-insensitive matching must ``.upper()``
+         first.
+      3. ``int`` code in ``_GRPC_STATUS_BY_CODE`` (0-16) -> ``(code, name)``.
+      4. Anything else -> ``ConfigError("status must be a gRPC code name or
+         number 0-16, got {status!r}", {})``.
+
+    The error message intentionally drops the ``--status `` CLI prefix: this
+    helper is reusable beyond the CLI, so its own message is CLI-agnostic.
+    ``validate_grpc_assertion_args`` preserves its separate, CLI-prefixed
+    message (it catches this helper's ``ConfigError`` and re-raises with the
+    ``--status …`` form).
+
+    Does NOT import ``grpc`` -- operates only on the two private maps above,
+    so it runs without the grpc extra.
+    """
+    # Coerce a numeric string (e.g. "5" arriving from the Click CLI, which
+    # declares --status as type=str) to int BEFORE the lookup — otherwise the
+    # int branch below is unreachable from the CLI and --status 5 is rejected.
+    # gRPC codes are 0-16 (non-negative); ``isdigit`` suffices and also rejects
+    # negatives ("-1".isdigit() is False) and floats. The ``isascii()`` guard is
+    # load-bearing: ``str.isdigit()`` is True for Unicode digit-strings like
+    # ``"²"`` / ``"٥"`` but ``int("²")`` raises ``ValueError`` — which would
+    # escape this helper (whose contract is ``ConfigError``, never ``ValueError``)
+    # as an uncaught traceback on the CLI assertion path. Restrict the coercion
+    # to plain ASCII digit-strings; anything else falls through to name lookup
+    # and the documented ``ConfigError``.
+    if isinstance(status, str) and status.isascii() and status.isdigit():
+        status = int(status)
+    # Name lookup (case-sensitive — see docstring)
+    if isinstance(status, str):
+        if status in _GRPC_STATUS_BY_NAME:
+            code = _GRPC_STATUS_BY_NAME[status]
+            return (code, _GRPC_STATUS_BY_CODE[code])
+    # Int-code lookup (bool subclasses int; preserved as-is from the
+    # pre-refactor code -- True/False coerce to 1/0, no behavior change here)
+    elif isinstance(status, int):
+        if status in _GRPC_STATUS_BY_CODE:
+            return (status, _GRPC_STATUS_BY_CODE[status])
+    raise ConfigError(
+        f"status must be a gRPC code name or number 0-16, got {status!r}",
+        {},
+    )
+
+
 # A dotted jq path whose final segment contains a hyphen, e.g.
 # ``.headers.x-request-id`` or ``.body.event-type``. jq parses such segments
 # as subtraction, producing a baffling compile error; this lets ``compile_jq``
@@ -462,34 +522,19 @@ def validate_grpc_assertion_args(
             json.loads(contains)
         except (json.JSONDecodeError, ValueError):
             raise ConfigError("--contains must be valid JSON", {})
-    # --status must be a valid gRPC code name or number 0-16
+    # --status must be a valid gRPC code name or number 0-16. Delegates to the
+    # shared ``parse_grpc_status`` helper for the actual resolution; the
+    # helper's OWN error message drops the ``--status `` prefix (it's reusable
+    # beyond the CLI), so re-raise here with the CLI-prefixed form to preserve
+    # this function's pre-refactor message verbatim.
     if status is not None:
-        # Coerce a numeric string (e.g. "5" arriving from the Click CLI, which
-        # declares --status as type=str) to int BEFORE the lookup — otherwise the
-        # int branch below is unreachable from the CLI and --status 5 is rejected.
-        # gRPC codes are 0-16 (non-negative); ``isdigit`` suffices.
-        if isinstance(status, str) and status.isdigit():
-            status = int(status)
-        # If it's a string, must be in _GRPC_STATUS_BY_NAME
-        if isinstance(status, str):
-            if status not in _GRPC_STATUS_BY_NAME:
-                raise ConfigError(
-                    f"--status must be a gRPC code name or number 0-16, got {status!r}",
-                    {},
-                )
-        # If it's an int, must be in _GRPC_STATUS_BY_CODE
-        elif isinstance(status, int):
-            if status not in _GRPC_STATUS_BY_CODE:
-                raise ConfigError(
-                    f"--status must be a gRPC code name or number 0-16, got {status!r}",
-                    {},
-                )
-        else:
-            # Wrong type (neither str nor int)
+        try:
+            parse_grpc_status(status)
+        except ConfigError:
             raise ConfigError(
                 f"--status must be a gRPC code name or number 0-16, got {status!r}",
                 {},
-            )
+            ) from None
     return None
 
 
@@ -537,16 +582,19 @@ def evaluate_grpc_assertions(
 
     failures = []
 
-    # Status assertion: normalize arg to code, compare to result['status']['code']
+    # Status assertion: normalize arg to code, compare to result['status']['code'].
+    # Delegates name/code resolution to ``parse_grpc_status`` (same coercion as
+    # ``validate_grpc_assertion_args`` -- both must agree). To preserve the
+    # pre-refactor failure-entry shape verbatim, mirror the original local
+    # mutation: a digit-string ("5") is reassigned to its int (5) BEFORE the
+    # failure entry is built, so ``expected`` reports the coerced value (5),
+    # not the raw CLI string ("5"). ``parse_grpc_status`` does the same
+    # coercion internally; replicating it here keeps the failure envelope
+    # byte-identical to the pre-refactor output.
     if status is not None:
-        # Normalize status arg to a code (coerce numeric string from CLI — see
-        # validate_grpc_assertion_args; both must agree on the coercion).
         if isinstance(status, str) and status.isdigit():
             status = int(status)
-        if isinstance(status, str):
-            expected_code = _GRPC_STATUS_BY_NAME[status]
-        else:  # int
-            expected_code = status
+        expected_code, _ = parse_grpc_status(status)
         actual_code = result["status"]["code"]
         if expected_code != actual_code:
             failures.append(

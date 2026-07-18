@@ -1,10 +1,18 @@
-"""gRPC client DTOs and skeleton with lazy grpcio import."""
+"""gRPC client DTOs and skeleton with lazy grpcio import.
+
+Proto-only helpers (descriptor resolution, service/method lookup, JSON<->protobuf
+translation) live in :mod:`agctl.clients.grpc_descriptors` — the shared kernel
+consumed by both this client and the upcoming gRPC mock server. This module
+keeps the reflection-resolution path (client-only) and the grpcio channel/call
+plumbing; everything else delegates to the kernel.
+"""
 
 from __future__ import annotations
 
 import pathlib
 from dataclasses import dataclass
 
+from agctl.clients import grpc_descriptors
 from agctl.config.models import GrpcTarget
 from agctl.errors import ConfigError
 
@@ -48,33 +56,6 @@ class GrpcHealthResult:
     address: str
     status: str
     note: str | None = None
-
-
-def _add_file_protos_order_tolerant(pool, file_protos) -> None:
-    """Add FileDescriptorProtos to the pool regardless of dependency order.
-
-    protoc's FileDescriptorSet.file order is NOT guaranteed dependency-first,
-    and the descriptor pool validates dependencies eagerly (raising TypeError
-    for a file whose import is not yet loaded — even via AddSerializedFile).
-    Make repeated passes, deferring any file whose dependency is not yet loaded,
-    until all are added. If no file can be added in a pass, surface the genuine
-    error by re-adding the first remaining file. See review finding I5.
-    """
-    remaining = list(file_protos)
-    while remaining:
-        progress = False
-        deferred = []
-        for fd in remaining:
-            try:
-                pool.AddSerializedFile(fd.SerializeToString())
-                progress = True
-            except TypeError:
-                deferred.append(fd)
-        if not progress:
-            # No file could be added -> genuine error (missing import, etc.).
-            # Re-raise so the real cause surfaces.
-            pool.AddSerializedFile(remaining[0].SerializeToString())
-        remaining = deferred
 
 
 class GrpcClient:
@@ -285,11 +266,14 @@ class GrpcClient:
                             seen_files.add(fd_name)
 
         # Add collected files in a dependency-order-tolerant pass.
-        _add_file_protos_order_tolerant(pool, all_file_protos)
+        grpc_descriptors.add_file_protos_order_tolerant(pool, all_file_protos)
         return pool
 
     def _resolve_via_descriptors(self):
         """Resolve descriptors from configured descriptor sources.
+
+        Thin delegate to :func:`grpc_descriptors.build_descriptor_pool` so the
+        client and the upcoming mock server share one source of truth.
 
         Returns:
             DescriptorPool: Pool built from all descriptor sources.
@@ -297,85 +281,15 @@ class GrpcClient:
         Raises:
             ConfigError: If no descriptors configured and reflection unavailable.
         """
-        from google.protobuf import descriptor_pool, descriptor_pb2
-        import pathlib
-
-        if not self._descriptors:
-            raise ConfigError(
-                "no gRPC descriptors available and server reflection is unavailable; "
-                "configure grpc.descriptors",
-                {"target": self._target.address},
-            )
-
-        pool = descriptor_pool.DescriptorPool()
-
-        # Merge all descriptor sources into one pool
-        for descriptor_source in self._descriptors:
-            if descriptor_source.descriptor_set:
-                # Load from binary descriptor set
-                descriptor_path = pathlib.Path(descriptor_source.descriptor_set)
-                descriptor_bytes = descriptor_path.read_bytes()
-
-                # Parse the FileDescriptorSet
-                file_descriptor_set = descriptor_pb2.FileDescriptorSet()
-                file_descriptor_set.ParseFromString(descriptor_bytes)
-
-                # Add each file descriptor to the pool in a dependency-order-
-                # tolerant pass (protoc's FileDescriptorSet.file order is NOT
-                # guaranteed dependency-first, and the pool validates deps
-                # eagerly). See review finding I5.
-                _add_file_protos_order_tolerant(pool, file_descriptor_set.file)
-
-            elif descriptor_source.proto:
-                # Compile from proto file
-                from grpc_tools import protoc
-
-                proto_path = pathlib.Path(descriptor_source.proto)
-
-                # Compile to in-memory FileDescriptorSet
-                # Use protoc.main with a custom temp output
-                import tempfile
-                import os
-
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    descriptor_set_path = os.path.join(tmpdir, "descriptor_set.pb")
-
-                    # Build proto search paths: the proto's own directory first,
-                    # then any configured include_paths.
-                    proto_paths = ["--proto_path", str(proto_path.parent)]
-                    for include_path in descriptor_source.include_paths:
-                        proto_paths.extend(["--proto_path", str(include_path)])
-
-                    # Call protoc to compile. protoc.main returns a nonzero int
-                    # on failure (it does NOT raise); surface as ConfigError
-                    # pointing at the proto. See review findings I4.
-                    rc = protoc.main(
-                        [
-                            "protoc",
-                            "--include_imports",
-                            *proto_paths,
-                            "--descriptor_set_out",
-                            descriptor_set_path,
-                            str(proto_path),
-                        ]
-                    )
-                    if rc != 0:
-                        raise ConfigError(
-                            f"protoc failed to compile {proto_path}: rc={rc}",
-                            {"proto": str(proto_path)},
-                        )
-
-                    # Load the generated descriptor set
-                    descriptor_bytes = pathlib.Path(descriptor_set_path).read_bytes()
-                    file_descriptor_set = descriptor_pb2.FileDescriptorSet()
-                    file_descriptor_set.ParseFromString(descriptor_bytes)
-
-                    _add_file_protos_order_tolerant(pool, file_descriptor_set.file)
-
-        return pool
+        return grpc_descriptors.build_descriptor_pool(
+            self._descriptors,
+            context_label=self._target.address,
+        )
 
     def find_method(self, service: str, method: str):
         """Find a method descriptor by service and method name.
+
+        Thin delegate to :func:`grpc_descriptors.find_method`.
 
         Args:
             service: Fully-qualified service name (e.g., "echo.Echo").
@@ -387,32 +301,17 @@ class GrpcClient:
         Raises:
             TemplateNotFound: If service or method not found.
         """
-        from agctl.errors import TemplateNotFound
-
-        pool = self.resolve_descriptors()
-
-        # Find service by name
-        try:
-            service_desc = pool.FindServiceByName(service)
-        except KeyError:
-            raise TemplateNotFound(
-                f"Unknown gRPC service: {service}",
-                {"service": service},
-            )
-
-        # Find method by name
-        method_desc = service_desc.methods_by_name.get(method)
-        if method_desc is None:
-            raise TemplateNotFound(
-                f"Unknown gRPC method: {method} on {service}",
-                {"service": service, "method": method},
-            )
-
-        return method_desc
+        return grpc_descriptors.find_method(
+            self.resolve_descriptors(), service, method
+        )
 
     @staticmethod
     def call_type_of(method_desc):
         """Determine the call type from a method descriptor.
+
+        Delegating staticmethod preserved for existing call sites (e.g.
+        ``GrpcClient.call_type_of(md)``) — routes to
+        :func:`grpc_descriptors.call_type_of`.
 
         Args:
             method_desc: A protobuf MethodDescriptor.
@@ -420,53 +319,28 @@ class GrpcClient:
         Returns:
             str: One of "unary", "server_stream", "client_stream", "bidi".
         """
-        is_client_streaming = method_desc.client_streaming
-        is_server_streaming = method_desc.server_streaming
-
-        if is_client_streaming and is_server_streaming:
-            return "bidi"
-        elif is_server_streaming:
-            return "server_stream"
-        elif is_client_streaming:
-            return "client_stream"
-        else:
-            return "unary"
+        return grpc_descriptors.call_type_of(method_desc)
 
     def _msg_class(self, message_desc):
-        """Build a protobuf message class from a descriptor."""
-        from google.protobuf import message_factory
+        """Build a protobuf message class from a descriptor.
 
-        return message_factory.GetMessageClass(message_desc)
+        Thin delegate to :func:`grpc_descriptors.message_class`.
+        """
+        return grpc_descriptors.message_class(message_desc)
 
     def _serialize(self, message_desc):
-        """Build a serializer callable: dict -> bytes."""
+        """Build a serializer callable: dict | bytes -> bytes.
 
-        def serializer(d: dict | bytes) -> bytes:
-            # If already serialized (bytes), pass through
-            if isinstance(d, bytes):
-                return d
-
-            from google.protobuf import json_format
-
-            cls = self._msg_class(message_desc)
-            msg = cls()
-            # ParseDict raises on unknown fields - call methods convert to ConfigError
-            json_format.ParseDict(d, msg, ignore_unknown_fields=False)
-            return msg.SerializeToString()
-
-        return serializer
+        Thin delegate to :func:`grpc_descriptors.serialize`.
+        """
+        return grpc_descriptors.serialize(message_desc)
 
     def _deserialize(self, message_desc):
-        """Build a deserializer callable: bytes -> dict."""
+        """Build a deserializer callable: bytes -> dict.
 
-        def deserializer(b: bytes) -> dict:
-            from google.protobuf import json_format
-
-            cls = self._msg_class(message_desc)
-            msg = cls.FromString(b)
-            return json_format.MessageToDict(msg)
-
-        return deserializer
+        Thin delegate to :func:`grpc_descriptors.deserialize`.
+        """
+        return grpc_descriptors.deserialize(message_desc)
 
     def _metadata_to_items(self, metadata: dict | None) -> list | None:
         """Convert metadata dict to list of (key, value) tuples or None."""

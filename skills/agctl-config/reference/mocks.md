@@ -1,13 +1,15 @@
-# `mock` mode — author HTTP stubs and Kafka reactors
+# `mock` mode — author HTTP stubs, Kafka reactors, and gRPC stubs
 
 Add a `mocks:` block so `agctl` can *impersonate* the system's external dependencies
-during local testing — an HTTP API the SUT calls, or the downstream Kafka consumer the
-SUT expects to react to its events. The non-negotiable contract (placeholder syntaxes,
-naming, verify-after) lives in `SKILL.md`; this file is the extraction detail.
+during local testing — an HTTP API the SUT calls, the downstream Kafka consumer the
+SUT expects to react to its events, or a gRPC service the SUT's gRPC client targets.
+The non-negotiable contract (placeholder syntaxes, naming, verify-after) lives in
+`SKILL.md`; this file is the extraction detail.
 
-Two sub-shapes live under one `mocks:` section. Point at the **dependency the SUT talks to**
-(not the SUT itself): an OpenAPI doc / route of the downstream HTTP service, or the
-`@KafkaListener` / event schema of the consumer you're standing in for.
+Three sub-shapes live under one `mocks:` section. Point at the **dependency the SUT talks to**
+(not the SUT itself): an OpenAPI doc / route of the downstream HTTP service, the
+`@KafkaListener` / event schema of the consumer you're standing in for, or the
+`.proto` / gRPC service descriptor of the downstream gRPC service.
 
 ```yaml
 mocks:
@@ -18,6 +20,13 @@ mocks:
   kafka:
     reactors:
       order-command-handler: { ... }   # joins the SUT's real broker as a consumer
+  grpc:
+    listen: "${AGCTL_MOCK_GRPC_HOST:-0.0.0.0}:${AGCTL_MOCK_GRPC_PORT:-50051}"
+    descriptors:
+      - proto: "protos/echo/v1/echo.proto"     # OR descriptor_set: "protos/echo.pb"
+      # include_paths: ["protos"]
+    stubs:
+      echo-unary: { ... }       # one server, many stubs (service/method-routed)
 ```
 
 ## ⚠️ The one thing that trips everyone: `{name}` here is *capture*, not `--param`
@@ -106,6 +115,80 @@ not a broker itself. Each reactor resolves a cluster (`reactor.cluster` → `kaf
 → single-cluster auto-default); the resolved cluster must have non-empty `brokers`, or
 `mock run` fails fast at startup (exit 2). `mock run` also needs the `kafka` extra installed
 (`pip install 'agctl[kafka]'`). HTTP-only mocks need neither brokers nor the extra.
+
+## Extraction — gRPC stub (`mocks.grpc.stubs.<name>`)
+
+The SUT's gRPC client points at `mocks.grpc.listen` (a plaintext h2c listener; **no TLS on
+the mock in v1**). The mock serves all four call types (unary / server-streaming / client-streaming
+/ bidi) via a generic servicer that dispatches `/<service>/<method>` through a descriptor-driven
+match→capture→render pipeline identical to HTTP/Kafka stubs. Health (`grpc.health.v1.Health`,
+SERVING) and server reflection are auto-served (gated by `health: true` / `reflection: true`,
+both default). Needs the `grpc` extra (`pip install 'agctl[grpc]'`).
+
+1. **listen** — `host:port`; `${ENV}` at load; default `0.0.0.0:50051`. Same `parse_listen` rules
+   as `mocks.http.listen` (IPv6 hosts bracketed; port 0 = ephemeral). **Pick a unique port across
+   runs**: grpcio enables `SO_REUSEPORT`, so two gRPC servers can silently bind the same port —
+   the port-in-use guard fires only when a non-grpc process holds the port.
+2. **descriptors** *(optional)* — `list[GrpcDescriptorSource]`; each entry sets **exactly one** of
+   `proto` (compiled in-memory via `grpc_tools.protoc`) or `descriptor_set` (a precompiled
+   `FileDescriptorSet` `.pb` file). **Omit to fall back to top-level `grpc.descriptors`.**
+   Descriptors are **required** to resolve `service`/`method` and encode responses — server
+   reflection is *served* (so the SUT's gRPC client can introspect) but cannot *bootstrap* the
+   mock itself; a config that expects reflection-only bootstrapping fails at server construction
+   (exit 2).
+3. **reflection** / **health** *(optional, both default `true`)* — toggle the auto-served
+   Reflection / Health servicers. Disable only if the SUT misbehaves when either is present.
+4. **concurrency_cap** *(optional, default `64`)* — `grpc.server(ThreadPoolExecutor(max_workers=…))`.
+5. **service** — fully-qualified gRPC service name from the proto (e.g. `echo.EchoService`).
+   Must resolve in the descriptor pool or `mock run` fails at server construction (exit 2).
+6. **method** — method name within the service. Same resolution + fail-fast as `service`.
+   **Call type is DERIVED from the descriptor** (unary / server_stream / client_stream / bidi),
+   not configured — it determines the match envelope and the required response shape.
+7. **match.body** *(optional)* — a JSON subset the deserialized **request message** must
+   contain for this stub to fire (`json_subset`, message-rooted). **Skipped for client_stream.**
+   Omit = match on `service`/`method` alone.
+8. **match.jq** *(optional)* — a jq boolean predicate over the **per-call-type envelope**
+   (unary/server_stream/bidi = `{service, method, metadata (lowercased), message}`;
+   client_stream = `{service, method, metadata, messages:[…], count}` matched once at stream
+   close), so `.message.msg == "hello"`, `.metadata.authorization != null`. AND-ed with
+   `match.body` (when both are present and the call type supports `body`). Needs
+   `pip install 'agctl[jq]'` (bundled in `agctl[grpc]`).
+9. **capture** *(optional)* — same `CaptureSpec` shape as HTTP/Kafka stubs; `from` shares the
+   `match.jq` root — the per-call-type envelope. `metadata` keys are lowercased.
+10. **response.status** — gRPC status **name** (`OK`, `NOT_FOUND`, … — case-sensitive) or
+    numeric code (0–16); default `OK`. Any non-OK value is returned as the terminal gRPC status
+    (no body for unary/client-stream; streamed `messages` first for server-stream).
+11. **response.message** *(unary / client-stream / bidi)* — the single response payload.
+    Render `{name}` against the capture context.
+12. **response.messages** *(server-streaming only)* — an ordered list; each entry is
+    `{message: <payload>, delay_ms: <int>}`. One gRPC message is streamed per entry, then the
+    terminal `status`. **Required for server-streaming methods** (and forbidden for the other
+    three call types); any other combination → `ConfigError` at
+    `mocks.grpc.stubs.<name>.response` at server construction.
+13. **response.metadata** *(optional)* — initial-metadata dict (`{x-trace-id: "…"}`); also
+    sent as trailers when the terminal `status` is non-OK. String values only.
+14. **delay_ms** *(optional)* — simulated latency before the response.
+15. **name** — kebab-case from the RPC.
+16. **description** — one line.
+
+**First-match-wins** over `stubs` in YAML mapping order, **keyed by `(service, method)`** —
+the dispatch groups stubs by `(service, method)` and iterates the group in insertion order.
+Two stubs sharing `(service, method)` and distinguished only by `match.body`/`match.jq` carry
+the same wrong-branch false-green risk as HTTP stubs (config validate does not yet warn here;
+mitigate by pairing with an assertion that distinguishes branches).
+
+**Per-call-type behavior — load-bearing:**
+
+| Call type | Match envelope | Response |
+|---|---|
+| **unary** | `{service, method, metadata, message}` per request | one `message` |
+| **server_stream** | same as unary (matched once on the single request) | stream all `messages`, then terminal `status` |
+| **client_stream** | `{service, method, metadata, messages:[…], count}` matched once at request-stream close (`match.body` skipped) | one `message` |
+| **bidi** | per-incoming-request envelope (echo-style) | one `message` per matched request (unmatched ⇒ `grpc.unmatched` + no response for that turn; stream continues) |
+
+**`grpc.unmatched` and `grpc.error` are fatal** — they set the runtime-error flag so `mock run`
+exits 1 at shutdown and `mock stop` raises `AssertionFailure` (exit 1). Add them to the
+post-run log grep alongside `http.unmatched` / `kafka.error` / `capture.missing`.
 
 ## Capture value coercion (load-bearing)
 
@@ -257,13 +340,27 @@ fire fails loudly (exit 1). See the `agctl` skill for the assertion flags.
 - **Node** `kafkajs` consumer `subscribe({ topic })` → `topic`; `producer.send({ topic,
   messages })` in the handler → `reaction`.
 
+### gRPC — the service the SUT's gRPC client calls
+- **`.proto` file** (preferred) → `service` (fully-qualified), `method`, and the call type
+  (unary / server-stream / client-stream / bidi — derived by agctl from the descriptor; you
+  don't configure it). Pair with the matching `response.message` (unary/client-stream/bidi)
+  or `response.messages` list (server-stream).
+- **Compiled descriptor set** (`.pb` `FileDescriptorSet`) — same resolution path; useful when
+  the proto file isn't easily reachable at runtime.
+- **Reflection** — useful for the SUT's gRPC client at runtime (auto-served when
+  `reflection: true`), **but it cannot bootstrap the mock itself** — `mocks.grpc` still needs
+  `descriptors:` (or top-level `grpc.descriptors`) to resolve service/method and encode
+  responses.
+
 ## What to clarify (only genuine gaps)
 
 - The concrete consume/produce topic strings if the code computes them.
 - Whether to pin `consumer_group` (default: **don't** — explain the resume hazard first).
-- The env-var names for `listen` / `consumer_group` if they should be overridable
-  (`${AGCTL_MOCK_HTTP_PORT:-18080}`).
+- The env-var names for `listen` / `consumer_group` / `grpc.listen` if they should be
+  overridable (`${AGCTL_MOCK_HTTP_PORT:-18080}`, `${AGCTL_MOCK_GRPC_PORT:-50051}`).
 - Whether the message value is always JSON (Avro/Protobuf topics are not mockable today).
+- For a gRPC stub: where the `.proto` / descriptor set lives (the proto's `service`/`method`
+  names; the call type is derived from the descriptor — confirm by reading it).
 
 ## Where it writes
 
@@ -281,8 +378,10 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
   replay, pagination, 429-then-retry. The static engine returns the same canned response
   regardless of prior calls.
 - **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** — cannot connect to a
-  plaintext mock at all (payments/auth/healthcare are disproportionately affected).
-- **Cross-transport sagas** (Kafka trigger → HTTP callback) — no causal linkage.
+  plaintext mock at all (payments/auth/healthcare are disproportionately affected). The gRPC
+  mock is plaintext-only v1 too — TLS-pinned gRPC SUT clients cannot connect.
+- **Cross-transport sagas** (Kafka trigger → HTTP callback) — no causal linkage. gRPC stub →
+  Kafka reaction (and vice versa) is deferred alongside this.
 - **Non-JSON Kafka values** (Avro/Protobuf/schema-registry) — emitted as `kafka.skipped`
   (visible), but effectively un-mockable.
 - **Pinned `consumer_group` reused across runs/devs** — partition split or resume-past-
@@ -291,38 +390,61 @@ them (full list + failure modes in DESIGN §10 "Known-wrong-result / Not Covered
   distinguished only by `match.jq`: a subtly-wrong predicate silently fires the wrong branch
   (returns 2xx + `http.hit`, **not** `http.unmatched`). The compile guard catches only
   syntax errors; mitigate by pairing with a response assertion (see "jq match semantics"
-  above).
+  above). Same risk for two gRPC stubs sharing `(service, method)` and distinguished only by
+  `match.body`/`match.jq`.
+- **gRPC: stateful / server-push bidi** — the mock's bidi is request/response pairing (one
+  rendered response per matched request); conversation state and server-push are not modeled.
+- **gRPC: per-message client-stream aggregation** — client-stream aggregates `messages` at
+  stream close and emits one response; per-message responding is not modeled.
+- **gRPC: descriptors required** — server reflection is *served* but cannot *bootstrap* the
+  mock; a config that omits `mocks.grpc.descriptors` AND top-level `grpc.descriptors` fails
+  at server construction (exit 2).
+- **gRPC: `SO_REUSEPORT` port-collision blind spot** — two gRPC servers can silently bind
+  the same port; the port-in-use guard fires only for a non-grpc port holder. Pick unique
+  ports across runs.
 
 ## Gotchas
 
 - `{name}` = capture-from-trigger here — **never** `${}` in a path/reaction template, and
-  there is no `--param` for mocks. `${ENV}` is fine in `listen`/`consumer_group`/topics.
+  there is no `--param` for mocks. `${ENV}` is fine in `listen`/`consumer_group`/topics/
+  `grpc.listen`.
 - `mocks.kafka` requires each reactor's resolved cluster to have non-empty
   `kafka.clusters.<name>.brokers` (and the `kafka` extra); HTTP-only mocks don't.
-- `reaction.headers` values must be strings — a non-string is a config error.
+- `mocks.grpc` requires the `grpc` extra regardless of whether `match.jq` is set
+  (`pip install 'agctl[grpc]'`); the descriptor-driven encode needs `grpcio`/`protobuf`.
+  HTTP-only and Kafka-only mocks import no server-side gRPC code.
+- `reaction.headers` / `response.metadata` values must be strings — a non-string is a config error.
 - `description` is optional but effectively required (contract #4); its absence degrades
   `discover` and earns a validate warning.
 - Mocks **are** surfaced by `agctl discover`: `--category mock-http-stubs` /
-  `mock-kafka-reactors` (and `--name <key>` for full detail). After editing, confirm the item
-  lists, then verify with `agctl config validate` and a `mock run --duration` smoke (see the
-  `agctl` skill).
+  `mock-kafka-reactors` / `mock-grpc-stubs` (and `--name <key>` for full detail). After
+  editing, confirm the item lists, then verify with `agctl config validate` and a
+  `mock run --duration` smoke (see the `agctl` skill).
+- For `mocks.grpc.stubs`: an unresolved `service`/`method` against the descriptor pool is a
+  `ConfigError` at `mocks.grpc.stubs.<name>` — but it lands at `mock run`/`mock start`
+  **startup** (server construction), NOT at `config validate` (the descriptor pool isn't
+  loaded offline). Always run a `mock run --duration 5` smoke after editing a grpc stub.
 - A jq **typo** in `match.jq` / reactor `match` / `capture.*.from` fails loud at startup
   (exit 2); a jq **eval error** (or a `from` resolving to `null`) against a particular
   request/message is a soft non-match / `capture.missing` (falls through, empty string).
   Two different guards for two different error classes — see "jq match semantics" above.
 - Under dialect `"2"`+, **`match` and `capture.from` share an envelope root** — `.body.amount`
-  (HTTP) / `.value.command` (Kafka) on both sides. Under dialect `"1"` `match` was
+  (HTTP) / `.value.command` (Kafka) / `.message.field` (gRPC, unary/server-stream/bidi) /
+  `.messages[-1].field` (gRPC, client-stream) on both sides. Under dialect `"1"` `match` was
   payload-rooted; `agctl config migrate` lifts a v1/v2 config to v3 (structural
   `kafka.clusters` lift for both; `.body | ` / `.value | ` prefix on the three match-site
   families for v1 only) but does **not** touch CLI `--match` flags in shell scripts /
   prompts.
 - HTTP `headers` in the capture envelope are **lowercased** (`.headers.authorization`);
   Kafka `headers` are **case-sensitive as-produced** (`.headers.rqUID`, exact producer
-  casing). Don't lowercase Kafka header names.
+  casing); gRPC `metadata` keys are **lowercased** (`.metadata.authorization`). Don't
+  lowercase Kafka header names.
 - `type: object` must occupy the **whole field** (`key: "{name}"` exactly) — inline use
   or a string-only slot (`reaction.key`, a header value) is a startup `ConfigError`.
 - `match.jq` / reactor `match` / `capture.*.from` need `pip install 'agctl[jq]'` (bundled
-  in `agctl[kafka]` and `agctl[db]`). A stub/reactor with none of these imports nothing.
+  in `agctl[kafka]`, `agctl[db]`, and `agctl[grpc]`). A stub/reactor with none of these
+  imports nothing — **except** gRPC stubs, which always need `agctl[grpc]` (descriptor-driven
+  encode).
 - **Native Windows:** the managed daemon (`mock start`/`stop`/`status`) is unavailable —
   it exits `2` with a `ConfigError`. Authoring the `mocks:` block, `agctl config validate`,
   and `mock run` (the foreground smoke-test command above) all work natively on Windows;

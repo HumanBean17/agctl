@@ -5,8 +5,10 @@ Two helpers consumed by the mock engine (Task 5, ``MockEngine.start()`` Step 0
 ALL errors for a single report):
 
 - :func:`iter_mock_jq_expressions` — generator yielding ``(path_label, expr)``
-  for every HTTP stub with a non-None ``match.jq`` and every Kafka reactor with
-  a non-None ``match``. Stubs are yielded first (in dict order), then reactors.
+  for every HTTP stub with a non-None ``match.jq``, every Kafka reactor with
+  a non-None ``match``, and every gRPC stub with a non-None ``match.jq``.
+  HTTP stubs are yielded first (in dict order), then Kafka reactors, then
+  gRPC stubs.
 - :func:`collect_jq_compile_errors` — drives :func:`compile_jq` over every
   expression the walker emits, catching :class:`ConfigError` so a single pass
   surfaces every authoring typo (rather than stopping at the first).
@@ -29,20 +31,21 @@ def iter_mock_jq_expressions(
     """Yield ``(path_label, expr)`` for every jq expression in ``mocks``.
 
     Iterates HTTP stubs first (in dict order), then Kafka reactors (in dict
-    order). For each stub, yields its ``match.jq`` (when not None) and then,
-    when the stub carries a non-None ``capture``, one ``capture.{cap}.from``
-    entry per capture (in dict order) — the capture ``from`` is itself a jq
-    expression that must compile. Reactors mirror this: ``match`` first, then
-    each ``capture.{cap}.from``. A stub/reactor with ``capture=None`` (or no
-    match) contributes no capture labels.
+    order), then gRPC stubs (in dict order). For each stub/reactor, yields its
+    ``match.jq`` / ``match`` (when not None) and then, when it carries a
+    non-None ``capture``, one ``capture.{cap}.from`` entry per capture (in dict
+    order) — the capture ``from`` is itself a jq expression that must compile.
+    gRPC stubs mirror HTTP stubs: ``match.jq`` first, then each
+    ``capture.{cap}.from``. A stub/reactor with ``capture=None`` (or no match)
+    contributes no capture labels.
 
     Walking the capture ``from`` here means :func:`collect_jq_compile_errors`
     (used by ``config validate``) and the engine's Step 0 pre-compile (used by
     ``mock run``) both surface a malformed ``from`` at the capture label,
     automatically — no caller changes needed.
 
-    ``mocks is None`` (or its ``http``/``kafka`` subsections are None) yields
-    nothing — the caller may pass a Config with mocks disabled without
+    ``mocks is None`` (or its ``http``/``kafka``/``grpc`` subsections are None)
+    yields nothing — the caller may pass a Config with mocks disabled without
     guarding.
     """
     if mocks is None:
@@ -66,6 +69,14 @@ def iter_mock_jq_expressions(
                         f"mocks.kafka.reactors.{name}.capture.{cap}.from",
                         spec.from_,
                     )
+
+    if mocks.grpc is not None:
+        for name, stub in mocks.grpc.stubs.items():
+            if stub.match is not None and stub.match.jq is not None:
+                yield f"mocks.grpc.stubs.{name}.match.jq", stub.match.jq
+            if stub.capture is not None:
+                for cap, spec in stub.capture.items():
+                    yield f"mocks.grpc.stubs.{name}.capture.{cap}.from", spec.from_
 
 
 def collect_jq_compile_errors(mocks: MocksConfig | None) -> list[dict]:

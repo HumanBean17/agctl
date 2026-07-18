@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..assertions import compile_jq
-from ..config.models import MocksConfig, parse_listen
+from ..config.models import GrpcDescriptorSource, MocksConfig, parse_listen
 from ..errors import ConfigError
 from .capture_validate import collect_capture_placement_errors
 from .http_server import MockHTTPServer
@@ -64,11 +64,15 @@ class MockEngine:
         until_stopped: bool = True,
         emit_fn: Callable[[dict], None] = _default_emit,
         run_id: str | None = None,
+        run_grpc: bool = False,
+        grpc_listen: str | None = None,
+        grpc_server_factory: Callable[..., Any] | None = None,
+        top_level_descriptors: list[GrpcDescriptorSource] | None = None,
     ):
         """Initialize the mock engine.
 
         Args:
-            mocks: MocksConfig with http/kafka definitions (None for no-op engine).
+            mocks: MocksConfig with http/kafka/grpc definitions (None for no-op engine).
             run_http: If True, start HTTP mock server.
             run_kafka: If True, start Kafka reactors.
             http_listen: HTTP listen address string (host:port).
@@ -80,6 +84,21 @@ class MockEngine:
             until_stopped: Ignored (kept for API compatibility).
             emit_fn: Callable to emit one NDJSON line (default: stdout).
             run_id: Engine run identifier (defaults to PID if None).
+            run_grpc: If True, start the gRPC mock server (Task 8). Defaults
+                False so pre-Task-10 ``new_mock_engine`` call sites keep working.
+            grpc_listen: Overrides ``mocks.grpc.listen`` when set (--grpc-listen).
+                None means use the config's listen verbatim.
+            grpc_server_factory: DI seam used by unit tests to inject a fake
+                ``MockGrpcServer`` without importing grpcio. Called with the
+                ``MockGrpcServer`` keyword signature
+                ``(config=..., top_level_descriptors=..., emit_event=...)``.
+                None → a default factory that lazy-imports the real
+                ``MockGrpcServer`` from ``..mock.grpc_server`` and constructs it.
+            top_level_descriptors: ``Config.grpc.descriptors`` forwarded by the
+                command layer (Task 10) — MockEngine only sees ``MocksConfig``,
+                so this is the only path the top-level fallback reaches the
+                server. ``MockGrpcServer`` falls back to it when the per-mock
+                ``mocks.grpc.descriptors`` is None. Defaults None (no fallback).
         """
         self._mocks = mocks
         self._run_http = run_http
@@ -90,6 +109,32 @@ class MockEngine:
         self._duration = duration
         self._emit_fn = emit_fn
         self._run_id = run_id if run_id is not None else str(os.getpid())
+        self._run_grpc = run_grpc
+        self._grpc_listen = grpc_listen
+        self._top_level_descriptors = top_level_descriptors
+
+        # DI seam. The default lazy-imports the real MockGrpcServer INSIDE the
+        # closure body so the engine module stays grpcio-free at import time
+        # (and at construction for run_grpc=False callers — Task 10's wiring
+        # won't pay the import cost unless a run actually starts a grpc server).
+        if grpc_server_factory is None:
+            def _default_grpc_server_factory(
+                *,
+                config,
+                top_level_descriptors,
+                emit_event,
+            ):
+                from .grpc_server import MockGrpcServer
+
+                return MockGrpcServer(
+                    config=config,
+                    top_level_descriptors=top_level_descriptors,
+                    emit_event=emit_event,
+                )
+
+            self._grpc_server_factory = _default_grpc_server_factory
+        else:
+            self._grpc_server_factory = grpc_server_factory
 
         # Event for coordinating shutdown
         self._stop = threading.Event()
@@ -104,6 +149,9 @@ class MockEngine:
         self._kafka_reactions = 0
         self._kafka_skipped = 0
         self._kafka_errors = 0
+        self._grpc_hits = 0
+        self._grpc_unmatched = 0
+        self._grpc_errors = 0
         self._runtime_error = False  # Track if any runtime error occurred
         # Set True only after the started line is emitted; gates summary so a
         # failed start (which never emitted started) cannot emit a spurious
@@ -115,6 +163,8 @@ class MockEngine:
         self._reactors: list[KafkaReactorClass] = []
         self._http_thread: threading.Thread | None = None
         self._reactor_threads: list[threading.Thread] = []
+        self._grpc_server: Any = None  # MockGrpcServer (Task 7) when run_grpc
+        self._grpc_thread: threading.Thread | None = None
         # Cancellable duration timer (threading.Timer); cancelled on shutdown
         # so an early shutdown doesn't leave a sleeping timer for the duration.
         self._duration_timer: threading.Timer | None = None
@@ -154,12 +204,29 @@ class MockEngine:
                 # Track fatal errors for fail-fast
                 if line.get("fatal"):
                     self._runtime_error = True
+            elif event_name == "grpc.hit":
+                self._grpc_hits += 1
+            elif event_name == "grpc.unmatched":
+                # Per DESIGN §8.3 an unmatched RPC is fatal (the mock is
+                # incomplete) → tally AND set the runtime-error flag so run()
+                # exits 1 and the summary surfaces grpc_unmatched > 0. Mirrors
+                # the kafka.error fatal handling above but unconditional (the
+                # event has no `fatal` field; unmatched IS the fatal signal).
+                self._grpc_unmatched += 1
+                self._runtime_error = True
+            elif event_name == "grpc.error":
+                # gRPC dispatch/handler error — always fatal (the gRPC server
+                # emits it with fatal=True; treat it as such unconditionally,
+                # mirroring kafka.error's fatal branch).
+                self._grpc_errors += 1
+                self._runtime_error = True
+            # capture.missing needs no new counter (informational only).
 
             # Write and flush via injected emit_fn
             self._emit_fn(line)
 
     def start(self) -> None:
-        """Start the engine: probe Kafka, bind HTTP, emit started line.
+        """Start the engine: probe Kafka, bind HTTP, construct+bind gRPC, emit started.
 
         Probe-then-bind ordering (DESIGN §9):
         0. Pre-compile every jq match expression (raises ConfigError on a
@@ -167,7 +234,10 @@ class MockEngine:
         1. If run_kafka, build reactors and call prepare() (probes brokers).
            On any failure, close already-prepared reactors and re-raise.
         2. If run_http, bind MockHTTPServer (raises ConfigError if port in use).
-        3. Emit the started line with http/kafka details.
+        2b. If run_grpc, construct MockGrpcServer via the factory seam and bind
+           it (``server.start()`` converts EADDRINUSE to ConfigError). Done
+           after HTTP so a grpc failure tears down a bound HTTP server.
+        3. Emit the started line with http/kafka/grpc details.
 
         On any exception, run shutdown() to release acquired resources.
         """
@@ -258,6 +328,50 @@ class MockEngine:
                         )
                     raise
 
+            # Step 2b: Construct + bind gRPC server (if run_grpc). Done AFTER
+            # the HTTP bind so a grpc failure tears down a bound HTTP server
+            # via the outer try → shutdown() (mirrors the kafka-then-http
+            # ordering: later failures clean up earlier successes). The factory
+            # is the DI seam: unit tests inject a fake; production lazy-imports
+            # the real MockGrpcServer (which itself converts EADDRINUSE to
+            # ConfigError inside ``server.start()``).
+            if self._run_grpc:
+                if self._mocks is None or self._mocks.grpc is None:
+                    raise ConfigError("run_grpc=True but no mocks.grpc configured", {})
+
+                grpc_config = self._mocks.grpc
+                # Resolve listen: --grpc-listen overrides mocks.grpc.listen.
+                # Mutate a COPY so the original MocksConfig is untouched (the
+                # command layer / other engines may still read it).
+                if self._grpc_listen is not None:
+                    try:
+                        parse_listen(self._grpc_listen)
+                    except ValueError as e:
+                        raise ConfigError(f"Invalid grpc_listen: {e}", {})
+                    grpc_config = grpc_config.model_copy(
+                        update={"listen": self._grpc_listen}
+                    )
+
+                # Top-level Config.grpc.descriptors fallback: MockEngine only
+                # sees MocksConfig, so the command layer (Task 10) threads the
+                # real ``Config.grpc.descriptors`` list through ``new_mock_engine``
+                # → here. ``MockGrpcServer`` falls back to it when the per-mock
+                # ``mocks.grpc.descriptors`` is None (sources = config.descriptors
+                # or top_level_descriptors or []). Passing the per-mock
+                # ``grpc_config.descriptors`` here as well would be redundant —
+                # the server already reads it off ``config``.
+                server = self._grpc_server_factory(
+                    config=grpc_config,
+                    top_level_descriptors=self._top_level_descriptors,
+                    emit_event=self.emit_event,
+                )
+                # ``start()`` binds; MockGrpcServer converts EADDRINUSE to
+                # ConfigError. Assign to self._grpc_server only after a
+                # successful bind so the failure path doesn't leave a
+                # partially-constructed server around for shutdown().
+                server.start()
+                self._grpc_server = server
+
             # Step 3: Emit started line
             self._emit_started_line()
             # Mark started: only now may shutdown emit a summary. If start()
@@ -337,6 +451,21 @@ class MockEngine:
                     self._reactor_threads.append(t)
                     t.start()
 
+            # Start gRPC serve thread (if run_grpc). ``serve_forever`` blocks
+            # until ``self._stop`` is set, mirroring the HTTP serve loop. The
+            # gRPC server's per-RPC handler threads are owned by its internal
+            # ThreadPoolExecutor; this thread only keeps ``wait_for_termination``
+            # alive so the server stays reachable. shutdown()'s
+            # ``self._grpc_server.shutdown()`` stops the underlying grpc.Server.
+            if self._run_grpc and self._grpc_server is not None:
+                grpc_server = self._grpc_server
+
+                def _serve_grpc(_server=grpc_server):
+                    _server.serve_forever(self._stop)
+
+                self._grpc_thread = threading.Thread(target=_serve_grpc, daemon=True)
+                self._grpc_thread.start()
+
             # Arm duration timer (if set) — a cancellable threading.Timer so an
             # early shutdown cancels it rather than sleeping the full duration.
             if self._duration is not None:
@@ -369,6 +498,22 @@ class MockEngine:
             self._stop.set()
             for t in self._reactor_threads:
                 t.join(timeout=2.0)
+
+            # Drain the gRPC server's in-flight handlers BEFORE the exit-code
+            # snapshot, mirroring the kafka "join before snapshot" pattern above.
+            # ``MockGrpcServer.shutdown()`` does ``server.stop(grace=2)`` — it
+            # lets in-flight handlers finish so a handler emitting
+            # ``grpc.unmatched``/``grpc.error`` during the grace window is
+            # counted BEFORE the exit code is read. Without this drain the
+            # shutdown runs later (in ``engine.shutdown()``, from ``mock_run``'s
+            # ``finally``, AFTER ``run()`` returned), so a late fatal gRPC event
+            # sets ``_runtime_error`` + counters that the SUMMARY reflects but
+            # the EXIT CODE does not → a false-green exit 0. The later
+            # ``shutdown()`` call is idempotent (``MockGrpcServer.shutdown``
+            # guards on ``self._server is not None``), so this pre-snapshot drain
+            # turns it into a no-op. Only the gRPC path is touched here.
+            if self._grpc_server is not None:
+                self._grpc_server.shutdown()
 
             # Determine exit code (DESIGN §11): exit 1 if ANY runtime error
             # occurred (any kafka.error, fatal or not) or a fatal/fail-fast
@@ -414,11 +559,23 @@ class MockEngine:
             self._http_server.shutdown()
             self._http_server.server_close()
 
+        # Stop gRPC server (idempotent — MockGrpcServer.shutdown() guards a
+        # None _server and a double-call). ``serve_forever`` returns once
+        # ``self._stop`` is set, so the gRPC thread should already be winding
+        # down by the time we join it below.
+        if self._grpc_server is not None:
+            self._grpc_server.shutdown()
+
         # Reactor loops exit on stop event (no explicit shutdown needed)
 
         # Join HTTP thread with timeout
         if self._http_thread is not None:
             self._http_thread.join(timeout=2.0)
+
+        # Join gRPC thread with timeout (serve_forever should return promptly
+        # once ``self._stop`` was set above + server.shutdown() ran).
+        if self._grpc_thread is not None:
+            self._grpc_thread.join(timeout=2.0)
 
         # Join reactor threads with timeout
         for t in self._reactor_threads:
@@ -473,6 +630,24 @@ class MockEngine:
         else:
             started_line["kafka"] = None
 
+        # Add gRPC details (Task 8). ``actual_listen()`` reports the bound
+        # host:port (post-bind, so an ephemeral ``:0`` request surfaces the
+        # actually-assigned port — mirrors the HTTP bound-address reporting).
+        # The ``stubs`` count is read off the resolved GrpcMockConfig that the
+        # server was constructed with (authoritative stub total, NOT the
+        # per-method dict-of-dicts which collapses same-service/method stubs).
+        if self._run_grpc and self._grpc_server is not None:
+            grpc_cfg = self._grpc_server._config
+            started_line["grpc"] = {
+                "listen": self._grpc_server.actual_listen(),
+                "stubs": len(grpc_cfg.stubs),
+                "services": list(self._grpc_server.services),
+                "reflection": grpc_cfg.reflection,
+                "health": grpc_cfg.health,
+            }
+        else:
+            started_line["grpc"] = None
+
         self.emit_event(started_line)
 
     def _emit_summary_line(self) -> None:
@@ -481,10 +656,11 @@ class MockEngine:
         if self._start_time is not None:
             duration_ms = int((time.monotonic() - self._start_time) * 1000)
 
-        # Snapshot the six counters under the lock so a reactor still emitting
-        # after a join-timeout can't produce a torn snapshot (counters read at
-        # different instants). The summary line itself is emitted atomically by
-        # emit_event (which re-acquires the lock) outside this block.
+        # Snapshot the counters under the lock so a reactor/handler still
+        # emitting after a join-timeout can't produce a torn snapshot (counters
+        # read at different instants). The summary line itself is emitted
+        # atomically by emit_event (which re-acquires the lock) outside this
+        # block.
         with self._emit_lock:
             http_hits = self._http_hits
             http_unmatched = self._http_unmatched
@@ -492,6 +668,9 @@ class MockEngine:
             kafka_reactions = self._kafka_reactions
             kafka_skipped = self._kafka_skipped
             kafka_errors = self._kafka_errors
+            grpc_hits = self._grpc_hits
+            grpc_unmatched = self._grpc_unmatched
+            grpc_errors = self._grpc_errors
 
         summary_line = {
             "event": "summary",
@@ -501,6 +680,9 @@ class MockEngine:
             "kafka_reactions": kafka_reactions,
             "kafka_skipped": kafka_skipped,
             "kafka_errors": kafka_errors,
+            "grpc_hits": grpc_hits,
+            "grpc_unmatched": grpc_unmatched,
+            "grpc_errors": grpc_errors,
             "duration_ms": duration_ms,
         }
 

@@ -141,6 +141,71 @@ defaults:
   timeout_seconds: 10
   database_connection: main-db
 
+# --- mocks: optional built-in mock servers (HTTP / Kafka / gRPC) ------------
+# Uncomment to enable `agctl mock run`. The three sub-sections are independent:
+# enable only the transports you need. Stubs/reactors are illustrative; see
+# DESIGN §7-8 for the full match/capture/response grammar. Every field below is
+# optional with a default, so the block validates with no environment set.
+# mocks:
+#   http:
+#     listen: "0.0.0.0:18080"          # or ${AGCTL_MOCK_HTTP_HOST:-0.0.0.0}:${AGCTL_MOCK_HTTP_PORT:-18080}
+#     stubs:
+#       create-order:
+#         description: "Stub the downstream order API"
+#         method: POST
+#         path: "/api/v1/orders"
+#         match:
+#           body: { priority: "high" }  # json_subset containment on request body
+#         response:
+#           status: 201
+#           body: { order_id: "{customer_id}-mock", status: "PENDING" }
+#
+#   kafka:
+#     reactors:
+#       order-confirm:
+#         description: "Confirm an order when ORDER_CREATED is seen"
+#         topic: orders.created
+#         consumer_group: agctl-mock-order-reactor  # omit for a unique per-run group
+#         match: '.value.eventType == "ORDER_CREATED"'   # envelope-rooted jq predicate
+#         reaction:
+#           topic: orders.confirmed
+#           value: { eventType: "ORDER_CONFIRMED" }
+#
+#   grpc:
+#     listen: "${AGCTL_MOCK_GRPC_HOST:-0.0.0.0}:${AGCTL_MOCK_GRPC_PORT:-50051}"
+#     reflection: true                 # serve gRPC server reflection (default true)
+#     health: true                     # serve grpc.health.v1.Health (default true)
+#     # descriptors: proto/descriptor-set sources used to resolve service/method
+#     # names and encode responses. Exactly one of `proto` or `descriptor_set`
+#     # per entry; omit entirely to rely on reflection alone.
+#     # descriptors:
+#     #   - proto: "protos/orders/v1/*.proto"
+#     #     include_paths: ["protos"]
+#     #   - descriptor_set: "protos/order-service.desc"
+#     stubs:
+#       create-order:                  # unary: exactly one response.message
+#         description: "Acknowledge a new order"
+#         service: orders.OrderService
+#         method: CreateOrder
+#         match:
+#           body: { confirm: true }    # subset match against the request message
+#         capture:
+#           customer_id: { from: ".message.customer_id" }  # envelope-rooted (.message)
+#         response:
+#           status: OK                 # gRPC status name or code (default OK)
+#           message: { order_id: "{customer_id}-mock", status: "PENDING" }
+#       stream-updates:                # server-stream: a response.messages list
+#         description: "Stream a sequence of order status updates"
+#         service: orders.OrderService
+#         method: StreamUpdates
+#         response:
+#           status: OK
+#           messages:
+#             - message: { status: "PENDING" }
+#               delay_ms: 0
+#             - message: { status: "CONFIRMED" }
+#               delay_ms: 50
+
 # --- grpc: gRPC service targets and templates -------------------------------
 grpc:
   # targets: named gRPC server addresses

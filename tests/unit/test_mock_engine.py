@@ -12,7 +12,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agctl.config.models import CaptureSpec, HttpMatch, HttpMockConfig, HttpStub, HttpResponse, KafkaMockConfig, KafkaReaction, KafkaReactor, MocksConfig
+from agctl.config.models import (
+    CaptureSpec,
+    GrpcMockConfig,
+    GrpcResponse,
+    GrpcStub,
+    HttpMatch,
+    HttpMockConfig,
+    HttpStub,
+    HttpResponse,
+    KafkaMockConfig,
+    KafkaReaction,
+    KafkaReactor,
+    MocksConfig,
+)
 from agctl.errors import ConfigError, ConnectionFailure
 from agctl.mock.engine import MockEngine
 
@@ -1330,4 +1343,568 @@ def test_run_kafka_without_kafka_clients_raises():
 
     with pytest.raises(ConfigError):
         engine.start()
+
+
+# =============================================================================
+# gRPC engine (Task 8): run_grpc + grpc_server_factory seam + grpc events
+# (all tests are grpcio-free — the fake factory injects a FakeGrpcServer)
+# =============================================================================
+
+
+class FakeGrpcServer:
+    """Fake ``MockGrpcServer`` for grpcio-free engine tests.
+
+    Records ``start``/``serve_forever``/``shutdown`` calls and exposes the
+    attributes the engine reads for the started line and lifecycle. Mirrors the
+    real ``MockGrpcServer`` constructor's keyword signature so the engine can
+    call the factory uniformly.
+    """
+
+    def __init__(
+        self,
+        *,
+        config,
+        top_level_descriptors,
+        emit_event,
+        descriptor_pool=None,
+    ):
+        self._config = config
+        self._emit_event = emit_event
+        self.start_called = False
+        self.serve_called = False
+        self.shutdown_called = False
+        # Used by the run-thread-spawned test to deterministically observe that
+        # serve_forever was entered before stop unblocked it.
+        self.serve_entered = threading.Event()
+        # Attributes the engine reads for the started block:
+        self.services = []
+        self.stubs_by_method = {}
+
+    def start(self):
+        self.start_called = True
+
+    def serve_forever(self, stop_event):
+        self.serve_called = True
+        self.serve_entered.set()
+        stop_event.wait()
+
+    def shutdown(self):
+        self.shutdown_called = True
+
+    def actual_listen(self):
+        return self._config.listen
+
+
+def _grpc_mocks(listen="127.0.0.1:50051"):
+    """Minimal MocksConfig with a single gRPC stub for engine tests."""
+    return MocksConfig(
+        grpc=GrpcMockConfig(
+            listen=listen,
+            stubs={
+                "s1": GrpcStub(
+                    service="pkg.Svc",
+                    method="Echo",
+                    response=GrpcResponse(message={}),
+                )
+            },
+        )
+    )
+
+
+def _make_fake_grpc_factory(record):
+    """Build a factory that constructs a FakeGrpcServer and stashes it in ``record[0]``."""
+
+    def factory(*, config, top_level_descriptors, emit_event):
+        server = FakeGrpcServer(
+            config=config,
+            top_level_descriptors=top_level_descriptors,
+            emit_event=emit_event,
+        )
+        record[0] = server
+        return server
+
+    return factory
+
+
+def test_grpc_start_constructs_server_and_emits_started_block():
+    """(a) ``run_grpc=True``: engine ``start()`` calls the factory + fake ``start()``,
+    and the started line carries a ``grpc`` block with the fake's listen address."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    record = [None]
+    engine = MockEngine(
+        mocks=_grpc_mocks(listen="127.0.0.1:50051"),
+        run_http=False,
+        run_kafka=False,
+        run_grpc=True,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        grpc_server_factory=_make_fake_grpc_factory(record),
+        emit_fn=capture_emit,
+        run_id="test-grpc-started",
+    )
+    engine.start()
+
+    fake = record[0]
+    assert fake is not None, "factory should have been called"
+    assert fake.start_called is True, "fake server.start() (bind) should have been called"
+
+    started = [l for l in captured_lines if l.get("event") == "started"][0]
+    assert started["grpc"] is not None
+    assert started["grpc"]["listen"] == "127.0.0.1:50051"
+    assert started["grpc"]["stubs"] == 1  # one stub in _grpc_mocks()
+    assert started["grpc"]["services"] == []
+    assert started["grpc"]["reflection"] is True  # GrpcMockConfig defaults
+    assert started["grpc"]["health"] is True
+
+    # Cleanup
+    engine._stop.set()
+    engine.run()
+    engine.shutdown()
+
+
+def test_grpc_run_spawns_serve_thread_that_exits_on_stop():
+    """(b) ``run()`` starts a daemon thread running ``serve_forever(stop)`` that
+    exits once the stop event is set."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    record = [None]
+    engine = MockEngine(
+        mocks=_grpc_mocks(),
+        run_http=False,
+        run_kafka=False,
+        run_grpc=True,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        grpc_server_factory=_make_fake_grpc_factory(record),
+        emit_fn=capture_emit,
+        run_id="test-grpc-run",
+    )
+    engine.start()
+    fake = record[0]
+    assert fake is not None
+
+    # Pre-set stop so run()'s loop exits immediately; the gRPC thread should
+    # still be created and enter serve_forever.
+    engine._stop.set()
+    engine.run()
+
+    # Wait deterministically for serve_forever to have been entered.
+    assert fake.serve_entered.wait(timeout=2.0), "serve_forever was not entered in time"
+    assert fake.serve_called is True
+    assert engine._grpc_thread is not None
+
+    engine.shutdown()
+
+
+def test_grpc_shutdown_calls_fake_shutdown():
+    """(c) engine ``shutdown()`` calls ``server.shutdown()`` on the constructed server."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    record = [None]
+    engine = MockEngine(
+        mocks=_grpc_mocks(),
+        run_http=False,
+        run_kafka=False,
+        run_grpc=True,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        grpc_server_factory=_make_fake_grpc_factory(record),
+        emit_fn=capture_emit,
+        run_id="test-grpc-shutdown",
+    )
+    engine.start()
+    engine._stop.set()
+    engine.run()
+    engine.shutdown()
+
+    assert record[0].shutdown_called is True
+
+
+def test_grpc_winddown_error_during_shutdown_drain_yields_exit_1():
+    """(Fix 3) Regression: an in-flight gRPC handler emitting ``grpc.error``
+    during the shutdown drain (after stop is set) must yield exit 1, not 0.
+
+    Mirrors the kafka wind-down regression (``test_winddown_kafka_error_after_stop_yields_exit_1``):
+    ``run()`` must drain the gRPC server (call ``shutdown()`` → ``server.stop(grace=2)``
+    → in-flight handlers finish) BEFORE reading the exit-code snapshot, so a
+    fatal ``grpc.error`` emitted during the drain is counted. Without the
+    drain-before-snapshot, ``run()`` reads counters before the late error lands
+    → exit 0 while the summary shows ``grpc_errors=1`` — a false green. The fake
+    server's ``shutdown()`` emits the ``grpc.error`` (idempotently — only once)
+    to deterministically model the in-flight-during-drain race.
+    """
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    class WinddownErrorGrpc(FakeGrpcServer):
+        """Fake whose ``shutdown()`` emits a fatal grpc.error exactly once.
+
+        Models an in-flight handler erroring during ``server.stop(grace=2)``'s
+        drain window, and the real server's idempotent shutdown (guard on
+        ``self._server is not None``) — the second call (from ``engine.shutdown()``)
+        must NOT re-emit / double-count.
+        """
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._drained = False
+
+        def shutdown(self):
+            if not self._drained:
+                self._drained = True
+                # In-flight handler aborts during the grace drain.
+                self._emit_event(
+                    {
+                        "event": "grpc.error",
+                        "service": "pkg.Svc",
+                        "method": "Echo",
+                        "call_type": "unary",
+                        "error": "handler aborted during drain",
+                        "fatal": True,
+                    }
+                )
+            self.shutdown_called = True
+
+    def factory(*, config, top_level_descriptors, emit_event):
+        return WinddownErrorGrpc(
+            config=config,
+            top_level_descriptors=top_level_descriptors,
+            emit_event=emit_event,
+        )
+
+    engine = MockEngine(
+        mocks=_grpc_mocks(),
+        run_http=False,
+        run_kafka=False,
+        run_grpc=True,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        grpc_server_factory=factory,
+        emit_fn=capture_emit,
+        run_id="test-grpc-winddown",
+    )
+    engine.start()
+    # Pre-set stop so run()'s loop exits immediately; the gRPC drain still runs
+    # (after the loop, before the snapshot) — that is the code path under test.
+    # (The gRPC serve thread does not set stop itself, unlike the kafka wind-down
+    # fake, so the loop would block forever without this pre-set.)
+    engine._stop.set()
+    exit_code = engine.run()
+
+    # Exit code must be 1 (a runtime error occurred during the drain), matching
+    # the summary's grpc_errors count — not a false-green 0.
+    assert exit_code == 1, (
+        f"expected exit 1 after wind-down grpc.error, got {exit_code}"
+    )
+    engine.shutdown()
+
+    errors = [l for l in captured_lines if l.get("event") == "grpc.error"]
+    assert len(errors) == 1, "the idempotent drain must emit exactly one grpc.error"
+    summary = [l for l in captured_lines if l.get("event") == "summary"][0]
+    assert summary["grpc_errors"] == 1
+
+
+def test_grpc_drain_shutdown_called_inside_run_before_engine_shutdown():
+    """(Fix 3) ``run()`` itself calls ``server.shutdown()`` before returning the
+    exit code (the drain is not deferred to ``engine.shutdown()``).
+
+    The drain must run inside ``run()`` so the exit-code snapshot (taken in
+    ``run()``) observes the drained counters. Verified by setting ``_stop``
+    before ``run()`` (so the loop exits immediately) and asserting the fake's
+    ``shutdown_called`` is True right after ``run()`` returns — BEFORE
+    ``engine.shutdown()`` is invoked.
+    """
+    record = [None]
+    engine = MockEngine(
+        mocks=_grpc_mocks(),
+        run_http=False,
+        run_kafka=False,
+        run_grpc=True,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        grpc_server_factory=_make_fake_grpc_factory(record),
+        emit_fn=lambda _line: None,
+        run_id="test-grpc-drain-ordering",
+    )
+    engine.start()
+    engine._stop.set()  # loop exits immediately; drain still runs
+    engine.run()
+
+    # The drain happened INSIDE run(), before engine.shutdown() is even called.
+    assert record[0] is not None
+    assert record[0].shutdown_called is True, (
+        "run() must drain the gRPC server before returning the exit code"
+    )
+    engine.shutdown()
+
+
+def test_grpc_events_tally_and_set_runtime_error_exit_1():
+    """(d) ``grpc.hit`` tallies; ``grpc.unmatched``/``grpc.error`` tally AND set
+    the runtime-error flag (→ exit code 1 + summary counters)."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    engine = MockEngine(
+        mocks=None,
+        run_http=False,
+        run_kafka=False,
+        run_grpc=False,  # exercise emit_event directly; no server constructed
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        emit_fn=capture_emit,
+        run_id="test-grpc-tally",
+    )
+    engine.start()
+
+    for _ in range(3):
+        engine.emit_event({"event": "grpc.hit"})
+    engine.emit_event({"event": "grpc.unmatched"})
+    engine.emit_event({"event": "grpc.error"})
+
+    engine._stop.set()
+    exit_code = engine.run()
+    assert exit_code == 1, "grpc.unmatched/grpc.error set _runtime_error → exit 1"
+
+    engine.shutdown()
+
+    summary = [l for l in captured_lines if l.get("event") == "summary"][0]
+    assert summary["grpc_hits"] == 3
+    assert summary["grpc_unmatched"] == 1
+    assert summary["grpc_errors"] == 1
+
+
+def test_run_grpc_false_emits_none_block_and_does_not_call_factory():
+    """(e) ``run_grpc=False``: started line has ``grpc=None`` and the factory is
+    never called (no server constructed)."""
+
+    def factory(*, config, top_level_descriptors, emit_event):
+        raise AssertionError("grpc_server_factory must not be called when run_grpc=False")
+
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    engine = MockEngine(
+        mocks=None,
+        run_http=False,
+        run_kafka=False,
+        run_grpc=False,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        grpc_server_factory=factory,
+        emit_fn=capture_emit,
+        run_id="test-no-grpc",
+    )
+    engine.start()
+
+    started = [l for l in captured_lines if l.get("event") == "started"][0]
+    assert started["grpc"] is None
+
+    engine._stop.set()
+    engine.run()
+    engine.shutdown()
+
+
+def test_grpc_factory_failure_propagates_and_shuts_down_http():
+    """(f) when the factory-constructed server's ``start()`` raises ``ConfigError``,
+    the exception propagates from engine ``start()`` AND already-started engines
+    (HTTP) are shut down (existing outer try → shutdown() pattern)."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    class StartFailingGrpc(FakeGrpcServer):
+        def start(self):
+            raise ConfigError(
+                "grpc bind failed: port already in use",
+                {"listen": "127.0.0.1:50051"},
+            )
+
+    def failing_factory(*, config, top_level_descriptors, emit_event):
+        return StartFailingGrpc(
+            config=config,
+            top_level_descriptors=top_level_descriptors,
+            emit_event=emit_event,
+        )
+
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            listen="127.0.0.1:0",
+            stubs={
+                "stub1": HttpStub(
+                    method="GET", path="/test", response=HttpResponse(status=200)
+                ),
+            },
+        ),
+        grpc=GrpcMockConfig(
+            listen="127.0.0.1:50051",
+            stubs={
+                "s1": GrpcStub(
+                    service="pkg.Svc",
+                    method="Echo",
+                    response=GrpcResponse(message={}),
+                )
+            },
+        ),
+    )
+
+    fake_http_instances = []
+
+    def make_fake_http(*args, **kwargs):
+        server = FakeHTTPServer(*args, **kwargs)
+        fake_http_instances.append(server)
+        return server
+
+    with patch("agctl.mock.engine.MockHTTPServer", side_effect=make_fake_http):
+        engine = MockEngine(
+            mocks=mocks,
+            run_http=True,
+            run_kafka=False,
+            run_grpc=True,
+            http_listen="127.0.0.1:0",
+            kafka_clients=None,
+            grpc_server_factory=failing_factory,
+            emit_fn=capture_emit,
+            run_id="test-grpc-fail",
+        )
+
+        with pytest.raises(ConfigError, match="grpc bind failed"):
+            engine.start()
+
+    # HTTP server was bound (constructed) then shut down as part of cleanup.
+    assert len(fake_http_instances) == 1, "HTTP server should have been constructed"
+    assert fake_http_instances[0].shutdown_called is True, (
+        "HTTP server should have been shut down when grpc start() failed"
+    )
+
+
+def test_grpc_listen_override_uses_resolved_listen():
+    """``grpc_listen`` override: engine passes a COPY of GrpcMockConfig with the
+    resolved listen to the factory (the original config is untouched)."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    seen_configs = []
+
+    def factory(*, config, top_level_descriptors, emit_event):
+        seen_configs.append(config)
+        return FakeGrpcServer(
+            config=config,
+            top_level_descriptors=top_level_descriptors,
+            emit_event=emit_event,
+        )
+
+    mocks = _grpc_mocks(listen="127.0.0.1:50051")  # config default
+    engine = MockEngine(
+        mocks=mocks,
+        run_http=False,
+        run_kafka=False,
+        run_grpc=True,
+        grpc_listen="127.0.0.1:60061",  # override
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        grpc_server_factory=factory,
+        emit_fn=capture_emit,
+        run_id="test-grpc-listen-override",
+    )
+    engine.start()
+
+    assert len(seen_configs) == 1
+    assert seen_configs[0].listen == "127.0.0.1:60061"
+    # Original config on MocksConfig is NOT mutated.
+    assert mocks.grpc.listen == "127.0.0.1:50051"
+
+    started = [l for l in captured_lines if l.get("event") == "started"][0]
+    assert started["grpc"]["listen"] == "127.0.0.1:60061"
+
+    engine._stop.set()
+    engine.run()
+    engine.shutdown()
+
+
+def test_run_grpc_without_mocks_grpc_raises_config_error():
+    """``run_grpc=True`` but ``mocks.grpc is None`` → ConfigError (mirrors the
+    HTTP/kafka guards)."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    engine = MockEngine(
+        mocks=None,
+        run_http=False,
+        run_kafka=False,
+        run_grpc=True,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        grpc_server_factory=_make_fake_grpc_factory([None]),
+        emit_fn=capture_emit,
+        run_id="test-grpc-no-config",
+    )
+
+    with pytest.raises(ConfigError, match="mocks.grpc"):
+        engine.start()
+
+
+def test_default_grpc_server_factory_lazy_imports_real_server():
+    """The default ``grpc_server_factory`` (None) lazy-imports ``MockGrpcServer``
+    from ``agctl.mock.grpc_server`` so the engine module itself stays grpcio-free
+    at import time. Verified by patching the lazy import target with a stub that
+    records its construction kwargs and exposes the lifecycle methods the engine
+    calls (start / serve_forever / shutdown / actual_listen)."""
+    captured = []
+
+    class Stub(FakeGrpcServer):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            captured.append((a, kw))
+
+    # The default factory does `from .grpc_server import MockGrpcServer`.
+    # Patch the attribute on the source module so the lazy import resolves to Stub.
+    import agctl.mock.grpc_server as grpc_server_mod
+
+    original = grpc_server_mod.MockGrpcServer
+    grpc_server_mod.MockGrpcServer = Stub
+    try:
+        engine = MockEngine(
+            mocks=_grpc_mocks(),
+            run_http=False,
+            run_kafka=False,
+            run_grpc=True,
+            http_listen="127.0.0.1:0",
+            kafka_clients=None,
+            # grpc_server_factory deliberately omitted → default lazy factory
+            emit_fn=lambda line: None,
+            run_id="test-default-factory",
+        )
+        engine.start()
+        engine._stop.set()
+        engine.run()
+        engine.shutdown()
+    finally:
+        grpc_server_mod.MockGrpcServer = original
+
+    # Default factory invoked the lazy import path exactly once with the
+    # MockGrpcServer keyword signature.
+    assert len(captured) == 1
+    _, kwargs = captured[0]
+    assert "config" in kwargs and "top_level_descriptors" in kwargs and "emit_event" in kwargs
 
