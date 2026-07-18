@@ -564,3 +564,104 @@ def test_find_in_window_with_codec_decodes_before_predicate():
     assert scanned == 1
     assert found is not None
     assert found["value"] == {"id": "x"}
+
+
+# ===========================================================================
+# Protobuf coverage (Task 14) — verifies the codec seam is format-agnostic:
+# produce emits Confluent-framed Protobuf bytes; consume_window decodes them.
+# Gated on google.protobuf + grpc_tools (the codec lazy-imports both).
+# ===========================================================================
+
+
+PROTO_SCHEMA_STR = 'syntax = "proto3"; message E { string id = 1; }'
+PROTO_SCHEMA_ID = 29
+
+
+class FakeProtobufSR:
+    """SR double whose ``by_id``/``latest`` return PROTOBUF schemas.
+
+    Duck-typed to the methods ``decode_payload`` / ``encode_payload`` touch;
+    ``("PROTOBUF", schema_str)`` matches Confluent SR's ``schemaType`` token.
+    """
+
+    def __init__(self):
+        self.by_id = {PROTO_SCHEMA_ID: ("PROTOBUF", PROTO_SCHEMA_STR)}
+        self.latest = {"t-value": ("PROTOBUF", PROTO_SCHEMA_STR, PROTO_SCHEMA_ID)}
+        self.get_schema_calls = 0
+        self.get_latest_schema_calls = 0
+
+    def get_schema(self, schema_id):
+        self.get_schema_calls += 1
+        return self.by_id[schema_id]
+
+    def get_latest_schema(self, subject):
+        self.get_latest_schema_calls += 1
+        return self.latest[subject]
+
+
+def _protobuf_value_bytes(id_value):
+    """Confluent-framed Protobuf bytes for ``{"id": id_value}`` against the
+    test schema (mirrors ``_avro_value_bytes`` for the protobuf case)."""
+    from agctl.serialization.protobuf_codec import encode_protobuf
+
+    return build_wire(PROTO_SCHEMA_ID, encode_protobuf({"id": id_value}, PROTO_SCHEMA_STR))
+
+
+def test_produce_with_protobuf_codec_publishes_confluent_framed_bytes():
+    """Protobuf value codec: produce publishes Confluent-framed Protobuf bytes
+    (magic 0x00 + 4-byte BE schema id + protobuf payload); the framed bytes
+    round-trip through decode_payload to the original record. Verifies the
+    KafkaClient codec seam is format-agnostic (no Format.AVRO hardcoding)."""
+    pytest.importorskip("google.protobuf")
+    pytest.importorskip("grpc_tools")
+    fake = FakeProducer({})
+    sr = FakeProtobufSR()
+    codec = {
+        "value": {"fmt": Format.PROTOBUF, "subject_strategy": "topic"},
+        "key": {"fmt": Format.KEY_STRING},
+        "sr": sr,
+    }
+    client = KafkaClient("host:9092", producer_factory=lambda c: fake, codec=codec)
+
+    client.produce("t", {"id": "x"}, key="k")
+
+    value_bytes = fake.calls[0]["value"]
+    # Confluent wire frame: magic 0x00 + 4-byte big-endian schema id + payload.
+    assert value_bytes[0] == 0
+    schema_id = struct.unpack(">I", value_bytes[1:5])[0]
+    assert schema_id == PROTO_SCHEMA_ID
+    # The framed bytes round-trip through decode_payload to the original record.
+    from agctl.serialization import decode_payload
+
+    assert decode_payload(value_bytes, Format.PROTOBUF, sr) == {"id": "x"}
+    # KEY_STRING key is utf-8 bytes (same legacy path as Avro).
+    assert fake.calls[0]["key"] == b"k"
+    # Encode resolved the schema via get_latest_schema exactly once.
+    assert sr.get_latest_schema_calls == 1
+
+
+def test_consume_window_with_protobuf_codec_decodes_value():
+    """consume_window with a Protobuf value codec decodes the framed Protobuf
+    bytes to a dict — the decode seam is format-agnostic."""
+    pytest.importorskip("google.protobuf")
+    pytest.importorskip("grpc_tools")
+    topic = "t"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(topic, 0, 0, b"k0", _protobuf_value_bytes("x"), now_ms - 100),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+    codec = {
+        "value": {"fmt": Format.PROTOBUF},
+        "key": {"fmt": Format.KEY_STRING},
+        "sr": FakeProtobufSR(),
+    }
+    client = KafkaClient("host:9092", consumer_factory=lambda c: consumer, codec=codec)
+
+    result = client.consume_window(
+        topic, lookback_seconds=30, timeout_seconds=0.02, from_beginning=True
+    )
+
+    assert len(result) == 1
+    assert result[0]["value"] == {"id": "x"}
+    assert result[0]["key"] == "k0"

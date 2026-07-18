@@ -242,21 +242,128 @@ def test_encode_payload_json_returns_encoded_bytes():
     assert json.loads(out) == {"id": "x"}
 
 
-# --- PROTOBUF placeholder --------------------------------------------------
+# --- PROTOBUF dispatch (Task 14) -------------------------------------------
+#
+# Mirrors the Avro cases (b)/(d) but for Protobuf: the codec lives in
+# ``protobuf_codec`` and is wired into the api in Task 14. Gated on
+# ``google.protobuf`` (the codec lazy-imports it via ``_require_protobuf``)
+# AND ``grpc_tools`` (protoc — the compile step needs it). The schema is a
+# ``.proto`` source string; the fake SR returns ``("PROTOBUF", proto)``.
+
+PROTO_SCHEMA_STR = 'syntax = "proto3"; message E { string id = 1; }'
+# A distinct id from the Avro SCHEMA_ID so a regression that hardcodes 17
+# surfaces immediately; the fake SR maps this id to the PROTOBUF schema.
+PROTO_SCHEMA_ID = 29
 
 
-def test_decode_payload_protobuf_raises_config_error():
-    # Until Task 14 wires the codec, PROTOBUF decode -> ConfigError pointing
-    # at the protobuf extra.
-    with pytest.raises(ConfigError) as exc_info:
-        decode_payload(b"\x00\x00\x00\x00\x00", Format.PROTOBUF, _FakeSR())
-    assert "protobuf" in str(exc_info.value).lower()
+class _FakeProtobufSR:
+    """Minimal SR double whose ``by_id``/``latest`` return PROTOBUF schemas.
+
+    Duck-typed: only the two methods the api touches are implemented. The
+    schema_type token is ``"PROTOBUF"`` (matches Confluent SR's
+    ``schemaType`` field); the api dispatches on this token to
+    :mod:`protobuf_codec`.
+    """
+
+    def __init__(self):
+        self.by_id: dict[int, tuple[str, str]] = {
+            PROTO_SCHEMA_ID: ("PROTOBUF", PROTO_SCHEMA_STR),
+        }
+        self.latest: dict[str, tuple[str, str, int]] = {
+            "t-value": ("PROTOBUF", PROTO_SCHEMA_STR, PROTO_SCHEMA_ID),
+        }
+        self.get_schema_calls = 0
+        self.get_latest_schema_calls = 0
+        self.register_schema_calls = 0
+
+    def get_schema(self, schema_id):
+        self.get_schema_calls += 1
+        return self.by_id[schema_id]
+
+    def get_latest_schema(self, subject):
+        self.get_latest_schema_calls += 1
+        return self.latest[subject]
+
+    def register_schema(self, *args, **kwargs):
+        # Present so the v1 no-auto-registration contract can be pinned.
+        self.register_schema_calls += 1
+        return PROTO_SCHEMA_ID
 
 
-def test_encode_payload_protobuf_raises_config_error():
-    with pytest.raises(ConfigError) as exc_info:
-        encode_payload({"x": 1}, Format.PROTOBUF, _FakeSR(), subject="t-value")
-    assert "protobuf" in str(exc_info.value).lower()
+def test_decode_payload_protobuf_returns_decoded_record():
+    # decode_payload(build_wire(sid, encode_protobuf({"id":"x"}, proto)),
+    #                Format.PROTOBUF, fake_sr) returns {"id":"x"}.
+    pytest.importorskip("google.protobuf")
+    pytest.importorskip("grpc_tools")
+    from agctl.serialization.protobuf_codec import encode_protobuf
+
+    encoded = encode_protobuf({"id": "x"}, PROTO_SCHEMA_STR)
+    raw = build_wire(PROTO_SCHEMA_ID, encoded)
+    fake = _FakeProtobufSR()
+    assert decode_payload(raw, Format.PROTOBUF, fake) == {"id": "x"}
+    # Decode resolved the writer schema via get_schema (Confluent contract).
+    assert fake.get_schema_calls == 1
+
+
+def test_encode_payload_protobuf_round_trips():
+    # encode_payload({"id":"x"}, Format.PROTOBUF, fake_sr, subject="t-value")
+    # returns wire-framed bytes whose parse_wire yields the registered id and
+    # whose decode_payload(...) round-trips to {"id":"x"}.
+    pytest.importorskip("google.protobuf")
+    pytest.importorskip("grpc_tools")
+    fake = _FakeProtobufSR()
+    wire_bytes = encode_payload(
+        {"id": "x"}, Format.PROTOBUF, fake, subject="t-value"
+    )
+
+    sid, payload = parse_wire(wire_bytes)
+    assert sid == PROTO_SCHEMA_ID
+    assert len(payload) > 0  # non-empty protobuf payload
+    # Round-trip through decode_payload to the original record.
+    assert decode_payload(wire_bytes, Format.PROTOBUF, fake) == {"id": "x"}
+    # Encode resolved the latest schema for the subject exactly once and
+    # never auto-registered.
+    assert fake.get_latest_schema_calls == 1
+    assert fake.register_schema_calls == 0
+
+
+def test_encode_payload_protobuf_resolves_via_get_latest_schema_no_auto_register():
+    # Pin the v1 encode contract for Protobuf the same way the Avro test
+    # does: get_latest_schema(subject) is called exactly once, register_schema
+    # never.
+    pytest.importorskip("google.protobuf")
+    pytest.importorskip("grpc_tools")
+    fake = _FakeProtobufSR()
+    encode_payload({"id": "x"}, Format.PROTOBUF, fake, subject="t-value")
+    assert fake.get_latest_schema_calls == 1
+    assert fake.register_schema_calls == 0
+
+
+def test_decode_payload_protobuf_without_sr_raises_config_error():
+    # The `sr is None` -> ConfigError path fires BEFORE any codec call, so
+    # this test deliberately does NOT importorskip("google.protobuf"): it
+    # must run on protobuf-less CI to cover the config-error branch.
+    with pytest.raises(ConfigError):
+        decode_payload(b"\x00\x00\x00\x00\x00x", Format.PROTOBUF, None)
+
+
+def test_encode_payload_protobuf_without_sr_raises_config_error():
+    # As above: no google.protobuf needed — ConfigError is raised before the
+    # codec/SR resolution path is entered.
+    with pytest.raises(ConfigError):
+        encode_payload({"id": "x"}, Format.PROTOBUF, None, subject="t-value")
+
+
+def test_decode_payload_protobuf_raises_serialization_error_on_non_frame():
+    # A non-framed raw (no magic byte) surfaces as SerializationError, same
+    # shape as the Avro branch.
+    pytest.importorskip("google.protobuf")
+    pytest.importorskip("grpc_tools")
+    fake = _FakeProtobufSR()
+    with pytest.raises(SerializationError) as exc_info:
+        decode_payload(b"plain bytes", Format.PROTOBUF, fake)
+    detail = exc_info.value.detail
+    assert detail.get("fmt") == "protobuf"
 
 
 # --- missing SR for non-JSON -----------------------------------------------

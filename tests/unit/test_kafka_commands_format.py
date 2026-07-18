@@ -563,6 +563,92 @@ def test_kafka_produce_no_format_flag_passes_codec_none_for_pure_json(monkeypatc
     assert fake_producer.calls[0]["value"] == b'{"a": 1}'
 
 
+def test_kafka_produce_value_format_flag_threads_protobuf_into_codec(
+    monkeypatch, tmp_path
+):
+    """``kafka produce --value-format protobuf`` resolves Format.PROTOBUF from
+    the flag and threads it into the codec captured by the monkeypatched
+    client factory. Verifies the CLI flag layer is format-agnostic (no
+    Avro-specific branch in the resolver path)."""
+    pytest.importorskip("google.protobuf")
+    pytest.importorskip("grpc_tools")
+
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "3"\n'
+        "kafka:\n"
+        "  clusters:\n"
+        "    default:\n"
+        "      brokers: [localhost:9092]\n"
+        "      schema_registry_url: http://sr:8081\n"
+        "  default_cluster: default\n"
+    )
+
+    # Fake SR returns a PROTOBUF schema so the encode path succeeds.
+    proto_schema = 'syntax = "proto3"; message E { string id = 1; }'
+
+    class _ProtoFakeSR:
+        def __init__(self):
+            self.by_id = {29: ("PROTOBUF", proto_schema)}
+            self.latest = {"t-value": ("PROTOBUF", proto_schema, 29)}
+
+        def get_schema(self, schema_id):
+            return self.by_id[schema_id]
+
+        def get_latest_schema(self, subject):
+            return self.latest[subject]
+
+        def check_reachable(self):
+            return None
+
+    fake_sr = _ProtoFakeSR()
+    monkeypatch.setattr(
+        "agctl.serialization.registry.SchemaRegistryClient",
+        lambda url, sr_config=None, **kw: fake_sr,
+    )
+
+    fake_producer = FakeProducer({})
+    captured = {}
+
+    def factory(cluster, group_id=None, *, codec=None):
+        captured["codec"] = codec
+        captured["cluster"] = cluster
+        return KafkaClient(
+            cluster.brokers,
+            producer_factory=lambda c: fake_producer,
+            codec=codec,
+        )
+
+    monkeypatch.setattr(kafka_commands, "new_kafka_client", factory)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", str(cfg),
+            "kafka", "produce",
+            "--topic", "t",
+            "--message", '{"id":"x"}',
+            "--value-format", "protobuf",
+        ],
+        env={},
+    )
+
+    assert result.exit_code == 0, result.output
+    codec = captured["codec"]
+    assert codec is not None
+    assert codec["value"]["fmt"] == Format.PROTOBUF
+    assert codec["key"]["fmt"] == Format.KEY_STRING
+    assert codec["sr"] is fake_sr
+    # The produced value is Confluent-framed Protobuf bytes (magic 0x00 + 4-byte
+    # schema id + payload), proving the CLI threaded the format through the
+    # produce path end-to-end.
+    value_bytes = fake_producer.calls[0]["value"]
+    assert value_bytes[0] == 0
+    import struct as _struct
+    schema_id = _struct.unpack(">I", value_bytes[1:5])[0]
+    assert schema_id == 29
+
+
 # ===========================================================================
 # (h) consume result envelope carries decode_errors: 0 on a clean run
 # ===========================================================================

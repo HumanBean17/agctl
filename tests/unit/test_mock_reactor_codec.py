@@ -677,3 +677,116 @@ def test_reaction_avro_key_resolves_record_subject_from_key_payload(
     assert reacted[0]["reactor"] == "record-key-reactor"
     assert not any(e["event"] == "kafka.error" for e in emit_event.events)
 
+
+# ===========================================================================
+# Protobuf coverage (Task 14): a JSON trigger -> Protobuf-encoded reaction.
+# Verifies the reactor's ``_encode_reaction`` path (which delegates to the
+# shared ``KafkaClient._encode_payload_with_codec`` helper) is format-agnostic
+# — it must work identically for Protobuf without any Avro-specific branch.
+# ===========================================================================
+
+
+def test_json_trigger_protobuf_reaction_publishes_confluent_framed_bytes(
+    emit_event, stop_event
+):
+    """JSON trigger -> Protobuf-encoded reaction published as Confluent-framed
+    bytes. The reactor encodes via ``encode_payload`` against the reaction
+    codec's Protobuf SR; the produced bytes carry magic 0x00, the registered
+    schema id, and a payload that round-trips through ``decode_payload`` to
+    the rendered record."""
+    pytest.importorskip("google.protobuf")
+    pytest.importorskip("grpc_tools")
+    from agctl.serialization import Format
+
+    # Single-message Protobuf schema with two fields so the rendered reaction
+    # datum exercises more than one field.
+    proto_schema = (
+        'syntax = "proto3";'
+        " message Reaction { string id = 1; int32 qty = 2; }"
+    )
+    proto_schema_id = 31
+
+    class _ProtoSR:
+        """Fake SR returning Protobuf schemas for the reaction subject."""
+
+        def __init__(self):
+            self.by_id = {proto_schema_id: ("PROTOBUF", proto_schema)}
+            self.latest = {"events-value": ("PROTOBUF", proto_schema, proto_schema_id)}
+            self.get_latest_schema_calls = 0
+
+        def get_schema(self, schema_id):
+            return self.by_id[schema_id]
+
+        def get_latest_schema(self, subject):
+            self.get_latest_schema_calls += 1
+            return self.latest[subject]
+
+    config = KafkaReactor(
+        topic="commands",
+        match='.value.command == "CREATE_ORDER"',
+        reaction=KafkaReaction(
+            topic="events",
+            key="{orderId}",
+            value={"id": "{orderId}", "qty": 1},
+        ),
+    )
+    sr = _ProtoSR()
+    codec = {
+        "value": {"fmt": Format.PROTOBUF, "subject_strategy": "topic"},
+        "key": {"fmt": Format.KEY_STRING, "subject_strategy": "topic"},
+        "sr": sr,
+    }
+    client = FakeKafkaClient(
+        script=[
+            _GoodMsg(
+                _msg(
+                    {"orderId": "ord-1", "command": "CREATE_ORDER"},
+                    key="ord-1",
+                )
+            ),
+        ]
+    )
+    reactor = Reactor(
+        name="pb-reactor",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-pb",
+        reaction_codec=codec,
+    )
+
+    reactor.run()
+
+    # Exactly one produce, raw bytes (encode happened in the reactor).
+    assert len(client.produce_calls) == 1
+    prod = client.produce_calls[0]
+    assert prod["topic"] == "events"
+    assert prod["_raw"] is True
+
+    value_bytes = prod["value"]
+    assert isinstance(value_bytes, (bytes, bytearray))
+    # Confluent wire frame: magic 0x00 + 4-byte big-endian schema id + payload.
+    assert value_bytes[0] == 0
+    schema_id = struct.unpack(">I", bytes(value_bytes[1:5]))[0]
+    assert schema_id == proto_schema_id
+
+    # KEY_STRING key encoded as utf-8 bytes.
+    assert prod["key"] == b"ord-1"
+
+    # Encode resolved the latest schema exactly once for "events-value".
+    assert sr.get_latest_schema_calls == 1
+
+    # Round-trip: decode the framed bytes back to the rendered record.
+    from agctl.serialization import decode_payload
+
+    assert decode_payload(bytes(value_bytes), codec["value"]["fmt"], sr) == {
+        "id": "ord-1",
+        "qty": 1,
+    }
+
+    reacted = [e for e in emit_event.events if e["event"] == "kafka.reacted"]
+    assert len(reacted) == 1
+    assert reacted[0]["reactor"] == "pb-reactor"
+

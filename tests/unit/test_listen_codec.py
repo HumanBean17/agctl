@@ -457,3 +457,42 @@ def test_probe_failure_surfaces_as_startup_error_before_started_line(
 
     assert not any(e.get("event") == "started" for e in emitted)
     assert not any(e.get("event") == "summary" for e in emitted)
+
+
+# ---------------------------------------------------------------------------
+# Protobuf coverage (Task 14): a decoded Protobuf message is written to the
+# capture file. The fake KafkaClient delivers the already-decoded dict (the
+# decode happens inside the real KafkaClient's codec seam, which we trust to
+# be format-agnostic — exercised end-to-end in test_kafka_client_codec.py).
+# What this test pins is that the CaptureLoop writes a Protobuf-decoded value
+# verbatim, with no Avro-specific assumption in the write path.
+# ---------------------------------------------------------------------------
+
+
+def test_decoded_protobuf_message_is_written_to_capture_file(tmp_path: Path):
+    """A decoded Protobuf message flows through CaptureLoop unchanged and
+    lands in the capture file with the same envelope shape as Avro."""
+    pytest.importorskip("google.protobuf")
+    pytest.importorskip("grpc_tools")
+    emitted: list[dict] = []
+    # The decoded value mirrors what KafkaClient would produce after running
+    # decode_payload on a Confluent-framed Protobuf message.
+    decoded_value = {"id": "evt-1"}
+    fake = _FakeKafkaClient(
+        script=[_GoodMsg(_msg(decoded_value, key="k-pb", offset=0))]
+    )
+    engine = _make_engine_with_fake_client(tmp_path, emitted, fake)
+
+    _drive_to_summary(engine, fake)
+
+    capture = tmp_path / f"{_TOPIC}.ndjson"
+    lines = [json.loads(ln) for ln in capture.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    env = lines[0]
+    # The decoded Protobuf value flowed through CaptureLoop unchanged.
+    assert env["topic"] == _TOPIC
+    assert env["value"] == decoded_value
+    assert env["key"] == "k-pb"
+    assert env["offset"] == 0
+    # Codec seam wired: CaptureLoop's consume_loop call carries on_decode_error.
+    assert fake.consume_calls[0]["on_decode_error"] is not None

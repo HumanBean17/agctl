@@ -9,17 +9,22 @@ This module composes the building blocks merged in Tasks 3-6:
 * :class:`agctl.serialization.registry.SchemaRegistryClient` — the cached,
   error-mapped SR wrapper (:meth:`get_schema`, :meth:`get_latest_schema`);
 * :mod:`agctl.serialization.avro_codec` — the lazy ``fastavro`` codec
-  (:func:`decode_avro` / :func:`encode_avro`).
+  (:func:`decode_avro` / :func:`encode_avro`);
+* :mod:`agctl.serialization.protobuf_codec` — the lazy Protobuf codec
+  (:func:`decode_protobuf` / :func:`encode_protobuf`).
 
-The codec for Protobuf lands in Task 13 and is wired here in Task 14;
-until then the ``Format.PROTOBUF`` branch raises :class:`ConfigError`
-pointing at the ``protobuf`` extra (no half-implementation).
+The Protobuf codec was merged in Task 13 and wired into the
+``Format.PROTOBUF`` branch here in Task 14 (replacing the Task-7
+placeholder). The dispatch mirrors the Avro path: SR resolves the schema
+string by id (decode) or by subject (encode); the codec does NO
+wire-framing — that is the api layer's job via :func:`wire.parse_wire` /
+:func:`wire.build_wire`.
 
 Design invariants:
 
 * JSON never needs a Schema Registry client (``sr`` may be ``None``).
-* Avro always needs an SR client — decode to resolve the writer schema
-  by id, encode to resolve the latest schema for the subject.
+* Avro/Protobuf always need an SR client — decode to resolve the writer
+  schema by id, encode to resolve the latest schema for the subject.
 * v1 encode contract: no auto-registration. The subject must already
   have a schema; :meth:`SchemaRegistryClient.get_latest_schema` surfaces
   a missing subject as :class:`ConfigError`.
@@ -35,7 +40,7 @@ import json
 from typing import Any
 
 from ..errors import ConfigError, SerializationError
-from . import avro_codec
+from . import avro_codec, protobuf_codec
 from .registry import SchemaRegistryClient
 from .wire import build_wire, parse_wire
 
@@ -54,11 +59,6 @@ class Format(str, enum.Enum):
     AVRO = "avro"
     PROTOBUF = "protobuf"
     KEY_STRING = "string"
-
-
-_PROTOBUF_EXTRA_MSG = (
-    "Protobuf codec requires the 'protobuf' extra: pip install 'agctl[protobuf]'"
-)
 
 
 def _decode_bytes(raw):
@@ -93,7 +93,12 @@ def decode_payload(
       :func:`avro_codec.decode_avro`. A missing ``sr`` is
       :class:`ConfigError`. Codec failures propagate as
       :class:`SerializationError` so the caller decides fatal-vs-skip.
-    * ``Format.PROTOBUF`` — :class:`ConfigError` until Task 14.
+    * ``Format.PROTOBUF`` — same wire-frame / SR-resolution shape as Avro
+      (the wire format is identical; only the payload codec differs):
+      :func:`wire.parse_wire` → ``sr.get_schema(schema_id)`` →
+      :func:`protobuf_codec.decode_protobuf`. A missing ``sr`` is
+      :class:`ConfigError`; codec failures surface as
+      :class:`SerializationError`.
     """
     if fmt == Format.JSON:
         try:
@@ -103,8 +108,27 @@ def decode_payload(
     if fmt == Format.KEY_STRING:
         return _decode_bytes(raw)
     if fmt == Format.PROTOBUF:
-        # Wired in Task 14; until then this is a deliberate placeholder.
-        raise ConfigError(_PROTOBUF_EXTRA_MSG, {"fmt": "protobuf"})
+        if sr is None:
+            raise ConfigError(
+                "Cannot decode Protobuf payload without a Schema Registry client",
+                {"fmt": "protobuf"},
+            )
+        try:
+            schema_id, payload = parse_wire(raw)
+        except ValueError as exc:
+            raise SerializationError(
+                "not a Confluent frame", {"fmt": "protobuf"}
+            ) from exc
+        schema_type, schema_str = sr.get_schema(schema_id)
+        try:
+            return protobuf_codec.decode_protobuf(payload, schema_str)
+        except SerializationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - codec boundary: wrap to SerializationError
+            raise SerializationError(
+                f"Protobuf decode failed: {exc}",
+                {"fmt": "protobuf", "schema_id": schema_id},
+            ) from exc
     if fmt == Format.AVRO:
         if sr is None:
             raise ConfigError(
@@ -150,7 +174,13 @@ def encode_payload(
       not in the schema, picked up via fastavro's ``strict=True``)
       surface as :class:`SerializationError` with ``subject`` (and
       ``schema_id``) in the detail.
-    * ``Format.PROTOBUF`` — :class:`ConfigError` until Task 14.
+    * ``Format.PROTOBUF`` — same SR-resolution / wire-framing shape as
+      Avro (the wire format is identical; only the payload codec
+      differs): ``sr.get_latest_schema(subject)`` →
+      :func:`protobuf_codec.encode_protobuf` → :func:`wire.build_wire`.
+      Encode-time codec failures (unknown field, type mismatch) surface
+      as :class:`SerializationError` with ``subject`` (and ``schema_id``)
+      in the detail.
     """
     if fmt == Format.JSON:
         return json.dumps(value).encode()
@@ -159,7 +189,22 @@ def encode_payload(
             return value
         return str(value).encode("utf-8")
     if fmt == Format.PROTOBUF:
-        raise ConfigError(_PROTOBUF_EXTRA_MSG, {"fmt": "protobuf"})
+        if sr is None:
+            raise ConfigError(
+                "Cannot encode Protobuf payload without a Schema Registry client",
+                {"fmt": "protobuf", "subject": subject},
+            )
+        schema_type, schema_str, schema_id = sr.get_latest_schema(subject)
+        try:
+            encoded = protobuf_codec.encode_protobuf(value, schema_str)
+        except SerializationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - codec boundary: wrap to SerializationError
+            raise SerializationError(
+                f"Protobuf encode failed for subject {subject!r}: {exc}",
+                {"fmt": "protobuf", "subject": subject, "schema_id": schema_id},
+            ) from exc
+        return build_wire(schema_id, encoded)
     if fmt == Format.AVRO:
         if sr is None:
             raise ConfigError(
