@@ -1194,6 +1194,10 @@ mocks:
             assert call_kwargs.get("top_level_descriptors") is None
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="managed daemon is POSIX-only; gated by _require_posix_daemon on Windows",
+)
 class TestMockStartGrpc:
     """`mock start` --grpc-listen / grpc result block / pidfile keying."""
 
