@@ -154,7 +154,7 @@ class KafkaClient:
     # produce
     # ------------------------------------------------------------------
 
-    def produce(self, topic, value, *, key=None, headers=None) -> dict:
+    def produce(self, topic, value, *, key=None, headers=None, _raw=False) -> dict:
         """Publish one message and return the DESIGN §4.2 ``kafka.produce`` shape.
 
         ``value`` is JSON-encoded; ``key`` and header values are encoded to
@@ -164,6 +164,18 @@ class KafkaClient:
         and resolved subject BEFORE publish; encode failures surface as
         :class:`SerializationError`. The returned shape's ``key`` stays
         ``_decode_bytes(key_bytes)`` (today's behavior) regardless of codec.
+
+        ``_raw`` (default ``False``) is a bypass for callers that have
+        already encoded ``value``/``key`` per a DIFFERENT codec than this
+        client's own — the mock reactor's reaction path. The trigger
+        client's codec is the TRIGGER topic's format (so ``consume_loop``
+        decodes trigger values correctly); a reactor that emits an Avro
+        reaction to a JSON-encoded trigger must encode the reaction via the
+        reaction codec, not the trigger codec. When ``_raw=True`` the
+        caller-supplied ``value``/``key`` are passed to the underlying
+        producer verbatim (already-encoded bytes); ``headers`` are still
+        utf-8 encoded for strings (header values are not part of the codec
+        contract).
         """
         Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END, OFFSET_BEGINNING = _import_kafka()
 
@@ -174,7 +186,14 @@ class KafkaClient:
         else:
             producer = Producer(producer_conf)
 
-        value_bytes, key_bytes = self._encode_payload(topic, value, key)
+        if _raw:
+            # Caller pre-encoded value/key per a different codec than this
+            # client's own (mock reactor reaction path). Use verbatim — the
+            # caller is responsible for the wire frame.
+            value_bytes = value
+            key_bytes = key
+        else:
+            value_bytes, key_bytes = self._encode_payload(topic, value, key)
 
         header_pairs = None
         if headers:

@@ -51,6 +51,7 @@ class FakeKafkaClient:
         max_retries=3,
         on_assign=None,
         on_revoke=None,
+        on_decode_error=None,
     ):
         """Scripted message delivery with retry logic."""
         self.consume_calls.append(

@@ -88,7 +88,7 @@ class FakeKafkaClient:
         if self._probe_raises:
             raise self._probe_raises
 
-    def consume_loop(self, topic, group_id, stop_event, handle, max_retries):
+    def consume_loop(self, topic, group_id, stop_event, handle, max_retries, **kwargs):
         """Fake consume_loop - returns immediately if configured."""
         self.consume_loop_called = True
         self._stop_signal = stop_event
@@ -110,7 +110,7 @@ class FakeKafkaClientStopFatal(FakeKafkaClient):
         """Explicitly fail produce so the reaction failure path is intentional."""
         raise RuntimeError("produce failed (fatal)")
 
-    def consume_loop(self, topic, group_id, stop_event, handle, max_retries):
+    def consume_loop(self, topic, group_id, stop_event, handle, max_retries, **kwargs):
         """Simulate a fatal error by calling handle with final=True."""
         self.consume_loop_called = True
         self._stop_signal = stop_event
@@ -149,7 +149,7 @@ class FakeKafkaClientNonFatalError(FakeKafkaClient):
         """Explicitly fail produce so the reaction failure path is intentional."""
         raise RuntimeError("produce failed (non-fatal)")
 
-    def consume_loop(self, topic, group_id, stop_event, handle, max_retries):
+    def consume_loop(self, topic, group_id, stop_event, handle, max_retries, **kwargs):
         """Simulate a non-fatal reaction failure (fail_fast=False → COMMIT)."""
         self.consume_loop_called = True
         self._stop_signal = stop_event
@@ -191,7 +191,7 @@ class FakeKafkaClientWinddownError(FakeKafkaClient):
     def produce(self, topic, value, *, key=None, headers=None):
         raise RuntimeError("produce failed (winddown)")
 
-    def consume_loop(self, topic, group_id, stop_event, handle, max_retries):
+    def consume_loop(self, topic, group_id, stop_event, handle, max_retries, **kwargs):
         self.consume_loop_called = True
         self._stop_signal = stop_event
         # 1. Signal stop FIRST — run()'s loop wakes immediately (wait() returns

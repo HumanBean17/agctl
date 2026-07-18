@@ -220,14 +220,23 @@ def _resolve_codec(
     cluster_name: str,
     cli_value_fmt: str | None,
     cli_key_fmt: str | None,
+    *,
+    probe: bool = True,
 ):
     """Resolve value/key formats and build the ``KafkaClient`` codec dict.
 
     Returns ``(codec, value_fmt, key_fmt)``. ``codec`` is ``None`` for pure
     JSON topics so the legacy byte-identical decode path applies (avoids a
     ``Format.JSON``-codec divergence). When at least one side resolves to a
-    non-default format, an SR client is required and the startup probe runs
-    exactly once before the codec is handed back.
+    non-default format, an SR client is required and (unless ``probe=False``)
+    the startup probe runs once before the codec is handed back.
+
+    ``probe=False`` skips the SR reachability probe — used by callers that
+    batch multiple codec resolutions against the same cluster (e.g.
+    :func:`agctl.commands.mock_commands.mock_run` resolves BOTH the trigger
+    and reaction codec per reactor) so the probe runs at most once per
+    cluster rather than once per codec. The caller is responsible for
+    probing the cluster's SR before relying on the codec.
 
     Defense-in-depth: a non-JSON format with no SR URL raises
     :class:`ConfigError` here (the validator already flags this; the command
@@ -260,8 +269,10 @@ def _resolve_codec(
             {"cluster": cluster_name},
         )
     # Probe ONCE up front: a misconfigured SR should surface before the
-    # first message rather than mid-flow.
-    probe_schema_registry(sr, cluster_name)
+    # first message rather than mid-flow. Skipped when the caller batches
+    # multiple codec resolutions and probes the cluster itself.
+    if probe:
+        probe_schema_registry(sr, cluster_name)
 
     subject_strategy = resolve_subject_strategy(cfg, topic, cluster_name)
     codec = {
