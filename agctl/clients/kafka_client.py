@@ -20,9 +20,15 @@ import json
 import time
 from datetime import datetime, timezone
 
-from ..errors import ConfigError, ConnectionFailure
+from ..errors import ConfigError, ConnectionFailure, SerializationError
 
 _KAFKA_EXTRA_MSG = "Kafka support requires the 'kafka' extra: pip install 'agctl[kafka]'"
+
+# Default subject-name strategy when a codec config omits ``subject_strategy``
+# (the most common Confluent convention). ``resolve_subject`` requires a
+# concrete strategy, so the codec path fills in ``"topic"`` rather than
+# passing ``None`` through.
+_DEFAULT_SUBJECT_STRATEGY = "topic"
 
 
 class ReactionResult(enum.Enum):
@@ -61,6 +67,20 @@ def _import_kafka():
     )
 
 
+def _import_serialization():
+    """Lazy-import the serialization surface (Task 7 API).
+
+    Kept lazy so this module imports cleanly even when callers never use a
+    codec (``codec=None``) — the serialization package pulls in the SR client
+    and (transitively) the typed config models, which are wasted import cost
+    for the legacy JSON path. Each codec-aware method imports once on first
+    use; Python caches the module afterward.
+    """
+    from ..serialization import Format, decode_payload, encode_payload, resolve_subject
+
+    return Format, decode_payload, encode_payload, resolve_subject
+
+
 def _ms_to_iso8601z(ts_ms):
     """Convert a Kafka timestamp (ms since epoch) to an ISO8601Z string."""
     if ts_ms is None or ts_ms < 0:
@@ -97,6 +117,20 @@ class KafkaClient:
     consumer_factory / producer_factory:
         Test-injection seams. Each is a callable ``conf -> (Consumer|Producer)``
         used in place of the real confluent_kafka classes.
+    codec:
+        Optional serialization codec (Task 8). Shape::
+
+            {"value": {"fmt": Format, "subject_strategy": str | None} | None,
+             "key":   {"fmt": Format, "subject_strategy": str | None} | None,
+             "sr":    SchemaRegistryClient | None}
+
+        When ``None`` (the default) all methods behave byte-for-byte as today
+        (raw JSON values, string keys). When set, ``produce`` encodes value/key
+        via :func:`encode_payload` (+ :func:`resolve_subject`) before publish
+        and the consume methods decode value/key via :func:`decode_payload`
+        per side. Single-side decode failures are non-fatal: reported via the
+        consume method's ``on_decode_error`` callback and the failed side
+        becomes ``None``. Tombstones (``value=None``) decode to ``None``.
     """
 
     def __init__(
@@ -107,12 +141,14 @@ class KafkaClient:
         extra_conf=None,
         consumer_factory=None,
         producer_factory=None,
+        codec=None,
     ):
         self._brokers = brokers if isinstance(brokers, list) else [brokers]
         self._group_id = group_id
         self._extra_conf = dict(extra_conf or {})
         self._consumer_factory = consumer_factory
         self._producer_factory = producer_factory
+        self._codec = codec
 
     # ------------------------------------------------------------------
     # produce
@@ -122,7 +158,12 @@ class KafkaClient:
         """Publish one message and return the DESIGN §4.2 ``kafka.produce`` shape.
 
         ``value`` is JSON-encoded; ``key`` and header values are encoded to
-        bytes if they are strings.
+        bytes if they are strings. When a ``codec`` is configured with a
+        non-JSON value format (or non-string key format), ``value``/``key``
+        are encoded via :func:`encode_payload` against the codec's SR client
+        and resolved subject BEFORE publish; encode failures surface as
+        :class:`SerializationError`. The returned shape's ``key`` stays
+        ``_decode_bytes(key_bytes)`` (today's behavior) regardless of codec.
         """
         Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END, OFFSET_BEGINNING = _import_kafka()
 
@@ -133,8 +174,7 @@ class KafkaClient:
         else:
             producer = Producer(producer_conf)
 
-        value_bytes = json.dumps(value).encode("utf-8")
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
+        value_bytes, key_bytes = self._encode_payload(topic, value, key)
 
         header_pairs = None
         if headers:
@@ -188,6 +228,61 @@ class KafkaClient:
             "timestamp": _ms_to_iso8601z(ts_ms),
         }
 
+    def _encode_payload(self, topic, value, key):
+        """Encode value+key bytes per the configured codec (or legacy JSON).
+
+        Returns ``(value_bytes, key_bytes)`` ready for ``producer.produce``.
+        When ``self._codec is None`` (or a side's config is absent / JSON /
+        KEY_STRING) the legacy path applies byte-for-byte — json.dumps for
+        the value, utf-8 for a string key. Only non-JSON value formats and
+        non-string key formats route through ``encode_payload``.
+
+        ``SerializationError`` from the codec propagates unchanged (produce
+        is the write path — a schema-violating record is a fatal
+        contract/config bug, not a per-message skip).
+        """
+        if self._codec is None:
+            return json.dumps(value).encode("utf-8"), (
+                key.encode("utf-8") if isinstance(key, str) else key
+            )
+
+        Format, _decode, encode_payload, resolve_subject = _import_serialization()
+        sr = self._codec.get("sr")
+        value_cfg = self._codec.get("value") or {}
+        key_cfg = self._codec.get("key") or {}
+        value_fmt = value_cfg.get("fmt", Format.JSON)
+        key_fmt = key_cfg.get("fmt", Format.KEY_STRING)
+
+        # Value: JSON / unset fmt -> legacy json.dumps (byte-identical). Any
+        # other fmt routes through encode_payload against the resolved subject.
+        if value_fmt == Format.JSON:
+            value_bytes = json.dumps(value).encode("utf-8")
+        else:
+            subject = resolve_subject(
+                topic,
+                "value",
+                value_cfg.get("subject_strategy") or _DEFAULT_SUBJECT_STRATEGY,
+                value,
+            )
+            value_bytes = encode_payload(value, value_fmt, sr, subject=subject)
+
+        # Key: None -> None (real Kafka null key). KEY_STRING / unset -> legacy
+        # utf-8 (byte-identical). Other fmts -> encode_payload.
+        if key is None:
+            key_bytes = None
+        elif key_fmt == Format.KEY_STRING:
+            key_bytes = key.encode("utf-8") if isinstance(key, str) else key
+        else:
+            subject = resolve_subject(
+                topic,
+                "key",
+                key_cfg.get("subject_strategy") or _DEFAULT_SUBJECT_STRATEGY,
+                key,
+            )
+            key_bytes = encode_payload(key, key_fmt, sr, subject=subject)
+
+        return value_bytes, key_bytes
+
     # ------------------------------------------------------------------
     # consume_window
     # ------------------------------------------------------------------
@@ -201,6 +296,7 @@ class KafkaClient:
         from_beginning=False,
         predicate=None,
         expect_count=None,
+        on_decode_error=None,
     ) -> list[dict]:
         """Seek each partition to the lookback window and read forward.
 
@@ -215,6 +311,11 @@ class KafkaClient:
         returns truthy are counted/collected; a predicate that raises is treated
         as a non-match (silently skipped, DESIGN §3.2). ``expect_count`` (optional)
         stops the loop as soon as that many (matched) messages are in hand.
+
+        ``on_decode_error`` (optional) is invoked once per single-side decode
+        failure when a codec is configured; the failed side becomes ``None`` in
+        that message's envelope (non-fatal — the message is still collected).
+        Ignored when ``codec is None``.
 
         Returns a list of normalized message dicts (DESIGN §4.2 message shape).
         """
@@ -241,7 +342,7 @@ class KafkaClient:
                     # below as a ConnectionFailure rather than a silent ok:0.
                     poll_errors.append(str(msg.error()))
                     continue
-                normalized = self._normalize_message(msg)
+                normalized = self._normalize_message(msg, on_decode_error=on_decode_error)
                 if predicate is not None:
                     try:
                         if not predicate(normalized):
@@ -286,6 +387,7 @@ class KafkaClient:
         lookback_seconds,
         timeout_seconds,
         from_beginning=False,
+        on_decode_error=None,
     ):
         """Poll the window incrementally; return the first message dict for
         which ``predicate(msg)`` is True, or ``None`` if the window elapses with
@@ -293,6 +395,10 @@ class KafkaClient:
         (``offsets_for_times`` seek to ``now - lookback_seconds``, or
         ``from_beginning``). ``predicate`` is called on each normalized message
         dict. Terminates promptly: stops polling the moment a match is found.
+
+        ``on_decode_error`` (optional) is invoked once per single-side decode
+        failure when a codec is configured; the failed side becomes ``None`` in
+        that message's envelope (non-fatal — the message is still scanned).
 
         Returns a ``(message, scanned_count)`` tuple so callers can report
         ``messages_scanned``; if no match, returns ``(None, scanned_count)``.
@@ -317,7 +423,7 @@ class KafkaClient:
                     # a clean "no match".
                     poll_errors.append(str(msg.error()))
                     continue
-                normalized = self._normalize_message(msg)
+                normalized = self._normalize_message(msg, on_decode_error=on_decode_error)
                 scanned += 1
                 try:
                     matched = predicate(normalized)
@@ -359,6 +465,7 @@ class KafkaClient:
         max_retries=3,
         on_assign=None,
         on_revoke=None,
+        on_decode_error=None,
     ) -> None:
         """Run a committed consume loop with retry logic.
 
@@ -379,6 +486,11 @@ class KafkaClient:
         own consumer group), used only on this thread, and ``close()``d in
         ``finally`` (D13).
 
+        ``on_decode_error`` (optional) is invoked once per single-side decode
+        failure when a codec is configured; the failed side becomes ``None`` in
+        that message's envelope (non-fatal — the message is still handed to
+        ``handle``, which can COMMIT past it).
+
         Args:
             topic: Kafka topic to consume.
             group_id: Consumer group id for this reactor (unique per reactor).
@@ -388,6 +500,7 @@ class KafkaClient:
             max_retries: Maximum retry attempts per message (default 3).
             on_assign: Optional rebalance callback for partition assignment.
             on_revoke: Optional rebalance callback for partition revocation.
+            on_decode_error: Optional callback for per-side decode failures.
         """
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
@@ -429,7 +542,7 @@ class KafkaClient:
                 # dict, so re-handling in-memory is correct and simpler; the
                 # commit offset advances only on store_offsets+commit, so
                 # crash-recovery positioning is unaffected.
-                normalized = self._normalize_message(msg)
+                normalized = self._normalize_message(msg, on_decode_error=on_decode_error)
                 for attempt in range(1, max_retries + 1):
                     if stop_event.is_set():
                         return
@@ -621,17 +734,28 @@ class KafkaClient:
                     except KafkaException as exc:
                         raise ConnectionFailure(message=str(exc)) from exc
 
-    @staticmethod
-    def _normalize_message(msg) -> dict:
-        raw_value = msg.value()
-        value = None
-        if raw_value is not None:
-            try:
-                value = json.loads(raw_value.decode("utf-8"))
-            except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
-                value = raw_value.decode("utf-8", errors="replace")
+    def _normalize_message(self, msg, *, on_decode_error=None) -> dict:
+        """Build the DESIGN §4.2 message envelope from a confluent_kafka msg.
 
-        key = _decode_bytes(msg.key())
+        When ``self._codec is None`` (or a side's codec config is absent / a
+        legacy fmt) the decode is byte-for-byte the legacy path: json.loads
+        for the value (utf-8 replace fallback), _decode_bytes for the key.
+        When a codec is configured with a non-legacy fmt, the value and key
+        are decoded per side via :func:`decode_payload`. Decode failures are
+        NON-fatal: ``on_decode_error`` (if provided) is invoked once per
+        failed side and that side becomes ``None`` (the other side still
+        decodes — a key failure does not lose the value). Tombstones
+        (``value=None``) always decode to ``value=None`` and are NOT counted
+        as decode errors.
+        """
+        raw_value = msg.value()
+        raw_key = msg.key()
+
+        if self._codec is None:
+            value = self._legacy_decode_value(raw_value)
+            key = _decode_bytes(raw_key)
+        else:
+            value, key = self._codec_decode(raw_value, raw_key, on_decode_error)
 
         headers = {}
         raw_headers = msg.headers() if msg.headers() else None
@@ -648,3 +772,74 @@ class KafkaClient:
             "timestamp": _ms_to_iso8601z(ts_ms),
             "headers": headers,
         }
+
+    # ------------------------------------------------------------------
+    # codec helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _legacy_decode_value(raw_value):
+        """Today's pre-codec value decode: json.loads with utf-8 replace fallback.
+
+        Kept as a helper so the ``codec is None`` path is byte-for-byte
+        identical to the pre-Task-8 implementation (the backward-compat
+        guarantee). Non-JSON bytes fall back to a replace-decoded string.
+        """
+        if raw_value is None:
+            return None
+        try:
+            return json.loads(raw_value.decode("utf-8"))
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            return raw_value.decode("utf-8", errors="replace")
+
+    def _codec_decode(self, raw_value, raw_key, on_decode_error):
+        """Decode value+key per the configured codec (per side).
+
+        Returns ``(value, key)``. Tombstones (``raw is None``) decode to
+        ``None`` for that side — never raised, never counted as an error
+        (a None value is a Kafka delete marker, not a corrupt payload).
+        For each non-None side, ``decode_payload`` runs inside a try/except:
+        on :class:`SerializationError` the callback (if any) is invoked once
+        and that side becomes ``None`` (the OTHER side still decodes, so a
+        bad key does not discard a healthy value).
+
+        Default formats: when the codec omits ``value`` or ``key``, that
+        side keeps today's behavior (JSON for value, KEY_STRING for key) —
+        so a codec configured only for the value leaves the key on the
+        legacy string path.
+        """
+        Format, decode_payload, _encode, _resolve = _import_serialization()
+        sr = self._codec.get("sr")
+        value_cfg = self._codec.get("value") or {}
+        key_cfg = self._codec.get("key") or {}
+        value_fmt = value_cfg.get("fmt", Format.JSON)
+        key_fmt = key_cfg.get("fmt", Format.KEY_STRING)
+
+        value = self._decode_one_side(
+            raw_value, value_fmt, sr, on_decode_error, "value"
+        )
+        key = self._decode_one_side(
+            raw_key, key_fmt, sr, on_decode_error, "key"
+        )
+        return value, key
+
+    @staticmethod
+    def _decode_one_side(raw, fmt, sr, on_decode_error, label):
+        """Decode one side (value or key); tombstone- and error-aware.
+
+        - ``raw is None`` → ``None`` (tombstone / absent), no error counted.
+        - :class:`SerializationError` from ``decode_payload`` → callback
+          invoked once with ``f"{label}: {exc}"``, returns ``None``.
+        - Any other exception propagates (ConfigError for a misconfigured
+          codec, etc.) — those are NOT per-message data failures.
+        """
+        if raw is None:
+            return None
+        # Lazy import: only paid when a codec is actually configured for decode.
+        _Format, decode_payload, _encode, _resolve = _import_serialization()
+        try:
+            return decode_payload(raw, fmt, sr)
+        except SerializationError as exc:
+            if on_decode_error is not None:
+                on_decode_error(f"{label}: {exc}")
+            return None
