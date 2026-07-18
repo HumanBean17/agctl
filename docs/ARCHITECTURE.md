@@ -141,6 +141,12 @@ agctl/
 │   ├── assert_eval.py          # evaluate_expectations: reuses kafka assert predicate machinery over capture files (no deadline)
 │   ├── capture.py              # CaptureLoop: per-topic consume_loop wrapper (seek-to-end-on-assign + jq capture-match + overflow valve)
 │   └── engine.py               # ListenEngine lifecycle (start/run/shutdown; per-topic threads; single-writer NDJSON emit; summary)
+├── serialization/              # Confluent Schema Registry codecs (Avro / Protobuf); module top stays stdlib-only
+│   ├── api.py                  # Format enum + decode_payload/encode_payload/resolve_subject/decode_message (composes wire + registry + codecs)
+│   ├── wire.py                 # pure-stdlib Confluent wire-frame kernel (parse_wire / build_wire / is_confluent_frame)
+│   ├── registry.py             # lazy SchemaRegistryClient (by-id / by-subject / by-latest caches; build_schema_registry_conf; check_reachable)
+│   ├── avro_codec.py           # lazy fastavro decode/encode (parsed-schema cache; strict=True on encode)
+│   └── protobuf_codec.py       # lazy DynamicMessage codec (compiles .proto via grpc_descriptors kernel; single-file v1)
 ├── data/
 │   └── sample-config.yaml      # packaged starter config (read via importlib.resources)
 └── clients/
@@ -464,7 +470,7 @@ results as they happen, so it violates "one object per invocation":
 **The second streaming exception — `mock run`.** Like `http ping`, the mock server must stream events as they happen:
 
 - Not wrapped by `@envelope`.
-- Emits one JSON object **per event** (`started`, `http.hit`, `http.unmatched`, `http.body_parse_skipped`, `capture.missing`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, `grpc.hit`, `grpc.unmatched`, `grpc.error`, `summary`) directly as they occur. The three engines share one event stream and one `started`/`summary` line; engines not running report `null` in `started` and zero counters in `summary`.
+- Emits one JSON object **per event** (`started`, `http.hit`, `http.unmatched`, `http.body_parse_skipped`, `capture.missing`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, `grpc.hit`, `grpc.unmatched`, `grpc.error`, `summary`) directly as they occur. The three engines share one event stream and one `started`/`summary` line; engines not running report `null` in `started` and zero counters in `summary`. `kafka.skipped` doubles as the per-message decode-failure signal under a non-JSON reactor codec (reason `"decode failed: …"`, non-fatal, COMMIT — the trigger client's codec seam invokes `on_decode_error` before `_handle`, which emits the event and clears the per-message flag).
 - All emission goes through a single-writer path (`threading.Lock` in `MockEngine.emit_event`) — concurrent HTTP handler threads, Kafka reactor threads, and gRPC per-RPC handler threads (served by the gRPC server's own `ThreadPoolExecutor(max_workers=concurrency_cap)`) emit safely without interleaved lines.
 - Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary, http_hits, http_unmatched, http_body_parse_skipped, kafka_reactions, kafka_skipped, kafka_errors, grpc_hits, grpc_unmatched, grpc_errors, duration_ms}` and exits `0` (clean, no runtime errors) or `1` (runtime errors occurred — any `kafka.error`, `grpc.unmatched`, `grpc.error`, or `--fail-fast` triggered).
 - Startup errors emit a single structured envelope **before** any event line.
@@ -488,9 +494,9 @@ results as they happen, so it violates "one object per invocation":
 **The sixth streaming exception — `kafka listen run`.** Like `mock run`, the Kafka capture listener streams lifecycle events as they happen:
 
 - Not wrapped by `@envelope`.
-- Emits one JSON object **per event** (`started`, per-topic `capture.overflow`, `kafka.error`, `summary`) directly as they occur (the per-message capture is written to disk, not stdout).
+- Emits one JSON object **per event** (`started`, per-topic `capture.overflow`, `decode.error`, `kafka.error`, `summary`) directly as they occur (the per-message capture is written to disk, not stdout). `decode.error` fires once per failed SIDE under a non-JSON topic codec (the codec seam's `on_decode_error` callback emits it, increments the topic's `decode_errors` counter, and arms a per-message skip flag so `_handle` COMMITs without writing a partial envelope — downstream `listen assert` predicates never see a None value misread as data); `fatal: false`, so it does NOT inflate the engine's `errors` tally.
 - All emission goes through a single-writer path (`threading.Lock` in `ListenEngine.emit_event`) so concurrent per-topic `CaptureLoop` threads emit safely without interleaved lines.
-- Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{event: "summary", topics:[{topic, captured, overflowed}], errors, duration_ms}` and exits `0` (clean) or `1` (any `kafka.error` occurred).
+- Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{event: "summary", topics:[{topic, captured, overflowed, decode_errors}], errors, duration_ms}` and exits `0` (clean) or `1` (any `kafka.error` occurred).
 - Startup errors emit a single structured envelope **before** any event line.
 
 **The managed daemon commands — `mock start`/`stop`/`status`** are NOT streaming exceptions. Each is a normal `@envelope`-wrapped command that emits exactly one JSON object and exits 0/1/2:
@@ -527,6 +533,7 @@ produces the `error` object.
 | `ConfigError` | `ConfigError` | 2 | Bad/missing config, unresolved required env var, version mismatch, bad invocation. |
 | `ConnectionFailure` | `ConnectionError` | 2 | Service/broker/database unreachable. |
 | `OperationTimeout` | `TimeoutError` | 1 | A non-assertion op exceeded its budget (slow HTTP, hung query). |
+| `SerializationError` | `SerializationError` | 2 | Codec / schema-conformance failure on a Kafka value or key (truncated Confluent frame, schema-violating record, Protobuf compile failure). Non-fatal per-message on the decode path (counted in `decode_errors` / emitted as `decode.error` or `kafka.skipped reason="decode failed: …"`); fatal on the encode path (a schema-violating record is a contract/config bug). |
 | `TemplateNotFound` | `TemplateNotFound` | 2 | Named template/pattern/connection missing. |
 
 **Naming nuance:** the *Python class* is `AssertionFailure` but its `type_name`
@@ -648,6 +655,7 @@ reactors sharing a cluster reuse a single client built via `clients_by_cluster`)
   message and violate the window.
 - **`consume_loop`** — committed consume loop for mock reactors AND the `kafka listen` `CaptureLoop`. The reactor/listener owns its consumer lifecycle (D13); each message invokes a `handle(message, attempt, final)` callback and returns a `ReactionResult` (`COMMIT` → store_offsets + commit; `RETRY` → re-handle the same in-memory message; `STOP` → exit loop). Supports `max_retries` (must be >= 1), `stop_event`, and optional rebalance callbacks (`on_assign`/`on_revoke`). `kafka listen`'s `CaptureLoop` forwards an `on_assign` that seeks every partition to `OFFSET_END` BEFORE the first poll delivers data (overriding the client's hardcoded `auto.offset.reset: earliest`), so the listener begins at the head — immune to scan-window misses, volume truncation, and broker retention cleanup. The consumer is closed in `finally` after the loop exits.
 - **`probe`** — one-shot broker connectivity check. Builds a consumer, calls `list_topics(topic, timeout)`, and closes the consumer. Raises `ConnectionFailure` on any Kafka/broker error (the engine calls this at startup before binding HTTP to satisfy the spec §11 "broker unreachable at startup → exit 2" guarantee).
+- **Codec seam (Avro/Protobuf via Confluent SR)** — `__init__(…, codec=None)` accepts the T8 codec shape `{"value": {"fmt": Format, "subject_strategy": str | None} | None, "key": …, "sr": SchemaRegistryClient | None}`. When `None` (default), every method is byte-for-byte the legacy JSON/string path. When set, `produce` encodes the value (and non-string key) via `encode_payload` against the codec's SR + resolved subject BEFORE publish (encode failures surface as `SerializationError`, fatal on the write path); `consume_window` / `find_in_window` / `consume_loop` accept an `on_decode_error` callback the codec seam invokes once per failed SIDE — the failed side becomes `None`, the message is still collected/scanned/handled, and the callback accounts the failure (consume/assert surface `decode_errors` in the result; the reactor emits `kafka.skipped reason="decode failed: …"`; the CaptureLoop emits `decode.error` and drops the whole message so downstream `listen assert` predicates never see a partial envelope). Tombstones (`value=None`) decode to `None` and are NOT counted as decode errors. The module-level `_encode_payload_with_codec(codec, topic, value, key)` is the single source of truth for the produce-side encode, shared by `KafkaClient._encode_payload` and `KafkaReactor._encode_reaction` (the reactor's reaction codec is independent of the trigger client's codec — a JSON trigger may yield an Avro reaction). The codec dict is built by `_resolve_codec(cfg, topic, cluster, cli_value_fmt, cli_key_fmt, probe=True)` in the command layer, which also runs the SR startup probe at most once per cluster.
 - **Test seams** — `producer_factory`/`consumer_factory` inject fakes sharing
   the real Producer/Consumer contract, including confluent-kafka 2.15.0's
   argument validation (e.g. `subscribe` rejects an explicit `None` for
@@ -1063,12 +1071,15 @@ extras, so a user installs only what they need and the package imports fast:
 | core (always) | `click`, `pyyaml`, `pydantic`, `python-dotenv` | CLI, config loading, schema, `.env` parsing |
 | `http` | `httpx` | `http *`, `check ready` |
 | `jq` | `jq` | HTTP response assertions (`--match`/`--jq-path` on `http call`/`request`), mock HTTP `match.jq` (and mock startup pre-compile of stub `match.jq` / reactor `match`) |
-| `kafka` | `confluent-kafka`, `jq` | `kafka *` |
+| `kafka` | `confluent-kafka[schemaregistry]`, `jq` | `kafka *` (the `[schemaregistry]` sub-extra pulls `authlib`/`cachetools`/`attrs`/`certifi`/`httpx` that `confluent_kafka.schema_registry` imports at module load; without it `pip install 'agctl[kafka]'` leaves SR import-broken) |
 | `db` | `psycopg[binary]`, `jq` | `db *` |
 | `logs` | `jq` | `logs *` (`--match` on logs query/assert/tail) |
 | `grpc` | `grpcio`, `grpcio-tools`, `grpcio-health-checking`, `grpcio-reflection`, `protobuf`, `jq` | `grpc *`, `mock run --only grpc` / `mocks.grpc` engine |
+| `avro` | `fastavro` | Avro decode/encode on `kafka.clusters.<c>.value_format: avro` topics (`agctl/serialization/avro_codec.py`) |
+| `protobuf` | `protobuf` | Protobuf decode/encode on `kafka.clusters.<c>.value_format: protobuf` topics (`agctl/serialization/protobuf_codec.py`); deliberately standalone — does NOT pull `grpcio` |
+| `schema-registry` | meta-extra `agctl[avro,protobuf]` | convenience: one pip install for both SR codecs |
 | `dev` | `pytest` | unit tests |
-| `integration` | `testcontainers`, `agctl[db,kafka,http,grpc]`, `pytest` | live integration tests |
+| `integration` | `testcontainers`, `agctl[db,kafka,http,grpc]`, `agctl[schema-registry]`, `pytest` | live integration tests (the SR codecs are needed for the Avro/Protobuf round-trip suite) |
 
 `jq` is bundled under `kafka`/`db`/`logs` (which always needed it) **and** exposed as a
 dedicated `jq` extra for HTTP-only users (response assertions) and HTTP-only-mock
@@ -1080,7 +1091,15 @@ mocks import no server-side gRPC code. At runtime the lazy-import convention (§
 keeps the error category correct: a missing library → `ConfigError` (exit 2)
 pointing at the right extra (`agctl[jq]` for http/mock, `agctl[grpc]` for the
 gRPC mock and `grpc *`, `agctl[logs]` for logs commands with `--match`), not an
-opaque `ModuleNotFoundError`.
+opaque `ModuleNotFoundError`. The Avro/Protobuf codecs (§3 `agctl/serialization/`)
+add three more: a missing `fastavro` → `ConfigError` pointing at `agctl[avro]`;
+a missing `protobuf` → `ConfigError` pointing at `agctl[protobuf]`; and a missing
+`confluent_kafka.schema_registry` (or one of its transitive deps, e.g. `authlib`)
+→ `ConfigError` pointing at `agctl[kafka]` whose message echoes the underlying
+import error text (the `[schemaregistry]` sub-extra pins those transitive deps
+so the common case is fixed by `pip install 'agctl[kafka]'`). The codecs and the
+SR client lazy-import inside the function that needs them, so importing
+`agctl.serialization.*` is extra-free.
 
 **Build & entry points:** hatchling backend, wheel target `agctl`; console
 scripts `agctl`/`agt` → `agctl.cli:cli`; entry-point groups `agctl.db_drivers`
@@ -1224,8 +1243,10 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
 
 - **Bounded statelessness carve-out — mock daemon state.** The managed daemon commands (`mock start`/`stop`/`status`) introduce on-disk state in the system: a pidfile (`mock-<port>.pid`) and NDJSON log (`mock-<port>.log`) under `<state-dir>/` (default `./.agctl/`). This is a deliberate, scoped exception to the stateless-invocation principle, confined to the daemon lifecycle. No other commands read or write cross-invocation state.
 - **Bounded statelessness carve-out — listen daemon state (second carve-out).** The `kafka listen` managed daemon (`start`/`stop`/`status`/`assert`/`results`/`messages`) is the second on-disk-state surface: a run-id-keyed pidfile (`listen-<run_id>.pid`) plus a run dir (`listen-<run_id>/`) holding `meta.json`, `asserts.jsonl` (attached expectations), per-topic `<topic>.ndjson` capture files, and `events.log`, all under `<state-dir>/`. Same scope discipline as mock — confined to the daemon lifecycle; the generic primitives (`spawn_daemon`/`terminate`/`require_posix_daemon`/`is_alive`/pidfile ops) are shared with mock via `agctl/daemon.py` (no `listen → mock` coupling). `stop` deletes the run dir + pidfile on every path (fatal or clean), so an uncollected expectation (`results` not run first) is silently dropped.
-- **No Schema Registry / Avro/Protobuf decoding** — Kafka values are raw JSON;
-  `schema_registry_url` is parsed but unused.
+- **No Schema Registry decoding for non-Confluent / JSON-Schema registries** —
+  the codec pipeline targets Confluent Schema Registry wire framing (magic
+  byte + 4-byte schema id) and supports `AVRO` and `PROTOBUF` schema types.
+  Non-Confluent registries and Confluent `JSON` schemas are deferred (T15+).
 - **No retry/polling DSL** — eventually-consistent assertions need a caller-side
   loop (e.g. shell around `db assert`).
 - **No multi-step scenario primitive** — an agent chains commands in a shell.
@@ -1256,7 +1277,7 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
 - **Stateful flows** (OAuth/token exchange, create-then-GET, idempotency-key replay, pagination) — static engine returns same canned response → false green.
 - **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** — cannot intercept HTTPS → integration untested → false green. The gRPC mock (`mocks.grpc`) is plaintext-only v1 — TLS-pinned gRPC SUT clients cannot connect either.
 - **Cross-transport sagas** (Kafka trigger → HTTP callback) — no causal linkage → false green. gRPC stub → Kafka reaction (and vice versa) is deferred alongside this.
-- **Protobuf Kafka values** (schema-registry-backed) — Protobuf codec deferred (`ConfigError` on resolve); Avro trigger decode + reaction encode wired. → false green.
+- **Single-file Protobuf schemas only (Confluent SR)** — the Protobuf codec (`agctl/serialization/protobuf_codec.py`) compiles the registry-returned `.proto` source string with `grpc_tools.protoc --include_imports` and resolves the LAST top-level message. Multi-file schemas with `import` statements are best-effort via the kernel's order-tolerant loader; if resolution fails, the codec raises `SerializationError` with a truncated `schema_snippet` (fail-loud, not silent). Avro decode/encode is unconstrained. JSON-Schema values are not yet decoded (deferred alongside non-Confluent registries; emitted as `decode.error`).
 - **`match` is envelope-rooted under dialect `"2"`+ (was: payload-rooted under `"1"`; unchanged by the v3 named-cluster schema lift). The five `match` eval sites (HTTP stub `match.jq`, Kafka reactor `match`, `kafka.patterns[].match`, `kafka assert/consume --match`, `http call`/`request --match`) feed the whole envelope; `capture.*.from` shares the same root. The gRPC mock adds a sixth site (gRPC stub `match.jq`) that feeds the per-call-type envelope from §8.1 — same rooting rule, same `capture.from` root. `match.body` / `--contains` / `--path` / `--jq-path`+`--equals` / `--status` remain payload-rooted. A v1/v2 config is rejected by `_check_version`; rewrite with `agctl config migrate`.
 - **Containerized SUT topology** — operator must target `host.docker.internal` / host LAN IP and avoid SUT that swallows connection errors → false green.
 - **Shared broker + pinned `consumer_group` reused across runs/devs** — partition split or resume-past-messages → silently missing/old reactions → false green (mitigated by unique-per-run default).

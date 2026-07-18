@@ -89,8 +89,36 @@ kafka:
       brokers:
         - "${KAFKA_BROKER_HOST}:9092"
       default_consumer_group: "agctl-consumer"  # optional
-      schema_registry_url: "${SCHEMA_REGISTRY_URL}" # optional; omit if not used
+      schema_registry_url: "${SCHEMA_REGISTRY_URL:-}" # optional; required when any topic
+                                                      # on this cluster resolves to a
+                                                      # non-JSON value_format / non-string
+                                                      # key_format (see kafka.topics below)
       timeout_seconds: 30                            # default consume/assert timeout
+
+      # kafka.clusters.<name>.value_format / key_format — cluster-level defaults for
+      #   the Confluent Schema Registry codecs. Per-topic overrides live under
+      #   kafka.topics.<t>; the CLI --value-format / --key-format flags override both
+      #   (level-1 precedence). Defaults: value_format "json" (legacy JSON.decode),
+      #   key_format "string" (UTF-8). Setting either to "avro" or "protobuf" opts the
+      #   topic into SR-driven decode (consume) and encode (produce); a missing extra
+      #   surfaces as ConfigError pointing at pip install 'agctl[avro|protobuf]'.
+      # value_format: json
+      # key_format: string
+
+      # kafka.clusters.<name>.schema_registry — auth / mTLS for the SR URL above.
+      #   The URL itself stays on the bare schema_registry_url field so existing
+      #   configs keep working; this block carries only credentials / TLS.
+      #   `auth` is auto-inferred when omitted (basic_auth present -> basic; ssl present
+      #   -> mtls; else plaintext). Cross-field shape (basic-requires-basic_auth,
+      #   mtls-requires-ssl) is enforced by config validate; out-of-enum `auth` is
+      #   rejected by Pydantic at parse time.
+      # schema_registry:
+      #   auth: basic                              # plaintext | basic | mtls
+      #   basic_auth:
+      #     username: "${SR_API_KEY}"
+      #     password: "${SR_API_SECRET}"
+      #   ssl:                                     # same shape as kafka.clusters.<name>.ssl
+      #     ca_location: "${SR_SSL_CA:-}"
 
       # kafka.clusters.<name>.ssl — optional TLS/mTLS settings, per cluster.
       #   Setting any field (to a non-empty value) enables TLS; security.protocol
@@ -117,6 +145,29 @@ kafka:
     #     - "${ANALYTICS_KAFKA_BROKER_HOST}:9092"
 
   default_cluster: default
+
+# ---------------------------------------------------------------------------
+# kafka.topics — per-topic serialization contract (sibling of clusters/patterns
+# under kafka:). Optional map; an unknown topic falls through to the resolved
+# cluster's value_format / key_format and ultimately to the json / string
+# defaults. Use this to opt a single topic into Avro/Protobuf without changing
+# the cluster default, or to pin a subject_strategy (encode subject name;
+# decode is strategy-independent because the wire frame already carries the
+# schema id).
+#
+#   topic.cluster resolves with the same precedence as patterns/reactors
+#   (topic.cluster -> kafka.default_cluster -> single-cluster auto-default); a
+#   dangling reference is a config-validate error. A topic resolving to
+#   avro/protobuf whose cluster has no schema_registry_url is also an error.
+#   subject_strategy on a topic whose resolved value_format is "json" is a
+#   warning (no encode effect).
+# ---------------------------------------------------------------------------
+  # topics:
+  #   orders.created:
+  #     value_format: avro
+  #     key_format: string
+  #     subject_strategy: topic                # topic | record | topic_record (encode only)
+  #     # cluster: analytics                   # optional; overrides default_cluster
 
 # ---------------------------------------------------------------------------
 # kafka.patterns — named Kafka filter patterns, analogous to HTTP templates.
@@ -698,6 +749,11 @@ agctl kafka consume
     [--from-beginning]          # seek to earliest offset (default: seek to now - lookback)
     [--consumer-group <name>]   # override default consumer group (default: agctl-consumer)
     [--cluster <name>]          # named kafka cluster (default: kafka.default_cluster / single-cluster)
+    [--value-format <fmt>]      # override value codec: json (default) | avro | protobuf
+                                #   (level-1 precedence; otherwise resolved from kafka.topics /
+                                #   kafka.clusters.<name>.value_format; needs the matching extra
+                                #   pip install 'agctl[avro|protobuf]' and a schema_registry_url)
+    [--key-format <fmt>]        # override key codec: string (default) | avro | protobuf
 ```
 
 `--match` is a jq boolean expression evaluated against each message **envelope** (`{key, value, partition, offset, timestamp, headers}`) — so `.value.eventType`, `.key`, `.headers.rqUID`. Header keys are case-sensitive (as-produced). A **malformed expression** (syntax error) raises `ConfigError` (exit 2) before any polling; messages where the expression evaluates to `false` or raises a **runtime error** against that specific message are silently skipped. This enables partial matching — you do not need to know the full message structure.
@@ -732,10 +788,16 @@ Publish a single message.
 ```
 agctl kafka produce
     --topic <name>
-    --message '{...}'           # JSON string; value is published as-is
+    --message '{...}'           # JSON string; value is published as-is (json format) or
+                                #   encoded against the resolved SR subject (avro/protobuf)
     [--key <string>]            # optional Kafka message key
     [--header key=value]        # repeatable; Kafka message headers
     [--cluster <name>]          # named kafka cluster (default: kafka.default_cluster / single-cluster)
+    [--value-format <fmt>]      # override value codec: json (default) | avro | protobuf
+                                #   (level-1 precedence; otherwise resolved from kafka.topics /
+                                #   kafka.clusters.<name>.value_format; v1 encode contract: the
+                                #   subject must already exist in the SR — no auto-registration)
+    [--key-format <fmt>]        # override key codec: string (default) | avro | protobuf
 ```
 
 **Example:**
@@ -772,6 +834,10 @@ agctl kafka assert
     [--consumer-group <name>]   # override default consumer group (default: agctl-consumer)
     [--cluster <name>]          # named kafka cluster; overrides the pattern's bound cluster
                                 #   (default: pattern.cluster > kafka.default_cluster / single-cluster)
+    [--value-format <fmt>]      # override value codec: json (default) | avro | protobuf
+                                #   (level-1 precedence; otherwise resolved from kafka.topics /
+                                #   kafka.clusters.<name>.value_format)
+    [--key-format <fmt>]        # override key codec: string (default) | avro | protobuf
 ```
 
 **Examples:**
@@ -806,6 +872,8 @@ agctl kafka assert \
 **TLS / transport model (produce, consume, assert):** All three commands connect to brokers using the resolved cluster's `ssl` block (see §2.1). Setting any field to a non-empty value enables TLS and defaults `security.protocol` to `SSL` (mTLS); `ca_location` is optional and falls back to the system trust store when unset. Hostname verification is **on** by default (librdkafka default) — set `endpoint_identification_algorithm: "none"` only for self-signed or dev brokers. An empty string (e.g. an unresolved `${VAR:-}`) is treated as unset, so a partially-configured `ssl:` block never silently downgrades to plaintext nor disables verification. TLS configuration is unit-tested only; the live integration suite runs a plaintext broker.
 
 **Cluster resolution (produce, consume, assert):** All three commands target a single named cluster per invocation. Resolution precedence: `--cluster` (explicit) > a pattern's bound `cluster` (`assert --pattern` only) > `kafka.default_cluster` > the single defined cluster when exactly one is configured. An unresolvable name (`>1 cluster` and no `--cluster`/`default_cluster`), or a name absent from `kafka.clusters`, raises `ConfigError` (exit 2). This mirrors DB connection resolution (`--connection` > template's `connection` > `defaults.database_connection`).
+
+**Value/key format resolution (produce, consume, assert):** When the resolved cluster carries a `schema_registry_url`, the codec for value and key is resolved with the same chain: `--value-format` / `--key-format` (explicit) > `kafka.topics.<topic>.value_format` / `key_format` > `kafka.clusters.<name>.value_format` / `key_format` > defaults (`json` for value, `string` for key). A non-default format with no `schema_registry_url` on the resolved cluster raises `ConfigError` (defense-in-depth; the validator flags it at `config validate` first). A misconfigured SR (unreachable, missing subject on encode, auth failure) raises `ConnectionFailure` (exit 2) before any message flows — a startup probe runs once per cluster per invocation. Per-message decode failures are non-fatal: the failed side becomes `null`, the message is still collected, and the count surfaces in `result.decode_errors` (consume / assert).
 
 #### `agctl kafka listen` — Long-lived Capture Daemon
 
@@ -2125,9 +2193,12 @@ Every invocation writes exactly one JSON object to stdout (the streaming command
     }
   ],
   "count": 1,
-  "timed_out": false
+  "timed_out": false,
+  "decode_errors": 0
 }
 ```
+
+`decode_errors` counts per-side codec failures under a non-JSON `--value-format`/`--key-format` or `kafka.topics.<t>.value_format`/`key_format` (truncated Confluent frame, schema-violating record, Protobuf compile failure). The failed side becomes `null` in that message's envelope (the other side still decodes), the message is still collected, and the count is non-fatal (exit stays 0/1 by assertion semantics). Always `0` for pure-JSON topics (codec seam not engaged).
 
 #### `kafka.produce`
 
@@ -2159,9 +2230,12 @@ Every invocation writes exactly one JSON object to stdout (the streaming command
     "headers": {}
   },
   "messages_scanned": 3,
-  "elapsed_ms": 340
+  "elapsed_ms": 340,
+  "decode_errors": 0
 }
 ```
+
+`decode_errors` carries the same per-side codec-failure count as `kafka.consume` (the assert path uses the same codec seam and `on_decode_error` callback). Non-fatal: a non-zero count does not flip the assert verdict — a corrupt payload that did not match is silently scanned past, and a corrupt payload that did match still surfaces the match with the failed side `null`.
 
 #### `db.query`
 
@@ -2511,7 +2585,7 @@ Refused to overwrite (without `--force`):
 | `http.unmatched` | Emitted per HTTP request that matched no stub (returned 404). Includes `method`, `path`, `status`. |
 | `http.body_parse_skipped` | Emitted when a stub matches but the request body doesn't parse as JSON and the response has unresolved placeholders. Includes `stub`, `method`, `path`, `reason`. |
 | `kafka.reacted` | Emitted per Kafka message that matched a reactor and produced a reaction. Includes `reactor`, `topic`, `key`, `duration_ms`. |
-| `kafka.skipped` | Emitted when messages are consumed but not matched (e.g., non-object value). Includes `reactor`, `topic`, `reason`, `count`. |
+| `kafka.skipped` | Emitted when messages are consumed but not matched (e.g., non-object value), OR when the trigger client's codec seam reports a per-side decode failure under a non-JSON trigger format (`reason: "decode failed: …"`, non-fatal, COMMIT — the reactor proceeds no further on that message: no match, no capture, no reaction). Includes `reactor`, `topic`, `reason`, `count`. |
 | `kafka.error` | Emitted on a reaction produce failure or reactor error. Includes `reactor`, `topic`, `error`, `fatal`. Under `--fail-fast`, the run exits `1` immediately after a fatal error. |
 | `grpc.hit` | Emitted per response message sent (one for unary; one per streamed message; one per matched request for client-stream / bidi). Includes `stub`, `service`, `method`, `call_type`, `status`, `duration_ms`. |
 | `grpc.unmatched` | Emitted when no stub matches `service/method`, or every predicate fails (returned `UNIMPLEMENTED`). Includes `service`, `method`, `call_type`. **Fatal** — sets the runtime-error flag so the run exits `1` at shutdown. |
@@ -2538,8 +2612,9 @@ Refused to overwrite (without `--force`):
 |---|---|
 | `started` | Emitted once at startup after every topic's capture loop has seeked its partitions to `OFFSET_END`. Includes `run_id`, `topics[]`, `group`, `cluster`, `started_at`. |
 | `capture.overflow` | Emitted at most once per topic when its capture file reaches `--max-bytes-per-topic`; the topic's capture loop STOPs (no truncation). Includes `topic`, `bytes`. |
+| `decode.error` | Emitted at most once per failed SIDE under a non-JSON topic codec (the codec seam's `on_decode_error` callback fires before `_handle`; the whole message is dropped so no partial envelope reaches downstream `listen assert` predicates). Includes `topic`, `error` (`"value: …"` / `"key: …"`), `fatal: false` — does NOT inflate the engine's `errors` tally. Ignored when the topic resolves to JSON (codec seam not engaged). |
 | `kafka.error` | Emitted on a per-topic capture-loop death (e.g. broker error). Includes `topic`, `error`, `fatal: true`. The engine exit code flips to 1. |
-| `summary` | Emitted once at shutdown. Includes `topics[]` (each `{topic, captured, overflowed}`), `errors`, `duration_ms`. |
+| `summary` | Emitted once at shutdown. Includes `topics[]` (each `{topic, captured, overflowed, decode_errors}`), `errors`, `duration_ms`. |
 
 **Startup errors:** Like `mock run`, startup failures emit **one** structured envelope before any event line (with `command: "kafka.listen.run"` and `error.type`), then exit `2`.
 
@@ -2846,10 +2921,15 @@ dependencies = [
 # `pip install 'agctl[...]'` rather than an opaque ImportError.
 [project.optional-dependencies]
 http = ["httpx>=0.27"]
-kafka = ["confluent-kafka>=2.4", "jq>=1.6"]
+# confluent_kafka.schema_registry imports authlib/cachetools/attrs/certifi/httpx
+# at module load; those ride on confluent-kafka's own [schemaregistry] sub-extra.
+kafka = ["confluent-kafka[schemaregistry]>=2.4", "jq>=1.6"]
 db = ["psycopg[binary]>=3.1", "jq>=1.6"]
+avro = ["fastavro>=1.8"]                     # SR Avro decode/encode
+protobuf = ["protobuf>=4.25"]                # SR Protobuf decode/encode (no grpcio pulled)
+schema-registry = ["agctl[avro,protobuf]"]   # convenience meta-extra
 dev = ["pytest>=8.0"]
-integration = ["testcontainers", "agctl[db,kafka,http]", "pytest>=8.0"]
+integration = ["testcontainers", "agctl[db,kafka,http]", "agctl[schema-registry]", "pytest>=8.0"]
 
 [project.scripts]
 agctl = "agctl.cli:cli"
@@ -3113,7 +3193,8 @@ These items are intentionally deferred. Do not implement them until the core des
 
 | Item | Notes |
 |---|---|
-| **Schema Registry integration** | `kafka.assert` should optionally decode Avro/Protobuf messages using the configured schema registry. Currently, all Kafka values are treated as raw JSON. |
+| **Schema Registry — JSON-Schema values + non-Confluent registries** | Avro and Protobuf decode/encode over Confluent Schema Registry shipped (opt-in via `kafka.topics.<t>.value_format`/`key_format` or cluster defaults; see §2.1 / §3.2). Deferred: Confluent `JSON` schema values and non-Confluent registries (e.g. AWS Glue, Apicurio with a non-Confluent wire format) — both surface as `decode.error` today. |
+| **Schema Registry — Protobuf multi-file / import schemas** | The v1 Protobuf codec compiles a single registry-returned `.proto` source string and resolves its last top-level message; multi-file `import`-ed schemas are best-effort via the kernel's order-tolerant loader and raise `SerializationError` on resolution failure (fail-loud). Full multi-file support is deferred. |
 | **Message ordering assertions** | `agctl kafka assert --ordered` to verify a sequence of messages in partition order. Requires careful offset tracking. |
 | **Multi-step scenario chaining** | A lightweight `scenarios` section in YAML that sequences named steps. Enables atomic pass/fail over a workflow without shell scripting. The JSON output envelope would add a `steps` array. |
 | **MCP server wrapper** | Expose `agctl` as an MCP (Model Context Protocol) tool server so agents that support MCP can call it without shell access. The JSON output schema maps cleanly to MCP tool results. |
@@ -3145,7 +3226,7 @@ The mock MVP covers **stateless, single-consumer, value-keyed, plaintext** flows
 | **Stateful flows** (OAuth/token exchange, create-then-GET lifecycle, idempotency-key replay, pagination cursors, 429-then-retry) | Static engine returns the same canned response regardless of prior calls. | State-propagation and dedupe logic go untested → false green. |
 | **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** | Plaintext mock only; cannot intercept HTTPS. | Integration is untested → false green (especially for payments/auth/healthcare). |
 | **Cross-transport sagas** (Kafka trigger → HTTP callback) | No causal linkage; requires manual orchestration. | End-to-end flow goes unexercised → false green. |
-| **Protobuf Kafka values** (schema-registry-backed) | Protobuf codec deferred (raises `ConfigError` on resolve); Avro triggers are decoded and Avro reactions encoded. | Topic appears idle → false green if consumer expects a reaction. |
+| **Multi-file / `import`-ed Protobuf schemas** (schema-registry-backed) | The Protobuf codec compiles a single `.proto` source string per Confluent subject (v1); multi-file schemas are best-effort and raise `SerializationError` on resolution failure. Avro and single-file Protobuf triggers/reactions ARE decoded/encoded when the topic opts in via `value_format`/`key_format`. | A multi-file-Protobuf topic that fails to compile emits `kafka.skipped reason="decode failed: …"` (mock) or `decode.error` (listen) → false green if consumer expects a reaction. |
 | **Containerized SUT topology** (docker-compose) | `0.0.0.0` bind works, but operator must target `host.docker.internal` / host LAN IP and avoid a SUT that swallows connection errors. | SUT may silently fail to connect → false green if it treats network errors as "fallback worked." |
 | **Shared broker + pinned `consumer_group` reused across runs/devs** | Partition split or resume-past-messages. | Silently missing/old reactions → false green. (Mitigated by unique-per-run default.) |
 | **TLS / TLS-pinned gRPC SUT clients** | `mocks.grpc` is plaintext-only v1 (no TLS on the mock listener). | TLS-pinned SUT clients cannot connect → integration untested → false green. |
