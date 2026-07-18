@@ -28,8 +28,8 @@ from ..assertions import compile_jq, jq_bool, jq_value, json_subset
 from ..command import envelope, load_config_or_raise
 
 if TYPE_CHECKING:
-    from ..config.models import KafkaCluster, KafkaConfig
-from ..errors import AssertionFailure, ConfigError, TemplateNotFound
+    from ..config.models import Config, KafkaCluster, KafkaConfig
+from ..errors import AssertionFailure, ConfigError, ConnectionFailure, TemplateNotFound
 from ..params import parse_params
 from ..resolution import fill_placeholders
 
@@ -39,7 +39,18 @@ __all__ = [
     "kafka_assert",
     "new_kafka_client",
     "resolve_cluster_name",
+    "resolve_topic_format",
+    "resolve_subject_strategy",
+    "resolve_schema_registry_client",
+    "probe_schema_registry",
 ]
+
+
+# Module-level cache for SchemaRegistryClient instances, keyed by cluster name.
+# Memoized per-invocation: a single CLI call resolves the SR client at most
+# once per cluster even when produce/consume/assert internals ask repeatedly.
+# Tests clear this dict to isolate memoization assertions.
+_sr_client_cache: dict[str, object] = {}
 
 
 def resolve_cluster_name(
@@ -79,6 +90,188 @@ def resolve_cluster_name(
     return name
 
 
+# --------------------------------------------------------------------------- #
+# Format / Schema-Registry resolvers (Task 9 — DESIGN §6.2/§6.3).
+#
+# Precedence for the value/key format:
+#   (1) ``--value-format`` / ``--key-format`` CLI flag — applied by the Click
+#       layer BEFORE calling :func:`resolve_topic_format` (override level 1);
+#   (2) ``cfg.kafka.topics[topic].value_format`` / ``key_format``;
+#   (3) ``cfg.kafka.clusters[cluster].value_format`` / ``key_format``;
+#   (4) default — ``Format.JSON`` for values, ``Format.KEY_STRING`` for keys.
+#
+# Unknown topics and missing fields fall through to the next level — these
+# resolvers NEVER raise for absence (a ConfigError for a misconfigured
+# format-vs-SR combination is the validator's job, surfaced earlier).
+# --------------------------------------------------------------------------- #
+
+
+def resolve_topic_format(
+    cfg: "Config", topic: str, cluster: str, which: str
+):
+    """Resolve the value or key :class:`Format` for ``topic`` on ``cluster``.
+
+    ``which`` is ``"value"`` or ``"key"``. Precedence: topic-level format →
+    cluster-level format → default (``Format.JSON`` for value,
+    ``Format.KEY_STRING`` for key). An unknown topic or unset field falls
+    through to the cluster default and ultimately to the side's default —
+    this function does NOT raise for absence.
+    """
+    from ..serialization import Format
+
+    if which == "value":
+        default = Format.JSON
+    elif which == "key":
+        default = Format.KEY_STRING
+    else:
+        raise ConfigError(
+            f"resolve_topic_format: 'which' must be 'value' or 'key', got {which!r}",
+            {"which": which},
+        )
+
+    topic_cfg = cfg.kafka.topics.get(topic) if topic else None
+    if topic_cfg is not None:
+        topic_fmt = (
+            topic_cfg.value_format if which == "value" else topic_cfg.key_format
+        )
+        if topic_fmt is not None:
+            return Format(topic_fmt)
+
+    cluster_cfg = cfg.kafka.clusters.get(cluster)
+    if cluster_cfg is not None:
+        cluster_fmt = (
+            cluster_cfg.value_format if which == "value" else cluster_cfg.key_format
+        )
+        if cluster_fmt is not None:
+            return Format(cluster_fmt)
+
+    return default
+
+
+def resolve_subject_strategy(cfg: "Config", topic: str, cluster: str) -> str:
+    """Resolve the encode subject-name strategy for ``topic`` on ``cluster``.
+
+    Returns the topic-level ``subject_strategy`` when set, otherwise the
+    Confluent default ``"topic"``. (There is no cluster-level strategy field
+    today — the cluster slot in the precedence chain is a reserved extension
+    point; falling through to ``"topic"`` matches Confluent's default.)
+    """
+    topic_cfg = cfg.kafka.topics.get(topic) if topic else None
+    if topic_cfg is not None and topic_cfg.subject_strategy is not None:
+        return topic_cfg.subject_strategy
+    return "topic"
+
+
+def resolve_schema_registry_client(
+    cfg: "Config", cluster: str
+):
+    """Build (and memoize) the cluster's :class:`SchemaRegistryClient`.
+
+    Returns the cached instance on repeat calls for the same cluster name.
+    Returns ``None`` when the cluster has no ``schema_registry_url`` (an
+    empty/missing URL counts as absent — the ``${VAR:-}`` interpolation
+    resolves an unset env var to ``""``). Construction delegates to
+    :class:`SchemaRegistryClient`; a missing ``kafka`` extra surfaces as
+    :class:`ConfigError` from there.
+    """
+    cached = _sr_client_cache.get(cluster)
+    if cached is not None:
+        return cached
+
+    cluster_cfg = cfg.kafka.clusters.get(cluster)
+    if cluster_cfg is None or not cluster_cfg.schema_registry_url:
+        return None
+
+    from ..serialization.registry import SchemaRegistryClient
+
+    client = SchemaRegistryClient(
+        cluster_cfg.schema_registry_url,
+        cluster_cfg.schema_registry,
+    )
+    _sr_client_cache[cluster] = client
+    return client
+
+
+def probe_schema_registry(sr, cluster: str) -> None:
+    """Pre-flight reachability probe for the cluster's Schema Registry.
+
+    Calls :meth:`SchemaRegistryClient.check_reachable`; on failure re-raises
+    as :class:`ConnectionFailure` naming BOTH the cluster (available only
+    here — the SR client itself knows just the URL) and the URL so operators
+    can locate the misconfigured cluster fast. Returns ``None`` on success.
+    """
+    try:
+        sr.check_reachable()
+    except ConnectionFailure as exc:
+        url = getattr(sr, "_url", None) or "<unknown>"
+        raise ConnectionFailure(
+            message=(
+                f"Schema Registry for cluster {cluster!r} unreachable at "
+                f"{url}: {exc.message}"
+            ),
+            detail={"cluster": cluster},
+        ) from exc
+    return None
+
+
+def _resolve_codec(
+    cfg: "Config",
+    topic: str,
+    cluster_name: str,
+    cli_value_fmt: str | None,
+    cli_key_fmt: str | None,
+):
+    """Resolve value/key formats and build the ``KafkaClient`` codec dict.
+
+    Returns ``(codec, value_fmt, key_fmt)``. ``codec`` is ``None`` for pure
+    JSON topics so the legacy byte-identical decode path applies (avoids a
+    ``Format.JSON``-codec divergence). When at least one side resolves to a
+    non-default format, an SR client is required and the startup probe runs
+    exactly once before the codec is handed back.
+
+    Defense-in-depth: a non-JSON format with no SR URL raises
+    :class:`ConfigError` here (the validator already flags this; the command
+    layer catches it again so an in-code config can't bypass it).
+    """
+    from ..serialization import Format
+
+    # Level-1 CLI override wins over topic/cluster resolution.
+    value_fmt = (
+        Format(cli_value_fmt) if cli_value_fmt is not None
+        else resolve_topic_format(cfg, topic, cluster_name, "value")
+    )
+    key_fmt = (
+        Format(cli_key_fmt) if cli_key_fmt is not None
+        else resolve_topic_format(cfg, topic, cluster_name, "key")
+    )
+
+    # Pure-JSON/string path: pass codec=None so the legacy byte-identical
+    # decode applies (T8 review: a Format.JSON codec would diverge from
+    # today's json.loads-with-fallback behavior on non-JSON bytes).
+    if value_fmt == Format.JSON and key_fmt == Format.KEY_STRING:
+        return None, value_fmt, key_fmt
+
+    sr = resolve_schema_registry_client(cfg, cluster_name)
+    if sr is None:
+        raise ConfigError(
+            f"Cluster {cluster_name!r} requires a Schema Registry for "
+            f"value={value_fmt.value} key={key_fmt.value} but has no "
+            f"schema_registry_url",
+            {"cluster": cluster_name},
+        )
+    # Probe ONCE up front: a misconfigured SR should surface before the
+    # first message rather than mid-flow.
+    probe_schema_registry(sr, cluster_name)
+
+    subject_strategy = resolve_subject_strategy(cfg, topic, cluster_name)
+    codec = {
+        "value": {"fmt": value_fmt, "subject_strategy": subject_strategy},
+        "key": {"fmt": key_fmt, "subject_strategy": subject_strategy},
+        "sr": sr,
+    }
+    return codec, value_fmt, key_fmt
+
+
 def _kafka_ssl_conf(cluster: "KafkaCluster") -> dict[str, str]:
     """Translate a cluster's ``ssl`` block into librdkafka conf keys.
 
@@ -112,7 +305,7 @@ def _kafka_ssl_conf(cluster: "KafkaCluster") -> dict[str, str]:
     return conf
 
 
-def new_kafka_client(cluster, group_id=None):
+def new_kafka_client(cluster, group_id=None, *, codec=None):
     """Build a real :class:`KafkaClient` from a resolved :class:`KafkaCluster`.
 
     Test seam: tests monkeypatch this attribute
@@ -121,6 +314,11 @@ def new_kafka_client(cluster, group_id=None):
     broker connection. The factory signature takes the resolved ``cluster``
     (not ``cfg.kafka``) so multi-cluster selection (Tasks 2-3) is decoupled
     from client construction.
+
+    ``codec`` (Task 9) is forwarded to :class:`KafkaClient` unchanged; the
+    shape is the T8 contract
+    (``{"value": {"fmt": Format, ...}, "key": {...}, "sr": SchemaRegistryClient | None}``).
+    ``None`` keeps the legacy byte-identical JSON/string decode path.
     """
     from ..clients.kafka_client import KafkaClient
 
@@ -128,6 +326,7 @@ def new_kafka_client(cluster, group_id=None):
         cluster.brokers,
         group_id=group_id,
         extra_conf=_kafka_ssl_conf(cluster),
+        codec=codec,
     )
 
 
@@ -160,6 +359,8 @@ def _kafka_produce_core(
     key: str | None,
     header: tuple[str, ...],
     cluster: str | None = None,
+    value_format: str | None = None,
+    key_format: str | None = None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
 ) -> dict:
@@ -170,7 +371,16 @@ def _kafka_produce_core(
     # Resolve the cluster: --cluster (explicit) > default > single-cluster.
     name = resolve_cluster_name(cfg.kafka, explicit=cluster)
     resolved = cfg.kafka.clusters[name]
-    client = new_kafka_client(resolved)
+    codec, _value_fmt, _key_fmt = _resolve_codec(
+        cfg, topic, name, value_format, key_format
+    )
+    if codec is not None:
+        client = new_kafka_client(resolved, codec=codec)
+    else:
+        # Pure-JSON path: codec=None keeps the legacy byte-identical encode and
+        # the call signature backward-compatible with test fakes that don't
+        # accept the codec kwarg (Option B — only thread codec when non-None).
+        client = new_kafka_client(resolved)
     return client.produce(topic, value, key=key, headers=headers or None)
 
 
@@ -180,6 +390,22 @@ def _kafka_produce_core(
 @click.option("--key", "key", default=None, help="Message key")
 @click.option("--header", "header", multiple=True, help="k=v message header")
 @click.option("--cluster", "cluster", default=None, help="Cluster name override")
+@click.option(
+    "--value-format",
+    "value_format",
+    type=click.Choice(["json", "avro", "protobuf"]),
+    default=None,
+    help="Override the value serialization format (level-1 precedence; "
+         "otherwise resolved from topic/cluster config).",
+)
+@click.option(
+    "--key-format",
+    "key_format",
+    type=click.Choice(["string", "avro", "protobuf"]),
+    default=None,
+    help="Override the key serialization format (level-1 precedence; "
+         "otherwise resolved from topic/cluster config).",
+)
 @click.pass_context
 def kafka_produce(
     ctx: click.Context,
@@ -188,12 +414,25 @@ def kafka_produce(
     key: str | None,
     header: tuple[str, ...],
     cluster: str | None,
+    value_format: str | None,
+    key_format: str | None,
 ) -> None:
     """Produce one message to a Kafka topic."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    _kafka_produce_envelope(config_path, topic, message, key, header, cluster, overlay_paths=list(ovs) if ovs else None, env_file=env_file)
+    _kafka_produce_envelope(
+        config_path,
+        topic,
+        message,
+        key,
+        header,
+        cluster,
+        value_format,
+        key_format,
+        overlay_paths=list(ovs) if ovs else None,
+        env_file=env_file,
+    )
 
 
 _kafka_produce_envelope = envelope("kafka.produce")(_kafka_produce_core)
@@ -215,6 +454,8 @@ def _kafka_consume_core(
     from_beginning: bool,
     consumer_group: str | None,
     cluster: str | None = None,
+    value_format: str | None = None,
+    key_format: str | None = None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
 ) -> dict:
@@ -246,6 +487,10 @@ def _kafka_consume_core(
     resolved_lookback = float(lookback) if lookback is not None else resolved_timeout
     group = _resolve_group(consumer_group, resolved)
 
+    codec, _value_fmt, _key_fmt = _resolve_codec(
+        cfg, topic, name, value_format, key_format
+    )
+
     # Build the optional jq filter as an inline predicate so consume_window can
     # apply it incrementally AND short-circuit as soon as --expect-count matching
     # messages arrive (DESIGN §3.2 "whichever comes first").
@@ -260,7 +505,20 @@ def _kafka_consume_core(
         def predicate(msg, _expr=match_expr):
             return jq_bool(msg, _expr)
 
-    client = new_kafka_client(resolved, group_id=group)
+    # Per-side decode failure counter (T8 on_decode_error callback). Stays at 0
+    # for pure-JSON paths (codec=None -> callback never invoked). Non-fatal:
+    # the failed side becomes None on the message envelope, the message is
+    # still collected, and the count surfaces in the result envelope.
+    decode_errors = 0
+
+    def _on_decode_error(_msg):
+        nonlocal decode_errors
+        decode_errors += 1
+
+    if codec is not None:
+        client = new_kafka_client(resolved, group_id=group, codec=codec)
+    else:
+        client = new_kafka_client(resolved, group_id=group)
     matched = client.consume_window(
         topic,
         lookback_seconds=resolved_lookback,
@@ -268,6 +526,7 @@ def _kafka_consume_core(
         from_beginning=from_beginning,
         predicate=predicate,
         expect_count=expect_count,
+        on_decode_error=_on_decode_error if codec is not None else None,
     )
 
     # D10: consume-count-miss is an AssertionError (exit 1).
@@ -291,6 +550,7 @@ def _kafka_consume_core(
         "messages": matched,
         "count": len(matched),
         "timed_out": timed_out,
+        "decode_errors": decode_errors,
     }
 
 
@@ -314,6 +574,22 @@ def _kafka_consume_core(
 @click.option("--from-beginning", "from_beginning", is_flag=True, default=False)
 @click.option("--consumer-group", "consumer_group", default=None, help="Consumer group override")
 @click.option("--cluster", "cluster", default=None, help="Cluster name override")
+@click.option(
+    "--value-format",
+    "value_format",
+    type=click.Choice(["json", "avro", "protobuf"]),
+    default=None,
+    help="Override the value serialization format (level-1 precedence; "
+         "otherwise resolved from topic/cluster config).",
+)
+@click.option(
+    "--key-format",
+    "key_format",
+    type=click.Choice(["string", "avro", "protobuf"]),
+    default=None,
+    help="Override the key serialization format (level-1 precedence; "
+         "otherwise resolved from topic/cluster config).",
+)
 @click.pass_context
 def kafka_consume(
     ctx: click.Context,
@@ -326,6 +602,8 @@ def kafka_consume(
     from_beginning: bool,
     consumer_group: str | None,
     cluster: str | None,
+    value_format: str | None,
+    key_format: str | None,
 ) -> None:
     """Consume messages from a Kafka topic window."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
@@ -342,6 +620,8 @@ def kafka_consume(
         from_beginning,
         consumer_group,
         cluster,
+        value_format,
+        key_format,
         overlay_paths=list(ovs) if ovs else None,
         env_file=env_file,
     )
@@ -434,6 +714,8 @@ def _kafka_assert_core(
     consumer_group: str | None,
     assertion: str | None,
     cluster: str | None = None,
+    value_format: str | None = None,
+    key_format: str | None = None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
 ) -> dict:
@@ -488,16 +770,34 @@ def _kafka_assert_core(
     resolved = cfg.kafka.clusters[name]
     group = _resolve_group(consumer_group, resolved)
 
+    codec, _value_fmt, _key_fmt = _resolve_codec(
+        cfg, inferred_topic, name, value_format, key_format
+    )
+
     # DESIGN §9.3: a custom assertion mode evaluates the full consumed window.
     if assertion is not None:
-        client = new_kafka_client(resolved, group_id=group)
+        decode_errors = 0
+
+        def _on_decode_error(_msg):
+            nonlocal decode_errors
+            decode_errors += 1
+
+        if codec is not None:
+            client = new_kafka_client(resolved, group_id=group, codec=codec)
+        else:
+            client = new_kafka_client(resolved, group_id=group)
         messages = client.consume_window(
             inferred_topic,
             lookback_seconds=resolved_lookback,
             timeout_seconds=resolved_timeout,
             from_beginning=from_beginning,
+            on_decode_error=_on_decode_error if codec is not None else None,
         )
-        return _run_kafka_custom_assertion(assertion, inferred_topic, messages, params)
+        result = _run_kafka_custom_assertion(
+            assertion, inferred_topic, messages, params
+        )
+        result["decode_errors"] = decode_errors
+        return result
 
     # Parse --contains / fill --pattern ONCE here so the predicate and the
     # no-match failure detail share one source of truth (no double json.loads,
@@ -531,7 +831,16 @@ def _kafka_assert_core(
         filled_pattern_match=filled_pattern_match,
     )
 
-    client = new_kafka_client(resolved, group_id=group)
+    decode_errors = 0
+
+    def _on_decode_error(_msg):
+        nonlocal decode_errors
+        decode_errors += 1
+
+    if codec is not None:
+        client = new_kafka_client(resolved, group_id=group, codec=codec)
+    else:
+        client = new_kafka_client(resolved, group_id=group)
     start = time.monotonic()
     matched, scanned = client.find_in_window(
         inferred_topic,
@@ -539,6 +848,7 @@ def _kafka_assert_core(
         lookback_seconds=resolved_lookback,
         timeout_seconds=resolved_timeout,
         from_beginning=from_beginning,
+        on_decode_error=_on_decode_error if codec is not None else None,
     )
     elapsed_ms = int((time.monotonic() - start) * 1000)
 
@@ -585,6 +895,7 @@ def _kafka_assert_core(
         "matching_message": matched,
         "messages_scanned": scanned,
         "elapsed_ms": elapsed_ms,
+        "decode_errors": decode_errors,
     }
 
 
@@ -616,6 +927,22 @@ def _kafka_assert_core(
     help="Named custom assertion mode",
 )
 @click.option("--cluster", "cluster", default=None, help="Cluster name override")
+@click.option(
+    "--value-format",
+    "value_format",
+    type=click.Choice(["json", "avro", "protobuf"]),
+    default=None,
+    help="Override the value serialization format (level-1 precedence; "
+         "otherwise resolved from topic/cluster config).",
+)
+@click.option(
+    "--key-format",
+    "key_format",
+    type=click.Choice(["string", "avro", "protobuf"]),
+    default=None,
+    help="Override the key serialization format (level-1 precedence; "
+         "otherwise resolved from topic/cluster config).",
+)
 @click.pass_context
 def kafka_assert(
     ctx: click.Context,
@@ -631,6 +958,8 @@ def kafka_assert(
     consumer_group: str | None,
     assertion: str | None,
     cluster: str | None,
+    value_format: str | None,
+    key_format: str | None,
 ) -> None:
     """Assert a matching message exists in a Kafka window."""
     config_path = ctx.obj.get("config_path") if ctx.obj else None
@@ -650,6 +979,8 @@ def kafka_assert(
         consumer_group,
         assertion,
         cluster,
+        value_format,
+        key_format,
         overlay_paths=list(ovs) if ovs else None,
         env_file=env_file,
     )
