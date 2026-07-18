@@ -244,6 +244,66 @@ def test_kafka_topic_avro_with_schema_registry_url_no_error():
     assert warnings == []
 
 
+def test_kafka_cluster_default_avro_without_schema_registry_url_is_error():
+    """Cluster default value_format=avro with no SR URL -> error at the cluster.
+
+    Distinguished from the topic-override path: the topic inherits the cluster
+    default (no value_format/key_format override), so the need arises from the
+    cluster default and the error path is ``kafka.clusters.<c>`` — not
+    ``kafka.topics.<t>``. Locks the cluster-default branch against silent
+    collapse.
+    """
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {
+                    "default": {
+                        "brokers": ["localhost:9092"],
+                        "value_format": "avro",
+                    }
+                },
+                "default_cluster": "default",
+                "topics": {"t1": {}},
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "kafka.clusters.default",
+            "message": (
+                "Topic 't1' format (value=avro) requires a schema registry "
+                "but cluster 'default' has no schema_registry_url"
+            ),
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_cluster_default_avro_with_schema_registry_url_no_error():
+    """Symmetric positive case: cluster default avro WITH a SR URL -> no error."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {
+                    "default": {
+                        "brokers": ["localhost:9092"],
+                        "value_format": "avro",
+                        "schema_registry_url": "http://localhost:8081",
+                    }
+                },
+                "default_cluster": "default",
+                "topics": {"t1": {}},
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+    assert warnings == []
+
+
 def test_kafka_schema_registry_basic_without_basic_auth_is_error():
     """schema_registry.auth=basic with no basic_auth block is an error (case d)."""
     cfg = Config.model_validate(
