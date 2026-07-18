@@ -22,6 +22,10 @@ Required environment variables (all optional; unset => skip):
   (default ``http://localhost:8081``).
 - ``AGCTL_TEST_PG_DSN`` — psycopg DSN for the live Postgres under test.
 - ``AGCTL_TEST_KAFKA_BROKER`` — ``host:port`` of the live Kafka broker.
+- ``AGCTL_TEST_SCHEMA_REGISTRY_URL`` — base URL of the live Confluent Schema
+  Registry under test (e.g. ``http://localhost:8081``). Under
+  ``AGCTL_TEST_LIVE=1`` the session fixture starts ``cp-schema-registry``
+  paired with the Kafka container and wires this var.
 
 Each fixture yields the resolved connection handle (or URL string) so the test
 can use it, or skips before yielding.
@@ -61,10 +65,17 @@ class _LiveStack:
     def __init__(self) -> None:
         self.postgres = None
         self.kafka = None
+        self.schema_registry = None
         self.http_server: ThreadingHTTPServer | None = None
         self.http_thread: threading.Thread | None = None
 
     def stop_all(self) -> None:
+        # Schema Registry stops BEFORE Kafka (it depends on the broker).
+        if self.schema_registry is not None:
+            try:
+                self.schema_registry.stop()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
         for attr in ("postgres", "kafka"):
             container = getattr(self, attr)
             if container is not None:
@@ -143,6 +154,72 @@ def _start_kafka(stack: _LiveStack) -> None:
     os.environ["AGCTL_TEST_KAFKA_BROKER"] = f"localhost:{port}"
 
 
+def _start_schema_registry(stack: _LiveStack) -> None:
+    """Start ``cp-schema-registry`` paired with the running Kafka container.
+
+    SR needs a running broker, so this MUST be called after :func:`_start_kafka`
+    and is a no-op (recording a skip reason) when Kafka did not start.
+
+    Wiring approach: SR runs in its own container and reaches the host-mapped
+    Kafka broker via ``host.docker.internal`` (built-in on Docker Desktop;
+    ``host-gateway`` mapping is added for Linux Docker 20.10+ compatibility).
+    The broker's advertised PLAINTEXT listener is the host-mapped port, which
+    is reachable from the host and — via the ``host.docker.internal`` alias —
+    from sibling containers too. SR exposes 8081; we yield
+    ``http://localhost:<mapped>``.
+    """
+    if stack.kafka is None:
+        # Kafka didn't start (its own skip reason is already recorded).
+        _LIVE_SKIP_REASONS["schema_registry"] = (
+            "schema registry requires a running Kafka container; "
+            "kafka did not start"
+        )
+        return
+
+    broker = os.environ.get("AGCTL_TEST_KAFKA_BROKER", "")
+    if not broker:
+        _LIVE_SKIP_REASONS["schema_registry"] = (
+            "AGCTL_TEST_KAFKA_BROKER not set after Kafka start"
+        )
+        return
+
+    try:
+        from testcontainers.core.container import DockerContainer
+        from testcontainers.kafka import LogMessageWaitStrategy
+        import re
+
+        # Pair the SR image with the Kafka container's image tag (both ship
+        # under cp-* from Confluent; the default KafkaContainer uses
+        # cp-kafka:7.6.0, so cp-schema-registry:7.6.0 matches the platform
+        # version and avoids schema-compat surprises).
+        sr = (
+            DockerContainer("confluentinc/cp-schema-registry:7.6.0")
+            .with_exposed_ports(8081)
+            .with_env("SCHEMA_REGISTRY_HOST_NAME", "localhost")
+            .with_env("SCHEMA_REGISTRY_LISTENERS", "http://0.0.0.0:8081")
+            .with_env(
+                "SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS",
+                f"PLAINTEXT://host.docker.internal:{broker.split(':', 1)[1]}",
+            )
+            # Linux Docker compat: map host.docker.internal to host-gateway
+            # (no-op on Docker Desktop, where the alias is built in).
+            .with_kwargs(extra_hosts={"host.docker.internal": "host-gateway"})
+            .waiting_for(
+                LogMessageWaitStrategy(
+                    re.compile(r".*(Started SchemaRegistryRestApp|Server started).*")
+                ).with_startup_timeout(60)
+            )
+        )
+        sr.start()
+    except Exception as exc:  # noqa: BLE001 - any failure => skip that service
+        _LIVE_SKIP_REASONS["schema_registry"] = f"{type(exc).__name__}: {exc}"
+        return
+
+    stack.schema_registry = sr
+    port = str(sr.get_exposed_port(8081))
+    os.environ["AGCTL_TEST_SCHEMA_REGISTRY_URL"] = f"http://localhost:{port}"
+
+
 def _start_http(stack: _LiveStack) -> None:
     try:
         server = ThreadingHTTPServer(("127.0.0.1", 0), _OkHandler)
@@ -172,6 +249,9 @@ def _live_services():
     stack = _LiveStack()
     _start_postgres(stack)
     _start_kafka(stack)
+    # SR must start AFTER Kafka (it needs a live broker to back its store) and
+    # is torn down BEFORE Kafka on session teardown (see _LiveStack.stop_all).
+    _start_schema_registry(stack)
     _start_http(stack)
     try:
         yield
@@ -278,6 +358,50 @@ def require_kafka():
     except Exception as exc:  # noqa: BLE001 - any failure means no service
         pytest.skip(f"Kafka broker at {broker} unavailable: {exc}")
     return broker
+
+
+# --- Schema Registry --------------------------------------------------------
+
+
+@pytest.fixture
+def require_schema_registry():
+    """Skip if a live Confluent Schema Registry is unreachable.
+
+    Yields the SR base URL (``$AGCTL_TEST_SCHEMA_REGISTRY_URL``). Under
+    ``AGCTL_TEST_LIVE=1`` the session fixture spins ``cp-schema-registry``
+    paired with the Kafka container (SR must start AFTER the broker); without
+    the flag (or when Docker is unavailable, or when SR failed to start) this
+    skips cleanly. The probe is a 2s GET against ``<url>/subjects`` — the
+    cheapest reachability call that does not require any registered schemas.
+
+    Self-skip is mandatory: this fixture NEVER fails when SR is absent.
+    """
+    reason = _live_skip_reason("schema_registry")
+    if reason:
+        pytest.skip(f"live Schema Registry unavailable: {reason}")
+
+    sr_url = os.environ.get("AGCTL_TEST_SCHEMA_REGISTRY_URL")
+    if not sr_url:
+        pytest.skip(
+            "AGCTL_TEST_SCHEMA_REGISTRY_URL not set; skipping live Schema "
+            "Registry integration test (set AGCTL_TEST_LIVE=1)"
+        )
+
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(
+            f"{sr_url}/subjects", timeout=2
+        ) as resp:
+            # 200 is the only success code for /subjects; anything else (401,
+            # 5xx, connection refused) is treated as "no service".
+            if resp.status != 200:
+                pytest.skip(
+                    f"Schema Registry at {sr_url} returned HTTP {resp.status}"
+                )
+    except Exception as exc:  # noqa: BLE001 - any failure means no service
+        pytest.skip(f"Schema Registry at {sr_url} unavailable: {exc}")
+    return sr_url
 
 
 @pytest.fixture
