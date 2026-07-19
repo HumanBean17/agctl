@@ -36,6 +36,25 @@ class _FakeSchema:
         self.schema_str = schema_str
 
 
+class _FakeRegisteredSchema:
+    """Stand-in for ``confluent_kafka.schema_registry.RegisteredSchema``.
+
+    Mirrors the real attribute shape (verified against confluent-kafka
+    2.15.0): ``.subject`` / ``.version`` / ``.schema_id`` / ``.guid`` /
+    ``.schema`` (the latter a :class:`_FakeSchema`). The wrapper's
+    :meth:`SchemaRegistryClient.get_latest_schema` unpacks via these
+    attributes — NOT by 4-tuple iteration — because the real
+    ``get_latest_version`` returns a non-iterable ``RegisteredSchema``.
+    """
+
+    def __init__(self, subject, version, schema, schema_id, guid=None):
+        self.subject = subject
+        self.version = version
+        self.schema = schema
+        self.schema_id = schema_id
+        self.guid = guid
+
+
 class _FakeSchemaRegistryError(Exception):
     """Stand-in for ``confluent_kafka.schema_registry.error.SchemaRegistryError``.
 
@@ -69,8 +88,10 @@ class _FakeSRClient:
             7: _FakeSchema("AVRO", '{"type":"record","name":"X"}'),
         }
         self._id_for_subject = 42
-        # subject -> (version, schema, id); get_latest_version returns
-        # the confluent shape (subject, version, schema, id).
+        # subject -> (version, schema, id); get_latest_version returns a
+        # ``_FakeRegisteredSchema`` mirroring the real non-iterable
+        # ``RegisteredSchema`` shape (.schema / .schema_id attributes),
+        # NOT a tuple — so a regression to 4-tuple unpacking is caught.
         self._latest_for_subject: dict[str, tuple[int, _FakeSchema, int]] = {
             "t-value": (
                 3,
@@ -101,15 +122,17 @@ class _FakeSRClient:
         return ["t-value"]
 
     def get_latest_version(self, subject):
-        # Mirrors the modern confluent_kafka shape:
-        # (subject, version, schema, id).
+        # Mirrors the real confluent_kafka shape: returns a
+        # ``RegisteredSchema`` (non-iterable) exposing ``.schema`` /
+        # ``.schema_id`` — NOT a tuple. The historical 4-tuple return
+        # hid the production bug this fake now catches.
         self.get_latest_version_calls += 1
         if subject in self._latest_exception:
             raise self._latest_exception[subject]
         if subject not in self._latest_for_subject:
             raise _FakeSchemaRegistryError(40404, f"Subject '{subject}' not found.")
         version, schema, schema_id = self._latest_for_subject[subject]
-        return (subject, version, schema, schema_id)
+        return _FakeRegisteredSchema(subject, version, schema, schema_id)
 
 
 def _factory(fake):
@@ -349,6 +372,70 @@ def test_get_latest_schema_network_error_raises_connection_failure():
     with pytest.raises(ConnectionFailure) as exc_info:
         client.get_latest_schema("t-value")
     assert "http://sr:8081" in exc_info.value.message
+
+
+def test_get_latest_schema_unpacks_registered_schema_attributes():
+    """Regression: ``get_latest_version`` returns a non-iterable
+    ``RegisteredSchema`` (NOT a 4-tuple).
+
+    The historical code did ``_subject, _version, schema, schema_id =
+    self._client.get_latest_version(subject)`` — that ``TypeError``s
+    against the real client (a ``RegisteredSchema`` is not iterable),
+    was caught by ``except Exception``, and surfaced as
+    ``ConnectionFailure`` — breaking every Avro/Protobuf encode in
+    production. The unit-suite fake used to return a 4-tuple too, so it
+    reproduced the wrong assumption and masked the bug.
+
+    This test pins the contract: the wrapper unpacks via ``.schema`` /
+    ``.schema_id`` ATTRIBUTES on the returned object, the way the real
+    confluent-kafka 2.15.0 ``RegisteredSchema`` exposes them. A future
+    regression to tuple-unpacking trips this test even when the fake
+    mirrors the real shape.
+    """
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    result = client.get_latest_schema("t-value")
+    # (schema_type, schema_str, schema_id) — pulled from the
+    # RegisteredSchema's .schema (a Schema) and .schema_id attributes.
+    assert result == ("AVRO", '{"type":"record","name":"X"}', 7)
+
+
+def test_get_latest_schema_rejects_4_tuple_return_shape():
+    """Belt-and-braces: if a future fake (or a stub) returns the legacy
+    4-tuple shape, the wrapper MUST fail rather than silently work —
+    because the real ``RegisteredSchema`` is non-iterable. This locks
+    the failure direction so the regression cannot re-hide.
+    """
+
+    class _TupleReturnFake:
+        def __init__(self):
+            self.get_latest_version_calls = 0
+
+        def get_latest_version(self, subject):
+            self.get_latest_version_calls += 1
+            # Legacy wrong shape (what the old fake returned).
+            return (subject, 3, _FakeSchema("AVRO", "{}"), 7)
+
+        def get_schema(self, schema_id):
+            raise KeyError(schema_id)
+
+        def register_schema(self, subject, schema):
+            return 1
+
+        def get_subjects(self):
+            return []
+
+    fake = _TupleReturnFake()
+    client = SchemaRegistryClient(
+        "http://sr:8081", client_factory=_factory(fake)[0]
+    )
+
+    with pytest.raises((TypeError, ConnectionFailure)):
+        # The wrapper must NOT accommodate the 4-tuple shape. Against the
+        # real client this would be the production bug; we refuse to
+        # paper over it.
+        client.get_latest_schema("t-value")
 
 
 # --- (f) check_reachable ----------------------------------------------------

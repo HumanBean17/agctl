@@ -413,6 +413,159 @@ def test_consume_window_without_on_decode_error_callback_still_non_fatal():
     assert result[0]["value"] is None  # null-valued, no raise
 
 
+def test_consume_window_corrupt_messages_excluded_from_expect_count():
+    """Spec §8: corrupt messages stay in ``messages[]`` (debug visibility)
+    but do NOT count toward ``--expect-count``.
+
+    A window with N corrupt + M good messages and ``--expect-count = M``
+    must satisfy the count with EXACTLY the M good messages — a regression
+    that counted corrupt messages toward the tally would falsely satisfy a
+    5-corrupt-Avro window as ``ok:5`` (false-green).
+
+    The expect-count comparison happens inside :meth:`consume_window`'s poll
+    loop (it short-circuits as soon as the count is met); this test
+    instruments the loop by passing ``expect_count = M`` (good only) and
+    confirming the loop runs to the timeout rather than short-circuiting
+    after the N corrupt ones.
+    """
+    pytest.importorskip("fastavro")
+    topic = "t"
+    now_ms = int(time.time() * 1000)
+    # 3 corrupt + 2 good. expect_count = 2 (the good count) must NOT be
+    # satisfied by the corrupt ones — the loop should keep polling past
+    # the corrupt batch and stop only once both good messages land.
+    messages = [
+        # Corrupt batch first (not a Confluent frame -> decode_payload raises).
+        FakeCMsg(topic, 0, 0, b"k-c1", b"corrupt-1", now_ms - 500),
+        FakeCMsg(topic, 0, 1, b"k-c2", b"corrupt-2", now_ms - 400),
+        FakeCMsg(topic, 0, 2, b"k-c3", b"corrupt-3", now_ms - 300),
+        # Good Avro messages.
+        FakeCMsg(topic, 0, 3, b"k-g1", _avro_value_bytes("g1"), now_ms - 200),
+        FakeCMsg(topic, 0, 4, b"k-g2", _avro_value_bytes("g2"), now_ms - 100),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+    codec = {
+        "value": {"fmt": Format.AVRO},
+        "key": {"fmt": Format.KEY_STRING},
+        "sr": FakeSR(),
+    }
+    errors = []
+    client = KafkaClient(
+        "host:9092", consumer_factory=lambda c: consumer, codec=codec
+    )
+
+    result = client.consume_window(
+        topic,
+        lookback_seconds=30,
+        timeout_seconds=0.05,
+        from_beginning=True,
+        expect_count=2,  # the GOOD count — must not be satisfied by corrupt ones
+        on_decode_error=errors.append,
+    )
+
+    # All 5 messages are in the result (corrupt ones kept for debug visibility,
+    # failed side as None per T8's per-side independence).
+    assert len(result) == 5
+    by_key = {m["key"]: m for m in result}
+    # Good messages decoded their values.
+    assert by_key["k-g1"]["value"] == {"id": "g1"}
+    assert by_key["k-g2"]["value"] == {"id": "g2"}
+    # Corrupt messages have value=None (failed side), still collected.
+    for k in ("k-c1", "k-c2", "k-c3"):
+        assert by_key[k]["value"] is None
+    # The 3 corrupt decode failures fired on_decode_error (one per failed side).
+    assert len(errors) == 3
+
+
+def test_consume_window_expect_count_not_satisfied_when_all_messages_corrupt():
+    """Spec §8 edge: a window of ONLY corrupt messages cannot satisfy ANY
+    positive ``--expect-count``. With ``expect_count = 1`` and 2 corrupt
+    messages, the count stays unsatisfied — the command layer surfaces this
+    as an AssertionError (exit 1) rather than a false ``ok:2``.
+
+    Pinned at the client layer: ``len(messages)`` exceeds ``expect_count``
+    but the loop did NOT short-circuit on the corrupt ones, so the
+    command-level ``len(matched) < expect_count`` check fires.
+    """
+    pytest.importorskip("fastavro")
+    topic = "t"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(topic, 0, 0, b"k-c1", b"corrupt-1", now_ms - 100),
+        FakeCMsg(topic, 0, 1, b"k-c2", b"corrupt-2", now_ms - 50),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+    codec = {
+        "value": {"fmt": Format.AVRO},
+        "key": {"fmt": Format.KEY_STRING},
+        "sr": FakeSR(),
+    }
+    client = KafkaClient(
+        "host:9092", consumer_factory=lambda c: consumer, codec=codec
+    )
+
+    # The loop runs to timeout (no good messages to satisfy expect_count=1).
+    # The command layer would translate this into AssertionError (exit 1).
+    result = client.consume_window(
+        topic,
+        lookback_seconds=30,
+        timeout_seconds=0.02,
+        from_beginning=True,
+        expect_count=1,
+        on_decode_error=lambda _err: None,
+    )
+    # Both corrupt messages collected (debug visibility).
+    assert len(result) == 2
+    # Both have value=None (corrupt), so neither satisfies expect_count=1.
+    # The command-level check `len([m for m in matched if not corrupt]) < 1`
+    # is reflected here: the client returned 2 messages but the
+    # ``good_count`` (tracked internally) is 0.
+    assert all(m["value"] is None for m in result)
+
+
+def test_find_in_window_skips_corrupt_messages_as_matches():
+    """Spec §8 mirror for assert: a corrupt message is scanned but cannot
+    be returned as the match. A predicate that would match anything (e.g.
+    ``True``) does NOT pick a corrupt message — the loop continues past it
+    to the first GOOD message.
+    """
+    pytest.importorskip("fastavro")
+    topic = "t"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        # Corrupt message first.
+        FakeCMsg(topic, 0, 0, b"k-c1", b"corrupt", now_ms - 100),
+        # Good message after.
+        FakeCMsg(topic, 0, 1, b"k-g1", _avro_value_bytes("g1"), now_ms - 50),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+    codec = {
+        "value": {"fmt": Format.AVRO},
+        "key": {"fmt": Format.KEY_STRING},
+        "sr": FakeSR(),
+    }
+    client = KafkaClient(
+        "host:9092", consumer_factory=lambda c: consumer, codec=codec
+    )
+
+    # Predicate that matches anything — the corrupt message must NOT be
+    # returned (its failed side is None; a "match" against None is a
+    # false-green). The good message is the first valid match.
+    found, scanned = client.find_in_window(
+        topic,
+        predicate=lambda m: True,
+        lookback_seconds=30,
+        timeout_seconds=0.05,
+        from_beginning=True,
+    )
+    # Both messages were scanned (corrupt included in the scan count).
+    assert scanned == 2
+    # The match is the GOOD message, not the corrupt one.
+    assert found is not None
+    assert found["key"] == "k-g1"
+    assert found["value"] == {"id": "g1"}
+
+
 # ===========================================================================
 # Tombstone guard (Task 7 review finding)
 # ===========================================================================

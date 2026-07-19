@@ -110,6 +110,14 @@ def _compile_proto_string(schema_str: str):
     """
     _descriptor_pool_module, descriptor_pb2, protoc = _require_protobuf()
 
+    # Append grpc_tools' bundled well-known-type protos (google/protobuf/*.proto)
+    # to --proto_path so single-file schemas that import e.g.
+    # ``google/protobuf/timestamp.proto`` (ubiquitous) resolve. Without this
+    # protoc fails on the import and the schema is unusable.
+    import grpc_tools  # noqa: PLC0415 — deliberate lazy import (extra-gated)
+
+    grpc_tools_proto_root = os.path.join(os.path.dirname(grpc_tools.__file__), "_proto")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         proto_path = pathlib.Path(tmpdir) / "schema.proto"
         proto_path.write_text(schema_str)
@@ -125,6 +133,8 @@ def _compile_proto_string(schema_str: str):
                 "--include_imports",
                 "--proto_path",
                 str(proto_path.parent),
+                "--proto_path",
+                grpc_tools_proto_root,
                 "--descriptor_set_out",
                 descriptor_set_path,
                 str(proto_path),

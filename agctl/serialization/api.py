@@ -99,7 +99,21 @@ def decode_payload(
       :func:`protobuf_codec.decode_protobuf`. A missing ``sr`` is
       :class:`ConfigError`; codec failures surface as
       :class:`SerializationError`.
+
+    A ``None`` ``raw`` (a Kafka tombstone / delete-marker) decodes to
+    ``None`` for every format (DESIGN §9) — never raises, even on the
+    Avro/Protobuf codec path where ``parse_wire(None)`` would otherwise
+    ``TypeError`` inside the ``except ValueError`` guard. The internal
+    per-side caller already guards ``raw is None``; this is the
+    public-API contract (``decode_payload`` / ``decode_message`` are
+    re-exported from :mod:`agctl.serialization.__init__`).
     """
+    if raw is None:
+        # Tombstone: Kafka delete-marker. Decodes to None per DESIGN §9
+        # regardless of format — and short-circuits BEFORE the codec path
+        # so ``parse_wire(None)`` (which would TypeError, not ValueError)
+        # cannot leak out of the public API.
+        return None
     if fmt == Format.JSON:
         try:
             return json.loads(raw)
@@ -237,22 +251,34 @@ def resolve_subject(
     * ``"record"`` → the record name (Avro ``schema.name``). For v1 the
       schema is not available inside this function, so the record name
       is taken from ``value["__record_name__"]`` if attached; otherwise
-      the strategy falls back to ``f"{topic}-{which}"`` (a logged event
-      is deferred to Task 9's resolver integration).
+      the strategy raises :class:`ConfigError` (fail-loud — see below).
     * ``"topic_record"`` → ``f"{topic}-{record_name}"`` (same v1
-      fallback as ``"record"``).
+      record-name resolution as ``"record"``).
 
-    The fallback keeps encode predictable when the schema is not yet
-    known: callers that want true record-name subjects must attach the
-    name to ``value`` (Task 9's resolver will do this once it has the
-    schema in hand).
+    Fail-loud (v1): when ``strategy`` is ``"record"`` / ``"topic_record"``
+    AND the record name cannot be resolved from the payload (no
+    ``__record_name__`` key), this raises :class:`ConfigError` rather
+    than silently degrading to ``TopicNameStrategy``. Nothing in v1
+    populates ``__record_name__`` from the schema (chicken-and-egg with
+    the schema fetch), so the previous silent fallback resolved the
+    WRONG subject — a false-green vector that violates the project's
+    fail-loud posture. The explicit-``__record_name__`` path (kept) is
+    exercised by
+    :func:`test_resolve_subject_record_uses_attached_record_name`.
     """
     if strategy == "topic":
         return f"{topic}-{which}"
     if strategy in ("record", "topic_record"):
         record_name = _record_name_from_value(value)
         if record_name is None:
-            return f"{topic}-{which}"
+            raise ConfigError(
+                (
+                    "subject_strategy 'record'/'topic_record' for topic "
+                    f"{topic!r}: record-name resolution is not supported "
+                    "in v1 — use subject_strategy: 'topic'"
+                ),
+                {"topic": topic, "which": which, "strategy": strategy},
+            )
         if strategy == "record":
             return record_name
         return f"{topic}-{record_name}"

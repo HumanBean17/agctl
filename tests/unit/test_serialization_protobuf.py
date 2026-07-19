@@ -240,3 +240,56 @@ def test_module_does_not_import_protobuf_at_top_level():
     assert "tempfile" in dir(mod)
     assert "grpc_descriptors" in dir(mod)
     assert "SerializationError" in dir(mod)
+
+
+# --- well-known-type imports (google/protobuf/*.proto) ----------------------
+#
+# protoc invocation must put grpc_tools' bundled WKT protos on --proto_path so
+# a single-file schema that imports ``google/protobuf/timestamp.proto``
+# (ubiquitous in real schemas) resolves. Without it protoc fails on the import
+# and the codec raises SerializationError — a regression this test pins.
+
+
+def test_schema_importing_well_known_timestamp_proto_compiles_and_decodes():
+    """A single-file schema importing ``google/protobuf/timestamp.proto``
+    compiles and decodes — proving the WKT protos ship on the protoc
+    ``--proto_path`` via ``grpc_tools._proto``.
+
+    Pre-fix: protoc returned non-zero (``google/protobuf/timestamp.proto:
+    File not found."``), the codec raised SerializationError, and every
+    schema with a WKT import was unusable.
+
+    The F6 fix targets protoc compilation (the ``--proto_path`` append);
+    the json_format WKT-string coercion (RFC3339 for Timestamp) is a
+    json_format behavior beyond F6's scope, so this test exercises the
+    COMPILE + raw-wire DECODE path rather than the encode round-trip.
+    """
+    _descriptors.clear()  # avoid cache hits across tests
+    schema = (
+        'syntax = "proto3";\n'
+        "import \"google/protobuf/timestamp.proto\";\n"
+        "message E {\n"
+        "  string id = 1;\n"
+        "  google.protobuf.Timestamp ts = 2;\n"
+        "}\n"
+    )
+
+    # (1) Schema compiles: protoc finds the WKT import on --proto_path.
+    #     Pre-fix this raised SerializationError("cannot compile ...").
+    file_protos = _compile_proto_string(schema)
+    names = [mt.name for fd in file_protos for mt in fd.message_type]
+    assert "E" in names
+
+    # (2) Descriptor resolves in a real DescriptorPool — the imported
+    #     ``google.protobuf.Timestamp`` symbol is findable.
+    desc = _message_descriptor(schema)
+    assert desc.full_name == "E"
+    ts_field = next(f for f in desc.fields if f.name == "ts")
+    assert ts_field.message_type.full_name == "google.protobuf.Timestamp"
+
+    # (3) Decode raw wire bytes: field 1 (id, string) = "x"; field 2 (ts)
+    #     omitted -> default empty Timestamp. The codec decodes without
+    #     raising and the decoded id round-trips.
+    raw = b"\x0a\x01x"  # field 1: tag 0x0a, len 1, "x"
+    decoded = decode_protobuf(raw, schema)
+    assert decoded["id"] == "x"

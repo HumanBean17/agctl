@@ -31,6 +31,31 @@ _KAFKA_EXTRA_MSG = "Kafka support requires the 'kafka' extra: pip install 'agctl
 _DEFAULT_SUBJECT_STRATEGY = "topic"
 
 
+def _make_decode_failure_tracker(on_decode_error):
+    """Wrap ``on_decode_error`` to flag whether it fired for THIS message.
+
+    Returns ``(wrapped_callback, failed_holder)`` where ``failed_holder`` is
+    a one-cell list the caller checks after :meth:`_normalize_message`. The
+    wrapped callback invokes the original (if any) AND flips the flag, so
+    per-side decode failures (key-side, value-side, or both) all collapse to
+    a single "this message had a decode failure" signal.
+
+    Used by :meth:`KafkaClient.consume_window` and
+    :meth:`KafkaClient.find_in_window` to exclude corrupt messages from the
+    ``--expect-count`` tally (spec §8): a window of N corrupt Avro messages
+    is NOT ``ok:N`` — corrupt messages stay in ``messages[]`` for debug
+    visibility (failed side as None) but cannot satisfy the count.
+    """
+    failed = [False]
+
+    def wrapped(err, _f=failed, _cb=on_decode_error):
+        _f[0] = True
+        if _cb is not None:
+            _cb(err)
+
+    return wrapped, failed
+
+
 class ReactionResult(enum.Enum):
     """Result of a message handler in consume_loop.
 
@@ -375,6 +400,14 @@ class KafkaClient:
         that message's envelope (non-fatal — the message is still collected).
         Ignored when ``codec is None``.
 
+        Spec §8 / corrupt-message handling: a message whose decode triggered
+        ``on_decode_error`` (any per-side failure) is kept in the returned
+        ``messages[]`` for debug visibility (the failed side is ``None``) but
+        does NOT count toward ``--expect-count`` — a window of N corrupt Avro
+        messages is NOT ``ok:N`` (false-green). ``kafka listen`` drops corrupt
+        messages entirely; ``consume``/``assert`` keep them visible but
+        uncounted.
+
         Returns a list of normalized message dicts (DESIGN §4.2 message shape).
         """
         Consumer, Producer, TopicPartition, KafkaError, KafkaException, OFFSET_END, OFFSET_BEGINNING = _import_kafka()
@@ -382,6 +415,10 @@ class KafkaClient:
         consumer = self._build_consumer()
 
         messages: list[dict] = []
+        # Count of NON-corrupt (no decode failure) messages collected — used
+        # for the --expect-count comparison (spec §8: corrupt messages don't
+        # satisfy the count even though they remain in messages[]).
+        good_count = 0
         poll_errors: list[str] = []
         try:
             self._setup_seek(consumer, topic, lookback_seconds, from_beginning)
@@ -400,7 +437,10 @@ class KafkaClient:
                     # below as a ConnectionFailure rather than a silent ok:0.
                     poll_errors.append(str(msg.error()))
                     continue
-                normalized = self._normalize_message(msg, on_decode_error=on_decode_error)
+                # Wrap on_decode_error so we can tell (per-message) whether any
+                # side failed to decode — without losing the original callback.
+                tracked_cb, decode_failed = _make_decode_failure_tracker(on_decode_error)
+                normalized = self._normalize_message(msg, on_decode_error=tracked_cb)
                 if predicate is not None:
                     try:
                         if not predicate(normalized):
@@ -409,10 +449,13 @@ class KafkaClient:
                         # Predicate error -> silently skip this message (DESIGN §3.2).
                         continue
                 messages.append(normalized)
-                # DESIGN §3.2: return as soon as --expect-count matching messages
-                # are received — "whichever comes first" (count satisfied or the
-                # timeout window elapses).
-                if expect_count is not None and len(messages) >= expect_count:
+                if not decode_failed[0]:
+                    good_count += 1
+                # DESIGN §3.2: return as soon as --expect-count matching GOOD
+                # (non-corrupt) messages are received — "whichever comes first"
+                # (count satisfied or the timeout window elapses). Spec §8: a
+                # corrupt message does NOT satisfy the count.
+                if expect_count is not None and good_count >= expect_count:
                     break
 
             # No messages AND every poll errored: the window didn't fail to match
@@ -458,6 +501,13 @@ class KafkaClient:
         failure when a codec is configured; the failed side becomes ``None`` in
         that message's envelope (non-fatal — the message is still scanned).
 
+        Spec §8 / corrupt-message handling: a message whose decode triggered
+        ``on_decode_error`` is scanned (``scanned_count``++) but cannot satisfy
+        the match — mirroring :meth:`consume_window`'s corrupt-excludes-from-
+        count rule (a corrupt payload that "matched" only because its failed
+        side collapsed to ``None`` is a false-green). ``kafka listen`` drops
+        corrupt messages entirely; ``assert`` scans past them without matching.
+
         Returns a ``(message, scanned_count)`` tuple so callers can report
         ``messages_scanned``; if no match, returns ``(None, scanned_count)``.
         """
@@ -481,8 +531,15 @@ class KafkaClient:
                     # a clean "no match".
                     poll_errors.append(str(msg.error()))
                     continue
-                normalized = self._normalize_message(msg, on_decode_error=on_decode_error)
+                # Track per-message decode failures (spec §8): a corrupt message
+                # is scanned but cannot be returned as a match.
+                tracked_cb, decode_failed = _make_decode_failure_tracker(on_decode_error)
+                normalized = self._normalize_message(msg, on_decode_error=tracked_cb)
                 scanned += 1
+                if decode_failed[0]:
+                    # Corrupt: skip predicate evaluation (the failed side is
+                    # None; a "match" against None is a false-green).
+                    continue
                 try:
                     matched = predicate(normalized)
                 except Exception:

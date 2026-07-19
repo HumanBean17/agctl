@@ -207,18 +207,20 @@ class SchemaRegistryClient:
         as :class:`ConnectionFailure` naming the URL, matching the other
         I/O methods.
 
-        The underlying ``get_latest_version(subject)`` returns the modern
-        confluent shape ``(subject, version, schema, id)`` where ``schema``
-        is a ``Schema`` object exposing ``.schema_type`` / ``.schema_str``.
+        The underlying ``get_latest_version(subject)`` returns a
+        ``RegisteredSchema`` (NOT a tuple) exposing ``.schema`` (a
+        ``Schema`` with ``.schema_type`` / ``.schema_str``) and
+        ``.schema_id``. We unpack via attributes — the historical
+        4-tuple unpack broke against the real non-iterable return.
         """
         cached = self._by_latest.get(subject)
         if cached is not None:
             return cached
 
         try:
-            _subject, _version, schema, schema_id = self._client.get_latest_version(
-                subject
-            )
+            registered = self._client.get_latest_version(subject)
+            schema = registered.schema
+            schema_id = registered.schema_id
         except Exception as exc:  # noqa: BLE001 - I/O boundary
             # 40404 SUBJECT_NOT_FOUND is a config/contract bug (the subject
             # has no schema yet), NOT a connectivity problem. Detect by

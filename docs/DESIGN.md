@@ -873,7 +873,7 @@ agctl kafka assert \
 
 **Cluster resolution (produce, consume, assert):** All three commands target a single named cluster per invocation. Resolution precedence: `--cluster` (explicit) > a pattern's bound `cluster` (`assert --pattern` only) > `kafka.default_cluster` > the single defined cluster when exactly one is configured. An unresolvable name (`>1 cluster` and no `--cluster`/`default_cluster`), or a name absent from `kafka.clusters`, raises `ConfigError` (exit 2). This mirrors DB connection resolution (`--connection` > template's `connection` > `defaults.database_connection`).
 
-**Value/key format resolution (produce, consume, assert):** When the resolved cluster carries a `schema_registry_url`, the codec for value and key is resolved with the same chain: `--value-format` / `--key-format` (explicit) > `kafka.topics.<topic>.value_format` / `key_format` > `kafka.clusters.<name>.value_format` / `key_format` > defaults (`json` for value, `string` for key). A non-default format with no `schema_registry_url` on the resolved cluster raises `ConfigError` (defense-in-depth; the validator flags it at `config validate` first). A misconfigured SR (unreachable, missing subject on encode, auth failure) raises `ConnectionFailure` (exit 2) before any message flows — a startup probe runs once per cluster per invocation. Per-message decode failures are non-fatal: the failed side becomes `null`, the message is still collected, and the count surfaces in `result.decode_errors` (consume / assert).
+**Value/key format resolution (produce, consume, assert):** When the resolved cluster carries a `schema_registry_url`, the codec for value and key is resolved with the same chain: `--value-format` / `--key-format` (explicit) > `kafka.topics.<topic>.value_format` / `key_format` > `kafka.clusters.<name>.value_format` / `key_format` > defaults (`json` for value, `string` for key). A non-default format with no `schema_registry_url` on the resolved cluster raises `ConfigError` (defense-in-depth; the validator flags it at `config validate` first). A misconfigured SR (unreachable, missing subject on encode, auth failure) raises `ConnectionFailure` (exit 2) before any message flows — a startup probe runs once per cluster per invocation. Per-message decode failures are non-fatal: the failed side becomes `null`, the message is still collected (kept in `messages[]` for debug visibility but **excluded from the `--expect-count` tally** — spec §8), and the count surfaces in `result.decode_errors` (consume / assert).
 
 #### `agctl kafka listen` — Long-lived Capture Daemon
 
@@ -2198,7 +2198,7 @@ Every invocation writes exactly one JSON object to stdout (the streaming command
 }
 ```
 
-`decode_errors` counts per-side codec failures under a non-JSON `--value-format`/`--key-format` or `kafka.topics.<t>.value_format`/`key_format` (truncated Confluent frame, schema-violating record, Protobuf compile failure). The failed side becomes `null` in that message's envelope (the other side still decodes), the message is still collected, and the count is non-fatal (exit stays 0/1 by assertion semantics). Always `0` for pure-JSON topics (codec seam not engaged).
+`decode_errors` counts per-side codec failures under a non-JSON `--value-format`/`--key-format` or `kafka.topics.<t>.value_format`/`key_format` (truncated Confluent frame, schema-violating record, Protobuf compile failure). A corrupt message is **included in `messages[]` with the failed side `null` (the other side still decodes; debug visibility)** but **excluded from the `--expect-count` tally** — a window of N corrupt Avro messages is NOT `ok:N` (false-green). `kafka listen` drops corrupt messages entirely. The `decode_errors` count is non-fatal (exit stays 0/1 by assertion semantics). Always `0` for pure-JSON topics (codec seam not engaged).
 
 #### `kafka.produce`
 
@@ -2235,7 +2235,7 @@ Every invocation writes exactly one JSON object to stdout (the streaming command
 }
 ```
 
-`decode_errors` carries the same per-side codec-failure count as `kafka.consume` (the assert path uses the same codec seam and `on_decode_error` callback). Non-fatal: a non-zero count does not flip the assert verdict — a corrupt payload that did not match is silently scanned past, and a corrupt payload that did match still surfaces the match with the failed side `null`.
+`decode_errors` carries the same per-side codec-failure count as `kafka.consume` (the assert path uses the same codec seam and `on_decode_error` callback). A corrupt message is **scanned past without satisfying the match** (its failed side is `null`; a predicate that "matched" against `null` would be a false-green) — `kafka listen` drops corrupt messages entirely. Non-fatal: a non-zero count does not flip the assert verdict.
 
 #### `db.query`
 

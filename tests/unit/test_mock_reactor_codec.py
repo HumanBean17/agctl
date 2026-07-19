@@ -870,14 +870,20 @@ def test_reaction_avro_key_resolves_record_subject_from_key_payload(
 
     sr = _RecordSubjectSR()
     codec = {
-        "value": {"fmt": Format.AVRO, "subject_strategy": "record"},
+        # Value strategy "topic" (the value carries no __record_name__).
+        # resolve_subject() now fail-loud REJECTS "record"/"topic_record"
+        # without an explicit __record_name__ (F3) — so the value MUST
+        # use "topic" here. The KEY (under test) keeps "record" and
+        # carries __record_name__="OrderKey" so its encode resolves
+        # the record-name subject "OrderKey".
+        "value": {"fmt": Format.AVRO, "subject_strategy": "topic"},
         "key": {"fmt": Format.AVRO, "subject_strategy": "record"},
         "sr": sr,
     }
 
     # Object-typed capture injects the dict KEY (carrying its own record
-    # name) into the reaction; the rendered VALUE has no __record_name__,
-    # so a value-derived resolution would fall back to "events-key".
+    # name) into the reaction; the VALUE renders without __record_name__
+    # and uses the topic-name subject directly.
     config = KafkaReactor(
         topic="commands",
         match='.value.command == "CREATE_ORDER"',
@@ -922,11 +928,13 @@ def test_reaction_avro_key_resolves_record_subject_from_key_payload(
 
     # The key encode queried the SR at the KEY's record-name subject.
     assert "OrderKey" in sr.queries
-    # The value (no __record_name__) fell back to the topic-name subject.
+    # The value uses subject_strategy="topic" (record-name resolution is
+    # fail-loud in v1 without __record_name__) so its subject is the
+    # plain topic-name "events-value".
     assert "events-value" in sr.queries
-    # The bug would have queried "events-key" (value has no record name so
-    # resolve_subject("record") falls back to topic-name for the key) — the
-    # SR does not have that subject, so the encode would have raised.
+    # The bug would have queried "events-key" (key-side resolve_subject
+    # passing value instead of key, then falling back to topic-name) —
+    # the SR does not have that subject, so the encode would have raised.
     assert "events-key" not in sr.queries
 
     # One produce call with both sides encoded as Confluent-framed bytes.

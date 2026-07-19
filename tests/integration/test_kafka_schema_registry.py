@@ -29,6 +29,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -526,7 +527,7 @@ def test_avro_mock_reactor_decode_encode(
     #    encodes the reaction value via the codec, produces it.
     proc = subprocess.Popen(
         [
-            ".venv/bin/python",
+            sys.executable,
             "-m",
             "agctl.cli",
             "--config",

@@ -114,6 +114,27 @@ def test_decode_payload_json_returns_parsed_dict():
     assert decode_payload(raw, Format.JSON, None) == {"id": "x", "n": 3}
 
 
+def test_decode_payload_none_raw_returns_none_for_every_format():
+    """A ``None`` raw (Kafka tombstone) decodes to ``None`` for every
+    format — DESIGN §9. The public ``decode_payload`` is re-exported
+    from :mod:`agctl.serialization.__init__`, so the guard must live
+    here, not at the (single) internal caller.
+
+    Pre-fix the AVRO/PROTOBUF branches called ``parse_wire(raw)`` inside
+    ``except ValueError``; ``len(None)`` raises ``TypeError`` (not
+    ``ValueError``), escaping the guard and crashing the public API on
+    a tombstone.
+    """
+    assert decode_payload(None, Format.JSON, None) is None
+    assert decode_payload(None, Format.KEY_STRING, None) is None
+    # Avro/Protobuf: ``sr`` is irrelevant on the None short-circuit, but
+    # pass a fake so a regression that dropped the guard ALSO trips the
+    # ``sr is None`` ConfigError branch (defensive — would surface the
+    # bug as a different, noisier error rather than a silent pass).
+    assert decode_payload(None, Format.AVRO, _FakeSR()) is None
+    assert decode_payload(None, Format.PROTOBUF, _FakeProtobufSR()) is None
+
+
 def test_decode_payload_json_returns_string_for_non_json_bytes():
     # (a) JSON: bytes that fail to parse as JSON fall back to today's
     # _decode_bytes behavior (utf-8 with errors="replace").
@@ -398,11 +419,35 @@ def test_resolve_subject_topic_strategy():
     )
 
 
-def test_resolve_subject_record_falls_back_when_no_record_name():
-    # In v1 the schema is not available inside resolve_subject, so the
-    # record strategy falls back to topic-style when no record name is
-    # attached to the value.
-    assert resolve_subject("orders", "value", "record", None) == "orders-value"
+def test_resolve_subject_record_raises_when_record_name_unresolvable():
+    """Fail-loud: ``record`` / ``topic_record`` without a record name
+    raises :class:`ConfigError` rather than silently degrading to
+    ``TopicNameStrategy``.
+
+    Nothing in v1 populates ``__record_name__`` from the schema
+    (chicken-and-egg with the schema fetch); the previous silent
+    fallback resolved the WRONG subject — a false-green vector that
+    violates the project's fail-loud posture. The explicit-
+    ``__record_name__`` path stays working (see
+    :func:`test_resolve_subject_record_uses_attached_record_name`).
+    """
+    # value=None, no __record_name__ attached.
+    with pytest.raises(ConfigError) as exc_info:
+        resolve_subject("orders", "value", "record", None)
+    detail = exc_info.value.detail
+    assert detail["strategy"] == "record"
+    assert detail["topic"] == "orders"
+    assert "subject_strategy: 'topic'" in str(exc_info.value)
+
+    # value present but no __record_name__ key.
+    with pytest.raises(ConfigError):
+        resolve_subject("orders", "value", "record", {"id": "x"})
+
+    # topic_record strategy: same fail-loud behavior.
+    with pytest.raises(ConfigError) as exc_info:
+        resolve_subject("orders", "key", "topic_record", None)
+    assert exc_info.value.detail["strategy"] == "topic_record"
+    assert exc_info.value.detail["which"] == "key"
 
 
 def test_resolve_subject_record_uses_attached_record_name():
