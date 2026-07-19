@@ -240,9 +240,15 @@ def test_avro_trigger_json_reaction_match_evaluates_against_decoded_dict(
 
     The trigger client (codec set on the CLIENT, not the reactor) decodes
     Avro bytes to a dict before delivery; the reactor's ``match`` jq
-    predicate evaluates against that decoded dict and the reaction is
-    published as a JSON dict (``reaction_codec=None`` -> today's path,
-    byte-identical, ``_raw=False``).
+    predicate evaluates against that decoded dict. The reaction is
+    published as JSON bytes via ``produce(_raw=True)``: post-fix the
+    reactor ALWAYS encodes via ``_encode_reaction`` (which delegates to
+    ``_encode_payload_with_codec`` and returns legacy ``json.dumps``
+    bytes when ``reaction_codec is None``) and ALWAYS publishes
+    ``_raw=True`` so the trigger client's own (Avro) codec is never
+    consulted on the reaction path — see
+    ``test_avro_trigger_json_reaction_does_not_route_through_trigger_codec``
+    for the regression that pinned this.
     """
     pytest.importorskip("fastavro")
     config = KafkaReactor(
@@ -272,18 +278,20 @@ def test_avro_trigger_json_reaction_match_evaluates_against_decoded_dict(
         stop_event=stop_event,
         fail_fast=False,
         run_id="run-1",
-        reaction_codec=None,  # JSON reaction -> today's path
+        reaction_codec=None,  # JSON reaction -> legacy json.dumps bytes
     )
 
     reactor.run()
 
-    # One JSON publish: dict value, string key, _raw False (no encode).
+    # One JSON publish: value bytes are json.dumps(rendered) (NOT a dict,
+    # NOT Confluent-Avro-framed bytes); key is utf-8 bytes; _raw True (the
+    # fix collapsed the two-branch publish path).
     assert len(client.produce_calls) == 1
     prod = client.produce_calls[0]
     assert prod["topic"] == "events"
-    assert prod["value"] == {"eventType": "ORDER_CREATED", "orderId": "ord-1"}
-    assert prod["key"] == "ord-1"
-    assert prod["_raw"] is False
+    assert prod["value"] == b'{"eventType": "ORDER_CREATED", "orderId": "ord-1"}'
+    assert prod["key"] == b"ord-1"
+    assert prod["_raw"] is True
 
     # kafka.reacted emitted; no skipped/error/decode events.
     reacted = [e for e in emit_event.events if e["event"] == "kafka.reacted"]
@@ -291,6 +299,282 @@ def test_avro_trigger_json_reaction_match_evaluates_against_decoded_dict(
     assert reacted[0]["reactor"] == "order-reactor"
     assert not any(e["event"] == "kafka.skipped" for e in emit_event.events)
     assert not any(e["event"] == "kafka.error" for e in emit_event.events)
+
+
+# ===========================================================================
+# (a-regression) Avro TRIGGER + JSON reaction via a REAL KafkaClient
+# ===========================================================================
+
+
+class _RecordingProducer:
+    """Minimal confluent_kafka.Producer stand-in that records produce calls.
+
+    Used by the Avro-trigger regression test to capture the reaction's
+    published bytes (so the test can assert the wire frame directly).
+    Fires the delivery callback immediately, matching ``FakeProducer`` in
+    ``tests/unit/test_kafka_client.py``.
+    """
+
+    def __init__(self, conf):
+        self.conf = conf
+        self.calls = []
+        self._p, self._o, self._ts = 0, 100, 1719660000000
+
+    def produce(self, topic, value, key=None, headers=None, on_delivery=None):
+        self.calls.append(
+            {"topic": topic, "value": value, "key": key, "headers": headers}
+        )
+        if on_delivery is not None:
+            on_delivery(None, _DeliveryMsg(self._p, self._o, self._ts))
+        self._o += 1
+
+    def flush(self, timeout):
+        return 0
+
+
+class _DeliveryMsg:
+    """confluent_kafka.Message stand-in for the produce delivery report."""
+
+    def __init__(self, partition, offset, ts_ms):
+        self._p, self._o, self._ts = partition, offset, ts_ms
+
+    def partition(self):
+        return self._p
+
+    def offset(self):
+        return self._o
+
+    def timestamp(self):
+        return (1, self._ts)
+
+
+class _LoopCMsg:
+    """confluent_kafka.Message stand-in ``consume_loop`` polls off a topic."""
+
+    def __init__(self, topic, partition, offset, key, value, ts_ms, headers=None):
+        self._topic = topic
+        self._p, self._o = partition, offset
+        self._key, self._value = key, value
+        self._ts, self._headers = ts_ms, headers
+
+    def topic(self):
+        return self._topic
+
+    def partition(self):
+        return self._p
+
+    def offset(self):
+        return self._o
+
+    def key(self):
+        return self._key
+
+    def value(self):
+        return self._value
+
+    def timestamp(self):
+        return (1, self._ts)
+
+    def headers(self):
+        return self._headers
+
+    def error(self):
+        return None
+
+
+class _LoopConsumer:
+    """Minimal consumer for ``KafkaClient.consume_loop``.
+
+    Implements only the methods ``consume_loop`` exercises: ``subscribe``,
+    ``poll``, ``store_offsets``, ``commit``, ``close``. Yields each scripted
+    message exactly once; once exhausted, sets the bound ``stop_event`` and
+    returns ``None`` so the consume_loop's ``while not stop_event.is_set()``
+    can terminate (without this the loop would poll forever).
+    """
+
+    def __init__(self, conf, messages, stop_event):
+        self.conf = conf
+        self._messages = list(messages)
+        self._cursor = 0
+        self._stop_event = stop_event
+        self.store_offsets_calls = []
+        self.commit_calls = []
+        self.closed = False
+
+    def subscribe(self, topics, **kwargs):
+        self._topics = list(topics)
+
+    def poll(self, timeout):
+        if self._cursor < len(self._messages):
+            m = self._messages[self._cursor]
+            self._cursor += 1
+            return m
+        # Out of messages: arm the stop_event so consume_loop exits, then
+        # return None (mirrors "no more data" without an external setter).
+        self._stop_event.set()
+        return None
+
+    def store_offsets(self, msg):
+        self.store_offsets_calls.append(msg)
+
+    def commit(self, offsets=None):
+        self.commit_calls.append(offsets)
+
+    def close(self):
+        self.closed = True
+
+
+def test_avro_trigger_json_reaction_does_not_route_through_trigger_codec(
+    emit_event, stop_event
+):
+    """(a-regression) Avro TRIGGER client + JSON reaction publishes JSON bytes.
+
+    The companion to (a) that uses a REAL ``KafkaClient`` constructed WITH
+    the trigger Avro codec via the ``producer_factory``/``consumer_factory``
+    seams (NOT a scripted Fake). The trigger client genuinely carries the
+    Avro codec on both the consume (decode) AND the produce (encode) sides,
+    so any leakage of the reaction through the trigger codec on the publish
+    path is observed as Confluent-Avro-framed bytes at the producer.
+
+    Pre-fix, the reactor's reaction publish had two branches. When
+    ``reaction_codec is None`` it took the legacy branch:
+    ``client.produce(topic, rendered_value, key=..., headers=...)`` with NO
+    ``_raw=True``. That delegated encoding to the trigger client's own
+    ``_encode_payload``, which — for an Avro-trigger reactor — mis-encoded
+    the rendered JSON reaction dict as Confluent-Avro-framed bytes against
+    ``<reaction_topic>-value`` (DESIGN §7.4 violation: formats must resolve
+    INDEPENDENTLY per direction). Post-fix the reactor ALWAYS encodes via
+    ``_encode_reaction`` (which returns legacy ``json.dumps`` bytes when
+    ``reaction_codec is None``) and ALWAYS publishes via
+    ``produce(..., _raw=True)``, so the trigger client's Avro codec is
+    consulted ONLY on consume (decode) and never on the reaction (encode).
+
+    Asserts the produced value bytes are EXACTLY the rendered JSON (and
+    explicitly do NOT start with the Confluent magic byte ``b"\\x00"``),
+    and that the Avro trigger value was nonetheless decoded correctly
+    (the reactor's ``match`` saw the decoded dict → one ``kafka.reacted``).
+    """
+    pytest.importorskip("fastavro")
+    import json as _json
+
+    from agctl.clients.kafka_client import KafkaClient
+    from agctl.serialization import Format
+    from agctl.serialization.avro_codec import encode_avro
+    from agctl.serialization.wire import build_wire
+
+    # Trigger topic codec: Avro value (the bug surface). The reaction codec
+    # is None (JSON reaction — the legacy byte-identical path the fix preserves).
+    trigger_schema_str = (
+        '{"type":"record","name":"Cmd",'
+        '"fields":[{"name":"orderId","type":"string"},'
+        '{"name":"command","type":"string"}]}'
+    )
+    trigger_schema_id = 71
+
+    class _AvroTriggerSR:
+        """SR double serving the trigger schema by id (decode-only path).
+
+        ``get_latest_schema`` is unused: ``reaction_codec=None`` means the
+        reactor never resolves a reaction subject, and ``_raw=True`` means
+        the trigger client's produce path skips its own encode entirely.
+        """
+
+        def __init__(self):
+            self.by_id = {trigger_schema_id: ("AVRO", trigger_schema_str)}
+            self.latest = {}
+
+        def get_schema(self, schema_id):
+            return self.by_id[schema_id]
+
+        def get_latest_schema(self, subject):
+            return self.latest[subject]
+
+    sr = _AvroTriggerSR()
+    trigger_codec = {
+        "value": {"fmt": Format.AVRO},
+        "key": {"fmt": Format.KEY_STRING},
+        "sr": sr,
+    }
+
+    trigger_topic = "commands"
+    reaction_topic = "events"
+    trigger_value_bytes = build_wire(
+        trigger_schema_id,
+        encode_avro(
+            {"orderId": "ord-1", "command": "CREATE_ORDER"},
+            trigger_schema_str,
+        ),
+    )
+
+    now_ms = 1719660000000
+    cmsg = _LoopCMsg(
+        trigger_topic, 0, 0, b"ord-1", trigger_value_bytes, now_ms
+    )
+    # The consumer is built by the client's ``_build_consumer``; bind the
+    # test's stop_event so poll() can terminate the loop when messages run out.
+    consumer = _LoopConsumer({}, [cmsg], stop_event)
+    producer = _RecordingProducer({})
+
+    client = KafkaClient(
+        "host:9092",
+        consumer_factory=lambda conf: consumer,
+        producer_factory=lambda conf: producer,
+        codec=trigger_codec,
+    )
+
+    config = KafkaReactor(
+        topic=trigger_topic,
+        match='.value.command == "CREATE_ORDER"',
+        reaction=KafkaReaction(
+            topic=reaction_topic,
+            key="{orderId}",
+            value={"eventType": "ORDER_CREATED", "orderId": "{orderId}"},
+        ),
+    )
+    reactor = Reactor(
+        name="avro-trigger-json-reaction",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+        reaction_codec=None,  # JSON reaction — the legacy byte-identical path
+    )
+
+    reactor.run()
+
+    # Exactly one produce reached the underlying producer (the reaction).
+    assert len(producer.calls) == 1
+    prod = producer.calls[0]
+    assert prod["topic"] == reaction_topic
+
+    value_bytes = prod["value"]
+    # Regression core: the reaction is JSON, NOT Confluent-Avro-framed.
+    # The Avro wire frame starts with the magic byte 0x00; JSON cannot
+    # (it starts with ``{`` → 0x7B). The bug would have produced 0x00.
+    assert isinstance(value_bytes, (bytes, bytearray))
+    assert value_bytes[:1] != b"\x00", (
+        f"reaction mis-encoded as Confluent-Avro-framed: "
+        f"first bytes = {bytes(value_bytes[:5])!r}"
+    )
+    # The reaction bytes are EXACTLY the rendered JSON (the legacy path's
+    # ``json.dumps(rendered_value).encode("utf-8")``).
+    assert value_bytes == _json.dumps(
+        {"eventType": "ORDER_CREATED", "orderId": "ord-1"}
+    ).encode("utf-8")
+    # The key is utf-8 bytes (KEY_STRING legacy path), not Avro-framed.
+    assert prod["key"] == b"ord-1"
+
+    # The trigger Avro value WAS decoded (match saw the dict → one reaction).
+    reacted = [e for e in emit_event.events if e["event"] == "kafka.reacted"]
+    assert len(reacted) == 1
+    assert reacted[0]["reactor"] == "avro-trigger-json-reaction"
+    assert reacted[0]["topic"] == reaction_topic
+    assert reacted[0]["key"] == "ord-1"
+    # No errors/skips — the trigger decoded cleanly, the reaction encoded cleanly.
+    assert not any(e["event"] == "kafka.error" for e in emit_event.events)
+    assert not any(e["event"] == "kafka.skipped" for e in emit_event.events)
 
 
 # ===========================================================================

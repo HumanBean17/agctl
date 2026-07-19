@@ -273,33 +273,38 @@ class KafkaReactor:
                     self._config.reaction.headers, capture_context
                 )
 
-            # Produce the reaction message. When a reaction codec is set
-            # (Task 12), the rendered value/key are encoded via
-            # :func:`encode_payload` against the codec's SR client and the
-            # resolved subject (topic strategy) BEFORE publish, and the
-            # bytes are handed to ``produce(_raw=True)`` so the trigger
-            # client's own codec (which is the TRIGGER topic's format, for
-            # decode) does not re-encode them. ``reaction_codec=None``
-            # keeps today's byte-identical JSON path.
+            # Produce the reaction message. ALWAYS encode via
+            # :meth:`_encode_reaction` and ALWAYS publish via
+            # ``produce(..., _raw=True)``: the reaction's wire format must
+            # depend ONLY on ``self._reaction_codec`` (which delegates to
+            # :func:`_encode_payload_with_codec` and returns legacy JSON
+            # bytes when ``reaction_codec is None``), NEVER on the trigger
+            # client's own codec. The reactor's ``client`` is the TRIGGER
+            # client — it carries the trigger topic's codec for DECODE. A
+            # previous branch called ``client.produce(rendered_value, ...)``
+            # WITHOUT ``_raw=True`` when ``reaction_codec is None``, which
+            # routed the rendered JSON reaction through the trigger
+            # client's codec on the produce path; for an Avro-trigger +
+            # JSON-reaction reactor that mis-encoded the JSON reaction as
+            # Avro against ``<reaction_topic>-value`` (DESIGN §7.4
+            # violation — formats resolve INDEPENDENTLY per direction).
+            # ``_raw=True`` hands the reactor-encoded bytes to the
+            # underlying producer verbatim, so the trigger codec is
+            # consulted ONLY on consume (decode) and never on the reaction
+            # (encode). ``reaction_codec=None`` keeps today's
+            # byte-identical JSON path: ``_encode_reaction`` returns
+            # ``json.dumps(value)`` + utf-8 key bytes for the legacy case.
             start = time.perf_counter()
-            if self._reaction_codec is not None:
-                value_bytes, key_bytes = self._encode_reaction(
-                    rendered_value, rendered_key
-                )
-                self._client.produce(
-                    self._config.reaction.topic,
-                    value_bytes,
-                    key=key_bytes,
-                    headers=rendered_headers,
-                    _raw=True,
-                )
-            else:
-                self._client.produce(
-                    self._config.reaction.topic,
-                    rendered_value,
-                    key=rendered_key,
-                    headers=rendered_headers,
-                )
+            value_bytes, key_bytes = self._encode_reaction(
+                rendered_value, rendered_key
+            )
+            self._client.produce(
+                self._config.reaction.topic,
+                value_bytes,
+                key=key_bytes,
+                headers=rendered_headers,
+                _raw=True,
+            )
             duration_ms = (time.perf_counter() - start) * 1000
 
             # Step 5: Emit kafka.reacted event on success
@@ -376,5 +381,3 @@ class KafkaReactor:
         return _encode_payload_with_codec(
             self._reaction_codec, self._config.reaction.topic, value, key
         )
-
-        return value_bytes, key_bytes

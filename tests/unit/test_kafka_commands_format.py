@@ -741,6 +741,97 @@ def test_kafka_assert_clean_run_has_decode_errors_zero(monkeypatch):
     assert payload["result"]["decode_errors"] == 0
 
 
+def test_kafka_consume_surfaces_decode_errors_when_codec_raises_on_one_message(
+    monkeypatch, tmp_path
+):
+    """``kafka consume`` reports ``decode_errors: 1`` and SUCCEEDS when the
+    resolved codec's decode raises on exactly one message.
+
+    Decode errors are non-fatal: the corrupt message is null-valued but
+    still COLLECTED (not dropped), the healthy message decodes normally,
+    and the command exit code is 0. The per-side ``on_decode_error``
+    callback (wired only when a codec resolves) increments the envelope's
+    ``decode_errors`` counter, surfacing data-quality issues without
+    failing the consume.
+
+    Drives a REAL ``KafkaClient`` (built inside the monkeypatched
+    ``new_kafka_client`` factory) with a ``FakeConsumer`` that yields one
+    healthy Avro-framed message + one corrupt framed message; the
+    ``--value-format avro`` CLI flag + cluster ``schema_registry_url``
+    resolve the Avro codec, attaching the callback.
+    """
+    pytest.importorskip("fastavro")
+    from agctl.serialization.avro_codec import encode_avro
+    from agctl.serialization.wire import build_wire
+
+    cfg = tmp_path / "agctl.yaml"
+    cfg.write_text(
+        'version: "3"\n'
+        "kafka:\n"
+        "  clusters:\n"
+        "    default:\n"
+        "      brokers: [localhost:9092]\n"
+        "      schema_registry_url: http://sr:8081\n"
+        "  default_cluster: default\n"
+    )
+
+    fake_sr = _CodecFakeSR()
+    monkeypatch.setattr(
+        "agctl.serialization.registry.SchemaRegistryClient",
+        lambda url, sr_config=None, **kw: fake_sr,
+    )
+
+    # Wire frames: one healthy Avro value (decodes to {"id": "x"}) and one
+    # corrupt value (not a Confluent frame -> decode_payload raises
+    # SerializationError, driving on_decode_error exactly once).
+    healthy_value_bytes = build_wire(SCHEMA_ID, encode_avro({"id": "x"}, SCHEMA_STR))
+    corrupt_value_bytes = b"not-a-frame"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg("t", 0, 0, b"k0", healthy_value_bytes, now_ms - 100),
+        FakeCMsg("t", 0, 1, b"k1", corrupt_value_bytes, now_ms - 50),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+
+    def factory(cluster, group_id=None, *, codec=None):
+        # Thread the resolved codec through so the decode path runs against
+        # the fake consumer's bytes (and the corrupt frame raises).
+        return KafkaClient(
+            cluster.brokers,
+            consumer_factory=lambda c: consumer,
+            producer_factory=lambda c: FakeProducer({}),
+            codec=codec,
+        )
+
+    monkeypatch.setattr(kafka_commands, "new_kafka_client", factory)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", str(cfg),
+            "kafka", "consume",
+            "--topic", "t",
+            "--value-format", "avro",
+            "--timeout", "0.02",
+            "--lookback", "10",
+        ],
+        env={},
+    )
+
+    payload = json.loads(result.output)
+    # Command SUCCEEDS — decode errors are non-fatal.
+    assert result.exit_code == 0, result.output
+    # Exactly one decode error surfaced (the corrupt message).
+    assert payload["result"]["decode_errors"] == 1
+    # Both messages collected (the corrupt one is null-valued, NOT dropped).
+    assert payload["result"]["count"] == 2
+    by_key = {m["key"]: m for m in payload["result"]["messages"]}
+    # Healthy message decoded normally.
+    assert by_key["k0"]["value"] == {"id": "x"}
+    # Corrupt message null-valued (decode failed -> value None).
+    assert by_key["k1"]["value"] is None
+
+
 # ===========================================================================
 # Codec wiring: SR probe runs once before the operation when avro resolves
 # ===========================================================================

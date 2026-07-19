@@ -459,6 +459,119 @@ def test_consume_window_tombstone_decodes_to_none_without_error():
 
 
 # ===========================================================================
+# Per-side decode independence — one side fails, the other keeps its value
+# ===========================================================================
+
+
+def test_consume_window_value_decodes_when_key_decode_fails():
+    """Per-side decode independence: VALUE decodes fine when the KEY fails.
+
+    A codec decoding value+key per side must NOT discard a healthy value
+    when the key fails to decode. The healthy side keeps its decoded
+    value, the failed side becomes ``None``, ``on_decode_error`` fires
+    EXACTLY once with the correct side label (``"key: ..."``), and the
+    message is NOT dropped (still appears in the result).
+
+    The key format is AVRO (not KEY_STRING) so a non-Confluent key frame
+    raises ``SerializationError`` — exercising the per-side try/except.
+    """
+    pytest.importorskip("fastavro")
+    topic = "t"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(
+            topic,
+            0,
+            0,
+            b"not-a-frame",  # corrupt KEY (not a Confluent frame) -> raises
+            _avro_value_bytes("v-good"),  # healthy Avro VALUE
+            now_ms - 100,
+        ),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+    codec = {
+        "value": {"fmt": Format.AVRO},
+        "key": {"fmt": Format.AVRO},  # AVRO key so the corrupt bytes raise
+        "sr": FakeSR(),
+    }
+    errors = []
+    client = KafkaClient(
+        "host:9092", consumer_factory=lambda c: consumer, codec=codec
+    )
+
+    result = client.consume_window(
+        topic,
+        lookback_seconds=30,
+        timeout_seconds=0.02,
+        from_beginning=True,
+        on_decode_error=errors.append,
+    )
+
+    # Message NOT dropped (single-side failure is non-fatal).
+    assert len(result) == 1
+    msg = result[0]
+    # Healthy side keeps its decoded value.
+    assert msg["value"] == {"id": "v-good"}
+    # Failed side is None.
+    assert msg["key"] is None
+    # Exactly one decode error, labeled with the FAILED side ("key: ...").
+    assert len(errors) == 1
+    assert errors[0].startswith("key:"), errors[0]
+
+
+def test_consume_window_key_decodes_when_value_decode_fails():
+    """Per-side decode independence (symmetric): KEY decodes fine when the
+    VALUE fails.
+
+    The more common case: a corrupt payload body with a healthy key. The
+    key must still decode (so the caller can route/identify the message by
+    key), the value becomes ``None``, and ``on_decode_error`` fires exactly
+    once with the ``"value: ..."`` label.
+    """
+    pytest.importorskip("fastavro")
+    topic = "t"
+    now_ms = int(time.time() * 1000)
+    messages = [
+        FakeCMsg(
+            topic,
+            0,
+            0,
+            _avro_value_bytes("k-good"),  # healthy Avro KEY
+            b"not-a-frame",  # corrupt VALUE (not a Confluent frame) -> raises
+            now_ms - 100,
+        ),
+    ]
+    consumer = FakeConsumer({}, messages=messages)
+    codec = {
+        "value": {"fmt": Format.AVRO},
+        "key": {"fmt": Format.AVRO},
+        "sr": FakeSR(),
+    }
+    errors = []
+    client = KafkaClient(
+        "host:9092", consumer_factory=lambda c: consumer, codec=codec
+    )
+
+    result = client.consume_window(
+        topic,
+        lookback_seconds=30,
+        timeout_seconds=0.02,
+        from_beginning=True,
+        on_decode_error=errors.append,
+    )
+
+    assert len(result) == 1
+    msg = result[0]
+    # Failed side is None.
+    assert msg["value"] is None
+    # Healthy side keeps its decoded value.
+    assert msg["key"] == {"id": "k-good"}
+    # Exactly one decode error, labeled with the FAILED side ("value: ...").
+    assert len(errors) == 1
+    assert errors[0].startswith("value:"), errors[0]
+
+
+# ===========================================================================
 # (f) consume_loop — decode before handler
 # ===========================================================================
 
