@@ -137,6 +137,7 @@ live validation was skipped. **Never** declare done on config that doesn't valid
 - [ ] `defaults.database_connection` (if set) ∈ `database.connections`.
 - [ ] Every `kafka.clusters.<name>.ssl.security_protocol` (if set) ∈ {PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT}.
 - [ ] `kafka.default_cluster` (if set, or when >1 cluster is defined) ∈ `kafka.clusters`; each `kafka.patterns.<name>.cluster` (if set) ∈ `kafka.clusters`.
+- [ ] Each `kafka.topics.<t>.cluster` (if set) ∈ `kafka.clusters`; each topic resolving to `value_format: avro|protobuf` (override OR its resolved cluster's default) has a `schema_registry_url` on that cluster; `kafka.clusters.<c>.schema_registry.auth: basic` carries `basic_auth`, `auth: mtls` carries `ssl` (Avro/Protobuf decode is opt-in via these fields).
 - [ ] Every `templates` / `database.templates` / `kafka.patterns` entry has a non-empty `description`.
 - [ ] If `mocks.kafka.reactors` is set, each reactor's resolved cluster (`reactor.cluster` → `default_cluster` → single-cluster auto-default) has non-empty `kafka.clusters.<name>.brokers` (required at `mock run` startup).
 - [ ] `mocks.http.listen` (if set) parses as `host:port` (IPv6 hosts bracketed, e.g. `[::1]:18080`).

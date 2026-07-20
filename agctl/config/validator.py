@@ -120,6 +120,122 @@ def validate_config(cfg: Config) -> tuple[list[dict], list[dict]]:
             }
         )
 
+    # §3.5 / §6.2 — kafka.topics.<t> cluster cross-refs + SR-dependent format
+    # checks + subject_strategy-vs-json warning. Cluster resolution mirrors
+    # resolve_cluster_name (topic.cluster -> default_cluster -> single-cluster
+    # auto-default) but is inlined here so config/ stays free of a commands/
+    # import (ARCHITECTURE §3).
+    for topic_name, topic in cfg.kafka.topics.items():
+        # (a) topic.cluster dangling ref -> error at the .cluster field.
+        if topic.cluster is not None and topic.cluster not in cfg.kafka.clusters:
+            errors.append(
+                {
+                    "path": f"kafka.topics.{topic_name}.cluster",
+                    "message": (
+                        f"Topic references unknown cluster '{topic.cluster}'"
+                    ),
+                }
+            )
+            continue  # cannot evaluate formats against an unknown cluster
+
+        # Resolve cluster name with the same precedence as resolve_cluster_name.
+        resolved = topic.cluster
+        if resolved is None:
+            resolved = cfg.kafka.default_cluster
+        if resolved is None and len(cfg.kafka.clusters) == 1:
+            resolved = next(iter(cfg.kafka.clusters))
+
+        # Unresolved (multi-cluster, no binding/default) -> nothing to check
+        # here; the resolver surfaces the ambiguity at call time.
+        if resolved is None or resolved not in cfg.kafka.clusters:
+            continue
+
+        cluster = cfg.kafka.clusters[resolved]
+        resolved_value_format = topic.value_format or cluster.value_format
+        resolved_key_format = topic.key_format or cluster.key_format
+        sr_needs: list[str] = []
+        if resolved_value_format in {"avro", "protobuf"}:
+            sr_needs.append(f"value={resolved_value_format}")
+        if resolved_key_format in {"avro", "protobuf"}:
+            sr_needs.append(f"key={resolved_key_format}")
+        sr_url = cluster.schema_registry_url
+        if sr_needs and not (sr_url and sr_url.strip()):
+            # Path: topic-level when an override drove the need, else
+            # cluster-level (the need arises only from a cluster default).
+            topic_drove = (
+                topic.value_format in {"avro", "protobuf"}
+                or topic.key_format in {"avro", "protobuf"}
+            )
+            errors.append(
+                {
+                    "path": (
+                        f"kafka.topics.{topic_name}"
+                        if topic_drove
+                        else f"kafka.clusters.{resolved}"
+                    ),
+                    "message": (
+                        f"Topic '{topic_name}' format ({', '.join(sr_needs)}) "
+                        f"requires a schema registry but cluster '{resolved}' "
+                        f"has no schema_registry_url"
+                    ),
+                }
+            )
+
+        # subject_strategy has no encode effect when value_format resolves to
+        # json (DESIGN §6.2).
+        if (
+            topic.subject_strategy is not None
+            and resolved_value_format == "json"
+        ):
+            warnings.append(
+                {
+                    "path": f"kafka.topics.{topic_name}.subject_strategy",
+                    "message": (
+                        f"subject_strategy '{topic.subject_strategy}' has no "
+                        f"effect on topic '{topic_name}' with resolved "
+                        f"value_format 'json'"
+                    ),
+                }
+            )
+
+    # §6.1 — kafka.clusters.<c>.schema_registry auth-shape checks. Pydantic
+    # ``Literal`` rejects out-of-enum ``auth`` at parse time, so the first
+    # branch is a defensive guard; the other two catch shape errors the schema
+    # cannot express (basic-requires-basic_auth, mtls-requires-ssl).
+    for cluster_name, cluster in cfg.kafka.clusters.items():
+        sr = cluster.schema_registry
+        if sr is None:
+            continue
+        if sr.auth is not None and sr.auth not in {"plaintext", "basic", "mtls"}:
+            errors.append(
+                {
+                    "path": f"kafka.clusters.{cluster_name}.schema_registry.auth",
+                    "message": (
+                        f"auth must be one of plaintext/basic/mtls "
+                        f"(got {sr.auth!r}) on cluster '{cluster_name}'"
+                    ),
+                }
+            )
+        elif sr.auth == "basic" and sr.basic_auth is None:
+            errors.append(
+                {
+                    "path": f"kafka.clusters.{cluster_name}.schema_registry.auth",
+                    "message": (
+                        f"auth 'basic' requires basic_auth on cluster "
+                        f"'{cluster_name}'"
+                    ),
+                }
+            )
+        elif sr.auth == "mtls" and sr.ssl is None:
+            errors.append(
+                {
+                    "path": f"kafka.clusters.{cluster_name}.schema_registry.auth",
+                    "message": (
+                        f"auth 'mtls' requires ssl on cluster '{cluster_name}'"
+                    ),
+                }
+            )
+
     # --- mock server validation -----------------------------------------------
 
     # Check 1: each mocks.kafka reactor must bind a resolvable cluster with

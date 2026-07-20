@@ -1,0 +1,569 @@
+"""Unit tests for the lazy Confluent Schema Registry client wrapper.
+
+The wrapper (``agctl/serialization/registry.py``) has two surfaces:
+
+* ``build_schema_registry_conf`` — a *pure* translation from the typed
+  :class:`SchemaRegistryConfig` to the dotted-key dict that
+  ``confluent_kafka.schema_registry.SchemaRegistryClient`` expects.
+* :class:`SchemaRegistryClient` — a thin cached wrapper around the real
+  client. Its constructor takes a ``client_factory`` test seam so these
+  tests run WITHOUT ``confluent_kafka`` importable; the one real-path
+  test uses ``pytest.importorskip``.
+
+Cases (a)-(g) mirror the task brief verbatim.
+"""
+
+import sys
+
+import pytest
+
+from agctl.config.models import BasicAuth, KafkaSSL, SchemaRegistryConfig
+from agctl.errors import ConfigError, ConnectionFailure
+from agctl.serialization.registry import (
+    SchemaRegistryClient,
+    build_schema_registry_conf,
+)
+
+
+# --- Fake SR client (the test seam target) ---------------------------------
+
+
+class _FakeSchema:
+    """Stand-in for ``confluent_kafka.schema_registry.Schema``."""
+
+    def __init__(self, schema_type, schema_str):
+        self.schema_type = schema_type
+        self.schema_str = schema_str
+
+
+class _FakeRegisteredSchema:
+    """Stand-in for ``confluent_kafka.schema_registry.RegisteredSchema``.
+
+    Mirrors the real attribute shape (verified against confluent-kafka
+    2.15.0): ``.subject`` / ``.version`` / ``.schema_id`` / ``.guid`` /
+    ``.schema`` (the latter a :class:`_FakeSchema`). The wrapper's
+    :meth:`SchemaRegistryClient.get_latest_schema` unpacks via these
+    attributes — NOT by 4-tuple iteration — because the real
+    ``get_latest_version`` returns a non-iterable ``RegisteredSchema``.
+    """
+
+    def __init__(self, subject, version, schema, schema_id, guid=None):
+        self.subject = subject
+        self.version = version
+        self.schema = schema
+        self.schema_id = schema_id
+        self.guid = guid
+
+
+class _FakeSchemaRegistryError(Exception):
+    """Stand-in for ``confluent_kafka.schema_registry.error.SchemaRegistryError``.
+
+    Carries an ``error_code`` (40404 = SUBJECT_NOT_FOUND, etc.) so the
+    wrapper can distinguish missing-subject from network errors without
+    importing the heavy ``kafka`` extra.
+    """
+
+    def __init__(self, error_code, message):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+class _FakeSRClient:
+    """Records every call so cache-hit tests can assert non-recall.
+
+    Method names/shapes mirror the *modern* confluent_kafka API
+    (``get_schema(schema_id)``, ``register_schema(subject, schema)``,
+    ``get_subjects()``) which is what the wrapper calls internally.
+    """
+
+    def __init__(self, conf):
+        self.conf = conf
+        self.get_schema_calls = 0
+        self.register_schema_calls = 0
+        self.subjects_calls = 0
+        self.get_latest_version_calls = 0
+        self.raise_on_subjects = False
+        # Return values a test can override after construction.
+        self._schema_for_id = {
+            7: _FakeSchema("AVRO", '{"type":"record","name":"X"}'),
+        }
+        self._id_for_subject = 42
+        # subject -> (version, schema, id); get_latest_version returns a
+        # ``_FakeRegisteredSchema`` mirroring the real non-iterable
+        # ``RegisteredSchema`` shape (.schema / .schema_id attributes),
+        # NOT a tuple — so a regression to 4-tuple unpacking is caught.
+        self._latest_for_subject: dict[str, tuple[int, _FakeSchema, int]] = {
+            "t-value": (
+                3,
+                _FakeSchema("AVRO", '{"type":"record","name":"X"}'),
+                7,
+            ),
+        }
+        # When set, get_latest_version(subject) raises this (used to
+        # simulate the missing-subject and network-error paths).
+        self._latest_exception: dict[str, Exception] = {}
+
+    def get_schema(self, schema_id):
+        self.get_schema_calls += 1
+        if schema_id not in self._schema_for_id:
+            raise KeyError(schema_id)
+        return self._schema_for_id[schema_id]
+
+    def register_schema(self, subject, schema):
+        self.register_schema_calls += 1
+        # Capture what the wrapper passed so tests can assert shape.
+        self.last_register = (subject, schema)
+        return self._id_for_subject
+
+    def get_subjects(self):
+        self.subjects_calls += 1
+        if self.raise_on_subjects:
+            raise RuntimeError("registry unreachable")
+        return ["t-value"]
+
+    def get_latest_version(self, subject):
+        # Mirrors the real confluent_kafka shape: returns a
+        # ``RegisteredSchema`` (non-iterable) exposing ``.schema`` /
+        # ``.schema_id`` — NOT a tuple. The historical 4-tuple return
+        # hid the production bug this fake now catches.
+        self.get_latest_version_calls += 1
+        if subject in self._latest_exception:
+            raise self._latest_exception[subject]
+        if subject not in self._latest_for_subject:
+            raise _FakeSchemaRegistryError(40404, f"Subject '{subject}' not found.")
+        version, schema, schema_id = self._latest_for_subject[subject]
+        return _FakeRegisteredSchema(subject, version, schema, schema_id)
+
+
+def _factory(fake):
+    """Build a ``client_factory`` closure that injects ``fake`` and captures conf."""
+
+    captured = {}
+
+    def factory(conf):
+        captured["conf"] = conf
+        fake.conf = conf
+        return fake
+
+    return factory, captured
+
+
+# --- (a) plaintext: no auth, no TLS ----------------------------------------
+
+
+def test_build_conf_plaintext_only_url():
+    # (a) ``build_schema_registry_conf("http://sr:8081", None)`` == {"url": ...}
+    assert build_schema_registry_conf("http://sr:8081", None) == {
+        "url": "http://sr:8081"
+    }
+
+
+def test_build_conf_empty_config_object_also_just_url():
+    # An empty SchemaRegistryConfig still yields only the url key.
+    conf = build_schema_registry_conf("http://sr:8081", SchemaRegistryConfig())
+    assert conf == {"url": "http://sr:8081"}
+
+
+# --- (b) basic auth ---------------------------------------------------------
+
+
+def test_build_conf_basic_auth_emits_user_info():
+    # (b) auth=basic, basic_auth={username:"u",password:"p"} -> "u:p"
+    sr = SchemaRegistryConfig(
+        auth="basic",
+        basic_auth=BasicAuth(username="u", password="p"),
+    )
+    conf = build_schema_registry_conf("http://sr:8081", sr)
+    assert conf["url"] == "http://sr:8081"
+    assert conf["basic.auth.user.info"] == "u:p"
+
+
+# --- (c) mTLS / SSL ---------------------------------------------------------
+
+
+def test_build_conf_ssl_populates_present_keys_only():
+    # (c) ca_location, certificate_location, key_location set; key_password
+    # unset -> the three ssl.* keys appear, ssl.key.password does NOT.
+    sr = SchemaRegistryConfig(
+        auth="mtls",
+        ssl=KafkaSSL(
+            ca_location="/etc/ssl/ca.pem",
+            certificate_location="/etc/ssl/cert.pem",
+            key_location="/etc/ssl/key.pem",
+        ),
+    )
+    conf = build_schema_registry_conf("https://sr:8081", sr)
+    assert conf["url"] == "https://sr:8081"
+    assert conf["ssl.ca.location"] == "/etc/ssl/ca.pem"
+    assert conf["ssl.certificate.location"] == "/etc/ssl/cert.pem"
+    assert conf["ssl.key.location"] == "/etc/ssl/key.pem"
+    # Unset fields must be omitted, not present-as-None/empty.
+    assert "ssl.key.password" not in conf
+
+
+def test_build_conf_ssl_password_emitted_when_set():
+    # key_password set -> the ssl.key.password key appears.
+    sr = SchemaRegistryConfig(
+        ssl=KafkaSSL(
+            ca_location="/etc/ssl/ca.pem",
+            key_password="secret",
+        ),
+    )
+    conf = build_schema_registry_conf("https://sr:8081", sr)
+    assert conf["ssl.ca.location"] == "/etc/ssl/ca.pem"
+    assert conf["ssl.key.password"] == "secret"
+    # The two unset ssl.* keys are still omitted.
+    assert "ssl.certificate.location" not in conf
+    assert "ssl.key.location" not in conf
+
+
+def test_build_conf_auth_field_is_not_a_conf_key():
+    # The ``auth`` field is a validator hint only; it must never leak into
+    # the confluent conf dict under any key.
+    sr = SchemaRegistryConfig(
+        auth="basic", basic_auth=BasicAuth(username="u", password="p")
+    )
+    conf = build_schema_registry_conf("http://sr:8081", sr)
+    assert "auth" not in conf
+    assert "basic.auth" not in conf
+
+
+# --- (d) get_schema cached --------------------------------------------------
+
+
+def test_get_schema_returns_value_and_caches():
+    # (d) get_schema(7) returns the fake's value AND a second get_schema(7)
+    # does not re-call the fake.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    factory, captured = _factory(fake)
+    client = SchemaRegistryClient(
+        "http://sr:8081", client_factory=factory
+    )
+
+    first = client.get_schema(7)
+    assert first == ("AVRO", '{"type":"record","name":"X"}')
+    assert fake.get_schema_calls == 1
+
+    second = client.get_schema(7)
+    assert second == first
+    # Cache hit: the underlying fake was NOT called again.
+    assert fake.get_schema_calls == 1
+
+
+def test_get_schema_distinct_ids_each_hit_once():
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake._schema_for_id[1] = _FakeSchema("PROTOBUF", "syntax=\"proto3\";")
+    fake._schema_for_id[2] = _FakeSchema("JSON", "{}")
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    client.get_schema(1)
+    client.get_schema(2)
+    client.get_schema(1)  # cached
+    client.get_schema(2)  # cached
+
+    assert fake.get_schema_calls == 2
+
+
+# --- (e) register_schema cached --------------------------------------------
+
+
+def test_register_schema_returns_id_and_caches():
+    # (e) register_schema("t-value", "...", "AVRO") returns the fake's id and
+    # is cached: a second identical call does not re-call the fake.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    schema_str = '{"type":"record","name":"X"}'
+    first = client.register_schema("t-value", schema_str, "AVRO")
+    assert first == 42
+    assert fake.register_schema_calls == 1
+
+    second = client.register_schema("t-value", schema_str, "AVRO")
+    assert second == 42
+    # Cache hit on (subject, schema_str).
+    assert fake.register_schema_calls == 1
+
+
+def test_register_schema_cache_keyed_on_subject_and_schema_str():
+    # Same schema_str under a different subject, or different schema_str
+    # under the same subject, must each miss the cache and hit the fake.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    client.register_schema("t-value", "{}", "AVRO")
+    client.register_schema("t-key", "{}", "AVRO")  # different subject
+    client.register_schema("t-value", '{"x":1}', "AVRO")  # different schema_str
+    client.register_schema("t-value", "{}", "AVRO")  # cached
+
+    assert fake.register_schema_calls == 3
+
+
+# --- get_latest_schema (Task 7 encode path) ---------------------------------
+
+
+def test_get_latest_schema_returns_tuple_and_caches():
+    # Success: returns (schema_type, schema_str, schema_id) for the
+    # subject's latest version AND a second call does NOT re-hit the fake.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake._latest_for_subject["t-value"] = (
+        3,
+        _FakeSchema("AVRO", '{"type":"record","name":"E"}'),
+        17,
+    )
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    first = client.get_latest_schema("t-value")
+    assert first == ("AVRO", '{"type":"record","name":"E"}', 17)
+    assert fake.get_latest_version_calls == 1
+
+    second = client.get_latest_schema("t-value")
+    assert second == first
+    # Cache hit: the underlying fake was NOT called again.
+    assert fake.get_latest_version_calls == 1
+
+
+def test_get_latest_schema_distinct_subjects_each_hit_once():
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake._latest_for_subject["t-value"] = (
+        1,
+        _FakeSchema("AVRO", '{"type":"record","name":"V"}'),
+        7,
+    )
+    fake._latest_for_subject["t-key"] = (
+        2,
+        _FakeSchema("AVRO", '{"type":"record","name":"K"}'),
+        9,
+    )
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    client.get_latest_schema("t-value")
+    client.get_latest_schema("t-key")
+    client.get_latest_schema("t-value")  # cached
+    client.get_latest_schema("t-key")  # cached
+
+    assert fake.get_latest_version_calls == 2
+
+
+def test_get_latest_schema_missing_subject_raises_config_error():
+    # If the subject does not exist (SR returns 40404 SUBJECT_NOT_FOUND),
+    # surface ConfigError with a clear message — NOT ConnectionFailure.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake._latest_exception["t-value"] = _FakeSchemaRegistryError(
+        40404, "Subject 't-value' not found."
+    )
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    with pytest.raises(ConfigError) as exc_info:
+        client.get_latest_schema("t-value")
+    message = str(exc_info.value)
+    assert "t-value" in message
+    assert "register" in message.lower()
+    # Must NOT be a ConnectionFailure — a missing subject is a config bug.
+    assert not isinstance(exc_info.value, ConnectionFailure)
+
+
+def test_get_latest_schema_network_error_raises_connection_failure():
+    # A non-40404 error (HTTP 5xx, connectivity, auth) surfaces as
+    # ConnectionFailure naming the URL.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake._latest_exception["t-value"] = RuntimeError("registry unreachable")
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    with pytest.raises(ConnectionFailure) as exc_info:
+        client.get_latest_schema("t-value")
+    assert "http://sr:8081" in exc_info.value.message
+
+
+def test_get_latest_schema_unpacks_registered_schema_attributes():
+    """Regression: ``get_latest_version`` returns a non-iterable
+    ``RegisteredSchema`` (NOT a 4-tuple).
+
+    The historical code did ``_subject, _version, schema, schema_id =
+    self._client.get_latest_version(subject)`` — that ``TypeError``s
+    against the real client (a ``RegisteredSchema`` is not iterable),
+    was caught by ``except Exception``, and surfaced as
+    ``ConnectionFailure`` — breaking every Avro/Protobuf encode in
+    production. The unit-suite fake used to return a 4-tuple too, so it
+    reproduced the wrong assumption and masked the bug.
+
+    This test pins the contract: the wrapper unpacks via ``.schema`` /
+    ``.schema_id`` ATTRIBUTES on the returned object, the way the real
+    confluent-kafka 2.15.0 ``RegisteredSchema`` exposes them. A future
+    regression to tuple-unpacking trips this test even when the fake
+    mirrors the real shape.
+    """
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    result = client.get_latest_schema("t-value")
+    # (schema_type, schema_str, schema_id) — pulled from the
+    # RegisteredSchema's .schema (a Schema) and .schema_id attributes.
+    assert result == ("AVRO", '{"type":"record","name":"X"}', 7)
+
+
+def test_get_latest_schema_rejects_4_tuple_return_shape():
+    """Belt-and-braces: if a future fake (or a stub) returns the legacy
+    4-tuple shape, the wrapper MUST fail rather than silently work —
+    because the real ``RegisteredSchema`` is non-iterable. This locks
+    the failure direction so the regression cannot re-hide.
+    """
+
+    class _TupleReturnFake:
+        def __init__(self):
+            self.get_latest_version_calls = 0
+
+        def get_latest_version(self, subject):
+            self.get_latest_version_calls += 1
+            # Legacy wrong shape (what the old fake returned).
+            return (subject, 3, _FakeSchema("AVRO", "{}"), 7)
+
+        def get_schema(self, schema_id):
+            raise KeyError(schema_id)
+
+        def register_schema(self, subject, schema):
+            return 1
+
+        def get_subjects(self):
+            return []
+
+    fake = _TupleReturnFake()
+    client = SchemaRegistryClient(
+        "http://sr:8081", client_factory=_factory(fake)[0]
+    )
+
+    with pytest.raises((TypeError, ConnectionFailure)):
+        # The wrapper must NOT accommodate the 4-tuple shape. Against the
+        # real client this would be the production bug; we refuse to
+        # paper over it.
+        client.get_latest_schema("t-value")
+
+
+# --- (f) check_reachable ----------------------------------------------------
+
+
+def test_check_reachable_returns_none_on_success():
+    # (f) success path: returns None when the fake's get_subjects() works.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    assert client.check_reachable() is None
+    assert fake.subjects_calls == 1
+
+
+def test_check_reachable_raises_connection_failure_on_error():
+    # (f) failure path: any error from the underlying client surfaces as
+    # ConnectionFailure naming the URL.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake.raise_on_subjects = True
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    with pytest.raises(ConnectionFailure) as exc_info:
+        client.check_reachable()
+    # The URL must appear in the message so operators can locate the registry.
+    assert "http://sr:8081" in exc_info.value.message
+
+
+def test_get_schema_maps_underlying_error_to_connection_failure():
+    # Non-check_reachable methods must also translate SR errors.
+    fake = _FakeSRClient({"url": "http://sr:8081"})
+    fake._schema_for_id.clear()  # any get_schema() will raise KeyError
+    client = SchemaRegistryClient("http://sr:8081", client_factory=_factory(fake)[0])
+
+    with pytest.raises(ConnectionFailure) as exc_info:
+        client.get_schema(99)
+    assert "http://sr:8081" in exc_info.value.message
+
+
+# --- missing kafka extra -> ConfigError -------------------------------------
+
+
+def test_missing_kafka_extra_raises_config_error(monkeypatch):
+    """A missing ``kafka`` extra must surface as ConfigError, never bare ImportError.
+
+    ``sys.modules['confluent_kafka.schema_registry'] = None`` makes Python
+    raise ImportError on the lazy ``from confluent_kafka.schema_registry import ...``
+    inside ``__init__`` (standard "halted; None in sys.modules" path). The
+    wrapper must translate that into a ConfigError pointing at ``agctl[kafka]``.
+    """
+    monkeypatch.setitem(sys.modules, "confluent_kafka.schema_registry", None)
+
+    with pytest.raises(ConfigError) as exc_info:
+        SchemaRegistryClient("http://sr:8081")  # no client_factory -> real path
+    assert "agctl[kafka]" in str(exc_info.value)
+
+
+def test_missing_transitive_dep_surfaces_in_config_error_message(monkeypatch):
+    """A missing *transitive* dependency (e.g. ``authlib``, pulled by
+    ``confluent_kafka.schema_registry`` itself) must surface in the ConfigError
+    message — not just the generic ``agctl[kafka]`` install hint.
+
+    The ``kafka`` extra installs ``confluent-kafka`` but does NOT pin
+    ``authlib``; when the SR submodule's own ``import authlib`` fails, the
+    resulting ``ModuleNotFoundError`` is an ``ImportError`` subclass, so the
+    wrapper's ``except ImportError`` catches it. Without echoing the underlying
+    error text, an operator sees only "install agctl[kafka]" — wrong remedy,
+    since the kafka extra IS already installed. This test locks the cause into
+    the surfaced message so a future refactor that swallows it again fails here.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "confluent_kafka.schema_registry":
+            raise ModuleNotFoundError("No module named 'authlib'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    # Ensure the lazy import actually re-enters our patched __import__ rather
+    # than short-circuiting on a previously-cached module entry.
+    monkeypatch.delitem(sys.modules, "confluent_kafka.schema_registry", raising=False)
+
+    with pytest.raises(ConfigError) as exc_info:
+        SchemaRegistryClient("http://sr:8081")  # no client_factory -> real path
+
+    message = str(exc_info.value)
+    # The missing transitive dependency MUST be named in the surfaced message
+    # — this is the assertion that locks the behavior and would fail if a
+    # future refactor swallowed the cause again.
+    assert "authlib" in message
+    # The spec-mandated install pointer is retained as a recovery hint.
+    assert "agctl[kafka]" in message
+
+
+# --- (g) real-path construction --------------------------------------------
+
+
+def test_real_schema_registry_client_constructs_from_conf():
+    # (g) Real path: when confluent_kafka is importable, constructing a
+    # SchemaRegistryClient from a conf dict must not raise. No network call
+    # is made by construction; this only exercises the lazy import + the
+    # real constructor's conf handling.
+    #
+    # Two skips: the brief names ``confluent_kafka``; we ALSO skip on the
+    # ``schema_registry`` submodule because that is what the wrapper actually
+    # lazy-imports (and in some envs the top-level wheel imports but its SR
+    # submodule pulls an uninstalled ``authlib``).
+    pytest.importorskip("confluent_kafka")
+    pytest.importorskip("confluent_kafka.schema_registry")
+
+    # Construction must not raise and must not perform any I/O.
+    client = SchemaRegistryClient("http://localhost:8081")
+    assert client is not None
+
+
+# --- module purity: lazy import discipline ----------------------------------
+
+
+def test_registry_module_top_level_has_no_confluent_import():
+    """The wrapper module must stay import-light at module top.
+
+    ``confluent_kafka`` is lazy-imported INSIDE ``__init__`` so this module
+    imports cleanly even without the ``kafka`` extra. A structural guard:
+    importing the module must not pull ``confluent_kafka`` into its globals.
+    """
+    import agctl.serialization.registry as mod  # noqa: F401
+
+    assert "confluent_kafka" not in dir(mod)
+    assert "SchemaRegistryClient" in dir(mod)  # our class, not theirs
+    assert callable(build_schema_registry_conf)

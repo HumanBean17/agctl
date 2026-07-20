@@ -5,6 +5,7 @@ and idempotent retries. Tests use a FakeKafkaClient that scripts message
 delivery and records produce calls.
 """
 
+import json
 import threading
 import time
 
@@ -51,6 +52,7 @@ class FakeKafkaClient:
         max_retries=3,
         on_assign=None,
         on_revoke=None,
+        on_decode_error=None,
     ):
         """Scripted message delivery with retry logic."""
         self.consume_calls.append(
@@ -92,14 +94,22 @@ class FakeKafkaClient:
         if self.probe_raises:
             raise self.probe_raises
 
-    def produce(self, topic, value, *, key=None, headers=None):
-        """Record produce call or raise configured error."""
+    def produce(self, topic, value, *, key=None, headers=None, _raw=False):
+        """Record produce call or raise configured error.
+
+        Accepts the ``_raw`` kwarg (recorded on the call) so the fake mirrors
+        the real ``KafkaClient.produce`` post-collapse of the reactor's
+        reaction publish path: the reactor ALWAYS publishes via
+        ``produce(..., _raw=True)`` (pre-encoded by ``_encode_reaction``),
+        even for the legacy JSON reaction (``reaction_codec=None``).
+        """
         self.produce_calls.append(
             {
                 "topic": topic,
                 "value": value,
                 "key": key,
                 "headers": headers,
+                "_raw": _raw,
             }
         )
         if self.produce_raises:
@@ -274,13 +284,22 @@ def test_reactor_match_capture_react(emit_event, stop_event):
 
     reactor.run()
 
-    # Verify produce was called with rendered templates
+    # Verify produce was called with rendered templates. Post-fix the
+    # reaction publish path is collapsed: the reactor ALWAYS encodes via
+    # ``_encode_reaction`` (legacy ``json.dumps`` when ``reaction_codec is
+    # None``) and ALWAYS publishes via ``produce(..., _raw=True)``. The
+    # produce call thus receives pre-encoded JSON BYTES (not a dict), a
+    # utf-8-encoded key, and ``_raw=True`` — preserving the test's intent
+    # (verify the rendered reaction content) at the new wire boundary.
     assert len(client.produce_calls) == 1
     prod = client.produce_calls[0]
     assert prod["topic"] == "events"
-    assert prod["value"] == {"eventType": "ORDER_CREATED", "orderId": "ord-1"}
-    assert prod["key"] == "ord-1"
+    assert prod["value"] == json.dumps(
+        {"eventType": "ORDER_CREATED", "orderId": "ord-1"}
+    ).encode("utf-8")
+    assert prod["key"] == b"ord-1"
     assert prod["headers"] == {"source": "mock-server"}
+    assert prod["_raw"] is True
 
     # Verify kafka.reacted event was emitted
     assert len(emit_event.events) == 1
@@ -325,9 +344,14 @@ def test_reactor_numeric_capture_coercion(emit_event, stop_event):
 
     reactor.run()
 
-    # Verify orderId was stringified to "42"
+    # Verify orderId was stringified to "42". Post-fix the value is
+    # published as pre-encoded JSON bytes (reaction_codec=None → legacy
+    # json.dumps path through ``_encode_reaction``), with ``_raw=True``.
     assert len(client.produce_calls) == 1
-    assert client.produce_calls[0]["value"] == {"orderId": "42"}
+    assert client.produce_calls[0]["value"] == json.dumps({"orderId": "42"}).encode(
+        "utf-8"
+    )
+    assert client.produce_calls[0]["_raw"] is True
 
 
 def test_reactor_jq_non_match_commits_no_event(emit_event, stop_event):
@@ -508,7 +532,7 @@ def test_reactor_reaction_failure_retry_then_commit(emit_event, stop_event):
     # Simulate produce that always fails (to force all retries)
     produce_call_count = [0]
 
-    def failing_produce(topic, value, *, key=None, headers=None):
+    def failing_produce(topic, value, *, key=None, headers=None, _raw=False):
         produce_call_count[0] += 1
         raise Exception("produce timeout")
 
@@ -684,7 +708,12 @@ def test_reactor_capture_from_key(emit_event, stop_event):
     )
     reactor.run()
     assert len(client.produce_calls) == 1
-    assert client.produce_calls[0]["value"] == {"threadId": "k-9"}
+    # Post-fix: reaction value is pre-encoded JSON bytes (reaction_codec=None
+    # → legacy json.dumps via ``_encode_reaction``), published ``_raw=True``.
+    assert client.produce_calls[0]["value"] == json.dumps({"threadId": "k-9"}).encode(
+        "utf-8"
+    )
+    assert client.produce_calls[0]["_raw"] is True
 
 
 def test_reactor_capture_from_header_case_sensitive(emit_event, stop_event):
@@ -720,7 +749,10 @@ def test_reactor_capture_from_header_case_sensitive(emit_event, stop_event):
     )
     reactor.run()
     assert len(client.produce_calls) == 1
-    assert client.produce_calls[0]["value"] == {"rs_headers": {"rqUID": "r-1"}}
+    assert client.produce_calls[0]["value"] == json.dumps(
+        {"rs_headers": {"rqUID": "r-1"}}
+    ).encode("utf-8")
+    assert client.produce_calls[0]["_raw"] is True
 
 
 def test_reactor_capture_object_passthrough_context_echo(emit_event, stop_event):
@@ -757,9 +789,13 @@ def test_reactor_capture_object_passthrough_context_echo(emit_event, stop_event)
     reactor.run()
     assert len(client.produce_calls) == 1
     # Real object, not a stringified dict (kafkaThreadHistoryFlow expectation).
-    assert client.produce_calls[0]["value"] == {
-        "context": {"conversationId": "abc", "eventType": "X"}
-    }
+    # Post-fix: the rendered object is published as pre-encoded JSON bytes
+    # (reaction_codec=None → json.dumps via ``_encode_reaction``), preserving
+    # the nested object structure byte-for-byte inside the JSON wire frame.
+    assert client.produce_calls[0]["value"] == json.dumps(
+        {"context": {"conversationId": "abc", "eventType": "X"}}
+    ).encode("utf-8")
+    assert client.produce_calls[0]["_raw"] is True
 
 
 def test_reactor_capture_object_overrides_implicit_scalar(emit_event, stop_event):
@@ -791,7 +827,10 @@ def test_reactor_capture_object_overrides_implicit_scalar(emit_event, stop_event
         run_id="run-1",
     )
     reactor.run()
-    assert client.produce_calls[0]["value"] == {"context": {"k": 1}}
+    assert client.produce_calls[0]["value"] == json.dumps({"context": {"k": 1}}).encode(
+        "utf-8"
+    )
+    assert client.produce_calls[0]["_raw"] is True
 
 
 def test_reactor_capture_missing_emits_event_and_empty(emit_event, stop_event):
@@ -824,7 +863,8 @@ def test_reactor_capture_missing_emits_event_and_empty(emit_event, stop_event):
     )
     reactor.run()
     assert len(client.produce_calls) == 1
-    assert client.produce_calls[0]["value"] == {"x": ""}
+    assert client.produce_calls[0]["value"] == json.dumps({"x": ""}).encode("utf-8")
+    assert client.produce_calls[0]["_raw"] is True
     missing = [e for e in emit_event.events if e["event"] == "capture.missing"]
     assert len(missing) == 1
     assert missing[0]["reactor"] == "chatx"
@@ -892,7 +932,10 @@ def test_match_and_capture_share_envelope_root_kafka(emit_event, stop_event):
     # Exactly one reaction: SEARCH matched and its rqUID was captured+rendered
     # (proves .value.command and .headers.rqUID agree on one envelope root).
     assert len(client.produce_calls) == 1
-    assert client.produce_calls[0]["value"] == {"rq": "abc-123"}
+    assert client.produce_calls[0]["value"] == json.dumps({"rq": "abc-123"}).encode(
+        "utf-8"
+    )
+    assert client.produce_calls[0]["_raw"] is True
 
     reacted = [e for e in emit_event.events if e["event"] == "kafka.reacted"]
     assert len(reacted) == 1

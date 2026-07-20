@@ -68,6 +68,7 @@ class MockEngine:
         grpc_listen: str | None = None,
         grpc_server_factory: Callable[..., Any] | None = None,
         top_level_descriptors: list[GrpcDescriptorSource] | None = None,
+        reaction_codecs: dict[str, Any] | None = None,  # reactor name -> codec dict (Task 12)
     ):
         """Initialize the mock engine.
 
@@ -99,6 +100,14 @@ class MockEngine:
                 so this is the only path the top-level fallback reaches the
                 server. ``MockGrpcServer`` falls back to it when the per-mock
                 ``mocks.grpc.descriptors`` is None. Defaults None (no fallback).
+            reaction_codecs: Mapping of reactor name -> reaction codec dict
+                (Task 12). The codec is resolved by the command layer from
+                the REACTION topic's format (independent of the trigger
+                topic's format, which lives on the per-reactor client).
+                Reactors absent from this map get ``reaction_codec=None``
+                (today's byte-identical JSON path). ``None`` (the default)
+                means no reactor has a reaction codec — preserves pre-Task-12
+                behavior across every reactor.
         """
         self._mocks = mocks
         self._run_http = run_http
@@ -112,6 +121,7 @@ class MockEngine:
         self._run_grpc = run_grpc
         self._grpc_listen = grpc_listen
         self._top_level_descriptors = top_level_descriptors
+        self._reaction_codecs = reaction_codecs
 
         # DI seam. The default lazy-imports the real MockGrpcServer INSIDE the
         # closure body so the engine module stays grpcio-free at import time
@@ -274,6 +284,11 @@ class MockEngine:
                 # Build reactors, each wired to its own client (keyed by reactor
                 # name) so a reactor can target its own cluster. The reactor
                 # runtime class itself still takes a single ``client``.
+                # Task 12: thread the per-reactor reaction codec (resolved by
+                # the command layer from the REACTION topic's format). A
+                # reactor absent from the map gets ``None`` (today's JSON
+                # reaction path — byte-identical to pre-Task-12).
+                reaction_codecs = self._reaction_codecs or {}
                 for name, reactor_config in self._mocks.kafka.reactors.items():
                     reactor = KafkaReactorClass(
                         name=name,
@@ -283,6 +298,7 @@ class MockEngine:
                         stop_event=self._stop,
                         fail_fast=self._fail_fast,
                         run_id=self._run_id,
+                        reaction_codec=reaction_codecs.get(name),
                     )
                     self._reactors.append(reactor)
 

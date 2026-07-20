@@ -113,12 +113,30 @@ class CaptureLoop:
         # once-only contract defensively.
         self._overflowed = False
 
+        # Decode-error accounting (Task 11). The KafkaClient's codec seam
+        # invokes ``on_decode_error`` once per failed SIDE (value or key)
+        # BEFORE ``handle`` is called for that message. A capture topic must
+        # not write a partial envelope (a None value would mislead downstream
+        # ``listen assert`` predicates), so any decode failure on a message
+        # drops the whole message: the callback emits ``decode.error`` +
+        # increments the counter + arms the per-message skip flag, and
+        # ``_handle`` clears the flag and COMMITs without writing.
+        # ``decode_errors`` is read by :meth:`ListenEngine._emit_summary`.
+        self.decode_errors: int = 0
+        self._decode_failed_for_msg: bool = False
+
     def run(self) -> None:
         """Run the consume loop until ``stop_event`` is set or the valve STOPs it.
 
         ``max_retries=1`` because capture is append-only and idempotent:
         :meth:`_handle` never returns ``RETRY`` (a failed local append is a
         hard failure, not a transient broker condition worth re-handling).
+
+        ``on_decode_error`` (Task 11) wires the codec seam's per-side decode
+        failure callback so a corrupt payload emits ``decode.error`` and the
+        message is skipped (no partial envelope written). Legacy JSON-only
+        listeners pass a codec-less client; the callback is still forwarded
+        and is simply never invoked by the client in that mode.
         """
         self._client.consume_loop(
             self._topic,
@@ -127,6 +145,35 @@ class CaptureLoop:
             handle=self._handle,
             on_assign=self._on_assign,
             max_retries=1,
+            on_decode_error=self._on_decode_error,
+        )
+
+    # ------------------------------------------------------------------
+    # decode-error callback (Task 11 codec seam)
+    # ------------------------------------------------------------------
+
+    def _on_decode_error(self, error_label: str) -> None:
+        """Per-side decode failure: emit ``decode.error``, count, arm skip.
+
+        The KafkaClient invokes this once per failed SIDE (value or key)
+        from inside ``_normalize_message`` BEFORE ``handle`` is called for
+        that message. Capture must not write a partial envelope (a None
+        value would mislead downstream ``listen assert`` predicates), so
+        ANY decode failure on a message drops the whole message. The
+        callback is non-fatal: ``fatal: False`` so the engine's exit-code
+        tally (``errors``) is unaffected — a corrupt payload is data, not
+        a broker condition. The per-message skip flag is cleared by
+        :meth:`_handle` on the subsequent COMMIT-without-write.
+        """
+        self.decode_errors += 1
+        self._decode_failed_for_msg = True
+        self._emit_event(
+            {
+                "event": "decode.error",
+                "topic": self._topic,
+                "error": error_label,
+                "fatal": False,
+            }
         )
 
     # ------------------------------------------------------------------
@@ -171,6 +218,13 @@ class CaptureLoop:
 
         Order is load-bearing:
 
+        0. **decode-error skip** (Task 11) — when the codec seam reported a
+           per-side decode failure for THIS message (the client invoked
+           ``on_decode_error`` before handing us the partially-decoded
+           envelope), the message is dropped wholesale: clear the per-message
+           skip flag and ``COMMIT`` without writing. The ``decode.error``
+           event was already emitted by :meth:`_on_decode_error`; downstream
+           ``listen assert`` predicates must not see a partial envelope.
         1. **capture-match filter** — when ``capture_match`` is set and the
            message does not satisfy the jq predicate, ``COMMIT`` (skip the
            write, advance the offset). Non-matches never count toward overflow.
@@ -182,6 +236,13 @@ class CaptureLoop:
         3. **append** — otherwise append one CapturedEnvelope NDJSON line under
            the per-topic lock and return ``COMMIT``.
         """
+        # Step 0: per-message decode-error skip (flag armed by the codec seam
+        # before this call). COMMIT past it so the offset advances and the
+        # loop continues; do NOT write a partial envelope.
+        if self._decode_failed_for_msg:
+            self._decode_failed_for_msg = False
+            return ReactionResult.COMMIT
+
         # Step 1: optional jq capture-match filter (skip non-matches silently).
         if self._capture_match is not None and not jq_bool(msg, self._capture_match):
             return ReactionResult.COMMIT

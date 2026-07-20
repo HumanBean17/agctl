@@ -167,3 +167,227 @@ def test_grpc_template_with_description_no_warning():
     errors, warnings = validate_config(cfg)
     assert errors == []
     assert warnings == []
+
+
+# --------------------------------------------------------------------------- #
+# Task 2: kafka.topics cluster cross-refs + schema_registry auth shape
+# (DESIGN §6.1 / §6.2). Cluster resolution mirrors resolve_cluster_name
+# (topic.cluster -> default_cluster -> single-cluster auto-default) but is
+# inlined here so config/ stays free of a commands/ import.
+# --------------------------------------------------------------------------- #
+
+
+def test_kafka_topic_unknown_cluster_is_error():
+    """A kafka.topics entry naming an absent cluster is an error (case a)."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {"real": {"brokers": ["localhost:9092"]}},
+                "topics": {"t1": {"cluster": "nope"}},
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "kafka.topics.t1.cluster",
+            "message": "Topic references unknown cluster 'nope'",
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_topic_avro_without_schema_registry_url_is_error():
+    """A topic resolving to avro on a cluster with no schema_registry_url (case b)."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {"c1": {"brokers": ["localhost:9092"]}},
+                "topics": {"t1": {"value_format": "avro"}},
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    # avro came from the topic override -> path is the topic, not the cluster.
+    assert errors == [
+        {
+            "path": "kafka.topics.t1",
+            "message": (
+                "Topic 't1' format (value=avro) requires a schema registry "
+                "but cluster 'c1' has no schema_registry_url"
+            ),
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_topic_avro_with_schema_registry_url_no_error():
+    """Same as above but the cluster carries a schema_registry_url (case c)."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {
+                    "c1": {
+                        "brokers": ["localhost:9092"],
+                        "schema_registry_url": "http://localhost:8081",
+                    }
+                },
+                "topics": {"t1": {"value_format": "avro"}},
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+    assert warnings == []
+
+
+def test_kafka_cluster_default_avro_without_schema_registry_url_is_error():
+    """Cluster default value_format=avro with no SR URL -> error at the cluster.
+
+    Distinguished from the topic-override path: the topic inherits the cluster
+    default (no value_format/key_format override), so the need arises from the
+    cluster default and the error path is ``kafka.clusters.<c>`` — not
+    ``kafka.topics.<t>``. Locks the cluster-default branch against silent
+    collapse.
+    """
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {
+                    "default": {
+                        "brokers": ["localhost:9092"],
+                        "value_format": "avro",
+                    }
+                },
+                "default_cluster": "default",
+                "topics": {"t1": {}},
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "kafka.clusters.default",
+            "message": (
+                "Topic 't1' format (value=avro) requires a schema registry "
+                "but cluster 'default' has no schema_registry_url"
+            ),
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_cluster_default_avro_with_schema_registry_url_no_error():
+    """Symmetric positive case: cluster default avro WITH a SR URL -> no error."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {
+                    "default": {
+                        "brokers": ["localhost:9092"],
+                        "value_format": "avro",
+                        "schema_registry_url": "http://localhost:8081",
+                    }
+                },
+                "default_cluster": "default",
+                "topics": {"t1": {}},
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+    assert warnings == []
+
+
+def test_kafka_schema_registry_basic_without_basic_auth_is_error():
+    """schema_registry.auth=basic with no basic_auth block is an error (case d)."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {
+                    "c1": {
+                        "brokers": ["localhost:9092"],
+                        "schema_registry": {"auth": "basic"},
+                    }
+                },
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "kafka.clusters.c1.schema_registry.auth",
+            "message": "auth 'basic' requires basic_auth on cluster 'c1'",
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_schema_registry_mtls_without_ssl_is_error():
+    """schema_registry.auth=mtls with no ssl block is an error (case e)."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {
+                    "c1": {
+                        "brokers": ["localhost:9092"],
+                        "schema_registry": {"auth": "mtls"},
+                    }
+                },
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "kafka.clusters.c1.schema_registry.auth",
+            "message": "auth 'mtls' requires ssl on cluster 'c1'",
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_topic_subject_strategy_with_json_is_warning():
+    """subject_strategy on a topic whose resolved value_format is json (case f)."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {"c1": {"brokers": ["localhost:9092"]}},
+                "topics": {"t1": {"subject_strategy": "record"}},
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+    assert warnings == [
+        {
+            "path": "kafka.topics.t1.subject_strategy",
+            "message": (
+                "subject_strategy 'record' has no effect on topic 't1' with "
+                "resolved value_format 'json'"
+            ),
+        }
+    ]
+
+
+def test_kafka_no_topics_no_schema_registry_baseline_clean():
+    """Baseline: no topics, no SR block -> zero errors/warnings (case g)."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {"c1": {"brokers": ["localhost:9092"]}},
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+    assert warnings == []

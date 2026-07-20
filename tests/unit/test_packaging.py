@@ -21,7 +21,12 @@ def test_jq_extra_exists():
 
     # Assert other extras are unchanged
     assert optional_deps["http"] == ["httpx>=0.27"], "http extra should be unchanged"
-    assert optional_deps["kafka"] == ["confluent-kafka>=2.4", "jq>=1.6"], "kafka extra should be unchanged"
+    # kafka extra gained the schemaregistry transitive deps (Task 15):
+    # confluent_kafka.schema_registry imports authlib/cachetools/attrs/certifi/
+    # httpx at module load, but confluent-kafka only declares these under its
+    # own [schemaregistry] extra, not as core deps. Requesting
+    # confluent-kafka[schemaregistry] makes SR work out of the box.
+    assert optional_deps["kafka"] == ["confluent-kafka[schemaregistry]>=2.4", "jq>=1.6"], "kafka extra should pull confluent-kafka[schemaregistry]"
     assert optional_deps["db"] == ["psycopg[binary]>=3.1", "jq>=1.6"], "db extra should be unchanged"
 
 

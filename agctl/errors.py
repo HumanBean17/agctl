@@ -44,3 +44,8 @@ class OperationTimeout(AgctlError):
 class TemplateNotFound(AgctlError):
     type_name = "TemplateNotFound"
     exit_code = 2
+
+
+class SerializationError(AgctlError):
+    type_name = "SerializationError"
+    exit_code = 2

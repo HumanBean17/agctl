@@ -75,9 +75,12 @@ those by hand, and only for v1 inputs (v2/v3 exprs are already envelope-rooted).
 
 - The concrete topic string if the code computes it.
 - Which field(s) identify the event for assertions (the `{placeholder}` carriers).
-- Whether the value is always JSON — agctl treats values as raw JSON today (no Avro/Protobuf
-  decode), so a binary/Avro topic won't match a jq predicate. Default: assume JSON and note the
-  assumption for the user to confirm on the first `kafka assert`.
+- Whether the value is JSON, Avro, or Protobuf. agctl defaults to raw-JSON decode; Avro and
+  Protobuf are decoded only when the topic is opted in via `kafka.topics.<t>.value_format`
+  (or a cluster-level `value_format` default) AND the cluster has a `schema_registry_url`.
+  A binary/Avro topic without that config won't match a jq predicate (its bytes won't parse
+  as JSON). Default: assume JSON; if the producer serializes Avro/Protobuf, say so and also
+  add the `kafka.topics.<t>` block (or the cluster default) so the pattern is matchable.
 
 ## Where it writes
 

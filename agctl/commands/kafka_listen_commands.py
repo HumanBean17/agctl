@@ -101,6 +101,9 @@ def new_listen_engine(
     duration: float | None,
     until_stopped: bool,
     emit_fn=None,
+    cfg=None,
+    value_format: str | None = None,
+    key_format: str | None = None,
 ):
     """Build a :class:`ListenEngine` (test seam — monkeypatched in tests).
 
@@ -109,6 +112,12 @@ def new_listen_engine(
     end-to-end without a real broker. ``until_stopped`` is accepted for parity
     with ``new_mock_engine``; :class:`ListenEngine` treats ``duration is None`` as
     run-until-stopped, so the flag is informational and not forwarded.
+
+    ``cfg`` (Task 11) enables the codec-aware path: when set, the engine
+    resolves each topic's value/key :class:`Format` and the cluster's SR client
+    and probes the SR before any capture begins. ``value_format``/``key_format``
+    are optional CLI overrides (Level 1 precedence). When ``cfg`` is None the
+    engine uses ``client`` unchanged for every topic (legacy JSON path).
     """
     from ..listen.engine import ListenEngine
 
@@ -122,6 +131,9 @@ def new_listen_engine(
         "capture_match": capture_match,
         "max_bytes": max_bytes,
         "duration": duration,
+        "cfg": cfg,
+        "value_format": value_format,
+        "key_format": key_format,
     }
     if emit_fn is not None:
         kwargs["emit_fn"] = emit_fn
@@ -319,6 +331,7 @@ def kafka_listen_run(
             max_bytes=max_bytes,
             duration=duration,
             until_stopped=(duration is None),
+            cfg=cfg,
         )
         engine.start()
 

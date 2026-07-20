@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 __all__ = ["mock_run", "new_mock_engine", "mock_start", "mock_stop", "mock_status"]
 
 # Import from kafka_commands to avoid duplication (no circular import)
-from .kafka_commands import new_kafka_client, resolve_cluster_name
+from .kafka_commands import _resolve_codec, new_kafka_client, resolve_cluster_name
 
 # Import daemon lifecycle helpers (Task 2: pidfile, liveness; Task 3: log parser)
 from ..mock.daemon import (
@@ -70,6 +70,7 @@ def new_mock_engine(
     grpc_listen: str | None = None,
     grpc_server_factory: "Callable[..., Any] | None" = None,
     top_level_descriptors: "list[GrpcDescriptorSource] | None" = None,
+    reaction_codecs: "dict[str, Any] | None" = None,
 ):
     """Build a MockEngine (test seam — monkeypatched in tests).
 
@@ -77,6 +78,10 @@ def new_mock_engine(
     fallback (Task 10 obligation) to MockEngine. ``grpc_server_factory`` and
     ``top_level_descriptors`` default to None so pre-Task-10 callers keep
     working; production passes the real descriptors list, tests inject a fake.
+
+    ``reaction_codecs`` (Task 12) forwards per-reactor reaction codec dicts
+    resolved from the REACTION topic's format. Default None keeps every
+    reactor on today's JSON reaction path (byte-identical to pre-Task-12).
     """
     from ..mock.engine import MockEngine
 
@@ -93,6 +98,7 @@ def new_mock_engine(
         grpc_listen=grpc_listen,
         grpc_server_factory=grpc_server_factory,
         top_level_descriptors=top_level_descriptors,
+        reaction_codecs=reaction_codecs,
     )
 
 
@@ -485,10 +491,25 @@ def mock_run(
         # Guard 5: If run_kafka, resolve each reactor's cluster and build one
         # KafkaClient per DISTINCT cluster (reactors sharing a cluster reuse the
         # same client). The per-reactor client map is keyed by reactor name.
+        #
+        # Task 12: each reactor's client is built with the TRIGGER topic's
+        # codec (so consume_loop decodes trigger values per the trigger format
+        # before _handle runs), and a separate per-reactor reaction_codecs map
+        # carries the REACTION topic's codec (so _handle encodes the reaction
+        # per the reaction format, independent of the trigger format). A reactor
+        # may thus decode a JSON trigger and emit an Avro reaction, or any other
+        # combination. Both codecs resolve against the SAME cluster (today a
+        # reactor binds to one cluster) and share that cluster's SR client +
+        # probe (the probe runs once per cluster, not once per codec).
         kafka_clients: dict[str, KafkaClient] | None = None
+        reaction_codecs: dict[str, dict] = {}
         if run_kafka:
             kafka_clients = {}
             clients_by_cluster: dict[str, KafkaClient] = {}
+            # Track which clusters have already been SR-probed so the probe
+            # runs at most once per cluster even when multiple reactors (or
+            # the trigger+reaction pair) on that cluster resolve to non-JSON.
+            probed_clusters: set[str] = set()
             for reactor_name, reactor in cfg.mocks.kafka.reactors.items():
                 try:
                     cluster_name = resolve_cluster_name(
@@ -514,9 +535,50 @@ def mock_run(
                         f"kafka.clusters.{cluster_name}.brokers is required when running Kafka reactors",
                         {"reactor": reactor_name, "cluster": cluster_name},
                     )
-                if cluster_name not in clients_by_cluster:
-                    clients_by_cluster[cluster_name] = new_kafka_client(cluster)
-                kafka_clients[reactor_name] = clients_by_cluster[cluster_name]
+
+                # Task 12: resolve trigger + reaction codecs. Each cluster's
+                # SR is probed AT MOST ONCE across the trigger + reaction
+                # pair AND across reactors on the same cluster.
+                # ``probed_clusters`` records clusters that have actually
+                # probed (only updated when a non-JSON codec resolved).
+                # The trigger call probes if the cluster hasn't been probed
+                # yet AND the trigger topic is non-JSON (the latter is
+                # decided inside ``_resolve_codec``, which returns early
+                # for JSON topics without probing). The reaction call
+                # probes only if the cluster STILL hasn't been probed —
+                # covering the JSON-trigger + Avro-reaction case where the
+                # trigger call returned None without probing.
+                trigger_codec, _t_vf, _t_kf = _resolve_codec(
+                    cfg, reactor.topic, cluster_name, None, None,
+                    probe=cluster_name not in probed_clusters,
+                )
+                if trigger_codec is not None:
+                    probed_clusters.add(cluster_name)
+                reaction_codec, _r_vf, _r_kf = _resolve_codec(
+                    cfg, reactor.reaction.topic, cluster_name, None, None,
+                    probe=cluster_name not in probed_clusters,
+                )
+                if reaction_codec is not None:
+                    probed_clusters.add(cluster_name)
+
+                # Trigger client: codec-aware per-reactor when non-JSON;
+                # shared-by-cluster when JSON (today's optimization — all
+                # JSON-only reactors on a cluster share one codec-less
+                # client, the byte-identical pre-Task-12 path).
+                if trigger_codec is None:
+                    if cluster_name not in clients_by_cluster:
+                        clients_by_cluster[cluster_name] = new_kafka_client(cluster)
+                    kafka_clients[reactor_name] = clients_by_cluster[cluster_name]
+                else:
+                    kafka_clients[reactor_name] = new_kafka_client(
+                        cluster, codec=trigger_codec
+                    )
+
+                # Reaction codec: None for pure JSON reactions (default;
+                # _handle keeps today's path). Non-None → _handle encodes
+                # via encode_payload before client.produce(_raw=True).
+                if reaction_codec is not None:
+                    reaction_codecs[reactor_name] = reaction_codec
 
         # Guard 6: Resolve http_listen
         if http_listen is not None:
@@ -560,6 +622,7 @@ def mock_run(
             run_grpc=run_grpc,
             grpc_listen=grpc_listen,
             top_level_descriptors=descriptors,
+            reaction_codecs=reaction_codecs or None,
         )
 
         # Start the engine (probes + binds — may raise ConfigError/ConnectionFailure)

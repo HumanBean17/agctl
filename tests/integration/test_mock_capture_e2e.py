@@ -13,6 +13,7 @@ unit suites cover each source individually.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -119,9 +120,9 @@ class _FakeKafkaClient:
     def probe(self, topic, *, group_id, timeout=5.0):
         return None
 
-    def produce(self, topic, value, *, key=None, headers=None):
+    def produce(self, topic, value, *, key=None, headers=None, _raw=False):
         self.produce_calls.append(
-            {"topic": topic, "value": value, "key": key, "headers": headers}
+            {"topic": topic, "value": value, "key": key, "headers": headers, "_raw": _raw}
         )
 
 
@@ -192,7 +193,11 @@ def test_chatx_context_echo_acceptance(emit_event, stop_event):
     )
     reactor.run()
     assert len(client.produce_calls) == 1
-    assert client.produce_calls[0]["value"] == {
+    prod = client.produce_calls[0]
+    # Post-fix the reactor always pre-encodes via _encode_reaction and publishes
+    # with _raw=True, so the recorded value is JSON bytes (not a dict).
+    assert prod["_raw"] is True
+    assert json.loads(prod["value"]) == {
         "threadId": "thread-9",
         "rs_headers": {"rqUID": "r-1"},
         "context": {"conversationId": "abc", "eventType": "MSG"},

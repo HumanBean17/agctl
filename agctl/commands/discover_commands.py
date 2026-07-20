@@ -28,7 +28,7 @@ import click
 from ..command import envelope, load_config_or_raise
 from ..config.models import parse_listen
 from ..errors import ConfigError, TemplateNotFound
-from .kafka_commands import resolve_cluster_name
+from .kafka_commands import resolve_cluster_name, resolve_topic_format
 
 __all__ = ["discover"]
 
@@ -411,6 +411,16 @@ def _item_core(config_path: str | None, category: str, name: str, overlay_paths:
             )
         except ConfigError:
             cluster = None
+
+        # Resolve formats (Task 10): topic override > cluster default > defaults.
+        # When cluster is None, use the ultimate defaults (json/string).
+        if cluster is not None:
+            value_format = resolve_topic_format(cfg, pat.topic, cluster, "value").value
+            key_format = resolve_topic_format(cfg, pat.topic, cluster, "key").value
+        else:
+            value_format = "json"
+            key_format = "string"
+
         item = {
             "category": "kafka-patterns",
             "name": name,
@@ -419,6 +429,8 @@ def _item_core(config_path: str | None, category: str, name: str, overlay_paths:
             "params": params,
             "example": _kafka_example(name, params),
             "cluster": cluster,
+            "value_format": value_format,
+            "key_format": key_format,
         }
         if pat.match is not None:
             item["match"] = pat.match
