@@ -1,4 +1,4 @@
-"""Unit tests for DBDriver protocol DTOs (DESIGN §9.1).
+"""Unit tests for DBDriver protocol DTOs and ``BaseDBDriver`` mixin (DESIGN §9.1).
 
 Covers construction, defaults, and ``dataclasses.asdict`` round-trip for the
 six DTOs defined in :mod:`agctl.clients.db_driver_protocol`:
@@ -9,13 +9,20 @@ six DTOs defined in :mod:`agctl.clients.db_driver_protocol`:
 - :class:`UniqueConstraint`
 - :class:`SchemaItem`
 - :class:`SchemaMatch`
+
+Also covers the shared helpers on :class:`BaseDBDriver`
+(``_redact_config`` and ``_lazy_import_or_raise``) that drivers inherit.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import importlib
+
+import pytest
 
 from agctl.clients.db_driver_protocol import (
+    BaseDBDriver,
     ColumnInfo,
     ForeignKey,
     SchemaItem,
@@ -23,6 +30,7 @@ from agctl.clients.db_driver_protocol import (
     UniqueConstraint,
     WriteResult,
 )
+from agctl.errors import ConfigError
 
 
 class TestWriteResult:
@@ -352,3 +360,102 @@ class TestSchemaMatch:
         )
         s = json.dumps(dataclasses.asdict(sm))
         assert '"table": "orders"' in s
+
+
+class TestBaseDBDriverRedactConfig:
+    """``BaseDBDriver._redact_config`` — secret-key and URL-userinfo redaction."""
+
+    def test_password_key_redacted(self):
+        """Keys matching the secret pattern are replaced by the sentinel."""
+        result = BaseDBDriver._redact_config(
+            {"user": "u", "password": "p", "host": "h"}
+        )
+        assert result == {"user": "u", "password": "***", "host": "h"}
+
+    def test_multiple_secret_keys_redacted(self):
+        """``api_token`` and ``ssl_key`` both match; non-matching keys pass through."""
+        result = BaseDBDriver._redact_config(
+            {"api_token": "x", "ssl_key": "y", "port": 5432}
+        )
+        assert result == {"api_token": "***", "ssl_key": "***", "port": 5432}
+
+    def test_postgresql_url_userinfo_redacted(self):
+        """``postgresql://user:pass@host`` userinfo is replaced by ``***``."""
+        result = BaseDBDriver._redact_config(
+            {"url": "postgresql://u:p4ss@h:5432/db"}
+        )
+        assert result == {"url": "postgresql://***@h:5432/db"}
+
+    def test_mysql_url_userinfo_redacted(self):
+        """``mysql://`` scheme is also handled (scheme-agnostic pattern)."""
+        result = BaseDBDriver._redact_config({"url": "mysql://root:secret@h:3306/db"})
+        assert result == {"url": "mysql://***@h:3306/db"}
+
+    def test_local_path_url_unchanged(self):
+        """A bare filesystem path (no scheme) is left unchanged."""
+        result = BaseDBDriver._redact_config({"url": "/path/to/db.sqlite"})
+        assert result == {"url": "/path/to/db.sqlite"}
+
+    def test_url_with_scheme_but_no_userinfo_unchanged(self):
+        """A ``file:`` URL without userinfo (no ``@``) is left unchanged."""
+        result = BaseDBDriver._redact_config({"url": "file:/path?mode=ro"})
+        assert result == {"url": "file:/path?mode=ro"}
+
+    def test_original_config_not_mutated(self):
+        """The input dict is not mutated by ``_redact_config``."""
+        original = {"user": "u", "password": "p", "url": "postgresql://u:p@h/db"}
+        snapshot = dict(original)
+        BaseDBDriver._redact_config(original)
+        assert original == snapshot
+
+
+class TestBaseDBDriverLazyImport:
+    """``BaseDBDriver._lazy_import_or_raise`` — deferred driver dependency import."""
+
+    def test_stdlib_module_returns_module(self):
+        """A successful import returns the imported module object."""
+        module = BaseDBDriver._lazy_import_or_raise("sqlite3", "db")
+        assert module is importlib.import_module("sqlite3")
+
+    def test_missing_module_raises_configerror_with_install_hint(self):
+        """A missing module surfaces as ``ConfigError`` with the install hint."""
+        with pytest.raises(ConfigError) as excinfo:
+            BaseDBDriver._lazy_import_or_raise("nonexistent_module_xyz", "db")
+        assert "pip install 'agctl[db]'" in str(excinfo.value)
+
+    def test_missing_module_chains_importerror_as_cause(self):
+        """The original ``ImportError`` is chained as ``__cause__``."""
+        with pytest.raises(ConfigError) as excinfo:
+            BaseDBDriver._lazy_import_or_raise("nonexistent_module_xyz", "db")
+        assert isinstance(excinfo.value.__cause__, ImportError)
+
+
+class TestBaseDBDriverClassAttributes:
+    """``BaseDBDriver`` exposes the three shared class attributes."""
+
+    def test_secret_key_pattern_is_compiled_regex(self):
+        """``_SECRET_KEY_PATTERN`` is a compiled regex matching the spec keywords."""
+        import re
+
+        assert isinstance(BaseDBDriver._SECRET_KEY_PATTERN, re.Pattern)
+        # Match-all four spec keywords (case-insensitive).
+        assert BaseDBDriver._SECRET_KEY_PATTERN.search("password")
+        assert BaseDBDriver._SECRET_KEY_PATTERN.search("secret")
+        assert BaseDBDriver._SECRET_KEY_PATTERN.search("token")
+        assert BaseDBDriver._SECRET_KEY_PATTERN.search("key")
+        # Case-insensitive.
+        assert BaseDBDriver._SECRET_KEY_PATTERN.search("API_TOKEN")
+        assert BaseDBDriver._SECRET_KEY_PATTERN.search("SSL_Key")
+
+    def test_redacted_sentinel_value(self):
+        """``_REDACTED_SENTINEL`` is the literal ``"***"``."""
+        assert BaseDBDriver._REDACTED_SENTINEL == "***"
+
+    def test_url_userinfo_pattern_is_compiled_regex(self):
+        """``_URL_USERINFO_PATTERN`` is a compiled regex with a scheme capture group."""
+        import re
+
+        assert isinstance(BaseDBDriver._URL_USERINFO_PATTERN, re.Pattern)
+        m = BaseDBDriver._URL_USERINFO_PATTERN.match("postgresql://u:p@h/db")
+        assert m is not None
+        assert m.group(1) == "postgresql://"
