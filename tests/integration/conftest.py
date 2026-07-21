@@ -26,6 +26,9 @@ Required environment variables (all optional; unset => skip):
   Registry under test (e.g. ``http://localhost:8081``). Under
   ``AGCTL_TEST_LIVE=1`` the session fixture starts ``cp-schema-registry``
   paired with the Kafka container and wires this var.
+- ``AGCTL_TEST_LOKI_URL`` — base URL of the live Loki under test (e.g.
+  ``http://localhost:3100``). Under ``AGCTL_TEST_LIVE=1`` the session fixture
+  starts ``grafana/loki:3.0.0`` on a host-mapped 3100 and wires this var.
 
 Each fixture yields the resolved connection handle (or URL string) so the test
 can use it, or skips before yielding.
@@ -66,6 +69,7 @@ class _LiveStack:
         self.postgres = None
         self.kafka = None
         self.schema_registry = None
+        self.loki = None
         self.http_server: ThreadingHTTPServer | None = None
         self.http_thread: threading.Thread | None = None
 
@@ -76,7 +80,9 @@ class _LiveStack:
                 self.schema_registry.stop()
             except Exception:  # noqa: BLE001 - best-effort teardown
                 pass
-        for attr in ("postgres", "kafka"):
+        # Loki is independent of the other services; stop alongside the
+        # remaining Docker containers.
+        for attr in ("postgres", "kafka", "loki"):
             container = getattr(self, attr)
             if container is not None:
                 try:
@@ -220,6 +226,41 @@ def _start_schema_registry(stack: _LiveStack) -> None:
     os.environ["AGCTL_TEST_SCHEMA_REGISTRY_URL"] = f"http://localhost:{port}"
 
 
+def _start_loki(stack: _LiveStack) -> None:
+    """Start ``grafana/loki:3.0.0`` on a host-mapped 3100.
+
+    Loki is independent of the other services (no broker/DB dependency), so it
+    can start in any order. The wait strategy polls the container logs for
+    Loki's readiness banner; a 60s startup timeout covers a cold image pull.
+    On success ``AGCTL_TEST_LOKI_URL`` is wired to ``http://localhost:<mapped>``;
+    any failure (Docker absent, image pull refused, timeout) records a skip
+    reason so ``require_loki`` skips cleanly instead of failing.
+    """
+    try:
+        import re
+
+        from testcontainers.core.container import DockerContainer
+        from testcontainers.kafka import LogMessageWaitStrategy
+
+        loki = (
+            DockerContainer("grafana/loki:3.0.0")
+            .with_exposed_ports(3100)
+            .waiting_for(
+                LogMessageWaitStrategy(
+                    re.compile(r".*(Loki started|ready for use).*")
+                ).with_startup_timeout(60)
+            )
+        )
+        loki.start()
+    except Exception as exc:  # noqa: BLE001 - any failure => skip that service
+        _LIVE_SKIP_REASONS["loki"] = f"{type(exc).__name__}: {exc}"
+        return
+
+    stack.loki = loki
+    port = str(loki.get_exposed_port(3100))
+    os.environ["AGCTL_TEST_LOKI_URL"] = f"http://localhost:{port}"
+
+
 def _start_http(stack: _LiveStack) -> None:
     try:
         server = ThreadingHTTPServer(("127.0.0.1", 0), _OkHandler)
@@ -252,6 +293,8 @@ def _live_services():
     # SR must start AFTER Kafka (it needs a live broker to back its store) and
     # is torn down BEFORE Kafka on session teardown (see _LiveStack.stop_all).
     _start_schema_registry(stack)
+    # Loki is independent of the broker/DB; starts in any order.
+    _start_loki(stack)
     _start_http(stack)
     try:
         yield
@@ -402,6 +445,46 @@ def require_schema_registry():
     except Exception as exc:  # noqa: BLE001 - any failure means no service
         pytest.skip(f"Schema Registry at {sr_url} unavailable: {exc}")
     return sr_url
+
+
+# --- Loki --------------------------------------------------------------------
+
+
+@pytest.fixture
+def require_loki():
+    """Skip if a live Loki is unreachable.
+
+    Yields the Loki base URL (``$AGCTL_TEST_LOKI_URL``). Under
+    ``AGCTL_TEST_LIVE=1`` the session fixture spins ``grafana/loki:3.0.0`` on a
+    host-mapped 3100; without the flag (or when Docker is unavailable, or when
+    Loki failed to start) this skips cleanly. The probe is a 2s GET against
+    ``<url>/ready`` -- Loki's cheapest readiness endpoint (204 on ready).
+
+    Self-skip is mandatory: this fixture NEVER fails when Loki is absent.
+    """
+    reason = _live_skip_reason("loki")
+    if reason:
+        pytest.skip(f"live Loki unavailable: {reason}")
+
+    loki_url = os.environ.get("AGCTL_TEST_LOKI_URL")
+    if not loki_url:
+        pytest.skip(
+            "AGCTL_TEST_LOKI_URL not set; skipping live Loki integration test "
+            "(set AGCTL_TEST_LIVE=1)"
+        )
+
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(f"{loki_url}/ready", timeout=2) as resp:
+            # Loki returns 204 for /ready when ready; accept any 2xx.
+            if not (200 <= resp.status < 300):
+                pytest.skip(
+                    f"Loki at {loki_url}/ready returned HTTP {resp.status}"
+                )
+    except Exception as exc:  # noqa: BLE001 - any failure means no service
+        pytest.skip(f"Loki at {loki_url} unavailable: {exc}")
+    return loki_url
 
 
 @pytest.fixture
