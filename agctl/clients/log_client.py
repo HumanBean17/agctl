@@ -2,7 +2,7 @@
 
 Selects a :class:`LogBackend` implementation by the source's ``type`` field,
 discovering third-party backends via the ``agctl.logs_backends`` entry-point
-group while always falling back to the built-in ``file`` backend.
+group while always providing the built-in ``file`` and ``loki`` backends.
 """
 
 from __future__ import annotations

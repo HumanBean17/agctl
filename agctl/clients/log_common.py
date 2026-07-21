@@ -11,6 +11,8 @@ branch (d), so a missing ``jq`` extra is only surfaced when a ``match_jq``
 filter is actually used (matching ``NdjsonFileBackend``'s historical behavior).
 """
 
+from __future__ import annotations
+
 import dataclasses
 import fnmatch
 

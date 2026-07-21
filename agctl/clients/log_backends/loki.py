@@ -18,8 +18,8 @@ client is injected and ``httpx`` is missing, :meth:`_fetch_entries` raises
 
 The high-level operations :meth:`scan`, :meth:`sample_schema`,
 :meth:`await_one`, and :meth:`follow` are all implemented here.
-``LokiBackend`` is intentionally not registered in
-:data:`agctl.clients.log_client.BUILTIN_BACKENDS` yet (Task 8).
+``LokiBackend`` is registered as the built-in ``"loki"`` type in
+:data:`agctl.clients.log_client.BUILTIN_BACKENDS` (alongside ``"file"``).
 """
 
 import inspect
@@ -744,7 +744,6 @@ class LokiBackend:
                     f"agctl: loki follow transient error: {exc}",
                     file=sys.stderr,
                 )
-                first_fetch = False
                 self._interruptible_sleep(stop_event, poll_interval_ms)
                 continue
 
