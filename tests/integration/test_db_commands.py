@@ -442,3 +442,608 @@ def test_db_schema_standalone_unique_index_surfaces(require_postgres):
     # No duplicate entries overall.
     assert len(uqs) == len({u["name"] for u in uqs})
 
+
+# ===========================================================================
+# Task 9: SQLite (in-process) + MySQL (testcontainers) integration coverage
+#
+# These tests exercise the full ``db query`` / ``db assert`` / ``db execute``
+# / ``db schema`` command surface through the CLI command layer against real
+# driver libraries (stdlib ``sqlite3`` and ``PyMySQL``), catching dialect-
+# specific surprises the unit tests with FakeCursor fakes cannot. SQLite
+# tests run unconditionally; MySQL tests skip cleanly when Docker is
+# unavailable.
+# ===========================================================================
+
+
+def _write_db_config(
+    tmp_path,
+    *,
+    connections: dict,
+    templates: dict | None = None,
+    default_connection: str | None = None,
+) -> str:
+    """Write a minimal agctl YAML with the given DB connections/templates.
+
+    Returns the path to the written file. The config has ONLY a ``database``
+    section plus a ``defaults.database_connection`` entry (no services/kafka/
+    etc.) — those sections are optional in the Config model, so the resulting
+    config is valid as long as ``version`` is set. Connection values are
+    written LITERALLY (no ``${VAR}`` interpolation) so the config is
+    self-contained and env-independent.
+
+    ``default_connection`` sets ``defaults.database_connection`` so commands
+    without an explicit ``--connection`` resolve to the named connection.
+    """
+    import yaml
+
+    cfg = {
+        "version": "3",
+        "database": {
+            "connections": connections,
+            "templates": templates or {},
+        },
+    }
+    if default_connection is not None:
+        cfg["defaults"] = {"database_connection": default_connection}
+    path = tmp_path / "agctl-test.yaml"
+    path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    return str(path)
+
+
+# ---------------------------------------------------------------------------
+# SQLite (in-process, tempfile-backed so cross-invocation state survives)
+# ---------------------------------------------------------------------------
+
+
+def test_sqlite_full_cycle(tmp_path):
+    """Full ``db execute`` -> ``db query`` -> ``db assert`` -> ``db schema``
+    round-trip on SQLite via the CLI command layer.
+
+    Uses a tempfile-backed SQLite DB so the row seeded in invocation #1 is
+    visible in invocation #2 (CliRunner.invoke opens a fresh connection each
+    time; ``:memory:`` would lose data between invocations).
+    """
+    import json
+
+    db_path = str(tmp_path / "sqlite-test.db")
+    connections = {
+        "test-sqlite": {"type": "sqlite", "url": db_path, "default": True},
+        "test-sqlite-writable": {
+            "type": "sqlite",
+            "url": db_path,
+            "writable": True,
+        },
+    }
+    cfg_path = _write_db_config(
+        tmp_path, connections=connections, default_connection="test-sqlite"
+    )
+
+    # Step 1: CREATE TABLE via db execute --write.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "execute",
+            "--connection", "test-sqlite-writable",
+            "--sql",
+            # SQLite quirk: ``id TEXT PRIMARY KEY`` alone reports nullable=True
+            # in PRAGMA table_xinfo (only ``NOT NULL`` makes notnull=1). Use
+            # explicit NOT NULL so the Level-2 nullable assertion holds.
+            "CREATE TABLE t (id TEXT NOT NULL PRIMARY KEY, status TEXT)",
+            "--write",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    # SQLite reports rowcount=-1 (no count) for DDL -> normalized to None.
+    assert envelope["result"]["rows_affected"] is None
+
+    # Step 2: INSERT via db execute --write.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "execute",
+            "--connection", "test-sqlite-writable",
+            "--sql",
+            "INSERT INTO t (id, status) VALUES (:id, :status)",
+            "--param", "id=o1",
+            "--param", "status=PENDING",
+            "--write",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["result"]["rows_affected"] == 1
+
+    # Step 3: db query returns the seeded row (fresh invocation).
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "query",
+            "--sql", "SELECT id, status FROM t WHERE id = :id",
+            "--param", "id=o1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["result"]["row_count"] == 1
+    assert envelope["result"]["rows"] == [{"id": "o1", "status": "PENDING"}]
+
+    # Step 4: db assert --expect-rows 1 passes.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "assert",
+            "--sql", "SELECT id FROM t",
+            "--expect-rows", "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["result"]["passed"] is True
+
+    # Step 5: db schema (Level 1) lists the table.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "schema",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["command"] == "db.schema.tables"
+    assert envelope["result"]["count"] == 1
+    items = envelope["result"]["items"]
+    assert (items[0]["schema"], items[0]["name"], items[0]["kind"]) == (
+        "main", "t", "table",
+    )
+
+    # Step 6: db schema --table t (Level 2) returns column metadata.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "schema",
+            "--table", "t",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["command"] == "db.schema.table"
+    res = envelope["result"]
+    assert res["table"] == "t"
+    assert res["kind"] == "table"
+    assert res["primary_key"] == ["id"]
+    cols = {c["name"]: c for c in res["columns"]}
+    assert cols["id"]["data_type"] == "TEXT"
+    assert cols["id"]["nullable"] is False
+    assert cols["status"]["nullable"] is True
+
+
+def test_sqlite_assert_expect_value(tmp_path):
+    """``db assert --expect-value --path .status --equals CONFIRMED`` on SQLite."""
+    import json
+
+    db_path = str(tmp_path / "sqlite-assert.db")
+    connections = {
+        "test-sqlite": {"type": "sqlite", "url": db_path, "default": True},
+        "test-sqlite-writable": {
+            "type": "sqlite",
+            "url": db_path,
+            "writable": True,
+        },
+    }
+    cfg_path = _write_db_config(
+        tmp_path, connections=connections, default_connection="test-sqlite"
+    )
+
+    # Setup: create + seed a row.
+    for sql in (
+        "CREATE TABLE orders (id TEXT PRIMARY KEY, status TEXT)",
+        "INSERT INTO orders (id, status) VALUES ('o9', 'CONFIRMED')",
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", cfg_path,
+                "db", "execute",
+                "--connection", "test-sqlite-writable",
+                "--sql", sql,
+                "--write",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    # Assert: --path .status --equals CONFIRMED on the first row.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "assert",
+            "--sql", "SELECT status FROM orders WHERE id = :id",
+            "--param", "id=o9",
+            "--expect-value",
+            "--path", ".status",
+            "--equals", "CONFIRMED",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["result"]["passed"] is True
+    assert envelope["result"]["actual"] == "CONFIRMED"
+
+
+def test_sqlite_execute_write_gates(tmp_path):
+    """``db execute`` write gates still hold on SQLite.
+
+    Two unchanged behaviors verified:
+    1. ``db execute`` without ``--write`` -> ConfigError (exit 2).
+    2. ``db execute --write`` on a ``writable: false`` connection -> ConfigError.
+    """
+    import json
+
+    db_path = str(tmp_path / "sqlite-gates.db")
+    connections = {
+        "test-sqlite": {"type": "sqlite", "url": db_path, "default": True},
+        "test-sqlite-writable": {
+            "type": "sqlite",
+            "url": db_path,
+            "writable": True,
+        },
+    }
+    cfg_path = _write_db_config(
+        tmp_path, connections=connections, default_connection="test-sqlite"
+    )
+
+    # Gate 1: no --write flag -> ConfigError.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "execute",
+            "--connection", "test-sqlite-writable",
+            "--sql", "CREATE TABLE demo (id INTEGER)",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is False
+    assert "error" in envelope
+
+    # Gate 2: --write on a writable=false connection -> ConfigError.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "execute",
+            "--connection", "test-sqlite",  # writable: false (default)
+            "--sql", "CREATE TABLE demo (id INTEGER)",
+            "--write",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is False
+    assert "error" in envelope
+
+
+# ---------------------------------------------------------------------------
+# MySQL (testcontainers; skip cleanly if Docker unavailable)
+# ---------------------------------------------------------------------------
+
+
+def _mysql_config(tmp_path, info):
+    """Build a config YAML with a mysql + writable-mysql connection from the
+    info dict yielded by ``require_mysql``."""
+    connections = {
+        "test-mysql": {
+            "type": "mysql",
+            "host": info["host"],
+            "port": info["port"],
+            "dbname": info["dbname"],
+            "user": info["user"],
+            "password": info["password"],
+            "default": True,
+        },
+        "test-mysql-writable": {
+            "type": "mysql",
+            "host": info["host"],
+            "port": info["port"],
+            "dbname": info["dbname"],
+            "user": info["user"],
+            "password": info["password"],
+            "writable": True,
+        },
+    }
+    return _write_db_config(
+        tmp_path, connections=connections, default_connection="test-mysql"
+    )
+
+
+def test_mysql_full_cycle(require_mysql, tmp_path):
+    """Full ``db execute`` -> ``db query`` -> ``db assert`` -> ``db schema``
+    round-trip on MySQL via the CLI command layer.
+
+    Verifies the ``desc.name`` -> ``desc[0]`` fix held: any ``db query`` or
+    ``db schema`` call would raise ``AttributeError`` against real PyMySQL
+    7-tuple descriptions if the driver still indexed by attribute. Also
+    exercises dialect-specific catalog reads (``ENUM('new','old')`` parsing,
+    FK introspection via ``information_schema``).
+    """
+    import json
+
+    cfg_path = _mysql_config(tmp_path, require_mysql)
+
+    # Drop+create a parent table and a child table with ENUM + FK.
+    for sql in (
+        "DROP TABLE IF EXISTS child",
+        "DROP TABLE IF EXISTS parent",
+        "CREATE TABLE parent (id INT PRIMARY KEY)",
+        (
+            "CREATE TABLE child ("
+            "id INT PRIMARY KEY, "
+            "parent_id INT NOT NULL, "
+            "state ENUM('new','old') NOT NULL DEFAULT 'new', "
+            "FOREIGN KEY (parent_id) REFERENCES parent(id)"
+            ") ENGINE=InnoDB"
+        ),
+        "INSERT INTO parent (id) VALUES (1)",
+        "INSERT INTO child (id, parent_id, state) VALUES (10, 1, 'new')",
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", cfg_path,
+                "db", "execute",
+                "--connection", "test-mysql-writable",
+                "--sql", sql,
+                "--write",
+            ],
+        )
+        assert result.exit_code == 0, f"setup SQL failed: {sql}\n{result.output}"
+
+    # db query returns the seeded row.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "query",
+            "--sql", "SELECT id, state FROM child WHERE id = :id",
+            "--param", "id=10",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["result"]["row_count"] == 1
+    assert envelope["result"]["rows"] == [{"id": 10, "state": "new"}]
+
+    # db assert --expect-rows 1 passes.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "assert",
+            "--sql", "SELECT id FROM child",
+            "--expect-rows", "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["result"]["passed"] is True
+
+    # db schema (Level 1) lists user tables; system schemas filtered out.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "schema",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["command"] == "db.schema.tables"
+    items = envelope["result"]["items"]
+    # Both parent and child tables appear; no system schemas (mysql/sys/etc).
+    names = {(it["schema"], it["name"]) for it in items}
+    assert ("test", "parent") in names
+    assert ("test", "child") in names
+    assert all(it["schema"] not in ("mysql", "sys", "information_schema", "performance_schema") for it in items)
+
+    # db schema --table child returns ENUM values parsed + FK introspected.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "schema",
+            "--table", "child",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["command"] == "db.schema.table"
+    res = envelope["result"]
+    assert res["table"] == "child"
+    assert res["kind"] == "table"
+    assert res["primary_key"] == ["id"]
+
+    # FK: child.parent_id -> parent.id
+    fks = res["foreign_keys"]
+    assert len(fks) == 1
+    fk = fks[0]
+    assert fk["columns"] == ["parent_id"]
+    assert fk["references_table"] == "parent"
+    assert fk["references_columns"] == ["id"]
+
+    # ENUM column: state has data_type="enum" + enum_values=["new","old"].
+    cols = {c["name"]: c for c in res["columns"]}
+    assert cols["state"]["data_type"] == "enum"
+    assert cols["state"]["enum_values"] == ["new", "old"]
+    assert cols["state"]["nullable"] is False
+
+
+def test_mysql_execute_write_visible(require_mysql, tmp_path):
+    """``db execute --write`` inserts a row, returns ``rows_affected=1``, and
+    the row appears in a subsequent ``db query`` (committed write visible
+    across invocations)."""
+    import json
+
+    cfg_path = _mysql_config(tmp_path, require_mysql)
+
+    # Setup: clean table.
+    for sql in (
+        "DROP TABLE IF EXISTS mysql_seed",
+        "CREATE TABLE mysql_seed (id INT PRIMARY KEY, name VARCHAR(255))",
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", cfg_path,
+                "db", "execute",
+                "--connection", "test-mysql-writable",
+                "--sql", sql,
+                "--write",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    # Insert via db execute --write.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "execute",
+            "--connection", "test-mysql-writable",
+            "--sql",
+            "INSERT INTO mysql_seed (id, name) VALUES (:id, :name)",
+            "--param", "id=42",
+            "--param", "name=hello",
+            "--write",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["result"]["rows_affected"] == 1
+    # MySQL has no RETURNING clause: returning is always [].
+    assert envelope["result"]["returning"] == []
+
+    # Visible in subsequent db query.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "query",
+            "--sql", "SELECT id, name FROM mysql_seed WHERE id = :id",
+            "--param", "id=42",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["result"]["row_count"] == 1
+    assert envelope["result"]["rows"] == [{"id": 42, "name": "hello"}]
+
+
+def test_mysql_execute_no_returning_clause(require_mysql, tmp_path):
+    """MySQL has no ``RETURNING`` clause: a SQL statement that ends with a
+    pseudo-RETURNING syntax errors at the MySQL server, surfacing as
+    ``ConnectionFailure`` (exit 2). This documents the dialect limitation."""
+    import json
+
+    cfg_path = _mysql_config(tmp_path, require_mysql)
+
+    # Drop+create a throwaway table.
+    for sql in (
+        "DROP TABLE IF EXISTS mysql_returning_test",
+        "CREATE TABLE mysql_returning_test (id INT PRIMARY KEY)",
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", cfg_path,
+                "db", "execute",
+                "--connection", "test-mysql-writable",
+                "--sql", sql,
+                "--write",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    # MySQL rejects RETURNING: a 1064 / 1066 syntax error -> ConnectionFailure.
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "execute",
+            "--connection", "test-mysql-writable",
+            "--sql",
+            "INSERT INTO mysql_returning_test (id) VALUES (1) RETURNING id",
+            "--write",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is False
+    assert "error" in envelope
+
+
+def test_mysql_auto_increment_generated_mapping(require_mysql, tmp_path):
+    """MySQL ``AUTO_INCREMENT`` columns map to ``generated="by_default_identity"``
+    in the Level-2 column metadata (Task 7's documented choice)."""
+    import json
+
+    cfg_path = _mysql_config(tmp_path, require_mysql)
+
+    # Setup: table with an AUTO_INCREMENT column.
+    for sql in (
+        "DROP TABLE IF EXISTS mysql_autoinc",
+        (
+            "CREATE TABLE mysql_autoinc ("
+            "id INT AUTO_INCREMENT PRIMARY KEY, "
+            "name VARCHAR(255)"
+            ") ENGINE=InnoDB"
+        ),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config", cfg_path,
+                "db", "execute",
+                "--connection", "test-mysql-writable",
+                "--sql", sql,
+                "--write",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    # Level-2 schema: AUTO_INCREMENT column has generated="by_default_identity".
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", cfg_path,
+            "db", "schema",
+            "--table", "mysql_autoinc",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    cols = {c["name"]: c for c in envelope["result"]["columns"]}
+    # AUTO_INCREMENT column has generated="by_default_identity" and default=None
+    # (the redaction rule: generated columns force default=None).
+    assert cols["id"]["generated"] == "by_default_identity"
+    assert cols["id"]["default"] is None
+    # Non-auto-increment column has no "generated" mapping.
+    assert cols["name"]["generated"] is None
+

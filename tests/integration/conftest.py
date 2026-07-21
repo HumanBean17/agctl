@@ -430,3 +430,136 @@ def require_kafka_second_broker():
     except Exception as exc:  # noqa: BLE001 - any failure means no service
         pytest.skip(f"Second Kafka broker at {broker} unavailable: {exc}")
     return broker
+
+
+# --- MySQL (Task 9) ---------------------------------------------------------
+
+
+# Session-scoped cache so multiple MySQL tests reuse ONE container (spin-up +
+# wait is ~10s on a warm Docker daemon). The first ``require_mysql`` caller
+# starts the container; subsequent callers get the cached handle. Teardown
+# happens at session exit via :func:`atexit`.
+_MYSQL_CONTAINER: Any | None = None
+_MYSQL_INFO: dict | None = None
+
+
+def _start_mysql_container() -> tuple[Any, dict]:
+    """Start a ``mysql:8`` testcontainer and return (container, info).
+
+    Lifted into a module-level helper so the first call from
+    :func:`require_mysql` and an atexit teardown hook can both reach it.
+    The image is pinned to ``mysql:8`` (per the Task 9 brief); a 60s
+    startup timeout is enforced via the wait-for-logs strategy.
+    """
+    from testcontainers.core.waiting_utils import wait_for_logs
+    from testcontainers.mysql import MySqlContainer
+
+    container = MySqlContainer(
+        "mysql:8",
+        username="test",
+        password="test",
+        dbname="test",
+    )
+    container.start()
+    # MySqlContainer's default wait strategy already probes for the
+    # "ready for connections" log line, but be defensive: an explicit
+    # wait_for_logs call adds a second safety net on slower CI hosts.
+    try:
+        wait_for_logs(
+            container,
+            r".*ready for connections.*",
+            timeout=60,
+        )
+    except Exception:  # noqa: BLE001 - best-effort; container is up
+        pass
+
+    info = {
+        "host": container.get_container_host_ip(),
+        "port": int(container.get_exposed_port(3306)),
+        "user": "test",
+        "password": "test",
+        "dbname": "test",
+    }
+    return container, info
+
+
+@pytest.fixture
+def require_mysql():
+    """Skip if a live MySQL is unreachable; otherwise yield connection info.
+
+    Two resolution paths, tried in order:
+
+    1. **Manual / CI** — ``$AGCTL_TEST_MYSQL_DSN`` already set (a
+       ``mysql://user:pass@host:port/dbname`` URI). The URI is parsed and
+       the discrete fields are yielded. Useful for pointing at an
+       already-running MySQL (``docker compose up mysql``).
+    2. **Local, via Docker** — spin up a ``mysql:8`` testcontainer on the
+       first call (cached for the session so subsequent MySQL tests reuse
+       it). Skips cleanly if Docker is unavailable or the container fails
+       to start.
+
+    Yields a dict ``{"host", "port", "user", "password", "dbname"}`` so
+    tests can build a DatabaseConnection config block. NEVER fails when
+    MySQL is absent — that is the whole point.
+    """
+    import atexit
+    import urllib.parse
+
+    global _MYSQL_CONTAINER, _MYSQL_INFO
+
+    dsn = os.environ.get("AGCTL_TEST_MYSQL_DSN")
+    if dsn:
+        # Manual path: parse the DSN into discrete fields. Verify reachability
+        # by actually opening a connection (mirroring ``require_postgres``),
+        # so a stale DSN skips cleanly instead of failing mid-test.
+        parsed = urllib.parse.urlparse(dsn)
+        info = {
+            "host": parsed.hostname or "localhost",
+            "port": parsed.port or 3306,
+            "user": urllib.parse.unquote(parsed.username) if parsed.username else "test",
+            "password": urllib.parse.unquote(parsed.password) if parsed.password else "test",
+            "dbname": (parsed.path.lstrip("/") or "test"),
+        }
+        try:
+            import pymysql
+            conn = pymysql.connect(
+                host=info["host"],
+                port=info["port"],
+                user=info["user"],
+                password=info["password"],
+                database=info["dbname"],
+                connect_timeout=2,
+            )
+            conn.close()
+        except ImportError:
+            pytest.skip("pymysql not installed; skipping live MySQL test")
+        except Exception as exc:  # noqa: BLE001 - any failure => skip
+            pytest.skip(f"MySQL at {dsn} unavailable: {exc}")
+        yield info
+        return
+
+    if _MYSQL_INFO is not None:
+        # Container already started earlier this session; reuse.
+        yield _MYSQL_INFO
+        return
+
+    try:
+        container, info = _start_mysql_container()
+    except Exception as exc:  # noqa: BLE001 - any failure => skip
+        pytest.skip(
+            f"MySQL testcontainer unavailable (Docker not running or image pull failed): {exc}"
+        )
+
+    _MYSQL_CONTAINER = container
+    _MYSQL_INFO = info
+
+    def _stop():
+        try:
+            container.stop()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
+
+    atexit.register(_stop)
+    yield info
+    # NOTE: container is NOT stopped here — it stays up for the session so
+    # subsequent MySQL tests reuse it. Final teardown is via atexit.
