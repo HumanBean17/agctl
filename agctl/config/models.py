@@ -201,6 +201,27 @@ class KafkaConfig(BaseModel):
 
 
 class DatabaseConnection(BaseModel):
+    """A named database connection (DESIGN §3.3).
+
+    Built-in driver types (``type`` field):
+    - ``postgresql`` — backed by psycopg (``db`` extra).
+    - ``mysql`` — backed by PyMySQL (``mysql`` extra).
+    - ``sqlite`` — backed by stdlib ``sqlite3`` (always available).
+
+    Connection params come from the optional ``url`` (connection URI) and/or
+    the discrete ``host``/``port``/``dbname``/``user``/``password`` fields.
+    When ``url`` is set the driver still forwards any discrete fields present
+    — discrete fields override URI params. An empty/missing ``url`` falls back
+    to discrete fields, so ``"${DB_URL:-}"`` lets you default to discrete
+    fields when the env var is unset.
+
+    ``options`` is a free-form dict of driver-specific extras merged into the
+    driver's connect kwargs at connect time (default empty). Recognized keys
+    vary by driver — e.g. PyMySQL accepts ``charset``, ``collation``,
+    ``connect_timeout``; psycopg accepts ``sslmode``, ``connect_timeout``;
+    sqlite3 accepts no extras (its ``url`` query string is the analog).
+    """
+
     type: str
     # Optional connection URI (e.g. "postgresql://user:pass@host:port/dbname").
     # When set, the driver passes it to psycopg as the conninfo string and still
@@ -216,6 +237,9 @@ class DatabaseConnection(BaseModel):
     password: str | None = None
     default: bool = False
     writable: bool = False
+    # Driver-specific extras (e.g. PyMySQL charset/connect_timeout, psycopg
+    # sslmode). Recognized keys vary by driver; default empty.
+    options: dict[str, Any] = Field(default_factory=dict)
 
 
 class DatabaseTemplate(BaseModel):
