@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Protocol
 
 from ..errors import ConfigError
+from .log_backends.loki import LokiBackend
 from .log_backends.ndjson_file import NdjsonFileBackend
 from .log_backend_protocol import (
     AwaitResult,
@@ -24,7 +25,10 @@ from .log_backend_protocol import (
 LOG_BACKEND_ENTRY_POINT_GROUP = "agctl.logs_backends"
 
 #: Built-in backends always available even without entry-point registration.
-BUILTIN_BACKENDS: dict[str, type] = {"file": NdjsonFileBackend}
+BUILTIN_BACKENDS: dict[str, type] = {
+    "file": NdjsonFileBackend,
+    "loki": LokiBackend,
+}
 
 
 class LogClient:
