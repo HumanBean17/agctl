@@ -12,7 +12,6 @@ monkeypatch a stub ``pymysql`` module so the recorded kwargs can be inspected.
 from __future__ import annotations
 
 import sys
-import types
 
 import pytest
 
@@ -34,12 +33,21 @@ from agctl.errors import ConfigError, ConnectionFailure
 
 
 def _col(name):
-    return types.SimpleNamespace(name=name)
+    """Return a PEP 249 column descriptor matching real PyMySQL's shape.
+
+    PyMySQL's ``FieldDescriptorPacket.description()`` returns a 7-tuple
+    ``(name, type_code, display_size, internal_size, precision, scale,
+    null_ok)`` -- NOT an object with a ``.name`` attribute. Mirroring that
+    shape here catches ``desc.name`` regressions at unit-test time rather
+    than waiting for an integration test against real PyMySQL.
+    """
+    return (name, None, None, None, None, None, None)
 
 
 class FakeCursor:
     def __init__(self, description, rows, rowcount=1):
-        self.description = description  # sequence of objects with .name
+        # description: sequence of 7-tuples per PEP 249 (see _col above).
+        self.description = description
         self._rows = rows
         self.rowcount = rowcount
         self.last_sql = None

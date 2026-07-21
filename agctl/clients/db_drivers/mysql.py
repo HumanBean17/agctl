@@ -235,7 +235,11 @@ class MySQLDriver(BaseDBDriver):
         cur = self._conn.cursor()
         try:
             cur.execute(rewrite, params)
-            column_names = [desc.name for desc in (cur.description or [])]
+            # PyMySQL's cursor.description is a tuple of 7-tuples
+            # (name, type_code, ...) per PEP 249 -- NOT objects with a .name
+            # attribute. Index [0] is the column name. This matches the
+            # SQLite driver's convention.
+            column_names = [desc[0] for desc in (cur.description or [])]
             rows = cur.fetchall()
         except pymysql.Error as exc:
             raise ConnectionFailure(message=str(exc)) from exc
@@ -380,7 +384,9 @@ class MySQLDriver(BaseDBDriver):
                     rel_sql += " AND table_schema = %s"
                     rel_params.append(schema)
                 cur.execute(rel_sql, rel_params)
-                rel_desc = [d.name for d in (cur.description or [])]
+                # PyMySQL cursor.description is a tuple of 7-tuples per PEP 249;
+                # index [0] is the column name (no .name attribute on tuples).
+                rel_desc = [d[0] for d in (cur.description or [])]
                 rel_rows = cur.fetchall()
 
                 matches: list[SchemaMatch] = []
@@ -425,7 +431,9 @@ class MySQLDriver(BaseDBDriver):
                 rel_sql += " WHERE table_schema = %s"
                 rel_params = [schema]
             cur.execute(rel_sql, rel_params)
-            rel_desc = [d.name for d in (cur.description or [])]
+            # PyMySQL cursor.description is a tuple of 7-tuples per PEP 249;
+            # index [0] is the column name (no .name attribute on tuples).
+            rel_desc = [d[0] for d in (cur.description or [])]
             rel_rows = cur.fetchall()
 
             count_sql = (
@@ -438,7 +446,9 @@ class MySQLDriver(BaseDBDriver):
                 count_params = [schema]
             count_sql += " GROUP BY table_schema, table_name"
             cur.execute(count_sql, count_params)
-            count_desc = [d.name for d in (cur.description or [])]
+            # PyMySQL cursor.description is a tuple of 7-tuples per PEP 249;
+            # index [0] is the column name (no .name attribute on tuples).
+            count_desc = [d[0] for d in (cur.description or [])]
             count_rows = cur.fetchall()
         except pymysql.Error as exc:
             raise ConnectionFailure(message=str(exc)) from exc
@@ -502,7 +512,9 @@ class MySQLDriver(BaseDBDriver):
             "ORDER BY ordinal_position",
             [schema_name, table_name],
         )
-        col_desc = [d.name for d in (cur.description or [])]
+        # PyMySQL cursor.description is a tuple of 7-tuples per PEP 249;
+        # index [0] is the column name (no .name attribute on tuples).
+        col_desc = [d[0] for d in (cur.description or [])]
 
         columns: list[ColumnInfo] = []
         for row in cur.fetchall():
@@ -552,7 +564,9 @@ class MySQLDriver(BaseDBDriver):
             "ORDER BY kcu.constraint_name, kcu.ordinal_position",
             [schema_name, table_name],
         )
-        con_desc = [d.name for d in (cur.description or [])]
+        # PyMySQL cursor.description is a tuple of 7-tuples per PEP 249;
+        # index [0] is the column name (no .name attribute on tuples).
+        con_desc = [d[0] for d in (cur.description or [])]
         primary_key: list[str] = []
         unique_constraints: list[UniqueConstraint] = []
         # Track unique-constraint columns by constraint name to preserve
@@ -603,7 +617,9 @@ class MySQLDriver(BaseDBDriver):
             "ORDER BY rc.constraint_name, kcu.ordinal_position",
             [schema_name, table_name],
         )
-        fk_desc = [d.name for d in (cur.description or [])]
+        # PyMySQL cursor.description is a tuple of 7-tuples per PEP 249;
+        # index [0] is the column name (no .name attribute on tuples).
+        fk_desc = [d[0] for d in (cur.description or [])]
         # Group FK columns by constraint name, preserving ordinal_position
         # order so composite FKs surface as a single ForeignKey DTO.
         fk_cols_by_name: dict[str, list[str]] = {}
