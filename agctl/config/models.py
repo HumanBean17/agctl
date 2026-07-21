@@ -392,12 +392,36 @@ class MocksConfig(BaseModel):
 
 
 class LogSource(BaseModel):
-    """Log source configuration (file or journald)."""
+    """Log source configuration (file, journald, or a remote backend).
+
+    ``url`` and ``query`` carry the endpoint and query expression for remote
+    backends (e.g. ``url: "http://loki:3100"`` and ``query: '{app="x"}'`` for a
+    Loki source). They are ``None`` for local ``file``/``journald`` sources.
+
+    ``options`` is a free-form dict of backend-specific extras (default empty) —
+    the intentional escape hatch for keys that vary by backend, mirroring
+    ``DatabaseConnection.options``. For Loki it carries auth/transport knobs
+    such as ``username``/``password``/``token``/``org_id``/``verify_tls``/
+    ``fetch_limit``/``direction``. Recognized keys vary by backend.
+
+    The model stays strict: unknown top-level keys are rejected (``extra=
+    "forbid"``) so typos surface at parse time — backend-specific keys must
+    live under ``options``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     type: str = "file"
     path: str | None = None
     format: str = "logstash"
     service: str | None = None
+    # Remote-backend endpoint (e.g. "http://loki:3100"). None for local sources.
+    url: str | None = None
+    # Remote-backend query expression (e.g. Loki LogQL '{app="x"}').
+    query: str | None = None
+    # Backend-specific extras (auth/transport knobs); default empty. Mirrors
+    # DatabaseConnection.options — recognized keys vary by backend.
+    options: dict[str, Any] = Field(default_factory=dict)
 
 
 class LogsDefaults(BaseModel):
