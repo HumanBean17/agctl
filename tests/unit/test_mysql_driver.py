@@ -334,6 +334,47 @@ def test_connect_options_merge_into_pymysql_kwargs(monkeypatch):
     assert kwargs["autocommit"] is False
 
 
+def test_connect_options_autocommit_does_not_crash_and_is_forced_false(monkeypatch):
+    """Regression: ``options={'autocommit': True}`` must not raise TypeError.
+
+    Before the fix, the driver called ``pymysql.connect(autocommit=False,
+    **kwargs)`` with ``kwargs`` containing the merged ``options`` dict. When
+    a user supplied ``autocommit`` via ``options`` (plausible — copied from
+    a PyMySQL tutorial), Python raised
+    ``TypeError: connect() got multiple values for keyword argument
+    'autocommit'`` BEFORE the function ran, which is NOT a ``pymysql.Error``
+    and so propagated as an unhandled crash instead of ``ConnectionFailure``
+    (fan-out review finding [R2#2]).
+
+    The fix moves ``autocommit=False`` into ``kwargs`` AFTER the options
+    merge so it always wins. This test pins both halves of the invariant:
+
+    1. ``connect()`` does NOT raise ``TypeError``.
+    2. The recorded ``autocommit`` kwarg is ``False`` (the explicit override
+       wins over the user-supplied ``True``).
+    """
+    fake = _RecordingPyMySQL()
+    _install_fake_pymysql(monkeypatch, fake)
+
+    driver = MySQLDriver()
+    # Must NOT raise TypeError.
+    driver.connect(
+        {
+            "type": "mysql",
+            "host": "h",
+            "options": {"autocommit": True},
+        }
+    )
+
+    assert len(fake.calls) == 1
+    args, kwargs = fake.calls[0]
+    assert args == ()
+    # Explicit override wins over the user-supplied ``True``.
+    assert kwargs["autocommit"] is False
+    # Other options still flow through.
+    assert kwargs["host"] == "h"
+
+
 # --- Scenario 9: discrete fields override URL -----------------------------
 
 

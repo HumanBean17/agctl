@@ -703,6 +703,22 @@ forwarded as kwargs and **override** the corresponding URI parameters (psycopg's
 merge semantics — kwargs win). When `url` is absent, the driver behaves as before,
 using only discrete fields.
 
+**Per-driver SQL param handling** — the three built-in drivers diverge on how
+they handle the JDBC-style `:name` params the agctl authoring layer emits.
+`MySQLDriver` mirrors PostgreSQL: PyMySQL is lazy-imported in `connect`
+(missing → `ConfigError`, `mysql` extra), `:name` params are rewritten to
+PyMySQL's native `%(name)s` form via `convert_sql_params`, `autocommit=False`
+is forced on the connection (after the options merge so user-supplied values
+cannot override it), and there is no `RETURNING` support (MySQL has no such
+clause — `execute_write` always returns `returning=[]`).
+`SQLiteDriver` is the per-driver-divergence showcase: stdlib `sqlite3` is
+imported at module top (no extra, no lazy import — the only one of the three
+that doesn't need a backing library), `:name` params are passed through
+unchanged (no `convert_sql_params` call — `sqlite3` natively accepts `:name`),
+and PRAGMA identifier validation enforces `^[a-zA-Z_][a-zA-Z0-9_]*$` on the
+PRAGMA target since PRAGMAs don't accept bind parameters and the identifier
+must be string-interpolated safely.
+
 **Optional `execute_write` capability** — write support is an optional driver
 capability, not required by the `DBDriver` protocol. `DbClient.execute_write`
 probes the driver for a callable `execute_write` attribute and raises
@@ -715,7 +731,7 @@ optional driver capability following the same probe pattern.
 probe (it inspects the driver for a callable `describe_schema` attribute without
 opening a connection); `agctl db schema` calls it to fail fast with
 `ConfigError` (exit 2) when the driver cannot introspect. `DbClient.describe_schema`
-delegates to the driver and returns its dict unchanged.
+delegates to the driver and serializes any DTO instances in the returned dict to plain dicts via `dataclasses.asdict` at this boundary, so the JSON shape seen by callers is unchanged regardless of the driver's internal return type.
 `PostgreSQLDriver.describe_schema` reads `pg_catalog` (relations from `pg_class`/
 `pg_namespace`/`pg_attribute`; columns from `pg_attribute`/`pg_type`; defaults,
 enum values, comments, and constraints from `pg_attrdef`/`pg_enum`/

@@ -210,8 +210,17 @@ class MySQLDriver(BaseDBDriver):
         if options:
             kwargs.update(options)
 
+        # Force ``autocommit=False`` AFTER the options merge so it always
+        # wins, even if a user supplies ``autocommit`` via ``options`` (e.g.
+        # copied from a PyMySQL tutorial). Setting it as a keyword argument
+        # to ``pymysql.connect`` alongside ``**kwargs`` would raise
+        # ``TypeError: got multiple values for keyword argument 'autocommit'``
+        # — which is NOT a ``pymysql.Error`` and would crash raw. See
+        # fan-out review finding [R2#2] for the regression scenario.
+        kwargs["autocommit"] = False
+
         try:
-            self._conn = pymysql.connect(autocommit=False, **kwargs)
+            self._conn = pymysql.connect(**kwargs)
         except pymysql.Error as exc:
             raise ConnectionFailure(
                 message=str(exc),

@@ -74,9 +74,14 @@ class ColumnInfo:
 
 @dataclass
 class ForeignKey:
-    """A single FOREIGN KEY constraint on a table."""
+    """A single FOREIGN KEY constraint on a table.
 
-    name: str
+    ``name`` is ``None`` for drivers whose backing database does not emit FK
+    names (e.g. SQLite — ``PRAGMA foreign_key_list`` has no name column; see
+    DESIGN §7.4). Otherwise it is the constraint's catalog identifier.
+    """
+
+    name: str | None
     columns: list[str]
     references_schema: str | None
     references_table: str

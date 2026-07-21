@@ -361,6 +361,49 @@ class TestSchemaMatch:
         s = json.dumps(dataclasses.asdict(sm))
         assert '"table": "orders"' in s
 
+    def test_schemamatch_json_field_order_pins_byte_equality_invariant(self):
+        """Pin the byte-equality invariant of ``agctl db schema`` JSON output.
+
+        This test exists because the ``SchemaMatch`` field declaration order
+        (``schema, table, kind, columns, primary_key, foreign_keys,
+        unique_constraints, comment`` — comment LAST) is load-bearing for
+        byte-equal JSON output of ``agctl db schema``. ``dataclasses.asdict``
+        walks fields in declaration order, and ``json.dumps`` preserves dict
+        insertion order, so the serialized JSON key order is exactly the
+        dataclass field declaration order.
+
+        Every other ``SchemaMatch`` test in this file uses Python dict ``==``,
+        which is order-insensitive and so cannot catch a regression of this
+        invariant. Reverting commit ``cd0369a`` (which fixed the order once)
+        would break this test and break users who pin ``agctl db schema``
+        output bytewise in golden files or test fixtures.
+
+        The invariant under test: in the serialized JSON string, the
+        ``unique_constraints`` key appears BEFORE the ``comment`` key.
+        ``columns`` is left empty so the only ``"comment"`` key in the JSON
+        is the SchemaMatch-level one (``ColumnInfo`` also has a ``comment``
+        field that would otherwise produce nested ``"comment"`` keys before
+        the outer one — that would mask the assertion).
+        """
+        import json
+
+        sm = SchemaMatch(
+            schema="s",
+            table="t",
+            kind="table",
+            columns=[],
+            primary_key=[],
+            foreign_keys=[],
+            unique_constraints=[
+                UniqueConstraint(name="uq_c", columns=["c"]),
+            ],
+            comment="c",
+        )
+        serialized = json.dumps(dataclasses.asdict(sm))
+        assert serialized.index('"unique_constraints"') < serialized.index(
+            '"comment"'
+        )
+
 
 class TestBaseDBDriverRedactConfig:
     """``BaseDBDriver._redact_config`` — secret-key and URL-userinfo redaction."""
