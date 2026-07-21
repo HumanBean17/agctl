@@ -138,10 +138,13 @@ class TestLoadDrivers:
 
 class TestDriverSelection:
     def test_unknown_type_raises_config_error(self):
+        # "mysql" used to be the placeholder here but is now a registered
+        # driver (Task 8); use a name that no driver will ever claim so the
+        # ConfigError path is exercised deterministically.
         with pytest.raises(ConfigError) as exc_info:
-            DbClient({"type": "mysql"})
-        assert "mysql" in exc_info.value.message
-        assert exc_info.value.detail.get("type") == "mysql"
+            DbClient({"type": "nonexistent_db"})
+        assert "nonexistent_db" in exc_info.value.message
+        assert exc_info.value.detail.get("type") == "nonexistent_db"
 
     def test_missing_type_raises_config_error(self):
         with pytest.raises(ConfigError):

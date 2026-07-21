@@ -12,13 +12,24 @@ import importlib.metadata
 from typing import Any
 
 from ..errors import ConfigError
+from .db_drivers.mysql import MySQLDriver
 from .db_drivers.postgresql import PostgreSQLDriver
+from .db_drivers.sqlite import SQLiteDriver
 
 #: Entry-point group used to discover third-party DB drivers.
 DB_DRIVER_ENTRY_POINT_GROUP = "agctl.db_drivers"
 
 #: Built-in drivers always available even without entry-point registration.
-BUILTIN_DRIVERS: dict[str, type] = {"postgresql": PostgreSQLDriver}
+#:
+#: Heavy DB deps (``psycopg``, ``pymysql``) are lazy-imported inside each
+#: driver's ``connect()`` / ``execute()`` methods, so populating this dict at
+#: module import time does NOT trigger those imports — ``import agctl`` works
+#: even when neither extra is installed. ``sqlite3`` is stdlib (zero cost).
+BUILTIN_DRIVERS: dict[str, type] = {
+    "postgresql": PostgreSQLDriver,
+    "mysql": MySQLDriver,
+    "sqlite": SQLiteDriver,
+}
 
 
 def _serialize_value(value: Any) -> Any:
