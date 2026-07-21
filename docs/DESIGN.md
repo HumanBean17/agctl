@@ -321,7 +321,9 @@ mocks:
 # ---------------------------------------------------------------------------
 # database — named connection profiles and SQL query templates.
 # All fields support ${ENV_VAR} interpolation (see §2.2).
-# Connection types: postgresql (extensible via plugins, see §9).
+# Connection types: postgresql, mysql, sqlite (extensible via plugins, see §9).
+# Each connection type accepts: type, url (optional), host/port/dbname/user/password (optional, override url),
+# and options (optional, driver-specific extras merged into the connection kwargs).
 # ---------------------------------------------------------------------------
 database:
   connections:
@@ -360,6 +362,39 @@ database:
       type: postgresql
       url: "${DATABASE_URL}"                 # e.g. "postgresql://user:pass@host:port/dbname"
       port: 5432                              # overrides the port from DATABASE_URL (if present)
+
+    mysql-replica:
+      type: mysql
+      host: mysql.example.com
+      port: 3306
+      dbname: production
+      user: ${MYSQL_USER}
+      password: ${MYSQL_PASSWORD}
+      options:
+        charset: utf8mb4
+      writable: false
+
+    mysql-local:
+      type: mysql
+      url: "mysql://user:pass@host:port/dbname"
+      writable: true
+
+    mysql-with-options:
+      type: mysql
+      url: "mysql://user:pass@host:port/dbname"
+      options:
+        connect_timeout: 10
+        read_timeout: 30
+
+    sqlite-dev:
+      type: sqlite
+      url: "/path/to/dev.db"
+      writable: true
+
+    sqlite-readonly:
+      type: sqlite
+      url: "file:/path/to/readonly.db?mode=ro"
+      writable: false
 
   # templates — named SQL queries. `connection` is optional (falls back to
   # defaults.database_connection). `sql` uses :paramName named params (JDBC-style).
@@ -2878,7 +2913,9 @@ agctl/                         # Repository root
 │       ├── db_client.py           # Dispatches to registered driver plugins
 │       ├── db_driver_protocol.py  # DBDriver Protocol
 │       └── db_drivers/
-│           └── postgresql.py      # Built-in psycopg-backed driver (lazy import)
+│           ├── mysql.py          # Built-in PyMySQL-backed driver (lazy import)
+│           ├── postgresql.py     # Built-in psycopg-backed driver (lazy import)
+│           └── sqlite.py         # Built-in sqlite3 driver
 │
 ├── tests/
 │   ├── unit/
@@ -2925,6 +2962,7 @@ http = ["httpx>=0.27"]
 # at module load; those ride on confluent-kafka's own [schemaregistry] sub-extra.
 kafka = ["confluent-kafka[schemaregistry]>=2.4", "jq>=1.6"]
 db = ["psycopg[binary]>=3.1", "jq>=1.6"]
+mysql = ["PyMySQL>=1.1", "jq>=1.6"]
 avro = ["fastavro>=1.8"]                     # SR Avro decode/encode
 protobuf = ["protobuf>=4.25"]                # SR Protobuf decode/encode (no grpcio pulled)
 schema-registry = ["agctl[avro,protobuf]"]   # convenience meta-extra
@@ -2936,7 +2974,9 @@ agctl = "agctl.cli:cli"
 agt = "agctl.cli:cli"
 
 [project.entry-points."agctl.db_drivers"]
+mysql = "agctl.clients.db_drivers.mysql:MySQLDriver"
 postgresql = "agctl.clients.db_drivers.postgresql:PostgreSQLDriver"
+sqlite = "agctl.clients.db_drivers.sqlite:SQLiteDriver"
 
 [project.entry-points."agctl.plugins"]
 # Third-party plugins register here, e.g.:
@@ -3061,6 +3101,10 @@ The Protocol requires only `connect`/`execute`/`close`. Two capabilities are **o
 
 - **`execute_write(sql, params) -> {rows_affected, returning}`** — enables `agctl db execute`. Absent → the driver is read-only and `db execute` raises `ConfigError` (exit 2) before any database operation.
 - **`describe_schema(table, schema) -> {items, matches}`** — enables `agctl db schema` (§3.3). Absent → the driver is valid but ineligible for `db schema`; `DbClient.supports_describe_schema()` is a pre-connect, side-effect-free probe, so the command fails fast with `ConfigError` (exit 2) **without opening a connection**.
+
+**DTOs and BaseDBDriver:** The protocol defines several data transfer objects (DTOs) in `db_driver_protocol.py`: `WriteResult` (rows affected, optional returning), `SchemaItem` (schema elements), `SchemaMatch` (discovery result), `ColumnInfo` (column metadata), `ForeignKey` (FK relationship), `UniqueConstraint` (unique constraint). Drivers MAY inherit from `BaseDBDriver` (a non-abstract mixin providing shared helpers: `_redact_config` for secret-safe error details and `_lazy_import_or_raise` for optional-dependency imports).
+
+**Optional-capability duck-typing:** Drivers implement optional methods (`execute_write`, `describe_schema`) to signal support. `DbClient` probes their presence with `callable(getattr(driver, method_name, None))` before calling them; if absent, the corresponding commands fail fast with `ConfigError` (exit 2). This duck-typing approach avoids explicit capability-flag registration.
 
 To add a MySQL driver in a separate package:
 

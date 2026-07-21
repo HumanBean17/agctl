@@ -43,6 +43,7 @@ jq = ["jq>=1.6"]
 # work out of the box and tracks future upstream additions automatically.
 kafka = ["confluent-kafka[schemaregistry]>=2.4", "jq>=1.6"]
 db = ["psycopg[binary]>=3.1", "jq>=1.6"]
+mysql = ["PyMySQL>=1.1", "jq>=1.6"]
 logs = ["jq>=1.6"]
 grpc = ["grpcio>=1.62", "grpcio-tools>=1.62", "grpcio-health-checking>=1.62", "grpcio-reflection>=1.62", "protobuf>=4.25", "jq>=1.6"]
 avro = ["fastavro>=1.8"]
@@ -72,6 +73,8 @@ agt = "agctl.cli:cli"
 
 [project.entry-points."agctl.db_drivers"]
 postgresql = "agctl.clients.db_drivers.postgresql:PostgreSQLDriver"
+mysql = "agctl.clients.db_drivers.mysql:MySQLDriver"
+sqlite = "agctl.clients.db_drivers.sqlite:SQLiteDriver"
 
 [project.entry-points."agctl.plugins"]
 # Third-party protocol plugins register here, e.g.:

@@ -7,9 +7,24 @@ import types
 import pytest
 
 from agctl.assertions import coerce_db_value
+from agctl.clients.db_client import DbClient
 from agctl.clients.db_driver_protocol import DBDriver
 from agctl.clients.db_drivers.postgresql import PostgreSQLDriver
-from agctl.errors import ConfigError, ConnectionFailure
+from agctl.errors import ConnectionFailure
+
+
+def _client_for(driver) -> DbClient:
+    """Wrap a driver in a DbClient for boundary-level assertions.
+
+    The driver returns DTOs (``WriteResult``, ``SchemaItem``, ``SchemaMatch``)
+    from its ``execute_write`` / ``describe_schema`` methods; :class:`DbClient`
+    serializes those to plain dicts at the boundary (the shape real consumers
+    — ``agctl db *`` commands, JSON output — see). Tests that assert on the
+    serialized dict shape go through this wrapper so they exercise the same
+    code path as production callers and keep their existing dict-shape
+    assertions intact.
+    """
+    return DbClient({"type": "postgresql"}, driver=driver)
 
 
 # --- Test seams -----------------------------------------------------------
@@ -347,14 +362,18 @@ def test_protocol_is_satisfied_by_postgresql_driver():
 
 
 def test_execute_write_insert_with_returning_returns_rows_affected_and_returning_rows():
-    """Test 1: INSERT with RETURNING (rowcount==1, description present)."""
+    """Test 1: INSERT with RETURNING (rowcount==1, description present).
+
+    Asserts at the DbClient boundary (dict shape consumers see); the driver
+    now returns a :class:`WriteResult` DTO internally.
+    """
     cols = [_col("id"), _col("status")]
     rows = [(1, "pending")]
     cur = FakeCursor(description=cols, rows=rows, rowcount=1)
     conn = FakeConn(cur)
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.execute_write(
+    result = client.execute_write(
         "INSERT INTO orders (total) VALUES (100) RETURNING id, status", {}
     )
 
@@ -365,12 +384,16 @@ def test_execute_write_insert_with_returning_returns_rows_affected_and_returning
 
 
 def test_execute_write_plain_write_no_returning():
-    """Test 2: Plain write no RETURNING (rowcount==3, description is None)."""
+    """Test 2: Plain write no RETURNING (rowcount==3, description is None).
+
+    Asserts at the DbClient boundary; the driver now returns a
+    :class:`WriteResult` DTO internally.
+    """
     cur = FakeCursor(description=None, rows=[], rowcount=3)
     conn = FakeConn(cur)
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.execute_write("UPDATE orders SET status = :status", {"status": "shipped"})
+    result = client.execute_write("UPDATE orders SET status = :status", {"status": "shipped"})
 
     assert result == {"rows_affected": 3, "returning": []}
     assert conn.commit_called is True
@@ -380,12 +403,16 @@ def test_execute_write_plain_write_no_returning():
 
 
 def test_execute_write_no_count_statement_ddl():
-    """Test 3: No-count statement / DDL (rowcount==-1, description is None)."""
+    """Test 3: No-count statement / DDL (rowcount==-1, description is None).
+
+    Asserts at the DbClient boundary; the driver now returns a
+    :class:`WriteResult` DTO internally.
+    """
     cur = FakeCursor(description=None, rows=[], rowcount=-1)
     conn = FakeConn(cur)
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.execute_write("CREATE TABLE foo (id INT)", {})
+    result = client.execute_write("CREATE TABLE foo (id INT)", {})
 
     assert result == {"rows_affected": None, "returning": []}
     assert conn.commit_called is True
@@ -393,14 +420,18 @@ def test_execute_write_no_count_statement_ddl():
 
 
 def test_execute_write_zero_affected_with_returning():
-    """Test 4: 0-affected (rowcount==0, description present)."""
+    """Test 4: 0-affected (rowcount==0, description present).
+
+    Asserts at the DbClient boundary; the driver now returns a
+    :class:`WriteResult` DTO internally.
+    """
     cols = [_col("id")]
     rows = []
     cur = FakeCursor(description=cols, rows=rows, rowcount=0)
     conn = FakeConn(cur)
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.execute_write(
+    result = client.execute_write(
         "UPDATE orders SET status = 'shipped' WHERE id = :id RETURNING id", {"id": 999}
     )
 
@@ -602,15 +633,19 @@ def _catalog_conn_with_relations(*relations):
 
 
 def test_describe_schema_level1_mixed_tables_and_view():
-    """Scenario 1: two tables + one view, normalized and sorted by (schema, name)."""
+    """Scenario 1: two tables + one view, normalized and sorted by (schema, name).
+
+    Asserts at the DbClient boundary (dict shape consumers see); the driver
+    now returns :class:`SchemaItem` DTOs internally.
+    """
     conn, _ = _catalog_conn_with_relations(
         _relation("public", "orders", "r", False, 6),
         _relation("public", "order_items", "r", False, 4),
         _relation("public", "order_view", "v", False, 3),
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table=None, schema=None)
+    result = client.describe_schema(table=None, schema=None)
 
     # Ascending string sort: '_' (0x5F) precedes lowercase letters, so
     # "order_items" < "order_view" < "orders".
@@ -624,15 +659,19 @@ def test_describe_schema_level1_mixed_tables_and_view():
 
 
 def test_describe_schema_level1_excludes_system_schemas():
-    """Scenario 2 (D6): pg_* and information_schema relations are excluded."""
+    """Scenario 2 (D6): pg_* and information_schema relations are excluded.
+
+    Asserts at the DbClient boundary; the driver now returns :class:`SchemaItem`
+    DTOs internally.
+    """
     conn, _ = _catalog_conn_with_relations(
         _relation("public", "orders", "r", False, 6),
         _relation("pg_catalog", "pg_class", "r", False, 12),
         _relation("information_schema", "columns", "v", False, 9),
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table=None, schema=None)
+    result = client.describe_schema(table=None, schema=None)
 
     assert result == {
         "items": [
@@ -642,14 +681,18 @@ def test_describe_schema_level1_excludes_system_schemas():
 
 
 def test_describe_schema_level1_excludes_partition_leaves():
-    """Scenario 3 (D6): partition leaf (relispartition=true) excluded; parent kept."""
+    """Scenario 3 (D6): partition leaf (relispartition=true) excluded; parent kept.
+
+    Asserts at the DbClient boundary; the driver now returns :class:`SchemaItem`
+    DTOs internally.
+    """
     conn, _ = _catalog_conn_with_relations(
         _relation("public", "orders", "p", False, 6),  # partitioned parent
         _relation("public", "orders_p2026", "r", True, 6),  # partition leaf
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table=None, schema=None)
+    result = client.describe_schema(table=None, schema=None)
 
     assert result == {
         "items": [
@@ -659,15 +702,19 @@ def test_describe_schema_level1_excludes_partition_leaves():
 
 
 def test_describe_schema_level1_excludes_matview_and_sequence():
-    """Scenario 4: relkind 'm' (matview) and 'S' (sequence) are excluded from v1."""
+    """Scenario 4: relkind 'm' (matview) and 'S' (sequence) are excluded from v1.
+
+    Asserts at the DbClient boundary; the driver now returns :class:`SchemaItem`
+    DTOs internally.
+    """
     conn, _ = _catalog_conn_with_relations(
         _relation("public", "orders", "r", False, 6),
         _relation("public", "orders_summary", "m", False, 3),
         _relation("public", "orders_id_seq", "S", False, 1),
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table=None, schema=None)
+    result = client.describe_schema(table=None, schema=None)
 
     assert result == {
         "items": [
@@ -677,15 +724,19 @@ def test_describe_schema_level1_excludes_matview_and_sequence():
 
 
 def test_describe_schema_level1_schema_filter_passed_as_bind_param():
-    """Scenario 5: --schema restricts to one namespace and reaches SQL as a bind param."""
+    """Scenario 5: --schema restricts to one namespace and reaches SQL as a bind param.
+
+    Asserts at the DbClient boundary; the driver now returns :class:`SchemaItem`
+    DTOs internally.
+    """
     conn, cur = _catalog_conn_with_relations(
         _relation("public", "orders", "r", False, 6),
         _relation("analytics", "events", "r", False, 5),
         _relation("analytics", "events_view", "v", False, 4),
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table=None, schema="analytics")
+    result = client.describe_schema(table=None, schema="analytics")
 
     assert result == {
         "items": [
@@ -844,7 +895,11 @@ def _level2_catalog_conn(
 
 
 def test_describe_schema_level2_plain_columns_and_primary_key():
-    """Scenario 1: plain columns + PK, full normalized matches[0] dict."""
+    """Scenario 1: plain columns + PK, full normalized matches[0] dict.
+
+    Asserts at the DbClient boundary (dict shape consumers see); the driver
+    now returns :class:`SchemaMatch` / :class:`ColumnInfo` DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
         columns=[
@@ -853,9 +908,9 @@ def test_describe_schema_level2_plain_columns_and_primary_key():
         ],
         constraints=[_l2_constraint("orders_pkey", "p", [1])],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     assert result == {
         "items": [],
@@ -894,7 +949,10 @@ def test_describe_schema_level2_plain_columns_and_primary_key():
 
 
 def test_describe_schema_level2_default_expressions_pass_through_verbatim():
-    """Scenario 2: default-expression text from pg_get_expr passes through."""
+    """Scenario 2: default-expression text from pg_get_expr passes through.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
         columns=[
@@ -906,9 +964,9 @@ def test_describe_schema_level2_default_expressions_pass_through_verbatim():
             (2, "now()"),
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     cols = {c["name"]: c for c in result["matches"][0]["columns"]}
     assert cols["status"]["default"] == "'PENDING'::order_status"
@@ -916,7 +974,10 @@ def test_describe_schema_level2_default_expressions_pass_through_verbatim():
 
 
 def test_describe_schema_level2_generated_mapping_and_default_redaction():
-    """Scenario 3 (load-bearing): generated mapping + default redaction."""
+    """Scenario 3 (load-bearing): generated mapping + default redaction.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
         columns=[
@@ -934,9 +995,9 @@ def test_describe_schema_level2_generated_mapping_and_default_redaction():
             (4, "nextval('orders_seq'::regclass)"),
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     cols = {c["name"]: c for c in result["matches"][0]["columns"]}
     # identity-always -> generated set, default redacted
@@ -954,7 +1015,10 @@ def test_describe_schema_level2_generated_mapping_and_default_redaction():
 
 
 def test_describe_schema_level2_enum_values_in_declared_order():
-    """Scenario 4 (load-bearing): enum_values populated for enum columns only."""
+    """Scenario 4 (load-bearing): enum_values populated for enum columns only.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
         columns=[
@@ -967,9 +1031,9 @@ def test_describe_schema_level2_enum_values_in_declared_order():
             (16385, "CANCELLED"),
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     cols = {c["name"]: c for c in result["matches"][0]["columns"]}
     assert cols["status"]["enum_values"] == ["PENDING", "PAID", "CANCELLED"]
@@ -977,7 +1041,10 @@ def test_describe_schema_level2_enum_values_in_declared_order():
 
 
 def test_describe_schema_level2_nullable_is_inverse_of_attnotnull():
-    """Scenario 5: nullable == not attnotnull."""
+    """Scenario 5: nullable == not attnotnull.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
         columns=[
@@ -985,9 +1052,9 @@ def test_describe_schema_level2_nullable_is_inverse_of_attnotnull():
             _l2_column(2, "b", "integer", False),  # nullable True
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     cols = {c["name"]: c for c in result["matches"][0]["columns"]}
     assert cols["a"]["nullable"] is False
@@ -995,7 +1062,10 @@ def test_describe_schema_level2_nullable_is_inverse_of_attnotnull():
 
 
 def test_describe_schema_level2_multicolumn_fk_positional_pairing():
-    """Scenario 6 (load-bearing): conkey/confkey positional pairing preserved."""
+    """Scenario 6 (load-bearing): conkey/confkey positional pairing preserved.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
         columns=[
@@ -1015,9 +1085,9 @@ def test_describe_schema_level2_multicolumn_fk_positional_pairing():
         ],
         ref_attrs=[(10, "x"), (11, "y")],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     fks = result["matches"][0]["foreign_keys"]
     assert len(fks) == 1
@@ -1030,7 +1100,10 @@ def test_describe_schema_level2_multicolumn_fk_positional_pairing():
 
 
 def test_describe_schema_level2_self_referencing_foreign_key():
-    """Scenario 7: self-referencing FK resolves to own schema/name."""
+    """Scenario 7: self-referencing FK resolves to own schema/name.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "categories")],
         columns=[
@@ -1049,9 +1122,9 @@ def test_describe_schema_level2_self_referencing_foreign_key():
             ),
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="categories", schema=None)
+    result = client.describe_schema(table="categories", schema=None)
 
     fks = result["matches"][0]["foreign_keys"]
     assert len(fks) == 1
@@ -1063,7 +1136,10 @@ def test_describe_schema_level2_self_referencing_foreign_key():
 
 
 def test_describe_schema_level2_unique_constraint_columns():
-    """Scenario 8: contype=='u' constraint -> unique_constraints entry."""
+    """Scenario 8: contype=='u' constraint -> unique_constraints entry.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
         columns=[
@@ -1074,9 +1150,9 @@ def test_describe_schema_level2_unique_constraint_columns():
             _l2_constraint("orders_status_customer_key", "u", [1, 2]),
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     assert result["matches"][0]["unique_constraints"] == [
         {"name": "orders_status_customer_key", "columns": ["status", "customer_id"]}
@@ -1084,7 +1160,10 @@ def test_describe_schema_level2_unique_constraint_columns():
 
 
 def test_describe_schema_level2_view_target_accepted():
-    """Scenario 9 (D5): a view relation is returned with kind == 'view'."""
+    """Scenario 9 (D5): a view relation is returned with kind == 'view'.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "order_view", relkind="v")],
         columns=[
@@ -1092,9 +1171,9 @@ def test_describe_schema_level2_view_target_accepted():
             _l2_column(2, "total", "integer", True),
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="order_view", schema=None)
+    result = client.describe_schema(table="order_view", schema=None)
 
     match = result["matches"][0]
     assert match["kind"] == "view"
@@ -1102,7 +1181,10 @@ def test_describe_schema_level2_view_target_accepted():
 
 
 def test_describe_schema_level2_table_and_column_comments():
-    """Scenario 10: column + table comments from pg_description surface."""
+    """Scenario 10: column + table comments from pg_description surface.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
         columns=[_l2_column(1, "total_cents", "integer", True)],
@@ -1111,9 +1193,9 @@ def test_describe_schema_level2_table_and_column_comments():
             (1, "cents, not dollars"),    # objsubid 1 -> column 1 comment
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     match = result["matches"][0]
     assert match["comment"] == "Customer orders"
@@ -1121,7 +1203,10 @@ def test_describe_schema_level2_table_and_column_comments():
 
 
 def test_describe_schema_level2_multi_schema_match_returns_all():
-    """Scenario 11: driver returns ALL matches across schemas (no disambiguation)."""
+    """Scenario 11: driver returns ALL matches across schemas (no disambiguation).
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[
             _l2_relation(16384, "public", "orders"),
@@ -1129,9 +1214,9 @@ def test_describe_schema_level2_multi_schema_match_returns_all():
         ],
         columns=[_l2_column(1, "id", "uuid", True)],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     assert result["items"] == []
     assert len(result["matches"]) == 2
@@ -1197,6 +1282,8 @@ def test_describe_schema_level2_unique_constraint_and_standalone_unique_index():
 
     The standalone index's indkey is staged as a STRING ("3") to exercise the
     int2vector string-normalization branch.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
     """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
@@ -1213,9 +1300,9 @@ def test_describe_schema_level2_unique_constraint_and_standalone_unique_index():
             _l2_unique_index("orders_external_ref_uidx", "3"),
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     # The pg_constraint entry is listed first, then the standalone index
     # captured by the pg_index loop.
@@ -1227,7 +1314,10 @@ def test_describe_schema_level2_unique_constraint_and_standalone_unique_index():
 
 def test_describe_schema_level2_standalone_unique_index_only_list_indkey():
     """A standalone unique index with NO pg_constraint unique is captured via
-    pg_index; the int2vector LIST form ([1, 2]) is normalized to column names."""
+    pg_index; the int2vector LIST form ([1, 2]) is normalized to column names.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
+    """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
         columns=[
@@ -1240,9 +1330,9 @@ def test_describe_schema_level2_standalone_unique_index_only_list_indkey():
             _l2_unique_index("orders_tenant_code_uidx", [1, 2]),
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     assert result["matches"][0]["unique_constraints"] == [
         {"name": "orders_tenant_code_uidx", "columns": ["tenant_id", "code"]},
@@ -1255,6 +1345,8 @@ def test_describe_schema_level2_expression_unique_index_skipped():
     column list to map, and emitting ``{"columns": []}`` would mislead an agent
     into thinking a uniqueness exists over no columns. The column-oriented
     ``unique_constraints`` contract can't honestly represent an expression.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
     """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
@@ -1268,9 +1360,9 @@ def test_describe_schema_level2_expression_unique_index_skipped():
             _l2_unique_index("orders_email_lower_uidx", "0"),
         ],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
 
     assert result["matches"][0]["unique_constraints"] == []
 
@@ -1290,6 +1382,8 @@ def test_describe_schema_level2_primary_key_not_duplicated_and_constraint_counte
     outcome: PK appears only in primary_key, the unique constraint appears
     exactly once in unique_constraints, and no PK echo leaks in. The SQL
     predicate itself is verified end-to-end by the integration test.
+
+    Asserts at the DbClient boundary; the driver now returns DTOs internally.
     """
     conn, _ = _level2_catalog_conn(
         relations=[_l2_relation(16384, "public", "orders")],
@@ -1306,9 +1400,9 @@ def test_describe_schema_level2_primary_key_not_duplicated_and_constraint_counte
         # standalone rows from pg_index.
         unique_indexes=[],
     )
-    driver = PostgreSQLDriver(connectable=conn)
+    client = _client_for(PostgreSQLDriver(connectable=conn))
 
-    result = driver.describe_schema(table="orders", schema=None)
+    result = client.describe_schema(table="orders", schema=None)
     match = result["matches"][0]
 
     # Primary key surfaces ONLY in primary_key, never in unique_constraints.

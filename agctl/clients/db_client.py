@@ -7,17 +7,54 @@ while always falling back to the built-in ``postgresql`` driver.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.metadata
 from typing import Any
 
 from ..errors import ConfigError
+from .db_drivers.mysql import MySQLDriver
 from .db_drivers.postgresql import PostgreSQLDriver
+from .db_drivers.sqlite import SQLiteDriver
 
 #: Entry-point group used to discover third-party DB drivers.
 DB_DRIVER_ENTRY_POINT_GROUP = "agctl.db_drivers"
 
 #: Built-in drivers always available even without entry-point registration.
-BUILTIN_DRIVERS: dict[str, type] = {"postgresql": PostgreSQLDriver}
+#:
+#: Heavy DB deps (``psycopg``, ``pymysql``) are lazy-imported inside each
+#: driver's ``connect()`` / ``execute()`` methods, so populating this dict at
+#: module import time does NOT trigger those imports — ``import agctl`` works
+#: even when neither extra is installed. ``sqlite3`` is stdlib (zero cost).
+BUILTIN_DRIVERS: dict[str, type] = {
+    "postgresql": PostgreSQLDriver,
+    "mysql": MySQLDriver,
+    "sqlite": SQLiteDriver,
+}
+
+
+def _serialize_value(value: Any) -> Any:
+    """Serialize a single top-level value from a driver's ``describe_schema`` dict.
+
+    - A dataclass instance (e.g. a stray ``SchemaItem``/``SchemaMatch`` at the
+      top of the dict) is converted via :func:`dataclasses.asdict`, which
+      itself recurses into nested dataclasses / lists / dicts.
+    - A list of dataclass instances (the normal case for ``items`` /
+      ``matches``) is mapped elementwise through :func:`dataclasses.asdict`,
+      leaving non-dataclass elements (strings, ints, plain dicts) untouched.
+    - Any other value (plain dict, string, None) passes through unchanged.
+
+    Non-dataclass elements inside a list are passed through as-is so a driver
+    that still emits plain dicts at this level (forward-compat / partial
+    migration) is not crashed on.
+    """
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    if isinstance(value, list):
+        return [
+            dataclasses.asdict(item) if dataclasses.is_dataclass(item) else item
+            for item in value
+        ]
+    return value
 
 
 class DbClient:
@@ -96,8 +133,14 @@ class DbClient:
         Probes the selected driver for a callable ``execute_write`` attribute.
         Raises ConfigError if the driver lacks this optional capability.
 
+        The driver may return either a plain dict (legacy/forward-compat) or a
+        :class:`~agctl.clients.db_driver_protocol.WriteResult` dataclass
+        instance; a dataclass instance is serialized to a plain dict via
+        :func:`dataclasses.asdict` at this boundary so the JSON shape seen by
+        callers is unchanged regardless of the driver's internal return type.
+
         Returns:
-            The dict returned by the driver's ``execute_write`` method.
+            The dict result of the driver's ``execute_write`` method.
         """
         execute_write_attr = getattr(self._driver, "execute_write", None)
         if not callable(execute_write_attr):
@@ -105,7 +148,10 @@ class DbClient:
                 f"connection's driver ({self._conn_dict['type']}) does not support writes",
                 {"driver": self._conn_dict["type"]},
             )
-        return self._driver.execute_write(sql, params)
+        result = self._driver.execute_write(sql, params)
+        if dataclasses.is_dataclass(result):
+            return dataclasses.asdict(result)
+        return result
 
     def supports_describe_schema(self) -> bool:
         """Return True if the driver offers a callable ``describe_schema``.
@@ -125,17 +171,24 @@ class DbClient:
 
         Probes :meth:`supports_describe_schema`; raises ConfigError if the
         driver lacks this optional capability. Otherwise delegates to the
-        driver and returns its dict unchanged.
+        driver and serializes any DTO instances inside the returned dict
+        (top-level values and nested-in-list values) into plain dicts via
+        :func:`dataclasses.asdict` so the JSON shape seen by callers is
+        unchanged regardless of the driver's internal return type.
 
         Returns:
-            The dict returned by the driver's ``describe_schema`` method.
+            The dict returned by the driver's ``describe_schema`` method,
+            with any dataclass instances serialized to plain dicts.
         """
         if not self.supports_describe_schema():
             raise ConfigError(
                 f"connection's driver ({self._conn_dict['type']}) does not support schema discovery",
                 {"driver": self._conn_dict["type"]},
             )
-        return self._driver.describe_schema(table, schema)
+        result = self._driver.describe_schema(table, schema)
+        if isinstance(result, dict):
+            return {key: _serialize_value(value) for key, value in result.items()}
+        return result
 
     def close(self) -> None:
         self._driver.close()

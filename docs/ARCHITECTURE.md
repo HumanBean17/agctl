@@ -153,8 +153,10 @@ agctl/
     ├── http_client.py          # httpx wrapper (lazy import)
     ├── kafka_client.py         # confluent-kafka wrapper (lazy import)
     ├── db_client.py            # driver dispatch via agctl.db_drivers entry points
-    ├── db_driver_protocol.py   # DBDriver Protocol
-    ├── db_drivers/postgresql.py  # built-in psycopg driver (lazy import)
+    ├── db_driver_protocol.py   # DBDriver Protocol + DTOs (WriteResult, SchemaItem, SchemaMatch, ColumnInfo, ForeignKey, UniqueConstraint) + BaseDBDriver mixin
+    ├── db_drivers/mysql.py     # built-in PyMySQL driver (inherits BaseDBDriver, lazy import)
+    ├── db_drivers/postgresql.py  # built-in psycopg driver (inherits BaseDBDriver, lazy import)
+    ├── db_drivers/sqlite.py    # built-in sqlite3 driver (inherits BaseDBDriver)
     ├── grpc_client.py          # grpcio wrapper (lazy import); reflection-resolution + JSON↔protobuf via the shared kernel
     ├── grpc_descriptors.py     # shared gRPC proto kernel: build_descriptor_pool, find_method, call_type_of, message_class, serialize, deserialize (grpcio-free at module top; lazy imports)
     ├── log_client.py           # log backend dispatch via agctl.logs_backends entry points
@@ -679,11 +681,11 @@ reactors sharing a cluster reuse a single client built via `clients_by_cluster`)
 
 ---
 
-### DbClient + driver (`clients/db_client.py`, `clients/db_drivers/postgresql.py`)
+### DbClient + driver (`clients/db_client.py`, `clients/db_drivers/mysql.py`, `clients/db_drivers/postgresql.py`, `clients/db_drivers/sqlite.py`)
 
 `DbClient` dispatches to a `DBDriver` selected by the connection's `type`:
 discovery merges entry points (`agctl.db_drivers`, §10) over the always-present
-built-in `{"postgresql": PostgreSQLDriver}`; broken third-party drivers are
+built-in `{"mysql": MySQLDriver, "postgresql": PostgreSQLDriver, "sqlite": SQLiteDriver}`; broken third-party drivers are
 skipped. The client delegates `connect`/`execute`/`close` and exposes DI seams
 (`driver`/`drivers`).
 
@@ -701,6 +703,22 @@ forwarded as kwargs and **override** the corresponding URI parameters (psycopg's
 merge semantics — kwargs win). When `url` is absent, the driver behaves as before,
 using only discrete fields.
 
+**Per-driver SQL param handling** — the three built-in drivers diverge on how
+they handle the JDBC-style `:name` params the agctl authoring layer emits.
+`MySQLDriver` mirrors PostgreSQL: PyMySQL is lazy-imported in `connect`
+(missing → `ConfigError`, `mysql` extra), `:name` params are rewritten to
+PyMySQL's native `%(name)s` form via `convert_sql_params`, `autocommit=False`
+is forced on the connection (after the options merge so user-supplied values
+cannot override it), and there is no `RETURNING` support (MySQL has no such
+clause — `execute_write` always returns `returning=[]`).
+`SQLiteDriver` is the per-driver-divergence showcase: stdlib `sqlite3` is
+imported at module top (no extra, no lazy import — the only one of the three
+that doesn't need a backing library), `:name` params are passed through
+unchanged (no `convert_sql_params` call — `sqlite3` natively accepts `:name`),
+and PRAGMA identifier validation enforces `^[a-zA-Z_][a-zA-Z0-9_]*$` on the
+PRAGMA target since PRAGMAs don't accept bind parameters and the identifier
+must be string-interpolated safely.
+
 **Optional `execute_write` capability** — write support is an optional driver
 capability, not required by the `DBDriver` protocol. `DbClient.execute_write`
 probes the driver for a callable `execute_write` attribute and raises
@@ -713,7 +731,7 @@ optional driver capability following the same probe pattern.
 probe (it inspects the driver for a callable `describe_schema` attribute without
 opening a connection); `agctl db schema` calls it to fail fast with
 `ConfigError` (exit 2) when the driver cannot introspect. `DbClient.describe_schema`
-delegates to the driver and returns its dict unchanged.
+delegates to the driver and serializes any DTO instances in the returned dict to plain dicts via `dataclasses.asdict` at this boundary, so the JSON shape seen by callers is unchanged regardless of the driver's internal return type.
 `PostgreSQLDriver.describe_schema` reads `pg_catalog` (relations from `pg_class`/
 `pg_namespace`/`pg_attribute`; columns from `pg_attribute`/`pg_type`; defaults,
 enum values, comments, and constraints from `pg_attrdef`/`pg_enum`/
@@ -1103,7 +1121,7 @@ SR client lazy-import inside the function that needs them, so importing
 
 **Build & entry points:** hatchling backend, wheel target `agctl`; console
 scripts `agctl`/`agt` → `agctl.cli:cli`; entry-point groups `agctl.db_drivers`
-(registers built-in `postgresql`), `agctl.logs_backends` (registers built-in `file`),
+(registers built-in `mysql`, `postgresql`, `sqlite`), `agctl.logs_backends` (registers built-in `file`),
 `agctl.plugins`, `agctl.assertions` (§10); requires Python `>=3.11`.
 
 ---
