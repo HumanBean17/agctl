@@ -112,16 +112,22 @@ class SchemaMatch:
     ``columns`` is ordered to match the underlying catalog. ``primary_key``
     lists the PK column names (empty list if none). ``foreign_keys`` and
     ``unique_constraints`` carry the table's constraints.
+
+    Field declaration order mirrors the original dict insertion order used by
+    the pre-refactor PostgreSQL driver (``schema, table, kind, columns,
+    primary_key, foreign_keys, unique_constraints, comment``) so that
+    ``dataclasses.asdict`` + ``json.dumps`` produces byte-identical output to
+    the original implementation.
     """
 
     schema: str
     table: str
     kind: str
-    comment: str | None
     columns: list[ColumnInfo]
     primary_key: list[str]
     foreign_keys: list[ForeignKey]
     unique_constraints: list[UniqueConstraint]
+    comment: str | None
 
 
 class BaseDBDriver:
