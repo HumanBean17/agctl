@@ -16,15 +16,15 @@ at module top. Importing this module must not require ``httpx``. When no
 client is injected and ``httpx`` is missing, :meth:`_fetch_entries` raises
 :class:`ConfigError` naming ``pip install 'agctl[loki]'``.
 
-The high-level operations :meth:`scan` and :meth:`sample_schema` are
-implemented here; :meth:`await_one` and :meth:`follow` remain
-:class:`NotImplementedError` stubs until Task 6. ``LokiBackend`` is
-intentionally not registered in
+The high-level operations :meth:`scan`, :meth:`sample_schema`,
+:meth:`await_one`, and :meth:`follow` are all implemented here.
+``LokiBackend`` is intentionally not registered in
 :data:`agctl.clients.log_client.BUILTIN_BACKENDS` yet (Task 8).
 """
 
 import inspect
 import json
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -49,6 +49,10 @@ _DEFAULT_FETCH_LIMIT: int = 500
 
 #: Default ``direction`` for ``query_range`` ("forward" == oldest-first).
 _DEFAULT_DIRECTION: str = "forward"
+
+#: Chunk size (ms) for the interruptible sleep in :meth:`LokiBackend.follow`.
+#: A production ``time.sleep`` blocks at most this long past a stop signal.
+_SLEEP_CHUNK_MS: int = 500
 
 
 class LokiBackend:
@@ -669,8 +673,123 @@ class LokiBackend:
         stop_event: threading.Event,
         poll_interval_ms: int,
     ) -> Iterator[CanonicalEntry]:
-        """Stream matching entries (Task 6)."""
-        raise NotImplementedError
+        """Stream matching entries as they arrive, until ``stop_event`` is set.
+
+        A poll generator (DESIGN §9.2). Each cycle:
+
+          1. If ``stop_event`` is set, return.
+          2. Issue a ``forward`` ``query_range`` over ``[start, now]`` (limit
+             = ``fetch_limit``), where ``start`` is seeded to now on the first
+             cycle and advanced to the newest emitted timestamp thereafter.
+          3. Apply :func:`log_common.entry_matches`; skip any
+             ``(timestamp, message)`` pair already emitted (dedup set);
+             yield new matches.
+          4. After each yield, re-check ``stop_event`` (prompt termination).
+          5. If nothing new was emitted, sleep ``poll_interval_ms/1000`` in
+             small chunks (interruptible -- a set ``stop_event`` terminates
+             within one chunk of being set).
+
+        Error tolerance:
+
+          * The **first** fetch lets ALL exceptions propagate so a startup
+            auth/connect/bad-query failure surfaces via the streaming
+            startup-error path (ARCH §6).
+          * On **subsequent** fetches, :class:`ConnectionFailure` and
+            :class:`OperationTimeout` are swallowed with a one-line stderr
+            warning (``agctl: loki follow transient error: ...``) and
+            retried on the next cycle (transient network blip).
+            :class:`ConfigError` (bad query / non-stream result) ALWAYS
+            propagates -- it is permanent.
+
+        Known limitation: a mid-stream auth change (401 appearing after a
+        successful start) is swallowed and retried rather than surfaced;
+        distinguishing it from a transient blip is deferred to a future
+        revision.
+
+        Args:
+            filt: :class:`LogFilter` applied to every fetched entry.
+            stop_event: When set, the generator returns promptly (checked
+                before each fetch, after each yield, and between sleep
+                chunks).
+            poll_interval_ms: Sleep between polls when no new entries were
+                emitted.
+
+        Yields:
+            :class:`CanonicalEntry` instances matching ``filt``, each
+            emitted at most once.
+        """
+        # Seed the high-water ``start`` to "now". Subsequent cycles advance
+        # it to the newest emitted entry's timestamp; a cycle that emits
+        # nothing leaves ``start`` unchanged (re-fetches the same window).
+        start = self._to_rfc3339_nano(datetime.now(timezone.utc))
+        emitted: set[tuple[str, str]] = set()
+        first_fetch = True
+
+        while not stop_event.is_set():
+            end = self._to_rfc3339_nano(datetime.now(timezone.utc))
+            try:
+                entries = self._fetch_entries(
+                    start=start,
+                    end=end,
+                    limit=self._fetch_limit,
+                    direction="forward",
+                )
+            except (ConnectionFailure, OperationTimeout) as exc:
+                # First-fetch errors ALWAYS propagate (startup-error path).
+                # ConfigError is not caught here and likewise propagates on
+                # any fetch -- it is permanent, not a transient blip.
+                if first_fetch:
+                    raise
+                print(
+                    f"agctl: loki follow transient error: {exc}",
+                    file=sys.stderr,
+                )
+                first_fetch = False
+                self._interruptible_sleep(stop_event, poll_interval_ms)
+                continue
+
+            first_fetch = False
+            newest_ts: str | None = None
+            yielded_any = False
+
+            for entry in entries:
+                if stop_event.is_set():
+                    return
+                if not log_common.entry_matches(entry, filt):
+                    continue
+                key = (entry.timestamp, entry.message)
+                if key in emitted:
+                    continue
+                emitted.add(key)
+                if newest_ts is None or entry.timestamp > newest_ts:
+                    newest_ts = entry.timestamp
+                yielded_any = True
+                yield entry
+                if stop_event.is_set():
+                    return
+
+            if yielded_any and newest_ts is not None:
+                # Advance the high-water to the newest emitted timestamp.
+                start = newest_ts
+            else:
+                # Nothing new this cycle; sleep interruptibly before polling.
+                self._interruptible_sleep(stop_event, poll_interval_ms)
+
+    def _interruptible_sleep(
+        self, stop_event: threading.Event, total_ms: int
+    ) -> None:
+        """Sleep for ``total_ms`` in chunks, exiting early if ``stop_event`` sets.
+
+        Chunked so a production :func:`time.sleep` does not block longer
+        than ``_SLEEP_CHUNK_MS`` past a stop signal. The injected test seam
+        :attr:`_sleep` is called once per chunk (so a test sleep that counts
+        calls sees one call per chunk, not one per logical sleep).
+        """
+        remaining_ms = max(int(total_ms), 1)
+        while remaining_ms > 0 and not stop_event.is_set():
+            step = min(_SLEEP_CHUNK_MS, remaining_ms)
+            self._sleep(step / 1000)
+            remaining_ms -= step
 
     def sample_schema(self, *, sample_lines: int = 100) -> SchemaDescriptor:
         """Infer field-presence patterns from a recent sample of entries.

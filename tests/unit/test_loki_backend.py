@@ -17,6 +17,7 @@ The missing-httpx test forces the lazy import to fail.
 """
 
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -604,6 +605,11 @@ class SequentialFakeHttpClient:
     Repeats the last response once the sequence is exhausted (so a poll loop
     that reads more times than expected still gets a canned answer rather than
     an IndexError). Mirrors :class:`FakeHttpClient`'s recorded-call shape.
+
+    A script item may be either a ``FakeResponse`` (returned) or an
+    ``Exception`` instance (raised) -- used by the follow tests to inject
+    transient :class:`ConnectionFailure` / :class:`OperationTimeout` errors
+    mid-stream without pulling in httpx.
     """
 
     def __init__(self, responses):
@@ -633,13 +639,15 @@ class SequentialFakeHttpClient:
         )
         if not self._responses:
             raise AssertionError("SequentialFakeHttpClient has no canned responses")
-        resp = (
+        item = (
             self._responses[self._idx]
             if self._idx < len(self._responses)
             else self._responses[-1]
         )
         self._idx += 1
-        return resp
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 def _ts(s):
@@ -863,3 +871,262 @@ def test_await_one_poll_timeout_no_matches_terminates():
     assert len(sleeps) == 1  # loop terminated, did not spin forever
     assert result.elapsed_ms == 300  # 0.3s fake wall-clock elapsed
     assert result.scanned == 0  # Phase 1 empty + no forward fetch
+
+
+# ============================================================================
+# Task 7: follow (poll generator with dedup + stop + transient tolerance)
+# ============================================================================
+
+def _make_stop_after_n_sleep(stop_event, n):
+    """Build a fake ``sleep`` that sets ``stop_event`` on the n-th call.
+
+    Bounds the otherwise-infinite ``follow`` loop deterministically: each
+    "no new entries" cycle calls sleep once (poll_interval_ms <= chunk size),
+    so the n-th sleep call corresponds to the n-th no-new cycle.
+    """
+    counter = [0]
+
+    def _sleep(seconds):
+        counter[0] += 1
+        if counter[0] >= n:
+            stop_event.set()
+
+    return _sleep
+
+
+# --- follow: yields new matches across polls -------------------------------
+def test_follow_yields_new_matches_across_polls_and_skips_repeats():
+    """[] then [A] then [A,B] across three polls yields exactly [A, B].
+
+    A is not re-yielded on poll 3 (dedup). The loop is bounded by a fake
+    sleep that sets stop_event on the 3rd no-new cycle.
+    """
+    stop_event = threading.Event()
+    sleep = _make_stop_after_n_sleep(stop_event, n=3)
+
+    body_empty = streams_body([({"app": "x"}, [])])
+    body_a = streams_body(
+        [({"app": "x"}, [[_ts("00"), '{"level":"ERROR","message":"A"}']])]
+    )
+    body_ab = streams_body(
+        [
+            (
+                {"app": "x"},
+                [
+                    [_ts("00"), '{"level":"ERROR","message":"A"}'],
+                    [_ts("01"), '{"level":"ERROR","message":"B"}'],
+                ],
+            )
+        ]
+    )
+    fake = SequentialFakeHttpClient(
+        [
+            FakeResponse(status_code=200, json_data=body_empty),
+            FakeResponse(status_code=200, json_data=body_a),
+            FakeResponse(status_code=200, json_data=body_ab),
+        ]
+    )
+    backend = LokiBackend(make_source(), http_client=fake, sleep=sleep)
+
+    yielded = list(
+        backend.follow(
+            LogFilter(level="ERROR"),
+            stop_event=stop_event,
+            poll_interval_ms=100,
+        )
+    )
+
+    assert [e.message for e in yielded] == ["A", "B"]
+
+
+# --- follow: dedup ---------------------------------------------------------
+def test_follow_dedups_repeated_timestamp_message_pair():
+    """The same (timestamp, message) returned every poll is yielded once."""
+    stop_event = threading.Event()
+    sleep = _make_stop_after_n_sleep(stop_event, n=2)
+
+    body = streams_body(
+        [({"app": "x"}, [[_ts("00"), '{"level":"ERROR","message":"A"}']])]
+    )
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake, sleep=sleep)
+
+    yielded = list(
+        backend.follow(
+            LogFilter(level="ERROR"),
+            stop_event=stop_event,
+            poll_interval_ms=100,
+        )
+    )
+
+    assert [e.message for e in yielded] == ["A"]
+
+
+# --- follow: filter respected ----------------------------------------------
+def test_follow_filter_respected_only_matching_yielded():
+    """LogFilter(level=ERROR) drops non-matching entries among fetched ones."""
+    stop_event = threading.Event()
+    sleep = _make_stop_after_n_sleep(stop_event, n=2)
+
+    body = streams_body(
+        [
+            (
+                {"app": "x"},
+                [
+                    [_ts("00"), '{"level":"INFO","message":"noise"}'],
+                    [_ts("01"), '{"level":"ERROR","message":"boom"}'],
+                ],
+            )
+        ]
+    )
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake, sleep=sleep)
+
+    yielded = list(
+        backend.follow(
+            LogFilter(level="ERROR"),
+            stop_event=stop_event,
+            poll_interval_ms=100,
+        )
+    )
+
+    assert [e.message for e in yielded] == ["boom"]
+
+
+# --- follow: stop_event honored between yields -----------------------------
+def test_follow_stop_event_set_between_yields_terminates_without_more_fetches():
+    """Setting stop_event after a yield terminates the generator before the
+    next ``_fetch_entries`` call (prompt termination)."""
+    stop_event = threading.Event()
+    body = streams_body(
+        [({"app": "x"}, [[_ts("00"), '{"level":"ERROR","message":"A"}']])]
+    )
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake, sleep=lambda s: None)
+
+    gen = backend.follow(
+        LogFilter(level="ERROR"),
+        stop_event=stop_event,
+        poll_interval_ms=100,
+    )
+    first = next(gen)
+    assert first.message == "A"
+
+    stop_event.set()
+    fetch_count = len(fake.calls)
+    with pytest.raises(StopIteration):
+        next(gen)
+    # No further fetch happened after stop_event was set.
+    assert len(fake.calls) == fetch_count
+
+
+# --- follow: stop_event honored during sleep -------------------------------
+def test_follow_stop_event_set_during_sleep_terminates():
+    """stop_event set by the injected sleep (no-new cycle) terminates the loop."""
+    stop_event = threading.Event()
+    sleep = _make_stop_after_n_sleep(stop_event, n=1)
+
+    body = streams_body([({"app": "x"}, [])])  # always empty -> always sleeps
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake, sleep=sleep)
+
+    yielded = list(
+        backend.follow(
+            LogFilter(level="ERROR"),
+            stop_event=stop_event,
+            poll_interval_ms=100,
+        )
+    )
+
+    assert yielded == []  # never matched; terminated via sleep-set-stop
+
+
+# --- follow: transient error tolerated (mid-stream) ------------------------
+def test_follow_transient_error_tolerated_with_stderr_warning(capsys):
+    """One mid-stream ConnectionFailure is swallowed with a stderr warning;
+    entries are yielded on the next poll; loop terminates via sleep-set-stop.
+
+    Sequence: poll 1 = empty (startup ok), poll 2 = ConnectionFailure
+    (transient, swallowed + warned), poll 3 = [A] (yielded), poll 4 = [A]
+    (deduped, no-new -> sleep 3 -> stop). The first-fetch-propagates rule
+    does NOT fire here because poll 1 succeeded.
+    """
+    stop_event = threading.Event()
+    sleep = _make_stop_after_n_sleep(stop_event, n=3)
+
+    body_empty = streams_body([({"app": "x"}, [])])
+    body_entries = streams_body(
+        [({"app": "x"}, [[_ts("00"), '{"level":"ERROR","message":"A"}']])]
+    )
+    fake = SequentialFakeHttpClient(
+        [
+            FakeResponse(status_code=200, json_data=body_empty),
+            ConnectionFailure("transient blip", {}),
+            FakeResponse(status_code=200, json_data=body_entries),
+        ]
+    )
+    backend = LokiBackend(make_source(), http_client=fake, sleep=sleep)
+
+    yielded = list(
+        backend.follow(
+            LogFilter(level="ERROR"),
+            stop_event=stop_event,
+            poll_interval_ms=100,
+        )
+    )
+
+    assert [e.message for e in yielded] == ["A"]
+    err = capsys.readouterr().err
+    assert "agctl: loki follow transient error" in err
+    assert "transient blip" in err
+
+
+# --- follow: first-fetch errors propagate (startup-error path) -------------
+def test_follow_first_fetch_transient_error_propagates():
+    """A transient error on the very first fetch propagates (startup path).
+
+    Mid-stream transients are swallowed, but the FIRST fetch letting errors
+    through is what surfaces bad-auth/connect failures at generator start
+    (ARCH §6 streaming startup-error path).
+    """
+    stop_event = threading.Event()
+    fake = SequentialFakeHttpClient(
+        [ConnectionFailure("startup connect failed", {})]
+    )
+    backend = LokiBackend(make_source(), http_client=fake, sleep=lambda s: None)
+
+    gen = backend.follow(
+        LogFilter(),
+        stop_event=stop_event,
+        poll_interval_ms=100,
+    )
+    with pytest.raises(ConnectionFailure) as ei:
+        next(gen)
+    assert "startup connect failed" in ei.value.message
+
+
+# --- follow: ConfigError always propagates ---------------------------------
+def test_follow_config_error_on_subsequent_fetch_propagates():
+    """ConfigError (bad query / non-stream result) is permanent -- propagates
+    even on a subsequent fetch, NOT swallowed like a transient blip."""
+    stop_event = threading.Event()
+    body_empty = streams_body([({"app": "x"}, [])])
+    bad_query_body = {"status": "error", "error": "parse error"}
+    fake = SequentialFakeHttpClient(
+        [
+            FakeResponse(status_code=200, json_data=body_empty),  # poll 1: ok
+            FakeResponse(
+                status_code=400, json_data=bad_query_body, text='{"status":"error"}'
+            ),  # poll 2: ConfigError
+        ]
+    )
+    backend = LokiBackend(make_source(), http_client=fake, sleep=lambda s: None)
+
+    gen = backend.follow(
+        LogFilter(level="ERROR"),
+        stop_event=stop_event,
+        poll_interval_ms=100,
+    )
+    with pytest.raises(ConfigError) as ei:
+        list(gen)
+    assert "parse error" in ei.value.message
