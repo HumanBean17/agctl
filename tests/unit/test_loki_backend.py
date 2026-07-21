@@ -719,11 +719,13 @@ def test_await_one_oneshot_no_match_returns_none():
 
 # --- poll mode (timeout_s > 0) ---------------------------------------------
 def test_await_one_poll_finds_match_after_one_sleep():
-    """Phase 1 backward (no match); exactly one sleep; forward poll matches.
+    """Phase 1 backward (no match); forward fetch 1 no match; one sleep; forward fetch 2 matches.
 
-    Asserts the two reads use the correct directions, exactly one sleep
-    occurred before the find, and scanned accumulates both reads
-    (backward=0 + forward=1).
+    Fetch-first ordering: the FIRST forward fetch returns only non-matching
+    entries, then after exactly one sleep the SECOND forward fetch returns
+    the match. Asserts the three reads use the correct directions, exactly
+    one sleep occurred before the find, and scanned accumulates all reads
+    (backward=0 + forward1=1 + forward2=1 == 2).
     """
     clock = FakeClock()
     sleeps = []
@@ -733,18 +735,22 @@ def test_await_one_poll_finds_match_after_one_sleep():
         sleeps.append(seconds)
 
     backward_body = streams_body([({"app": "x"}, [])])  # Phase 1: nothing
-    forward_body = streams_body(
+    forward_no_match = streams_body(
+        [({"app": "x"}, [[_ts("10"), '{"level":"INFO","message":"A"}']])]
+    )
+    forward_match = streams_body(
         [
             (
                 {"app": "x"},
-                [[_ts("10"), '{"level":"ERROR","message":"found"}']],
+                [[_ts("20"), '{"level":"ERROR","message":"found"}']],
             )
         ]
     )
     fake = SequentialFakeHttpClient(
         [
             FakeResponse(status_code=200, json_data=backward_body),
-            FakeResponse(status_code=200, json_data=forward_body),
+            FakeResponse(status_code=200, json_data=forward_no_match),
+            FakeResponse(status_code=200, json_data=forward_match),
         ]
     )
     backend = LokiBackend(
@@ -761,11 +767,12 @@ def test_await_one_poll_finds_match_after_one_sleep():
 
     assert result.entry is not None
     assert result.entry.message == "found"
-    assert result.scanned == 1  # backward(0) + forward(1)
+    assert result.scanned == 2  # backward(0) + forward1(1) + forward2(1)
     assert len(sleeps) == 1  # exactly one sleep before the find
-    assert len(fake.calls) == 2  # one backward + one forward
+    assert len(fake.calls) == 3  # one backward + two forward
     assert fake.calls[0]["params"]["direction"] == "backward"
     assert fake.calls[1]["params"]["direction"] == "forward"
+    assert fake.calls[2]["params"]["direction"] == "forward"
 
 
 def test_await_one_poll_no_double_count_same_timestamp():
@@ -823,12 +830,12 @@ def test_await_one_poll_no_double_count_same_timestamp():
 
 
 def test_await_one_poll_timeout_no_matches_terminates():
-    """timeout_s>0, no matches ever: first sleep blows past deadline -> None.
+    """timeout_s>0, no matches ever: loop terminates after exactly one sleep.
 
-    The fake clock advances 0.3s on the first sleep, exceeding the 0.2s
-    deadline, so the loop terminates after exactly one sleep with no forward
-    fetch. entry is None, elapsed_ms reflects the fake wall time, and scanned
-    is just the Phase 1 read (which returned nothing).
+    Fetch-first ordering: after Phase 1's backward read, one forward fetch
+    runs (returns empty), then the sleep advances the fake clock 0.3s past
+    the 0.2s deadline, so the loop exits. entry is None, elapsed_ms reflects
+    the fake wall time, and scanned stays 0 (both reads returned empty).
     """
     clock = FakeClock()
     sleeps = []

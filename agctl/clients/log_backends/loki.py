@@ -536,12 +536,15 @@ class LokiBackend:
           * **Poll** (``timeout_s > 0``): Phase 1 is the same backward read
             (count its ``scanned``); if it matches, return immediately.
             Phase 2 loops until the deadline (injectable ``monotonic``):
-            ``self._sleep(poll_interval_ms/1000)`` first, then a ``forward``
-            ``query_range`` whose ``start`` is the **last-seen Loki
-            timestamp** high-water. An entry re-included at a timestamp
-            already covered is deduped client-side (counted/matched once), so
-            ``scanned`` never double-counts. On deadline, return
-            ``entry=None`` with cumulative ``scanned``.
+            each iteration does a ``forward`` ``query_range`` whose ``start``
+            is the **last-seen Loki timestamp** high-water, filters for new
+            matches, and returns on the first one; otherwise it sleeps
+            ``poll_interval_ms/1000`` and re-checks the deadline. Fetch-first
+            (not sleep-first) so the first poll fires immediately after Phase
+            1. An entry re-included at a timestamp already covered is deduped
+            client-side (counted/matched once), so ``scanned`` never
+            double-counts. On deadline, return ``entry=None`` with cumulative
+            ``scanned``.
 
         The high-water is the max entry ``timestamp`` string seen so far
         (RFC3339Nano UTC strings sort lexically, so a string ``max`` suffices
@@ -572,7 +575,11 @@ class LokiBackend:
         # deterministic without real waiting.
         now_dt = datetime.now(timezone.utc)
         start_dt = since if since is not None else now_dt - timedelta(hours=1)
-        window_start_ts = self._to_rfc3339_nano(start_dt)
+        # Z-suffixed so the high-water seed matches Loki's entry-timestamp
+        # format (Loki emits RFC3339Nano with ``Z``; ``_to_rfc3339_nano``
+        # emits ``+00:00``). The seed is lexically compared against entry
+        # timestamps below, so the formats must agree.
+        window_start_ts = self._to_rfc3339_nano(start_dt).replace("+00:00", "Z")
 
         # -- Phase 1: one backward historical read (both modes) --------------
         entries = self._fetch_entries(
@@ -605,13 +612,13 @@ class LokiBackend:
                 elapsed_ms=self._elapsed_ms_since(start_wall),
             )
 
-        # -- Phase 2: sleep-first forward poll loop until the deadline -------
+        # -- Phase 2: fetch-first forward poll loop until the deadline -------
+        # Fetch-first: the FIRST action is a forward fetch (responsive --
+        # checks for new entries immediately after Phase 1, then sleeps
+        # between polls). On no match, sleep and re-check the deadline at
+        # the top of the loop.
         deadline = start_wall + timeout_s
         while self._monotonic() < deadline:
-            self._sleep(poll_interval_ms / 1000)
-            if self._monotonic() >= deadline:
-                break
-
             now_dt = datetime.now(timezone.utc)
             entries = self._fetch_entries(
                 start=last_ts,
@@ -639,6 +646,10 @@ class LokiBackend:
                         scanned=scanned,
                         elapsed_ms=self._elapsed_ms_since(start_wall),
                     )
+
+            # No match this poll; sleep before re-checking the deadline.
+            # Guard against poll_interval_ms == 0 (would otherwise busy-wait).
+            self._sleep(max(poll_interval_ms, 1) / 1000)
 
         # Deadline exhausted with no match.
         return AwaitResult(
