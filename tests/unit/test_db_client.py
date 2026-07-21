@@ -3,6 +3,14 @@
 import pytest
 
 from agctl.clients.db_client import DbClient
+from agctl.clients.db_driver_protocol import (
+    ColumnInfo,
+    ForeignKey,
+    SchemaItem,
+    SchemaMatch,
+    UniqueConstraint,
+    WriteResult,
+)
 from agctl.clients.db_drivers.postgresql import PostgreSQLDriver
 from agctl.config.models import DatabaseConnection
 from agctl.errors import ConfigError
@@ -250,3 +258,179 @@ class TestDescribeSchema:
         # Probe before any connect(); the driver must not have been connected.
         assert client.supports_describe_schema() is True
         assert fake.connected_with is None
+
+
+# --- DTO serialization (Task 3) -------------------------------------------
+#
+# Drivers return DTOs (WriteResult, SchemaItem, SchemaMatch) from their
+# execute_write / describe_schema methods. DbClient serializes these to plain
+# dicts at the boundary so callers (the `agctl db *` command layer, JSON
+# output, agents consuming JSON) see the same shape they saw before the
+# refactor — without ever knowing the internal return type changed.
+
+
+class FakeDriverReturningWriteResult(FakeDriver):
+    """Fake driver whose execute_write returns a WriteResult DTO."""
+
+    def execute_write(self, sql, params):
+        return WriteResult(rows_affected=3, returning=[{"id": "x"}])
+
+
+class FakeDriverReturningPlainDict(FakeDriver):
+    """Backward-compat fake: driver still returns a plain dict (no asdict crash)."""
+
+    def execute_write(self, sql, params):
+        return {"rows_affected": 1, "returning": []}
+
+
+class FakeDriverReturningSchemaItems(FakeDriver):
+    """Fake driver whose describe_schema returns DTOs in `items`."""
+
+    def describe_schema(self, table, schema):
+        return {
+            "items": [
+                SchemaItem(
+                    schema="public",
+                    name="orders",
+                    kind="table",
+                    column_count=3,
+                )
+            ]
+        }
+
+
+class FakeDriverReturningSchemaMatches(FakeDriver):
+    """Fake driver whose describe_schema returns DTOs in `matches`."""
+
+    def describe_schema(self, table, schema):
+        return {
+            "matches": [
+                SchemaMatch(
+                    schema="public",
+                    table="t",
+                    kind="table",
+                    comment=None,
+                    columns=[
+                        ColumnInfo(
+                            name="id",
+                            data_type="int",
+                            nullable=False,
+                            default=None,
+                            generated=None,
+                            enum_values=None,
+                            comment=None,
+                        )
+                    ],
+                    primary_key=[],
+                    foreign_keys=[
+                        ForeignKey(
+                            name="t_fk",
+                            columns=["id"],
+                            references_schema="public",
+                            references_table="other",
+                            references_columns=["id"],
+                        )
+                    ],
+                    unique_constraints=[
+                        UniqueConstraint(name="t_uidx", columns=["code"])
+                    ],
+                )
+            ]
+        }
+
+
+class TestDtoSerialization:
+    """Verify DbClient serializes DTO returns into plain dicts at the boundary."""
+
+    def test_execute_write_serializes_write_result_dto(self):
+        """WriteResult DTO -> plain dict (same shape, not the dataclass instance)."""
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=FakeDriverReturningWriteResult(),
+        )
+        result = client.execute_write("INSERT INTO t (x) VALUES (1)", {"x": 1})
+
+        # The result is a plain dict, not a WriteResult instance.
+        assert isinstance(result, dict)
+        assert not hasattr(result, "__dataclass_fields__")
+        assert result == {"rows_affected": 3, "returning": [{"id": "x"}]}
+
+    def test_execute_write_passes_through_plain_dict(self):
+        """Backward compat: a driver that returns a plain dict is not crashed on."""
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=FakeDriverReturningPlainDict(),
+        )
+        result = client.execute_write("INSERT INTO t (x) VALUES (1)", {"x": 1})
+
+        assert isinstance(result, dict)
+        assert result == {"rows_affected": 1, "returning": []}
+
+    def test_describe_schema_serializes_schema_item_dtos(self):
+        """SchemaItem DTOs in `items` -> list of plain dicts."""
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=FakeDriverReturningSchemaItems(),
+        )
+        result = client.describe_schema(None, None)
+
+        assert result == {
+            "items": [
+                {"schema": "public", "name": "orders", "kind": "table", "column_count": 3}
+            ]
+        }
+        # No nested DTO survives the boundary.
+        assert all(not hasattr(it, "__dataclass_fields__") for it in result["items"])
+
+    def test_describe_schema_serializes_schema_match_dtos_recursively(self):
+        """SchemaMatch DTOs in `matches` -> fully-nested dict equivalent.
+
+        The nested ColumnInfo / ForeignKey / UniqueConstraint DTOs must also
+        be serialized to plain dicts (dataclasses.asdict recurses).
+        """
+        client = DbClient(
+            DatabaseConnection(type="postgresql", host="h"),
+            driver=FakeDriverReturningSchemaMatches(),
+        )
+        result = client.describe_schema(None, None)
+
+        assert result == {
+            "matches": [
+                {
+                    "schema": "public",
+                    "table": "t",
+                    "kind": "table",
+                    "comment": None,
+                    "columns": [
+                        {
+                            "name": "id",
+                            "data_type": "int",
+                            "nullable": False,
+                            "default": None,
+                            "generated": None,
+                            "enum_values": None,
+                            "comment": None,
+                        }
+                    ],
+                    "primary_key": [],
+                    "foreign_keys": [
+                        {
+                            "name": "t_fk",
+                            "columns": ["id"],
+                            "references_schema": "public",
+                            "references_table": "other",
+                            "references_columns": ["id"],
+                        }
+                    ],
+                    "unique_constraints": [
+                        {"name": "t_uidx", "columns": ["code"]}
+                    ],
+                }
+            ]
+        }
+        # No DTO survives at any depth inside the returned structure.
+        match = result["matches"][0]
+        assert isinstance(match, dict)
+        assert all(isinstance(c, dict) for c in match["columns"])
+        assert all(isinstance(fk, dict) for fk in match["foreign_keys"])
+        assert all(isinstance(u, dict) for u in match["unique_constraints"])

@@ -7,60 +7,34 @@ connection may be injected via ``connectable`` for testing.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from ...assertions import coerce_db_value
-from ...errors import ConfigError, ConnectionFailure
+from ...errors import ConnectionFailure
 from ...resolution import convert_sql_params
+from ..db_driver_protocol import (
+    BaseDBDriver,
+    ColumnInfo,
+    ForeignKey,
+    SchemaItem,
+    SchemaMatch,
+    UniqueConstraint,
+    WriteResult,
+)
 
 
-# Secret-style keys redacted wholesale before a config copy enters any error
-# detail (substring match, case-insensitive). Deliberately broad: a key like
-# `key_password` or `api_token` is caught along with `password`.
-_SECRET_KEY_PATTERN = re.compile(r"password|secret|token|key", re.IGNORECASE)
-
-# Matches a Postgres URL's ``user:pass@`` (or ``user@``) userinfo prefix so it
-# can be replaced with a sentinel — e.g. ``postgres://u:p4ss@h:5432/db`` ->
-# ``postgres://***@h:5432/db``. URLs without userinfo (no ``@`` before the first
-# ``/``) are left untouched. ``postgres(ql)://`` scheme only.
-_URL_USERINFO_PATTERN = re.compile(r"^(postgres(?:ql)?://)[^@/]+@")
-
-_REDACTED_SENTINEL = "***"
-
-
-def _redact_config(config: dict) -> dict:
-    """Return a copy of ``config`` safe to embed in an error ``detail``.
-
-    The original ``config`` is NOT mutated (the caller still needs the real
-    values for the actual connection attempt). Applied transformations:
-
-    - Any key whose name contains ``password``/``secret``/``token``/``key``
-      (case-insensitive) -> ``"***"``.
-    - A ``url`` string with leading ``user:pass@`` userinfo -> the userinfo is
-      replaced by ``"***"`` (scheme + host kept). URLs without userinfo, or
-      non-string ``url`` values, pass through unchanged.
-    """
-    redacted: dict = {}
-    for key, value in config.items():
-        if _SECRET_KEY_PATTERN.search(key):
-            redacted[key] = _REDACTED_SENTINEL
-        elif key == "url" and isinstance(value, str):
-            redacted[key] = _URL_USERINFO_PATTERN.sub(
-                lambda m: f"{m.group(1)}{_REDACTED_SENTINEL}@", value
-            )
-        else:
-            redacted[key] = value
-    return redacted
-
-
-class PostgreSQLDriver:
+class PostgreSQLDriver(BaseDBDriver):
     """psycopg-backed implementation of the :class:`DBDriver` protocol.
 
     ``connectable`` is an optional pre-built psycopg connection used for test
     injection. When provided, the driver does NOT own the connection and
     :meth:`close` will leave it open. When omitted, :meth:`connect` builds one
     from config and the driver owns its lifecycle.
+
+    Inherits :meth:`BaseDBDriver._redact_config` (scheme-agnostic URL
+    userinfo + secret-key redaction) and :meth:`BaseDBDriver._lazy_import_or_raise`
+    (psycopg deferred import surfaced as :class:`ConfigError` with the
+    ``db`` extra hint).
     """
 
     def __init__(self, *, connectable=None):
@@ -84,12 +58,7 @@ class PostgreSQLDriver:
             # Injected connection: nothing to do.
             return
 
-        try:
-            import psycopg
-        except ImportError as exc:  # pragma: no cover - env-dependent
-            raise ConfigError(
-                "Database support requires the 'db' extra: pip install 'agctl[db]'"
-            ) from exc
+        psycopg = self._lazy_import_or_raise("psycopg", "db")
 
         kwargs = {}
         for key in ("host", "port", "dbname", "user", "password"):
@@ -107,7 +76,7 @@ class PostgreSQLDriver:
         except psycopg.Error as exc:
             raise ConnectionFailure(
                 message=str(exc),
-                detail={"driver": "postgresql", "config": _redact_config(config)},
+                detail={"driver": "postgresql", "config": self._redact_config(config)},
             ) from exc
 
     def execute(self, sql: str, params: dict) -> list[dict[str, Any]]:
@@ -118,7 +87,7 @@ class PostgreSQLDriver:
         / connection errors surface as :class:`ConnectionFailure`. No commit is
         issued (read-only).
         """
-        import psycopg  # local; module already imported in connect() normally
+        psycopg = self._lazy_import_or_raise("psycopg", "db")
 
         rewrite = convert_sql_params(sql)
         cur = self._conn.cursor()
@@ -136,19 +105,19 @@ class PostgreSQLDriver:
             for row in rows
         ]
 
-    def execute_write(self, sql: str, params: dict) -> dict:
+    def execute_write(self, sql: str, params: dict) -> WriteResult:
         """Run a write query, returning rows affected and optional RETURNING data.
 
         ``sql`` uses JDBC-style ``:name`` params; these are rewritten to psycopg
         ``%(name)s`` form via :func:`convert_sql_params` before execution. Returns
-        ``{"rows_affected": int | None, "returning": list[dict]}`` where
-        ``rows_affected`` is ``None`` for statements that don't report a count
-        (e.g., DDL) and ``returning`` contains coerced dict rows when the query
-        includes a ``RETURNING`` clause. The transaction is committed after
-        result materialization; any exception during execute/fetch/coercion/commit
-        triggers a rollback and surfaces as :class:`ConnectionFailure`.
+        a :class:`WriteResult` with ``rows_affected`` (None for statements that
+        don't report a count, e.g. DDL) and ``returning`` (coerced dict rows
+        when the query includes a ``RETURNING`` clause, empty otherwise). The
+        transaction is committed after result materialization; any exception
+        during execute/fetch/coercion/commit triggers a rollback and surfaces
+        as :class:`ConnectionFailure`.
         """
-        import psycopg
+        import psycopg  # local; module already imported in connect() normally
 
         rewrite = convert_sql_params(sql)
         cur = self._conn.cursor()
@@ -184,7 +153,7 @@ class PostgreSQLDriver:
         finally:
             cur.close()
 
-        return {"rows_affected": rows_affected, "returning": returning}
+        return WriteResult(rows_affected=rows_affected, returning=returning)
 
     def describe_schema(self, table: str | None, schema: str | None) -> dict:
         """Return the live schema of the connection (DESIGN §7, optional capability).
@@ -237,7 +206,7 @@ class PostgreSQLDriver:
         ``items`` is kept (empty) so the return shape is uniform across both
         branches.
         """
-        import psycopg
+        psycopg = self._lazy_import_or_raise("psycopg", "db")
 
         if table is not None:
             # Level 2: one relation's columns + keys. Find every relation named
@@ -357,27 +326,30 @@ class PostgreSQLDriver:
                 continue
 
             items.append(
-                {
-                    "schema": schema_name,
-                    "name": rec.get("relation_name"),
-                    "kind": kind,
-                    "column_count": rec.get("column_count"),
-                }
+                SchemaItem(
+                    schema=schema_name,
+                    name=rec.get("relation_name"),
+                    kind=kind,
+                    column_count=rec.get("column_count"),
+                )
             )
 
-        items.sort(key=lambda it: (it["schema"], it["name"]))
+        items.sort(key=lambda it: (it.schema, it.name))
         return {"items": items}
 
     def _describe_one_relation(
         self, cur, *, oid, schema_name, table_name, kind
-    ) -> dict:
-        """Build the normalized Level-2 dict for one relation.
+    ) -> SchemaMatch:
+        """Build the normalized Level-2 :class:`SchemaMatch` for one relation.
 
         Issues the per-relation catalog SELECTs (columns, defaults, enum
         values, comments, constraints) on the shared ``cur``. Any
         ``psycopg.Error`` propagates to :meth:`describe_schema`'s mapping to
         :class:`ConnectionFailure`. Catalog cells are emitted verbatim
-        (``coerce_db_value`` is deliberately not applied).
+        (``coerce_db_value`` is deliberately not applied). Returns a
+        :class:`SchemaMatch` DTO whose ``columns``/``foreign_keys``/
+        ``unique_constraints`` carry :class:`ColumnInfo`, :class:`ForeignKey`,
+        and :class:`UniqueConstraint` instances respectively.
         """
         # Columns (pg_attribute + pg_type for data_type/typtype). attnum > 0
         # excludes system columns; NOT attisdropped excludes dropped ones.
@@ -477,15 +449,15 @@ class PostgreSQLDriver:
             else:
                 enum_values = None
             columns.append(
-                {
-                    "name": crec.get("attname"),
-                    "data_type": crec.get("data_type"),
-                    "nullable": not crec.get("attnotnull"),
-                    "default": default,
-                    "generated": generated,
-                    "enum_values": enum_values,
-                    "comment": column_comments.get(attnum),
-                }
+                ColumnInfo(
+                    name=crec.get("attname"),
+                    data_type=crec.get("data_type"),
+                    nullable=not crec.get("attnotnull"),
+                    default=default,
+                    generated=generated,
+                    enum_values=enum_values,
+                    comment=column_comments.get(attnum),
+                )
             )
 
         # Constraints (pg_constraint): PK/FK/unique. conkey/confkey are
@@ -505,8 +477,8 @@ class PostgreSQLDriver:
         )
         con_desc = [d.name for d in (cur.description or [])]
         primary_key: list[str] = []
-        foreign_keys: list[dict] = []
-        unique_constraints: list[dict] = []
+        foreign_keys: list[ForeignKey] = []
+        unique_constraints: list[UniqueConstraint] = []
         # Cache of referenced-relation attnum->name maps; pre-seeded with this
         # relation so self-referencing FKs (confrelid == own oid) reuse the
         # local map without an extra round trip.
@@ -528,7 +500,9 @@ class PostgreSQLDriver:
                     for k in conkey
                     if attnum_to_name.get(k) is not None
                 ]
-                unique_constraints.append({"name": conname, "columns": cols})
+                unique_constraints.append(
+                    UniqueConstraint(name=conname, columns=cols)
+                )
             elif contype == "f":
                 local_cols = [
                     attnum_to_name[k]
@@ -558,13 +532,13 @@ class PostgreSQLDriver:
                     if ref_map.get(k) is not None
                 ]
                 foreign_keys.append(
-                    {
-                        "name": conname,
-                        "columns": local_cols,
-                        "references_schema": crec.get("ref_schema"),
-                        "references_table": crec.get("ref_table"),
-                        "references_columns": ref_cols,
-                    }
+                    ForeignKey(
+                        name=conname,
+                        columns=local_cols,
+                        references_schema=crec.get("ref_schema"),
+                        references_table=crec.get("ref_table"),
+                        references_columns=ref_cols,
+                    )
                 )
 
         # Standalone unique indexes (CREATE UNIQUE INDEX ...): these have NO
@@ -572,7 +546,7 @@ class PostgreSQLDriver:
         # Query pg_index for unique, non-primary, non-partial indexes that do
         # NOT back a pg_constraint (the NOT EXISTS excludes indexes already
         # captured above, preventing double-counting), and append each to
-        # unique_constraints in the same {"name", "columns"} shape so the
+        # unique_constraints as a UniqueConstraint DTO so the
         # constraints-then-indexes ordering is preserved. indkey is an
         # int2vector that psycopg may return as a string ("1 2") or a list
         # ([1, 2]); normalize defensively and map attnums to names via the
@@ -618,19 +592,19 @@ class PostgreSQLDriver:
             if not cols:
                 continue
             unique_constraints.append(
-                {"name": irec.get("indexname"), "columns": cols}
+                UniqueConstraint(name=irec.get("indexname"), columns=cols)
             )
 
-        return {
-            "schema": schema_name,
-            "table": table_name,
-            "kind": kind,
-            "columns": columns,
-            "primary_key": primary_key,
-            "foreign_keys": foreign_keys,
-            "unique_constraints": unique_constraints,
-            "comment": table_comment,
-        }
+        return SchemaMatch(
+            schema=schema_name,
+            table=table_name,
+            kind=kind,
+            comment=table_comment,
+            columns=columns,
+            primary_key=primary_key,
+            foreign_keys=foreign_keys,
+            unique_constraints=unique_constraints,
+        )
 
     def close(self) -> None:
         """Close the connection iff the driver owns it."""
