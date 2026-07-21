@@ -321,7 +321,7 @@ mocks:
 # ---------------------------------------------------------------------------
 # database — named connection profiles and SQL query templates.
 # All fields support ${ENV_VAR} interpolation (see §2.2).
-# Connection types: postgresql (extensible via plugins, see §9).
+# Connection types: postgresql, mysql, sqlite (extensible via plugins, see §9).
 # ---------------------------------------------------------------------------
 database:
   connections:
@@ -2878,7 +2878,9 @@ agctl/                         # Repository root
 │       ├── db_client.py           # Dispatches to registered driver plugins
 │       ├── db_driver_protocol.py  # DBDriver Protocol
 │       └── db_drivers/
-│           └── postgresql.py      # Built-in psycopg-backed driver (lazy import)
+│           ├── mysql.py          # Built-in PyMySQL-backed driver (lazy import)
+│           ├── postgresql.py     # Built-in psycopg-backed driver (lazy import)
+│           └── sqlite.py         # Built-in sqlite3 driver
 │
 ├── tests/
 │   ├── unit/
@@ -2925,6 +2927,7 @@ http = ["httpx>=0.27"]
 # at module load; those ride on confluent-kafka's own [schemaregistry] sub-extra.
 kafka = ["confluent-kafka[schemaregistry]>=2.4", "jq>=1.6"]
 db = ["psycopg[binary]>=3.1", "jq>=1.6"]
+mysql = ["PyMySQL>=1.1", "jq>=1.6"]
 avro = ["fastavro>=1.8"]                     # SR Avro decode/encode
 protobuf = ["protobuf>=4.25"]                # SR Protobuf decode/encode (no grpcio pulled)
 schema-registry = ["agctl[avro,protobuf]"]   # convenience meta-extra
@@ -2936,7 +2939,9 @@ agctl = "agctl.cli:cli"
 agt = "agctl.cli:cli"
 
 [project.entry-points."agctl.db_drivers"]
+mysql = "agctl.clients.db_drivers.mysql:MySQLDriver"
 postgresql = "agctl.clients.db_drivers.postgresql:PostgreSQLDriver"
+sqlite = "agctl.clients.db_drivers.sqlite:SQLiteDriver"
 
 [project.entry-points."agctl.plugins"]
 # Third-party plugins register here, e.g.:

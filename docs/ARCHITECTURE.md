@@ -153,8 +153,10 @@ agctl/
     ├── http_client.py          # httpx wrapper (lazy import)
     ├── kafka_client.py         # confluent-kafka wrapper (lazy import)
     ├── db_client.py            # driver dispatch via agctl.db_drivers entry points
-    ├── db_driver_protocol.py   # DBDriver Protocol
-    ├── db_drivers/postgresql.py  # built-in psycopg driver (lazy import)
+    ├── db_driver_protocol.py   # DBDriver Protocol + DTOs (WriteResult, SchemaItem, SchemaMatch, ColumnInfo, ForeignKey, UniqueConstraint) + BaseDBDriver mixin
+    ├── db_drivers/mysql.py     # built-in PyMySQL driver (inherits BaseDBDriver, lazy import)
+    ├── db_drivers/postgresql.py  # built-in psycopg driver (inherits BaseDBDriver, lazy import)
+    ├── db_drivers/sqlite.py    # built-in sqlite3 driver (inherits BaseDBDriver)
     ├── grpc_client.py          # grpcio wrapper (lazy import); reflection-resolution + JSON↔protobuf via the shared kernel
     ├── grpc_descriptors.py     # shared gRPC proto kernel: build_descriptor_pool, find_method, call_type_of, message_class, serialize, deserialize (grpcio-free at module top; lazy imports)
     ├── log_client.py           # log backend dispatch via agctl.logs_backends entry points
@@ -679,11 +681,11 @@ reactors sharing a cluster reuse a single client built via `clients_by_cluster`)
 
 ---
 
-### DbClient + driver (`clients/db_client.py`, `clients/db_drivers/postgresql.py`)
+### DbClient + driver (`clients/db_client.py`, `clients/db_drivers/mysql.py`, `clients/db_drivers/postgresql.py`, `clients/db_drivers/sqlite.py`)
 
 `DbClient` dispatches to a `DBDriver` selected by the connection's `type`:
 discovery merges entry points (`agctl.db_drivers`, §10) over the always-present
-built-in `{"postgresql": PostgreSQLDriver}`; broken third-party drivers are
+built-in `{"mysql": MySQLDriver, "postgresql": PostgreSQLDriver, "sqlite": SQLiteDriver}`; broken third-party drivers are
 skipped. The client delegates `connect`/`execute`/`close` and exposes DI seams
 (`driver`/`drivers`).
 
@@ -1103,7 +1105,7 @@ SR client lazy-import inside the function that needs them, so importing
 
 **Build & entry points:** hatchling backend, wheel target `agctl`; console
 scripts `agctl`/`agt` → `agctl.cli:cli`; entry-point groups `agctl.db_drivers`
-(registers built-in `postgresql`), `agctl.logs_backends` (registers built-in `file`),
+(registers built-in `mysql`, `postgresql`, `sqlite`), `agctl.logs_backends` (registers built-in `file`),
 `agctl.plugins`, `agctl.assertions` (§10); requires Python `>=3.11`.
 
 ---
