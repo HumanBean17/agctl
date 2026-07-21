@@ -17,10 +17,16 @@ The missing-httpx test forces the lazy import to fail.
 """
 
 import sys
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agctl.clients.log_backend_protocol import CanonicalEntry
+from agctl.clients.log_backend_protocol import (
+    CanonicalEntry,
+    LogFilter,
+    ScanResult,
+    SchemaDescriptor,
+)
 from agctl.clients.log_backends.loki import LokiBackend
 from agctl.config.models import LogSource
 from agctl.errors import ConfigError, ConnectionFailure, OperationTimeout
@@ -375,3 +381,195 @@ def test_missing_httpx_raises_config_error_naming_extra(monkeypatch):
         backend._fetch_entries(start="s", end="e", limit=10, direction="forward")
     assert "pip install 'agctl[loki]'" in ei.value.message
     assert ei.value.detail.get("type") == "loki"
+
+
+# ============================================================================
+# Task 5: scan + sample_schema
+# ============================================================================
+
+def _three_logstash_lines():
+    """Three logstash-JSON lines: ERROR/WARN/INFO; ERROR carries ``orderId``."""
+    return [
+        ["2026-07-22T00:00:00Z", '{"level":"ERROR","message":"boom","orderId":"o1"}'],
+        ["2026-07-22T00:00:01Z", '{"level":"WARN","message":"careful"}'],
+        ["2026-07-22T00:00:02Z", '{"level":"INFO","message":"hi"}'],
+    ]
+
+
+def _win():
+    """A fixed 1-minute window used by most scan tests (deterministic)."""
+    return (
+        datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 22, 0, 1, 0, tzinfo=timezone.utc),
+    )
+
+
+# --- scan: happy path + filtering ------------------------------------------
+def test_scan_happy_path_level_filter():
+    body = streams_body([({"app": "x"}, _three_logstash_lines())])
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake)
+
+    since, until = _win()
+    result = backend.scan(
+        LogFilter(level="ERROR"),
+        since=since,
+        until=until,
+        limit=10,
+        tail_lines=200,
+    )
+
+    assert isinstance(result, ScanResult)
+    assert result.scanned == 3
+    assert result.matched == 1
+    assert result.truncated is False
+    assert len(result.entries) == 1
+    assert result.entries[0].level == "ERROR"
+    assert result.entries[0].message == "boom"
+    # request used the default fetch_limit (500) and forward direction
+    call = fake.calls[0]
+    assert call["params"]["direction"] == "forward"
+    assert call["params"]["limit"] == 500
+
+
+def test_scan_match_jq_filter_over_three_lines():
+    pytest.importorskip("jq")
+    body = streams_body([({"app": "x"}, _three_logstash_lines())])
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake)
+
+    since, until = _win()
+    result = backend.scan(
+        LogFilter(match_jq='.fields.orderId == "o1"'),
+        since=since,
+        until=until,
+        limit=10,
+        tail_lines=0,
+    )
+    assert result.matched == 1
+    assert result.entries[0].fields == {"orderId": "o1"}
+
+
+# --- scan: truncation honesty ----------------------------------------------
+def test_scan_truncated_when_matched_exceeds_limit():
+    # 5 matching ERROR lines, limit=2 -> matched==5, returned==2, truncated
+    lines = [
+        [f"2026-07-22T00:00:0{i}Z", '{"level":"ERROR","message":"e"}']
+        for i in range(5)
+    ]
+    body = streams_body([({"app": "x"}, lines)])
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake)
+
+    since, until = _win()
+    result = backend.scan(
+        LogFilter(level="ERROR"), since=since, until=until, limit=2, tail_lines=0
+    )
+    assert result.scanned == 5
+    assert result.matched == 5
+    assert len(result.entries) == 2
+    assert result.truncated is True
+
+
+def test_scan_truncated_at_server_cap_when_scanned_equals_fetch_limit():
+    # fetch_limit=4, fake returns exactly 4, all match, limit=10 -> truncated
+    # even though matched(4) <= limit(10): the server-cap signal fires.
+    lines = [
+        [f"2026-07-22T00:00:0{i}Z", '{"level":"ERROR","message":"e"}']
+        for i in range(4)
+    ]
+    body = streams_body([({"app": "x"}, lines)])
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(options={"fetch_limit": 4}), http_client=fake)
+
+    since, until = _win()
+    result = backend.scan(
+        LogFilter(level="ERROR"), since=since, until=until, limit=10, tail_lines=0
+    )
+    assert result.scanned == 4
+    assert result.matched == 4
+    assert result.truncated is True
+
+
+def test_scan_not_truncated_when_below_both_signals():
+    lines = [
+        ["2026-07-22T00:00:00Z", '{"level":"ERROR","message":"e"}'],
+        ["2026-07-22T00:00:01Z", '{"level":"ERROR","message":"e2"}'],
+    ]
+    body = streams_body([({"app": "x"}, lines)])
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake)  # fetch_limit=500
+
+    since, until = _win()
+    result = backend.scan(
+        LogFilter(level="ERROR"), since=since, until=until, limit=10, tail_lines=0
+    )
+    assert result.scanned == 2
+    assert result.matched == 2
+    assert result.truncated is False
+
+
+# --- scan: default lookback ------------------------------------------------
+def test_scan_default_lookback_is_one_hour_when_since_is_none():
+    body = streams_body([({"app": "x"}, [])])
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake)
+
+    until = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+    backend.scan(LogFilter(), since=None, until=until, limit=10, tail_lines=0)
+
+    call = fake.calls[0]
+    start = datetime.fromisoformat(call["params"]["start"])
+    end = datetime.fromisoformat(call["params"]["end"])
+    # end is the provided `until`; start is ~1h before end
+    assert end == until
+    delta = end - start
+    assert timedelta(seconds=3599) <= delta <= timedelta(seconds=3601)
+
+
+# --- scan: tail_lines ignored ----------------------------------------------
+def test_scan_tail_lines_is_ignored():
+    body = streams_body([({"app": "x"}, _three_logstash_lines())])
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake)
+
+    since, until = _win()
+    r1 = backend.scan(LogFilter(), since=since, until=until, limit=10, tail_lines=0)
+    r2 = backend.scan(
+        LogFilter(), since=since, until=until, limit=10, tail_lines=999
+    )
+    # Same scanned/matched (result invariant) ...
+    assert r1.scanned == r2.scanned
+    assert r1.matched == r2.matched
+    # ... and the request params are identical (tail_lines nowhere on the wire).
+    p1, p2 = fake.calls[0]["params"], fake.calls[1]["params"]
+    for k in ("query", "start", "end", "limit", "direction"):
+        assert p1[k] == p2[k]
+
+
+# --- sample_schema ---------------------------------------------------------
+def test_sample_schema_infers_standard_conditional_observed():
+    lines = [
+        [
+            "2026-07-22T00:00:00Z",
+            '{"level":"ERROR","message":"m","logger_name":"App",'
+            '"stack_trace":"...","tags":["t1"],"requestId":"r1"}',
+        ],
+    ]
+    body = streams_body([({"app": "x"}, lines)])
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake)
+
+    schema = backend.sample_schema(sample_lines=50)
+
+    assert isinstance(schema, SchemaDescriptor)
+    for slot in ("timestamp", "level", "logger", "message"):
+        assert slot in schema.standard
+    assert "stack_trace" in schema.conditional
+    assert "tags" in schema.conditional
+    assert "requestId" in schema.observed
+
+    # sample_schema uses backward direction + sample_lines as the request limit
+    call = fake.calls[0]
+    assert call["params"]["direction"] == "backward"
+    assert call["params"]["limit"] == 50

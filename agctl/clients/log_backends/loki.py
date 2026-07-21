@@ -16,9 +16,10 @@ at module top. Importing this module must not require ``httpx``. When no
 client is injected and ``httpx`` is missing, :meth:`_fetch_entries` raises
 :class:`ConfigError` naming ``pip install 'agctl[loki]'``.
 
-The four high-level operations (``scan``/``await_one``/``follow``/
-``sample_schema``) are stubs raising :class:`NotImplementedError` here --
-Tasks 5-7 fill them in. ``LokiBackend`` is intentionally not registered in
+The high-level operations :meth:`scan` and :meth:`sample_schema` are
+implemented here; :meth:`await_one` and :meth:`follow` remain
+:class:`NotImplementedError` stubs until Task 6. ``LokiBackend`` is
+intentionally not registered in
 :data:`agctl.clients.log_client.BUILTIN_BACKENDS` yet (Task 8).
 """
 
@@ -27,7 +28,7 @@ import json
 import threading
 import time
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from agctl.clients import log_common
 from agctl.clients.log_backend_protocol import (
@@ -92,6 +93,10 @@ class LokiBackend:
         self._http_client = http_client
         self._monotonic = monotonic
         self._sleep = sleep
+        # Lazy-built httpx.Client cache (real path only; injected clients are
+        # returned as-is). None == "not built yet"; populated on first read so
+        # repeated ``_fetch_entries`` calls reuse one connection pool.
+        self._lazy_http_client = None
 
         # Resolve config once -- the read surface reads these attributes
         # rather than re-walking source.options on each call.
@@ -246,21 +251,28 @@ class LokiBackend:
 
         Raises :class:`ConfigError` (exit 2) if no client was injected and
         ``httpx`` is not importable -- the message names the install extra.
+
+        The lazy (real) path caches one :class:`httpx.Client` on the instance
+        so repeated reads reuse a connection pool; the injected-client path
+        (used by tests) is returned unchanged every time.
         """
+        # Injected client path -- unchanged (tests inject fakes here).
         if self._http_client is not None:
             return self._http_client
-        try:
-            import httpx  # noqa: F401  (lazy: kept off the module top-level)
-        except ImportError as exc:
-            raise ConfigError(
-                "loki backend requires httpx: pip install 'agctl[loki]'",
-                {"type": "loki"},
-            ) from exc
-        # Build a fresh client per call (no pooling across calls in the
-        # skeleton; Task 6+ may cache one on the instance). ``verify`` is a
-        # Client-construction arg in httpx 0.28 (.get() does not accept it),
-        # so the resolved TLS policy is applied here, not at the call site.
-        return httpx.Client(verify=self._verify_tls)
+        # Lazy real path -- build once, cache on the instance for pooling.
+        if self._lazy_http_client is None:
+            try:
+                import httpx  # noqa: F401  (lazy: off the module top-level)
+            except ImportError as exc:
+                raise ConfigError(
+                    "loki backend requires httpx: pip install 'agctl[loki]'",
+                    {"type": "loki"},
+                ) from exc
+            # ``verify`` is a Client-construction arg in httpx 0.28 (.get()
+            # does not accept it), so the resolved TLS policy is applied here,
+            # not at the call site.
+            self._lazy_http_client = httpx.Client(verify=self._verify_tls)
+        return self._lazy_http_client
 
     def _build_auth(self) -> tuple[dict, tuple | None]:
         """Construct per-request headers/auth from the resolved config.
@@ -442,7 +454,7 @@ class LokiBackend:
             service=self._service,
         )
 
-    # -- high-level operations (stubs; Tasks 5-7 fill them in) ---------------
+    # -- high-level operations (scan/sample_schema: Task 5; await_one/follow: Task 6) ---
     def scan(
         self,
         filt: LogFilter,
@@ -452,8 +464,55 @@ class LokiBackend:
         limit: int,
         tail_lines: int,
     ) -> ScanResult:
-        """Scan a time window (Task 5)."""
-        raise NotImplementedError
+        """Scan a time window with client-side filtering and honest truncation.
+
+        Issues a single :meth:`_fetch_entries` call over the window
+        ``[since, until]`` (defaults: ``until = now``, ``since = now - 1h``)
+        with ``limit = fetch_limit`` and ``direction = options.direction``
+        (default ``"forward"``). Normalization already happened in
+        :meth:`_fetch_entries`; this method layers :func:`log_common.entry_matches`
+        on top client-side.
+
+        Truncation is reported honestly via two independent signals:
+          * ``matched > limit`` -- the client-side cap dropped matches, OR
+          * ``scanned == fetch_limit`` -- the server cap was hit (Loki may
+            have more lines beyond the ``query_range`` ``limit``).
+
+        ``tail_lines`` is accepted for protocol compatibility but ignored --
+        it is a file-backend hint with no Loki meaning (Loki orders by time).
+
+        Args:
+            filt: :class:`LogFilter` applied to every fetched entry.
+            since: Window start (default: ``until - 1h``).
+            until: Window end (default: ``now`` UTC).
+            limit: Max matches to return; ``matched`` may exceed this.
+            tail_lines: Ignored (file-backend hint).
+
+        Returns:
+            :class:`ScanResult` with up to ``limit`` matched entries.
+        """
+        end_dt = until if until is not None else datetime.now(timezone.utc)
+        start_dt = since if since is not None else end_dt - timedelta(hours=1)
+
+        entries = self._fetch_entries(
+            start=self._to_rfc3339_nano(start_dt),
+            end=self._to_rfc3339_nano(end_dt),
+            limit=self._fetch_limit,
+            direction=self._direction,
+        )
+
+        scanned = len(entries)
+        matched_entries = [e for e in entries if log_common.entry_matches(e, filt)]
+        matched = len(matched_entries)
+
+        truncated = (matched > limit) or (scanned == self._fetch_limit)
+
+        return ScanResult(
+            entries=matched_entries[:limit],
+            matched=matched,
+            scanned=scanned,
+            truncated=truncated,
+        )
 
     def await_one(
         self,
@@ -478,5 +537,37 @@ class LokiBackend:
         raise NotImplementedError
 
     def sample_schema(self, *, sample_lines: int = 100) -> SchemaDescriptor:
-        """Infer field presence from a sample (Task 7)."""
-        raise NotImplementedError
+        """Infer field-presence patterns from a recent sample of entries.
+
+        Fetches up to ``sample_lines`` entries from the last hour
+        (``direction="backward"`` so the newest lines are sampled first) and
+        delegates to :func:`log_common.infer_schema` for the union of present
+        standard slots, conditional slots, and observed ``fields`` keys.
+
+        Args:
+            sample_lines: Max lines to sample (``query_range`` ``limit``).
+
+        Returns:
+            :class:`SchemaDescriptor` summarizing the sample.
+        """
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(hours=1)
+        entries = self._fetch_entries(
+            start=self._to_rfc3339_nano(start_dt),
+            end=self._to_rfc3339_nano(end_dt),
+            limit=sample_lines,
+            direction="backward",
+        )
+        return log_common.infer_schema(entries)
+
+    @staticmethod
+    def _to_rfc3339_nano(dt: datetime) -> str:
+        """Convert a :class:`datetime` to an RFC3339Nano UTC string.
+
+        Naive datetimes are treated as UTC (not local time) so the default
+        lookback math stays host-independent. Output is ``isoformat()`` in
+        UTC (microsecond precision; accepted by Loki's ``query_range``).
+        """
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
