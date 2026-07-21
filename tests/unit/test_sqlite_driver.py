@@ -575,3 +575,92 @@ def test_describe_schema_comment_always_none():
     match = result["matches"][0]
     assert match.comment is None
     assert all(c.comment is None for c in match.columns)
+
+
+# ---------------------------------------------------------------------------
+# Scenario 20: Composite FK grouped into a single ForeignKey DTO
+# ---------------------------------------------------------------------------
+#
+# PRAGMA foreign_key_list emits one row per column of a composite FK, keyed by
+# `id` (the FK identifier) with `seq` giving column position. The brief's
+# contract requires grouping by `id`: a composite FOREIGN KEY(a, b)
+# REFERENCES parent(x, y) must surface as ONE ForeignKey DTO with
+# columns=["a","b"] and references_columns=["x","y"], NOT two single-column
+# DTOs. The rows must preserve `seq` order within the group.
+
+
+def test_describe_schema_composite_fk_grouped_into_single_dto():
+    """A composite FOREIGN KEY(a,b) REFERENCES parent(x,y) yields ONE FK DTO.
+
+    Seeds parent(x, y, PRIMARY KEY(x, y)) and child(a, b, FOREIGN KEY(a, b)
+    REFERENCES parent(x, y)). The Level-2 result for `child` must surface a
+    single ForeignKey with columns=["a","b"] (seq order preserved) and
+    references_columns=["x","y"] and references_table="parent".
+    """
+    driver = SQLiteDriver(connectable=sqlite3.connect(":memory:"))
+    try:
+        driver.execute(
+            "CREATE TABLE parent(x INTEGER, y INTEGER, PRIMARY KEY(x, y))", {}
+        )
+        driver.execute(
+            "CREATE TABLE child("
+            "a INTEGER, "
+            "b INTEGER, "
+            "FOREIGN KEY(a, b) REFERENCES parent(x, y))",
+            {},
+        )
+        result = driver.describe_schema(table="child", schema=None)
+    finally:
+        driver.close()
+
+    matches = result["matches"]
+    assert len(matches) == 1
+    foreign_keys = matches[0].foreign_keys
+    # Exactly ONE DTO — the bug produces two single-column DTOs.
+    assert len(foreign_keys) == 1
+    fk = foreign_keys[0]
+    assert isinstance(fk, ForeignKey)
+    # Anonymous FK in SQLite.
+    assert fk.name is None
+    assert fk.references_schema is None
+    assert fk.references_table == "parent"
+    # seq order preserved within the composite group.
+    assert fk.columns == ["a", "b"]
+    assert fk.references_columns == ["x", "y"]
+
+
+# ---------------------------------------------------------------------------
+# Scenario 21: Composite PK ordered by pk value (not cid order)
+# ---------------------------------------------------------------------------
+#
+# PRAGMA table_info/table_xinfo emits a `pk` column: 0 = not in PK, otherwise
+# the 1-based position of the column within the PK (so the column with pk=1
+# comes first, pk=2 second, etc.). The current implementation iterates rows in
+# `cid` order and appends names whenever `pk` is truthy, which yields cid
+# order rather than pk-value order. For CREATE TABLE t(a, b, c, PRIMARY
+# KEY(b, a)), the correct PK list is ["b","a"] (b has pk=1, a has pk=2); the
+# bug yields ["a","b"] (a has cid=0, b has cid=1).
+
+
+def test_describe_schema_composite_pk_ordered_by_pk_value():
+    """PRIMARY KEY(b, a) surfaces as ["b","a"], not cid order ["a","b"].
+
+    Seeds CREATE TABLE t(a, b, c, PRIMARY KEY(b, a)). PRAGMA table_info gives
+    b pk=1 and a pk=2; the contract orders by pk value, so the correct
+    primary_key list is ["b","a"]. The bug iterates cid order and would yield
+    ["a","b"].
+    """
+    driver = SQLiteDriver(connectable=sqlite3.connect(":memory:"))
+    try:
+        driver.execute(
+            "CREATE TABLE t(a INTEGER, b INTEGER, c INTEGER, PRIMARY KEY(b, a))",
+            {},
+        )
+        result = driver.describe_schema(table="t", schema=None)
+    finally:
+        driver.close()
+
+    matches = result["matches"]
+    assert len(matches) == 1
+    # Ordered by pk value, NOT cid order.
+    assert matches[0].primary_key == ["b", "a"]

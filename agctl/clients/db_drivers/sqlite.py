@@ -315,12 +315,18 @@ class SQLiteDriver(BaseDBDriver):
             xinfo_cur.close()
 
         columns: list[ColumnInfo] = []
-        primary_key: list[str] = []
+        # Collect PK members as (pk_value, name) and sort after the loop:
+        # PRAGMA table_info/table_xinfo emits a `pk` column whose value is
+        # the 1-based position of the column within the PK (0 = not in PK).
+        # Iterating in cid order and appending when `pk` is truthy would yield
+        # cid order rather than pk-value order — wrong for a composite
+        # PRIMARY KEY(b, a) (cid order ["a","b"] vs pk-value order ["b","a"]).
+        pk_members: list[tuple[int, str]] = []
         for cid, name, data_type, notnull, dflt_value, pk, hidden in xinfo_rows:
-            # nullable inverts notnull; PK flag drives primary_key ordering.
+            # nullable inverts notnull; PK membership drives primary_key below.
             nullable = not notnull
             if pk:
-                primary_key.append(name)
+                pk_members.append((pk, name))
             # hidden: 0 = normal, 1 = hidden (e.g. implicit), 2/3 = generated
             # (virtual/stored). Map 2/3 -> "stored" per DESIGN §7; else None.
             generated = "stored" if hidden in (2, 3) else None
@@ -335,8 +341,17 @@ class SQLiteDriver(BaseDBDriver):
                     comment=None,  # SQLite has no native comment metadata.
                 )
             )
+        # Order PK columns by their pk value (1, 2, 3, ...) rather than cid.
+        primary_key = [name for _pk, name in sorted(pk_members, key=lambda p: p[0])]
 
         # Foreign keys (anonymous in SQLite — foreign_key_list emits no name).
+        # PRAGMA foreign_key_list emits one row PER COLUMN of a (possibly
+        # composite) FK, keyed by `id` (the FK identifier) with `seq` giving
+        # the 1-based column position within the composite group. Group by
+        # `id`, preserving `seq` order, and emit ONE ForeignKey per group so
+        # FOREIGN KEY(a,b) REFERENCES t(x,y) surfaces as a single DTO with
+        # columns=["a","b"] and references_columns=["x","y"] (not two
+        # single-column DTOs).
         fk_cur = self._conn.cursor()
         try:
             fk_cur.execute(f"PRAGMA foreign_key_list({table_name})")
@@ -344,17 +359,33 @@ class SQLiteDriver(BaseDBDriver):
         finally:
             fk_cur.close()
 
-        foreign_keys: list[ForeignKey] = [
-            ForeignKey(
-                name=None,
-                columns=[from_col],
-                references_schema=None,
-                references_table=ref_table,
-                references_columns=[to_col],
+        # Accumulate per-id: preserve first-seen order across groups so the
+        # FK list ordering stays stable across re-describe calls. Within a
+        # group, sort by seq to preserve composite-column position.
+        fk_groups: dict[int, list[tuple[int, str, str]]] = {}
+        fk_group_order: list[int] = []
+        # Also remember the referenced table per id (constant across the
+        # group; captured from the first row seen for that id).
+        fk_ref_table: dict[int, str] = {}
+        for _id, seq, ref_table, from_col, to_col, _on_upd, _on_del, _match in fk_rows:
+            if _id not in fk_groups:
+                fk_groups[_id] = []
+                fk_group_order.append(_id)
+                fk_ref_table[_id] = ref_table
+            fk_groups[_id].append((seq, from_col, to_col))
+
+        foreign_keys: list[ForeignKey] = []
+        for _id in fk_group_order:
+            members = sorted(fk_groups[_id], key=lambda m: m[0])
+            foreign_keys.append(
+                ForeignKey(
+                    name=None,
+                    columns=[m[1] for m in members],
+                    references_schema=None,
+                    references_table=fk_ref_table[_id],
+                    references_columns=[m[2] for m in members],
+                )
             )
-            for (_id, _seq, ref_table, from_col, to_col, _on_upd, _on_del, _match)
-            in fk_rows
-        ]
 
         # Unique constraints + unique indexes: SQLite surfaces both via
         # index_list — origin 'u' is a named UNIQUE constraint (column-level
