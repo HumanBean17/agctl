@@ -523,8 +523,133 @@ class LokiBackend:
         poll_interval_ms: int,
         tail_lines: int,
     ) -> AwaitResult:
-        """Block for the next matching entry (Task 6)."""
-        raise NotImplementedError
+        """Block for the next matching entry, or time out and return ``None``.
+
+        Two modes share a Phase 1 historical read:
+
+          * **One-shot** (``timeout_s <= 0``): a single ``backward``
+            ``query_range`` over ``[since or now-1h, now]`` (limit =
+            ``fetch_limit``). The first entry satisfying ``filt`` (via
+            :func:`log_common.entry_matches`) is returned; otherwise
+            ``entry=None``. ``scanned`` is the count fetched.
+
+          * **Poll** (``timeout_s > 0``): Phase 1 is the same backward read
+            (count its ``scanned``); if it matches, return immediately.
+            Phase 2 loops until the deadline (injectable ``monotonic``):
+            ``self._sleep(poll_interval_ms/1000)`` first, then a ``forward``
+            ``query_range`` whose ``start`` is the **last-seen Loki
+            timestamp** high-water. An entry re-included at a timestamp
+            already covered is deduped client-side (counted/matched once), so
+            ``scanned`` never double-counts. On deadline, return
+            ``entry=None`` with cumulative ``scanned``.
+
+        The high-water is the max entry ``timestamp`` string seen so far
+        (RFC3339Nano UTC strings sort lexically, so a string ``max`` suffices
+        for same-format values). It is seeded from Phase 1's window start so a
+        Phase 1 with no entries still anchors the first forward query.
+
+        ``tail_lines`` is accepted for protocol compatibility but ignored
+        (file-backend hint; Loki orders by time).
+
+        Args:
+            filt: :class:`LogFilter` applied to every fetched entry.
+            since: Phase 1 window start (default: ``now - 1h``).
+            timeout_s: ``<= 0`` for one-shot; ``> 0`` polls until this many
+                seconds of wall clock (per injected ``monotonic``) elapse.
+            poll_interval_ms: Sleep between forward polls (poll mode only).
+            tail_lines: Ignored (file-backend hint).
+
+        Returns:
+            :class:`AwaitResult` with the first match (or ``None``),
+            cumulative ``scanned``, and ``elapsed_ms`` from the injected
+            monotonic clock.
+        """
+        start_wall = self._monotonic()
+
+        # Resolve the Phase 1 window once. `end`/`start` are real wall-clock
+        # values; tests inject a canned HTTP client that ignores them. The
+        # deadline below uses the injected `monotonic` so polling is
+        # deterministic without real waiting.
+        now_dt = datetime.now(timezone.utc)
+        start_dt = since if since is not None else now_dt - timedelta(hours=1)
+        window_start_ts = self._to_rfc3339_nano(start_dt)
+
+        # -- Phase 1: one backward historical read (both modes) --------------
+        entries = self._fetch_entries(
+            start=window_start_ts,
+            end=self._to_rfc3339_nano(now_dt),
+            limit=self._fetch_limit,
+            direction="backward",
+        )
+        scanned = len(entries)
+
+        # High-water: max entry ts seen, or the window start if nothing came
+        # back (so the first forward query has a stable anchor).
+        last_ts = (
+            max(e.timestamp for e in entries) if entries else window_start_ts
+        )
+
+        for entry in entries:
+            if log_common.entry_matches(entry, filt):
+                return AwaitResult(
+                    entry=entry,
+                    scanned=scanned,
+                    elapsed_ms=self._elapsed_ms_since(start_wall),
+                )
+
+        # One-shot mode: no Phase 2 polling.
+        if timeout_s <= 0:
+            return AwaitResult(
+                entry=None,
+                scanned=scanned,
+                elapsed_ms=self._elapsed_ms_since(start_wall),
+            )
+
+        # -- Phase 2: sleep-first forward poll loop until the deadline -------
+        deadline = start_wall + timeout_s
+        while self._monotonic() < deadline:
+            self._sleep(poll_interval_ms / 1000)
+            if self._monotonic() >= deadline:
+                break
+
+            now_dt = datetime.now(timezone.utc)
+            entries = self._fetch_entries(
+                start=last_ts,
+                end=self._to_rfc3339_nano(now_dt),
+                limit=self._fetch_limit,
+                direction="forward",
+            )
+
+            # Dedup: a forward response with start=last_ts can re-include
+            # entries at exactly `last_ts`. Count/match only the strictly-new
+            # ones (timestamp > last_ts) so each entry is seen exactly once.
+            new_entries = [e for e in entries if e.timestamp > last_ts]
+            scanned += len(new_entries)
+
+            # Advance the high-water past the newest timestamp in this batch.
+            if entries:
+                newest = max(e.timestamp for e in entries)
+                if newest > last_ts:
+                    last_ts = newest
+
+            for entry in new_entries:
+                if log_common.entry_matches(entry, filt):
+                    return AwaitResult(
+                        entry=entry,
+                        scanned=scanned,
+                        elapsed_ms=self._elapsed_ms_since(start_wall),
+                    )
+
+        # Deadline exhausted with no match.
+        return AwaitResult(
+            entry=None,
+            scanned=scanned,
+            elapsed_ms=self._elapsed_ms_since(start_wall),
+        )
+
+    def _elapsed_ms_since(self, start_wall: float) -> int:
+        """Wall-clock ms elapsed since ``start_wall`` per the injected clock."""
+        return int((self._monotonic() - start_wall) * 1000)
 
     def follow(
         self,

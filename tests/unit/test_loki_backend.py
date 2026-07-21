@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agctl.clients.log_backend_protocol import (
+    AwaitResult,
     CanonicalEntry,
     LogFilter,
     ScanResult,
@@ -573,3 +574,285 @@ def test_sample_schema_infers_standard_conditional_observed():
     call = fake.calls[0]
     assert call["params"]["direction"] == "backward"
     assert call["params"]["limit"] == 50
+
+
+# ============================================================================
+# Task 6: await_one (two-phase poll with timestamp high-water)
+# ============================================================================
+
+class FakeClock:
+    """Controllable monotonic clock for deterministic await_one polling.
+
+    ``monotonic`` reads ``t``; ``sleep`` advances ``t`` by the slept seconds.
+    Tests can override ``sleep`` to jump the clock by a different amount (e.g.
+    to blow past a deadline in one step).
+    """
+
+    def __init__(self, start: float = 0.0):
+        self.t = start
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds
+
+
+class SequentialFakeHttpClient:
+    """Returns canned responses in sequence, recording every ``.get(...)`` call.
+
+    Repeats the last response once the sequence is exhausted (so a poll loop
+    that reads more times than expected still gets a canned answer rather than
+    an IndexError). Mirrors :class:`FakeHttpClient`'s recorded-call shape.
+    """
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self._idx = 0
+        self.calls = []
+
+    def get(
+        self,
+        url,
+        *,
+        params=None,
+        headers=None,
+        auth=None,
+        timeout=None,
+        verify=None,
+    ):
+        self.calls.append(
+            {
+                "url": url,
+                "params": dict(params) if params is not None else {},
+                "headers": dict(headers) if headers is not None else {},
+                "auth": auth,
+                "timeout": timeout,
+                "verify": verify,
+            }
+        )
+        if not self._responses:
+            raise AssertionError("SequentialFakeHttpClient has no canned responses")
+        resp = (
+            self._responses[self._idx]
+            if self._idx < len(self._responses)
+            else self._responses[-1]
+        )
+        self._idx += 1
+        return resp
+
+
+def _ts(s):
+    """Shorthand RFC3339 timestamp used by the await_one fixtures."""
+    return f"2026-07-22T00:00:{s}Z"
+
+
+# --- one-shot mode (timeout_s <= 0) ----------------------------------------
+def test_await_one_oneshot_match_returns_first_match_no_sleep():
+    """timeout_s<=0: one backward read; first matching entry returned; no sleep."""
+    body = streams_body(
+        [
+            (
+                {"app": "x"},
+                [
+                    [_ts("00"), '{"level":"INFO","message":"noise"}'],
+                    [_ts("01"), '{"level":"ERROR","message":"boom"}'],
+                ],
+            )
+        ]
+    )
+    clock = FakeClock()
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(
+        make_source(), http_client=fake, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"),
+        since=datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc),
+        timeout_s=0,
+        poll_interval_ms=100,
+        tail_lines=0,
+    )
+
+    assert isinstance(result, AwaitResult)
+    assert result.entry is not None
+    assert result.entry.level == "ERROR"
+    assert result.entry.message == "boom"
+    assert result.scanned == 2  # both entries fetched from the backward read
+    # Only the single backward read; the sleep-driven forward path never ran.
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["params"]["direction"] == "backward"
+
+
+def test_await_one_oneshot_no_match_returns_none():
+    """timeout_s<=0: backward read with only non-matching entries -> None."""
+    body = streams_body(
+        [
+            (
+                {"app": "x"},
+                [
+                    [_ts("00"), '{"level":"INFO","message":"a"}'],
+                    [_ts("01"), '{"level":"WARN","message":"b"}'],
+                ],
+            )
+        ]
+    )
+    clock = FakeClock()
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(
+        make_source(), http_client=fake, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"),
+        since=datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc),
+        timeout_s=0,
+        poll_interval_ms=100,
+        tail_lines=0,
+    )
+
+    assert result.entry is None
+    assert result.scanned == 2  # fetched count, even though nothing matched
+    assert len(fake.calls) == 1
+
+
+# --- poll mode (timeout_s > 0) ---------------------------------------------
+def test_await_one_poll_finds_match_after_one_sleep():
+    """Phase 1 backward (no match); exactly one sleep; forward poll matches.
+
+    Asserts the two reads use the correct directions, exactly one sleep
+    occurred before the find, and scanned accumulates both reads
+    (backward=0 + forward=1).
+    """
+    clock = FakeClock()
+    sleeps = []
+
+    def fake_sleep(seconds):
+        clock.t += seconds
+        sleeps.append(seconds)
+
+    backward_body = streams_body([({"app": "x"}, [])])  # Phase 1: nothing
+    forward_body = streams_body(
+        [
+            (
+                {"app": "x"},
+                [[_ts("10"), '{"level":"ERROR","message":"found"}']],
+            )
+        ]
+    )
+    fake = SequentialFakeHttpClient(
+        [
+            FakeResponse(status_code=200, json_data=backward_body),
+            FakeResponse(status_code=200, json_data=forward_body),
+        ]
+    )
+    backend = LokiBackend(
+        make_source(), http_client=fake, monotonic=clock.monotonic, sleep=fake_sleep
+    )
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"),
+        since=datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc),
+        timeout_s=5.0,
+        poll_interval_ms=100,
+        tail_lines=0,
+    )
+
+    assert result.entry is not None
+    assert result.entry.message == "found"
+    assert result.scanned == 1  # backward(0) + forward(1)
+    assert len(sleeps) == 1  # exactly one sleep before the find
+    assert len(fake.calls) == 2  # one backward + one forward
+    assert fake.calls[0]["params"]["direction"] == "backward"
+    assert fake.calls[1]["params"]["direction"] == "forward"
+
+
+def test_await_one_poll_no_double_count_same_timestamp():
+    """An entry re-included across two forward polls is counted/matched once.
+
+    Forward poll 1 returns [A(ts=T1)] (no match). Forward poll 2 re-includes
+    A at the same ts=T1 and adds B(ts=T2, match). The high-water start
+    advances past T1 so A is deduped in poll 2: scanned counts A once and B
+    once (==2), and A is not re-matched (result is B, not A).
+    """
+    clock = FakeClock()
+
+    def fake_sleep(seconds):
+        clock.t += seconds
+
+    backward_body = streams_body([({"app": "x"}, [])])
+    forward_poll1 = streams_body(
+        [({"app": "x"}, [[_ts("10"), '{"level":"INFO","message":"A"}']])]
+    )
+    # Poll 2 re-includes A at the SAME ts (T1) and adds the matching B at T2.
+    forward_poll2 = streams_body(
+        [
+            (
+                {"app": "x"},
+                [
+                    [_ts("10"), '{"level":"INFO","message":"A"}'],  # re-included
+                    [_ts("20"), '{"level":"ERROR","message":"B"}'],  # new + match
+                ],
+            )
+        ]
+    )
+    fake = SequentialFakeHttpClient(
+        [
+            FakeResponse(status_code=200, json_data=backward_body),
+            FakeResponse(status_code=200, json_data=forward_poll1),
+            FakeResponse(status_code=200, json_data=forward_poll2),
+        ]
+    )
+    backend = LokiBackend(
+        make_source(), http_client=fake, monotonic=clock.monotonic, sleep=fake_sleep
+    )
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"),
+        since=datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc),
+        timeout_s=5.0,
+        poll_interval_ms=100,
+        tail_lines=0,
+    )
+
+    assert result.entry is not None
+    assert result.entry.message == "B"  # A was NOT re-matched
+    # A counted once (poll 1) + B once (poll 2) == 2; A not double-counted.
+    assert result.scanned == 2
+
+
+def test_await_one_poll_timeout_no_matches_terminates():
+    """timeout_s>0, no matches ever: first sleep blows past deadline -> None.
+
+    The fake clock advances 0.3s on the first sleep, exceeding the 0.2s
+    deadline, so the loop terminates after exactly one sleep with no forward
+    fetch. entry is None, elapsed_ms reflects the fake wall time, and scanned
+    is just the Phase 1 read (which returned nothing).
+    """
+    clock = FakeClock()
+    sleeps = []
+
+    def fake_sleep(seconds):
+        # Jump past the 0.2s deadline in one step regardless of `seconds`.
+        clock.t += 0.3
+        sleeps.append(seconds)
+
+    body = streams_body([({"app": "x"}, [])])  # every read returns empty
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(
+        make_source(), http_client=fake, monotonic=clock.monotonic, sleep=fake_sleep
+    )
+
+    result = backend.await_one(
+        LogFilter(level="ERROR"),
+        since=datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc),
+        timeout_s=0.2,
+        poll_interval_ms=100,
+        tail_lines=0,
+    )
+
+    assert result.entry is None
+    assert len(sleeps) == 1  # loop terminated, did not spin forever
+    assert result.elapsed_ms == 300  # 0.3s fake wall-clock elapsed
+    assert result.scanned == 0  # Phase 1 empty + no forward fetch
