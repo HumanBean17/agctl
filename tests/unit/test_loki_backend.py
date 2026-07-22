@@ -187,6 +187,15 @@ def test_validate_config_fetch_limit_non_int_raises():
         backend.validate_config()
 
 
+def test_validate_config_fetch_limit_bool_raises():
+    # ``isinstance(True, int)`` is True in Python, so ``fetch_limit: true``
+    # would otherwise sneak past as 1. Reject it explicitly.
+    source = make_source(options={"fetch_limit": True})
+    backend = LokiBackend(source)
+    with pytest.raises(ConfigError):
+        backend.validate_config()
+
+
 def test_validate_config_direction_bad_value_raises():
     source = make_source(options={"direction": "sideways"})
     backend = LokiBackend(source)
@@ -870,6 +879,28 @@ def test_await_one_oneshot_no_match_returns_none():
     assert len(fake.calls) == 1
 
 
+# --- _to_rfc3339_utc: nanosecond precision (lexical compare vs Loki entries) -
+def test_to_rfc3339_utc_emits_nanosecond_precision():
+    """The formatter emits 9-digit nanosecond precision (datetime's microsecond
+    resolution padded ``* 1000``), matching Loki's RFC3339Nano entry-timestamp
+    format. A seed compared lexically against a nanosecond entry extending the
+    same microsecond must sort below it (the bug the µs format caused in
+    ``await_one``'s Phase-1-empty seed).
+    """
+    dt = datetime(2026, 7, 22, 12, 0, 0, 123456, tzinfo=timezone.utc)
+    s = LokiBackend._to_rfc3339_utc(dt)
+    assert s == "2026-07-22T12:00:00.123456000Z"
+    # Zero microseconds still emits a full 9-digit fractional part (isoformat
+    # would have dropped it entirely).
+    assert LokiBackend._to_rfc3339_utc(
+        datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+    ) == "2026-07-22T12:00:00.000000000Z"
+    # Lexical ordering vs a nanosecond entry extending the same microsecond:
+    # the seed (....123456000Z) sorts below an entry at ....123456789Z, so a
+    # forward poll seeded by it would correctly include that newer entry.
+    assert s < "2026-07-22T12:00:00.123456789Z"
+
+
 # --- poll mode (timeout_s > 0) ---------------------------------------------
 def test_await_one_poll_finds_match_after_one_sleep():
     """Phase 1 backward (no match); forward fetch 1 no match; one sleep; forward fetch 2 matches.
@@ -1275,3 +1306,84 @@ def test_follow_config_error_on_subsequent_fetch_propagates():
     with pytest.raises(ConfigError) as ei:
         list(gen)
     assert "parse error" in ei.value.message
+
+
+# --- follow: advance-on-fetched prevents entry loss under volume -----------
+def test_follow_advances_start_on_fetched_so_later_match_is_not_dropped():
+    """Under volume, follow must advance ``start`` to the newest FETCHED entry's
+    timestamp (not just emitted/matching), else a matching entry sitting beyond
+    ``fetch_limit`` is permanently dropped.
+
+    Scenario (fetch_limit=3): the stream holds [INFO, INFO, INFO, ERROR] at
+    strictly-increasing ts0<ts1<ts2<ts3. A windowed fake returns, for each
+    forward fetch over ``[start, end]``, the entries with timestamp strictly
+    newer than ``start``, capped at ``fetch_limit``, oldest-first (real Loki
+    forward semantics).
+
+      * Poll 1: ``start=seed`` -> returns the 3 INFO entries (ts0..ts2) capped
+        at fetch_limit=3. None match ``level=ERROR``, so nothing is emitted and
+        the ERROR@ts3 sits beyond the cap.
+      * Under the OLD advance-on-emitted policy: ``start`` never moves (nothing
+        emitted), so poll 2 re-reads the SAME window and again returns the 3
+        INFO entries -> ERROR@ts3 is permanently dropped (silent entry loss).
+      * Under the FIXED advance-on-fetched policy: ``start`` advances to ts2
+        (newest fetched), so poll 2 reads ``(ts2, now]`` and returns ERROR@ts3,
+        which is yielded.
+    """
+    stop_event = threading.Event()
+
+    fetch_limit = 3
+    # Strictly-increasing ts strings seeded just after "now" so they sort after
+    # follow's initial ``start = _to_rfc3339_utc(now)`` seed (both produced by
+    # the same formatter, so lexical comparison is format-consistent).
+    base = datetime.now(timezone.utc)
+    ts = [
+        LokiBackend._to_rfc3339_utc(base + timedelta(seconds=i))
+        for i in range(1, 5)
+    ]
+    # 3 non-matching INFO entries then 1 matching ERROR, forward order.
+    all_pairs = [
+        [ts[0], '{"level":"INFO","message":"noise-0"}'],
+        [ts[1], '{"level":"INFO","message":"noise-1"}'],
+        [ts[2], '{"level":"INFO","message":"noise-2"}'],
+        [ts[3], '{"level":"ERROR","message":"boom"}'],
+    ]
+
+    class WindowedFakeHttpClient:
+        """Loki-forward stand-in: entries with ts > start, capped at limit."""
+
+        def __init__(self):
+            self.calls = []
+
+        def get(
+            self, url, *, params=None, headers=None, auth=None, timeout=None, verify=None
+        ):
+            self.calls.append(
+                {
+                    "url": url,
+                    "params": dict(params) if params is not None else {},
+                }
+            )
+            start = params["start"]
+            limit = params["limit"]
+            selected = [p for p in all_pairs if p[0] > start][:limit]
+            body = streams_body([({"app": "x"}, selected)])
+            return FakeResponse(status_code=200, json_data=body)
+
+    sleep = _make_stop_after_n_sleep(stop_event, n=6)
+    fake = WindowedFakeHttpClient()
+    backend = LokiBackend(
+        make_source(options={"fetch_limit": fetch_limit}), http_client=fake, sleep=sleep
+    )
+
+    yielded = list(
+        backend.follow(
+            LogFilter(level="ERROR"),
+            stop_event=stop_event,
+            poll_interval_ms=100,
+        )
+    )
+
+    # The ERROR entry sitting beyond fetch_limit MUST be delivered (it would be
+    # permanently dropped under the old advance-on-emitted policy).
+    assert [e.message for e in yielded] == ["boom"]

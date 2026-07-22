@@ -170,8 +170,14 @@ class LokiBackend:
                 "(or both omitted); a lone username or password is not supported",
                 {"type": "loki"},
             )
-        # fetch_limit must be a positive int (default 500 is fine).
-        if not isinstance(self._fetch_limit, int) or self._fetch_limit <= 0:
+        # fetch_limit must be a positive int (default 500 is fine). The bool
+        # guard is required because ``isinstance(True, int)`` is True in Python,
+        # so ``fetch_limit: true`` would otherwise sneak past and resolve to 1.
+        if (
+            not isinstance(self._fetch_limit, int)
+            or isinstance(self._fetch_limit, bool)
+            or self._fetch_limit <= 0
+        ):
             raise ConfigError(
                 f"loki backend: 'fetch_limit' must be a positive int, "
                 f"got {self._fetch_limit!r}",
@@ -713,7 +719,11 @@ class LokiBackend:
           1. If ``stop_event`` is set, return.
           2. Issue a ``forward`` ``query_range`` over ``[start, now]`` (limit
              = ``fetch_limit``), where ``start`` is seeded to now on the first
-             cycle and advanced to the newest emitted timestamp thereafter.
+             cycle and advanced to the newest FETCHED entry's timestamp
+             thereafter (matching ``await_one``'s advance-on-fetched policy --
+             advancing on all fetched entries, not just emitted/matching ones,
+             prevents silent entry loss when >fetch_limit non-matching entries
+             accumulate between two matches).
           3. Apply :func:`log_common.entry_matches`; skip any
              ``(timestamp, message)`` pair already emitted (dedup set);
              yield new matches.
@@ -751,9 +761,9 @@ class LokiBackend:
             :class:`CanonicalEntry` instances matching ``filt``, each
             emitted at most once.
         """
-        # Seed the high-water ``start`` to "now". Subsequent cycles advance
-        # it to the newest emitted entry's timestamp; a cycle that emits
-        # nothing leaves ``start`` unchanged (re-fetches the same window).
+        # Seed the high-water ``start`` to "now". Subsequent cycles advance it
+        # to the newest FETCHED entry's timestamp (see the cycle-2 note above);
+        # a cycle that fetches nothing leaves ``start`` unchanged.
         start = self._to_rfc3339_utc(datetime.now(timezone.utc))
         emitted: set[tuple[str, str]] = set()
         first_fetch = True
@@ -781,9 +791,23 @@ class LokiBackend:
                 continue
 
             first_fetch = False
-            newest_ts: str | None = None
-            yielded_any = False
 
+            # Advance the high-water ``start`` to the newest FETCHED entry's
+            # timestamp each cycle, regardless of whether entries matched the
+            # filter (matching ``await_one``'s advance-on-fetched policy). This
+            # prevents silent entry loss under volume: if >fetch_limit
+            # non-matching entries accumulate between two matches, advancing
+            # only on emitted (matching) entries would leave the ``[start, now]``
+            # window returning the same capped prefix of non-matching entries
+            # forever, dropping any later match sitting beyond ``fetch_limit``.
+            # The ``(timestamp, message)`` dedup below stays as defense-in-depth
+            # but is no longer load-bearing since the window no longer re-covers
+            # fetched entries.
+            newest_fetched_ts = max((e.timestamp for e in entries), default=None)
+            if newest_fetched_ts is not None:
+                start = newest_fetched_ts
+
+            yielded_any = False
             for entry in entries:
                 if stop_event.is_set():
                     return
@@ -793,24 +817,15 @@ class LokiBackend:
                 if key in emitted:
                     continue
                 emitted.add(key)
-                if newest_ts is None or entry.timestamp > newest_ts:
-                    newest_ts = entry.timestamp
                 yielded_any = True
                 yield entry
                 if stop_event.is_set():
                     return
 
-            if yielded_any and newest_ts is not None:
-                # Advance the high-water to the newest EMITTED (matching)
-                # timestamp, not the newest fetched one. Contrast with
-                # ``await_one``, which advances on all fetched entries. The
-                # consequence: under a strict filter + high volume, non-matching
-                # fetched entries are re-fetched each cycle (the ``emitted``
-                # dedup set prevents them from being re-yielded). Advancing
-                # ``follow`` on all fetched entries is a known follow-up.
-                start = newest_ts
-            else:
-                # Nothing new this cycle; sleep interruptibly before polling.
+            if not yielded_any:
+                # Nothing new yielded this cycle (empty fetch, only non-matching
+                # entries, or pure dedup repeats); sleep interruptibly before
+                # polling. ``start`` has already advanced past fetched entries.
                 self._interruptible_sleep(stop_event, poll_interval_ms)
 
     def _interruptible_sleep(
@@ -855,17 +870,27 @@ class LokiBackend:
 
     @staticmethod
     def _to_rfc3339_utc(dt: datetime) -> str:
-        """Convert a :class:`datetime` to an RFC3339 UTC string (``Z`` suffix).
+        """Convert a :class:`datetime` to an RFC3339Nano UTC string (``Z`` suffix).
 
         Naive datetimes are treated as UTC (not local time) so the default
-        lookback math stays host-independent. Output is ``isoformat()`` in
-        UTC with a trailing ``Z`` (microsecond precision; accepted by Loki's
-        ``query_range``). The uniform ``Z`` suffix keeps ``start``/``end`` and
-        the ``await_one`` high-water seed format-consistent with Loki's own
-        entry timestamps (RFC3339Nano ``Z``), so lexical string comparison
-        stays valid (Loki accepts both ``+00:00`` and ``Z``; we normalize to
-        ``Z`` to agree with the entry-timestamp format it emits).
+        lookback math stays host-independent. Output carries 9-digit nanosecond
+        precision (``datetime`` only has microsecond resolution, padded
+        ``* 1000``) with a trailing ``Z``, matching the format of the entry
+        timestamps Loki emits (RFC3339Nano ``Z``). The uniform ns precision
+        keeps ``start``/``end`` and the ``await_one``/``follow`` high-water
+        seeds format-consistent with Loki entry timestamps, so lexical string
+        comparison stays valid: a microsecond-precision seed miscompares
+        lexically against a nanosecond entry extending the same microsecond.
         """
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        dt = dt.astimezone(timezone.utc)
+        # Format manually to guarantee 9-digit nanosecond precision (datetime
+        # only carries microseconds; ``.isoformat()`` would emit 6 digits -- or
+        # omit the fractional part entirely when microsecond==0 -- neither of
+        # which matches Loki's nanosecond entry-timestamp format).
+        return (
+            f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
+            f"T{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+            f".{dt.microsecond * 1000:09d}Z"
+        )
