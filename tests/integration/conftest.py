@@ -230,35 +230,70 @@ def _start_loki(stack: _LiveStack) -> None:
     """Start ``grafana/loki:3.0.0`` on a host-mapped 3100.
 
     Loki is independent of the other services (no broker/DB dependency), so it
-    can start in any order. The wait strategy polls the container logs for
-    Loki's readiness banner; a 60s startup timeout covers a cold image pull.
+    can start in any order. Rather than scrape the container logs for a
+    readiness banner (the regex was unverified for ``grafana/loki:3.0.0`` and a
+    non-match silently burns the whole 60s startup timeout, leaving
+    ``require_loki`` to skip even with Docker + ``AGCTL_TEST_LIVE=1`` set), the
+    container is started and then its ``/ready`` HTTP endpoint is polled
+    directly for up to ~60s -- the same endpoint ``require_loki`` probes.
+
     On success ``AGCTL_TEST_LOKI_URL`` is wired to ``http://localhost:<mapped>``;
-    any failure (Docker absent, image pull refused, timeout) records a skip
-    reason so ``require_loki`` skips cleanly instead of failing.
+    any failure (Docker absent, image pull refused, ``/ready`` never 2xx within
+    the budget) records a skip reason and tears the container down so
+    ``require_loki`` skips cleanly instead of failing. This function NEVER
+    raises -- the safe-skip invariant is preserved.
     """
     try:
-        import re
-
         from testcontainers.core.container import DockerContainer
-        from testcontainers.kafka import LogMessageWaitStrategy
 
-        loki = (
-            DockerContainer("grafana/loki:3.0.0")
-            .with_exposed_ports(3100)
-            .waiting_for(
-                LogMessageWaitStrategy(
-                    re.compile(r".*(Loki started|ready for use).*")
-                ).with_startup_timeout(60)
-            )
-        )
+        loki = DockerContainer("grafana/loki:3.0.0").with_exposed_ports(3100)
         loki.start()
     except Exception as exc:  # noqa: BLE001 - any failure => skip that service
         _LIVE_SKIP_REASONS["loki"] = f"{type(exc).__name__}: {exc}"
         return
 
+    # Container started; gate on the /ready HTTP endpoint. Poll for up to ~60s
+    # (covering a cold image pull on the first run); on failure record a skip
+    # reason and stop the container so require_loki skips cleanly.
+    import time
+    import urllib.request
+
+    ready = False
+    last_exc: Exception | None = None
+    try:
+        port = str(loki.get_exposed_port(3100))
+        url = f"http://localhost:{port}"
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(f"{url}/ready", timeout=2) as resp:
+                    if 200 <= resp.status < 300:
+                        ready = True
+                        break
+            except Exception as exc:  # noqa: BLE001 - not ready yet; keep polling
+                last_exc = exc
+                time.sleep(1)
+    except Exception as exc:  # noqa: BLE001 - unexpected post-start failure
+        _LIVE_SKIP_REASONS["loki"] = f"{type(exc).__name__}: {exc}"
+        try:
+            loki.stop()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
+        return
+
+    if not ready:
+        reason = "loki /ready never returned 2xx within 60s startup budget"
+        if last_exc is not None:
+            reason += f": {type(last_exc).__name__}: {last_exc}"
+        _LIVE_SKIP_REASONS["loki"] = reason
+        try:
+            loki.stop()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
+        return
+
     stack.loki = loki
-    port = str(loki.get_exposed_port(3100))
-    os.environ["AGCTL_TEST_LOKI_URL"] = f"http://localhost:{port}"
+    os.environ["AGCTL_TEST_LOKI_URL"] = url
 
 
 def _start_http(stack: _LiveStack) -> None:

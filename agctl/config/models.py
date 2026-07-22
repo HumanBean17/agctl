@@ -399,14 +399,23 @@ class LogSource(BaseModel):
     Loki source). They are ``None`` for local ``file``/``journald`` sources.
 
     ``options`` is a free-form dict of backend-specific extras (default empty) —
-    the intentional escape hatch for keys that vary by backend, mirroring
-    ``DatabaseConnection.options``. For Loki it carries auth/transport knobs
-    such as ``username``/``password``/``token``/``org_id``/``verify_tls``/
-    ``fetch_limit``/``direction``. Recognized keys vary by backend.
+    the intentional escape hatch for keys that vary by backend. It mirrors the
+    *shape* of ``DatabaseConnection.options`` (a free-form dict of
+    driver/backend-specific keys), not the strictness — see below. For Loki it
+    carries auth/transport knobs such as ``username``/``password``/``token``/
+    ``org_id``/``verify_tls``/``fetch_limit``/``direction``. Recognized keys
+    vary by backend.
 
-    The model stays strict: unknown top-level keys are rejected (``extra=
-    "forbid"``) so typos surface at parse time — backend-specific keys must
-    live under ``options``.
+    The model is deliberately strict: unknown top-level keys are rejected
+    (``extra="forbid"``) so typos surface loudly at parse time rather than
+    being silently ignored. This is stricter than :class:`DatabaseConnection`,
+    which uses Pydantic's default ``ignore``. The strictness is intentional
+    here because the remote-backend auth keys (``username``/``password``/
+    ``token``) are the highest-misplacement risk: a ``username`` accidentally
+    authored at the top level (instead of under ``options``) would otherwise be
+    silently dropped and surface as a confusing runtime 401. Note this also
+    means stray top-level keys on an existing ``file`` source will now be
+    rejected at load — put backend-specific keys under ``options``.
     """
 
     model_config = ConfigDict(extra="forbid")

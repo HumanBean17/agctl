@@ -38,11 +38,12 @@ SLOT_SOURCE_SET: frozenset[str] = frozenset(
     }
 )
 
-# Canonical (post-normalize) slot names tracked by ``infer_schema``.
+# Canonical (post-normalize) standard slot names tracked by ``infer_schema``.
+# (The two conditional slots ``stack_trace``/``tags`` are checked directly in
+# ``infer_schema`` rather than via a constant here.)
 _STANDARD_SLOTS: frozenset[str] = frozenset(
     {"timestamp", "level", "logger", "message", "thread", "service"}
 )
-_CONDITIONAL_SLOTS: frozenset[str] = frozenset({"stack_trace", "tags"})
 
 # Logstash noise keys excluded from the ``observed`` schema list.
 _SCHEMA_NOISE: frozenset[str] = frozenset({"@version", "level_value"})

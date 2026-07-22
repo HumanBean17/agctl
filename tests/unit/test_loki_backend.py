@@ -149,8 +149,62 @@ def test_validate_config_username_without_password_raises():
         backend.validate_config()
 
 
+def test_validate_config_password_without_username_raises():
+    # Symmetric to username-without-password: a lone password must also fail
+    # at validate time (otherwise _build_auth silently drops it -> confusing
+    # runtime 401 instead of a clean ConfigError).
+    source = make_source(options={"password": "p"})
+    backend = LokiBackend(source)
+    with pytest.raises(ConfigError):
+        backend.validate_config()
+
+
 def test_validate_config_minimal_valid_does_not_raise():
     source = make_source()  # url + query only
+    backend = LokiBackend(source)
+    backend.validate_config()  # must not raise
+
+
+# --- validate_config: fetch_limit / direction / verify_tls (DESIGN §5.3) -----
+def test_validate_config_fetch_limit_zero_raises():
+    source = make_source(options={"fetch_limit": 0})
+    backend = LokiBackend(source)
+    with pytest.raises(ConfigError):
+        backend.validate_config()
+
+
+def test_validate_config_fetch_limit_negative_raises():
+    source = make_source(options={"fetch_limit": -1})
+    backend = LokiBackend(source)
+    with pytest.raises(ConfigError):
+        backend.validate_config()
+
+
+def test_validate_config_fetch_limit_non_int_raises():
+    source = make_source(options={"fetch_limit": "500"})
+    backend = LokiBackend(source)
+    with pytest.raises(ConfigError):
+        backend.validate_config()
+
+
+def test_validate_config_direction_bad_value_raises():
+    source = make_source(options={"direction": "sideways"})
+    backend = LokiBackend(source)
+    with pytest.raises(ConfigError):
+        backend.validate_config()
+
+
+def test_validate_config_verify_tls_string_raises():
+    source = make_source(options={"verify_tls": "false"})
+    backend = LokiBackend(source)
+    with pytest.raises(ConfigError):
+        backend.validate_config()
+
+
+def test_validate_config_valid_fetch_limit_direction_verify_tls_pass():
+    source = make_source(
+        options={"fetch_limit": 1000, "direction": "backward", "verify_tls": False}
+    )
     backend = LokiBackend(source)
     backend.validate_config()  # must not raise
 
@@ -286,6 +340,19 @@ def test_normalize_loki_line_plain_text_becomes_message():
     assert entry.message == "hello"
 
 
+def test_normalize_loki_line_json_not_dict_becomes_message():
+    # A JSON scalar (e.g. "42" -> int 42) is valid JSON but not a dict; it is
+    # stringified into ``message`` rather than routed through normalize_dict.
+    backend = LokiBackend(make_source(service="svc"))
+    entry = backend._normalize_loki_line("42", "T")
+    assert isinstance(entry, CanonicalEntry)
+    assert entry.timestamp == "T"
+    assert entry.level == ""
+    assert entry.logger == ""
+    assert entry.message == "42"
+    assert entry.service == "svc"
+
+
 # --- HTTP status error mapping ---------------------------------------------
 def test_status_400_raises_config_error_with_body():
     body = {"status": "error", "error": "parse error"}
@@ -332,6 +399,51 @@ def test_status_200_non_stream_resulttype_raises_config_error():
     with pytest.raises(ConfigError) as ei:
         backend._fetch_entries(start="s", end="e", limit=10, direction="forward")
     assert ei.value.detail.get("result_type") == "matrix"
+
+
+# --- _parse_streams: defensive parsing --------------------------------------
+def test_parse_streams_skips_malformed_pairs():
+    """Malformed [ts, line] pairs (non-list or len < 2) are skipped; valid
+    pairs are still normalized. Guards against a single bad chunk aborting the
+    whole response."""
+    body = {
+        "status": "success",
+        "data": {
+            "resultType": "streams",
+            "result": [
+                {
+                    "stream": {"app": "x"},
+                    "values": [
+                        ["T1", '{"level":"INFO","message":"keep"}'],  # valid
+                        ["solo"],  # len < 2 -> skipped
+                        "not-a-list",  # not a list/tuple -> skipped
+                        ["T2", '{"level":"ERROR","message":"also-keep"}'],  # valid
+                    ],
+                }
+            ],
+        },
+    }
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake)
+
+    entries = backend._fetch_entries(
+        start="s", end="e", limit=10, direction="forward"
+    )
+    assert [e.message for e in entries] == ["keep", "also-keep"]
+    assert [e.timestamp for e in entries] == ["T1", "T2"]
+
+
+def test_parse_streams_non_json_body_on_200_raises_connection_failure():
+    """A 200 whose body is not valid JSON is surfaced as ConnectionFailure
+    (carrying the raw text) rather than crashing with a JSONDecodeError."""
+    fake = FakeHttpClient(
+        response=FakeResponse(status_code=200, json_data=None, text="<html>nope</html>")
+    )
+    backend = LokiBackend(make_source(), http_client=fake)
+    with pytest.raises(ConnectionFailure) as ei:
+        backend._fetch_entries(start="s", end="e", limit=10, direction="forward")
+    assert "non-json" in ei.value.message.lower()
+    assert ei.value.detail.get("body") == "<html>nope</html>"
 
 
 # --- transport-exception mapping (httpx required) --------------------------
@@ -547,6 +659,39 @@ def test_scan_tail_lines_is_ignored():
     p1, p2 = fake.calls[0]["params"], fake.calls[1]["params"]
     for k in ("query", "start", "end", "limit", "direction"):
         assert p1[k] == p2[k]
+
+
+# --- scan: custom direction + per-request timeout plumbing -----------------
+def test_scan_custom_direction_backward_flows_through():
+    """options.direction='backward' is plumbed into the query_range request."""
+    body = streams_body([({"app": "x"}, _three_logstash_lines())])
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(
+        make_source(options={"direction": "backward"}), http_client=fake
+    )
+
+    since, until = _win()
+    backend.scan(
+        LogFilter(), since=since, until=until, limit=10, tail_lines=0
+    )
+    assert fake.calls[0]["params"]["direction"] == "backward"
+
+
+def test_scan_plumbs_default_per_request_timeout():
+    """The recorded fake call carries the per-request HTTP timeout kwarg so a
+    regression dropping it fails this assertion."""
+    body = streams_body([({"app": "x"}, _three_logstash_lines())])
+    fake = FakeHttpClient(response=FakeResponse(status_code=200, json_data=body))
+    backend = LokiBackend(make_source(), http_client=fake)
+
+    since, until = _win()
+    backend.scan(
+        LogFilter(), since=since, until=until, limit=10, tail_lines=0
+    )
+    # scan does not override the per-request timeout, so the default applies.
+    from agctl.clients.log_backends.loki import _DEFAULT_FETCH_TIMEOUT_S
+
+    assert fake.calls[0]["timeout"] == _DEFAULT_FETCH_TIMEOUT_S
 
 
 # --- sample_schema ---------------------------------------------------------
@@ -870,7 +1015,7 @@ def test_await_one_poll_timeout_no_matches_terminates():
     assert result.entry is None
     assert len(sleeps) == 1  # loop terminated, did not spin forever
     assert result.elapsed_ms == 300  # 0.3s fake wall-clock elapsed
-    assert result.scanned == 0  # Phase 1 empty + no forward fetch
+    assert result.scanned == 0  # Phase 1 empty + forward fetch empty
 
 
 # ============================================================================

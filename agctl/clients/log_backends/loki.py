@@ -42,6 +42,9 @@ from agctl.config.models import LogSource
 from agctl.errors import ConfigError, ConnectionFailure, OperationTimeout
 
 #: Default per-request httpx timeout (seconds) when callers do not pass one.
+#: NOTE: the per-request HTTP timeout is NOT tunable via ``--timeout`` (v1
+#: limitation) -- the ``LogBackend`` protocol exposes no per-request knob, and
+#: ``--timeout`` only bounds ``await_one``'s total poll budget.
 _DEFAULT_FETCH_TIMEOUT_S: float = 10.0
 
 #: Default ``fetch_limit`` (max lines per ``query_range`` response).
@@ -125,7 +128,14 @@ class LokiBackend:
           * ``query`` is required (non-empty);
           * basic (``username``+``password``) and bearer (``token``) auth
             are mutually exclusive -- setting both is an error;
-          * ``username`` without ``password`` is an error.
+          * ``username`` and ``password`` must be both-set or both-unset
+            (a lone password is silently dropped by ``_build_auth`` -- reject
+            it here so the caller gets a clean validate-time error instead of
+            a confusing runtime 401);
+          * ``options.fetch_limit`` must be an int ``> 0`` (default 500);
+          * ``options.direction`` (if present) must be ``"forward"`` or
+            ``"backward"``;
+          * ``options.verify_tls`` (if present) must be a bool.
 
         A minimal valid config (``url`` + ``query`` only) passes cleanly.
         """
@@ -151,11 +161,35 @@ class LokiBackend:
                 "are mutually exclusive",
                 {"type": "loki"},
             )
-        # Username without password (passwordless basic is not supported).
-        if self._username is not None and self._password is None:
+        # username/password must be both-set or both-unset. _build_auth only
+        # attaches basic auth when BOTH are non-None, so a lone half-pair is
+        # silently dropped -- reject symmetrically here.
+        if (self._username is None) != (self._password is None):
             raise ConfigError(
-                "loki backend: 'username' requires 'password'",
+                "loki backend: 'username' and 'password' must both be set "
+                "(or both omitted); a lone username or password is not supported",
                 {"type": "loki"},
+            )
+        # fetch_limit must be a positive int (default 500 is fine).
+        if not isinstance(self._fetch_limit, int) or self._fetch_limit <= 0:
+            raise ConfigError(
+                f"loki backend: 'fetch_limit' must be a positive int, "
+                f"got {self._fetch_limit!r}",
+                {"type": "loki", "fetch_limit": self._fetch_limit},
+            )
+        # direction must be one of the two query_range values.
+        if self._direction not in ("forward", "backward"):
+            raise ConfigError(
+                f"loki backend: 'direction' must be 'forward' or 'backward', "
+                f"got {self._direction!r}",
+                {"type": "loki", "direction": self._direction},
+            )
+        # verify_tls must be a bool (no string "false"/"true" coercion).
+        if not isinstance(self._verify_tls, bool):
+            raise ConfigError(
+                f"loki backend: 'verify_tls' must be a bool, "
+                f"got {self._verify_tls!r}",
+                {"type": "loki", "verify_tls": self._verify_tls},
             )
 
     # -- HTTP read path ------------------------------------------------------
@@ -499,8 +533,8 @@ class LokiBackend:
         start_dt = since if since is not None else end_dt - timedelta(hours=1)
 
         entries = self._fetch_entries(
-            start=self._to_rfc3339_nano(start_dt),
-            end=self._to_rfc3339_nano(end_dt),
+            start=self._to_rfc3339_utc(start_dt),
+            end=self._to_rfc3339_utc(end_dt),
             limit=self._fetch_limit,
             direction=self._direction,
         )
@@ -579,16 +613,15 @@ class LokiBackend:
         # deterministic without real waiting.
         now_dt = datetime.now(timezone.utc)
         start_dt = since if since is not None else now_dt - timedelta(hours=1)
-        # Z-suffixed so the high-water seed matches Loki's entry-timestamp
-        # format (Loki emits RFC3339Nano with ``Z``; ``_to_rfc3339_nano``
-        # emits ``+00:00``). The seed is lexically compared against entry
-        # timestamps below, so the formats must agree.
-        window_start_ts = self._to_rfc3339_nano(start_dt).replace("+00:00", "Z")
+        # The high-water seed is lexically compared against entry timestamps
+        # below; ``_to_rfc3339_utc`` emits a ``Z`` suffix matching Loki's own
+        # RFC3339 entry timestamps, so the formats agree.
+        window_start_ts = self._to_rfc3339_utc(start_dt)
 
         # -- Phase 1: one backward historical read (both modes) --------------
         entries = self._fetch_entries(
             start=window_start_ts,
-            end=self._to_rfc3339_nano(now_dt),
+            end=self._to_rfc3339_utc(now_dt),
             limit=self._fetch_limit,
             direction="backward",
         )
@@ -626,7 +659,7 @@ class LokiBackend:
             now_dt = datetime.now(timezone.utc)
             entries = self._fetch_entries(
                 start=last_ts,
-                end=self._to_rfc3339_nano(now_dt),
+                end=self._to_rfc3339_utc(now_dt),
                 limit=self._fetch_limit,
                 direction="forward",
             )
@@ -721,12 +754,12 @@ class LokiBackend:
         # Seed the high-water ``start`` to "now". Subsequent cycles advance
         # it to the newest emitted entry's timestamp; a cycle that emits
         # nothing leaves ``start`` unchanged (re-fetches the same window).
-        start = self._to_rfc3339_nano(datetime.now(timezone.utc))
+        start = self._to_rfc3339_utc(datetime.now(timezone.utc))
         emitted: set[tuple[str, str]] = set()
         first_fetch = True
 
         while not stop_event.is_set():
-            end = self._to_rfc3339_nano(datetime.now(timezone.utc))
+            end = self._to_rfc3339_utc(datetime.now(timezone.utc))
             try:
                 entries = self._fetch_entries(
                     start=start,
@@ -768,7 +801,13 @@ class LokiBackend:
                     return
 
             if yielded_any and newest_ts is not None:
-                # Advance the high-water to the newest emitted timestamp.
+                # Advance the high-water to the newest EMITTED (matching)
+                # timestamp, not the newest fetched one. Contrast with
+                # ``await_one``, which advances on all fetched entries. The
+                # consequence: under a strict filter + high volume, non-matching
+                # fetched entries are re-fetched each cycle (the ``emitted``
+                # dedup set prevents them from being re-yielded). Advancing
+                # ``follow`` on all fetched entries is a known follow-up.
                 start = newest_ts
             else:
                 # Nothing new this cycle; sleep interruptibly before polling.
@@ -807,21 +846,26 @@ class LokiBackend:
         end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(hours=1)
         entries = self._fetch_entries(
-            start=self._to_rfc3339_nano(start_dt),
-            end=self._to_rfc3339_nano(end_dt),
+            start=self._to_rfc3339_utc(start_dt),
+            end=self._to_rfc3339_utc(end_dt),
             limit=sample_lines,
             direction="backward",
         )
         return log_common.infer_schema(entries)
 
     @staticmethod
-    def _to_rfc3339_nano(dt: datetime) -> str:
-        """Convert a :class:`datetime` to an RFC3339Nano UTC string.
+    def _to_rfc3339_utc(dt: datetime) -> str:
+        """Convert a :class:`datetime` to an RFC3339 UTC string (``Z`` suffix).
 
         Naive datetimes are treated as UTC (not local time) so the default
         lookback math stays host-independent. Output is ``isoformat()`` in
-        UTC (microsecond precision; accepted by Loki's ``query_range``).
+        UTC with a trailing ``Z`` (microsecond precision; accepted by Loki's
+        ``query_range``). The uniform ``Z`` suffix keeps ``start``/``end`` and
+        the ``await_one`` high-water seed format-consistent with Loki's own
+        entry timestamps (RFC3339Nano ``Z``), so lexical string comparison
+        stays valid (Loki accepts both ``+00:00`` and ``Z``; we normalize to
+        ``Z`` to agree with the entry-timestamp format it emits).
         """
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).isoformat()
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
