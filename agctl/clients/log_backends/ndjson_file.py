@@ -1,7 +1,5 @@
 """NDJSON file backend for logstash-formatted logs (DESIGN §9.2)."""
 
-import dataclasses
-import fnmatch
 import json
 import os
 import sys
@@ -12,7 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from agctl.assertions import _parse_iso_datetime, _to_utc, jq_bool
+from agctl.assertions import _parse_iso_datetime, _to_utc
+from agctl.clients import log_common
 from agctl.clients.log_backend_protocol import (
     AwaitResult,
     CanonicalEntry,
@@ -22,18 +21,6 @@ from agctl.clients.log_backend_protocol import (
 )
 from agctl.config.models import LogSource
 from agctl.errors import ConfigError
-
-
-_SLOT_SOURCE_SET = {
-    "@timestamp",
-    "level",
-    "logger_name",
-    "thread_name",
-    "message",
-    "service",
-    "stack_trace",
-    "tags",
-}
 
 
 class NdjsonFileBackend:
@@ -80,35 +67,15 @@ class NdjsonFileBackend:
     def _normalize(self, raw: dict) -> CanonicalEntry:
         """Map a parsed logstash JSON object to CanonicalEntry.
 
-        Slot fields (timestamp, level, logger, thread, message, service,
-        stack_trace, tags) are mapped directly. All other top-level keys
-        (e.g. MDC, StructuredArguments, @version, level_value) go into
-        the ``fields`` dict.
+        Thin delegator to :func:`log_common.normalize_dict` -- the slot
+        mapping, upper-casing, and non-slot ``fields`` bucketing all live
+        there now (shared with future backends). No overrides are passed:
+        file lines carry their own ``@timestamp`` / ``service``. Kept as an
+        instance method so the existing test contract
+        (``backend._normalize(raw)``) continues to exercise the shared
+        helper end-to-end.
         """
-        # Extract slot fields
-        timestamp = raw.get("@timestamp")
-        level = str(raw.get("level", "")).upper()
-        logger = raw.get("logger_name")
-        message = raw.get("message")
-        thread = raw.get("thread_name")
-        service = raw.get("service")
-        stack_trace = raw.get("stack_trace")
-        tags = raw.get("tags")
-
-        # All other keys go to fields
-        fields = {k: v for k, v in raw.items() if k not in _SLOT_SOURCE_SET}
-
-        return CanonicalEntry(
-            timestamp=timestamp,
-            level=level,
-            logger=logger,
-            message=message,
-            thread=thread,
-            service=service,
-            stack_trace=stack_trace,
-            tags=tags,
-            fields=fields,
-        )
+        return log_common.normalize_dict(raw)
 
     def _read_window(
         self,
@@ -166,22 +133,13 @@ class NdjsonFileBackend:
 
             scanned += 1
 
-            # Apply filters (AND logic)
-            if filt.level is not None:
-                if entry.level != filt.level.upper():
-                    continue
-
-            if filt.logger_glob is not None:
-                if not fnmatch.fnmatch(entry.logger or "", filt.logger_glob):
-                    continue
-
-            if filt.message_substring is not None:
-                if filt.message_substring not in (entry.message or ""):
-                    continue
-
-            if filt.match_jq is not None:
-                if not jq_bool(dataclasses.asdict(entry), filt.match_jq):
-                    continue
+            # Apply filters (AND of active dimensions) -- delegated to
+            # log_common.entry_matches so file/Loki backends share one
+            # implementation. Window bounds (since/until) are NOT inside
+            # entry_matches: file backends apply them client-side above,
+            # Loki will push them server-side.
+            if not log_common.entry_matches(entry, filt):
+                continue
 
             matched += 1
             if len(entries) < limit:
@@ -477,23 +435,9 @@ class NdjsonFileBackend:
 
             scanned += 1
 
-            # Apply filters (AND logic)
-            if filt.level is not None and entry.level != filt.level.upper():
-                continue
-
-            if filt.logger_glob is not None and not fnmatch.fnmatch(
-                entry.logger or "", filt.logger_glob
-            ):
-                continue
-
-            if filt.message_substring is not None and (
-                filt.message_substring not in (entry.message or "")
-            ):
-                continue
-
-            if filt.match_jq is not None and not jq_bool(
-                dataclasses.asdict(entry), filt.match_jq
-            ):
+            # Apply filters (AND of active dimensions) -- delegated to
+            # log_common.entry_matches (shared with _read_window / follow).
+            if not log_common.entry_matches(entry, filt):
                 continue
 
             entries.append(entry)
@@ -597,26 +541,11 @@ class NdjsonFileBackend:
 
                             entry = self._normalize(raw)
 
-                            # Apply filters (AND logic)
-                            if filt.level is not None:
-                                if entry.level != filt.level.upper():
-                                    continue
-
-                            if filt.logger_glob is not None:
-                                if not fnmatch.fnmatch(
-                                    entry.logger or "", filt.logger_glob
-                                ):
-                                    continue
-
-                            if filt.message_substring is not None:
-                                if filt.message_substring not in (
-                                    entry.message or ""
-                                ):
-                                    continue
-
-                            if filt.match_jq is not None:
-                                if not jq_bool(dataclasses.asdict(entry), filt.match_jq):
-                                    continue
+                            # Apply filters (AND of active dimensions) --
+                            # delegated to log_common.entry_matches
+                            # (shared with _read_window / _read_increment).
+                            if not log_common.entry_matches(entry, filt):
+                                continue
 
                             # Yield the matching entry
                             yield entry
@@ -642,10 +571,11 @@ class NdjsonFileBackend:
             sample_lines: Number of trailing lines to sample (default 100)
 
         Returns:
-            SchemaDescriptor with:
-            - standard: Fields from predefined set present in sample
-            - conditional: Optional fields (stack_trace, tags) present in sample
-            - observed: All keys from fields dict, excluding logstash noise
+            SchemaDescriptor inferred by :func:`log_common.infer_schema`
+            over the normalized sample (standard slots present and
+            non-empty; conditional ``stack_trace`` / ``tags`` present;
+            ``observed`` is the union of ``fields`` keys excluding the
+            logstash noise keys ``@version`` and ``level_value``).
         """
         if self._path is None:
             return SchemaDescriptor(standard=[], conditional=[], observed=[])
@@ -653,66 +583,21 @@ class NdjsonFileBackend:
         if not path.exists():
             return SchemaDescriptor(standard=[], conditional=[], observed=[])
 
-        # Read last sample_lines from file
+        # Read last sample_lines from file, normalize each parseable line,
+        # then delegate presence-tracking to log_common.infer_schema (shared
+        # with future backends -- any backend that can produce a list of
+        # CanonicalEntry reuses the same union logic).
         lines = self._tail_lines(path, sample_lines)
 
-        # Standard slot field set (from brief)
-        standard_slots = {
-            "timestamp",
-            "level",
-            "logger",
-            "message",
-            "thread",
-            "service",
-        }
-
-        # Conditional slot field set (from brief)
-        conditional_slots = {"stack_trace", "tags"}
-
-        # Track presence across entries
-        standard_seen = set()
-        conditional_seen = set()
-        observed_keys = set()
-
+        entries: list[CanonicalEntry] = []
         for line in lines:
             if not line.strip():
                 continue
-
             try:
                 raw = json.loads(line)
             except json.JSONDecodeError:
                 # Skip non-JSON lines silently for schema inference
                 continue
+            entries.append(self._normalize(raw))
 
-            entry = self._normalize(raw)
-
-            # Check standard slots (non-None/non-empty)
-            if entry.timestamp is not None and entry.timestamp != "":
-                standard_seen.add("timestamp")
-            if entry.level is not None and entry.level != "":
-                standard_seen.add("level")
-            if entry.logger is not None and entry.logger != "":
-                standard_seen.add("logger")
-            if entry.message is not None and entry.message != "":
-                standard_seen.add("message")
-            if entry.thread is not None and entry.thread != "":
-                standard_seen.add("thread")
-            if entry.service is not None and entry.service != "":
-                standard_seen.add("service")
-
-            # Check conditional slots (non-None)
-            if entry.stack_trace is not None:
-                conditional_seen.add("stack_trace")
-            if entry.tags is not None:
-                conditional_seen.add("tags")
-
-            # Collect all observed keys from fields (excluding logstash noise)
-            for key in entry.fields.keys():
-                if key not in {"@version", "level_value"}:
-                    observed_keys.add(key)
-
-        return SchemaDescriptor(
-            standard=sorted(standard_seen),
-            conditional=sorted(conditional_seen),
-            observed=sorted(observed_keys),
-        )
+        return log_common.infer_schema(entries)

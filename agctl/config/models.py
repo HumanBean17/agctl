@@ -392,12 +392,45 @@ class MocksConfig(BaseModel):
 
 
 class LogSource(BaseModel):
-    """Log source configuration (file or journald)."""
+    """Log source configuration (file, journald, or a remote backend).
+
+    ``url`` and ``query`` carry the endpoint and query expression for remote
+    backends (e.g. ``url: "http://loki:3100"`` and ``query: '{app="x"}'`` for a
+    Loki source). They are ``None`` for local ``file``/``journald`` sources.
+
+    ``options`` is a free-form dict of backend-specific extras (default empty) —
+    the intentional escape hatch for keys that vary by backend. It mirrors the
+    *shape* of ``DatabaseConnection.options`` (a free-form dict of
+    driver/backend-specific keys), not the strictness — see below. For Loki it
+    carries auth/transport knobs such as ``username``/``password``/``token``/
+    ``org_id``/``verify_tls``/``fetch_limit``/``direction``. Recognized keys
+    vary by backend.
+
+    The model is deliberately strict: unknown top-level keys are rejected
+    (``extra="forbid"``) so typos surface loudly at parse time rather than
+    being silently ignored. This is stricter than :class:`DatabaseConnection`,
+    which uses Pydantic's default ``ignore``. The strictness is intentional
+    here because the remote-backend auth keys (``username``/``password``/
+    ``token``) are the highest-misplacement risk: a ``username`` accidentally
+    authored at the top level (instead of under ``options``) would otherwise be
+    silently dropped and surface as a confusing runtime 401. Note this also
+    means stray top-level keys on an existing ``file`` source will now be
+    rejected at load — put backend-specific keys under ``options``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     type: str = "file"
     path: str | None = None
     format: str = "logstash"
     service: str | None = None
+    # Remote-backend endpoint (e.g. "http://loki:3100"). None for local sources.
+    url: str | None = None
+    # Remote-backend query expression (e.g. Loki LogQL '{app="x"}').
+    query: str | None = None
+    # Backend-specific extras (auth/transport knobs); default empty. Mirrors
+    # DatabaseConnection.options — recognized keys vary by backend.
+    options: dict[str, Any] = Field(default_factory=dict)
 
 
 class LogsDefaults(BaseModel):

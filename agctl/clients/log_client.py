@@ -2,7 +2,7 @@
 
 Selects a :class:`LogBackend` implementation by the source's ``type`` field,
 discovering third-party backends via the ``agctl.logs_backends`` entry-point
-group while always falling back to the built-in ``file`` backend.
+group while always providing the built-in ``file`` and ``loki`` backends.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Protocol
 
 from ..errors import ConfigError
+from .log_backends.loki import LokiBackend
 from .log_backends.ndjson_file import NdjsonFileBackend
 from .log_backend_protocol import (
     AwaitResult,
@@ -24,7 +25,10 @@ from .log_backend_protocol import (
 LOG_BACKEND_ENTRY_POINT_GROUP = "agctl.logs_backends"
 
 #: Built-in backends always available even without entry-point registration.
-BUILTIN_BACKENDS: dict[str, type] = {"file": NdjsonFileBackend}
+BUILTIN_BACKENDS: dict[str, type] = {
+    "file": NdjsonFileBackend,
+    "loki": LokiBackend,
+}
 
 
 class LogClient:
