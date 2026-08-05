@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 import click
 
 from ..assertions import compile_jq
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 from ..daemon import (
     is_alive,
     read_pidfile,
@@ -930,6 +930,7 @@ def _kafka_listen_results_core(
     config_path: str | None = None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     """Core logic for ``kafka listen results`` (Task 9).
 
@@ -939,6 +940,13 @@ def _kafka_listen_results_core(
     Any failure raises :class:`AssertionFailure` so each per-result
     ``ExpectationResult`` (with its self-debugging ``matched_count``/``modes``
     detail) flows out through ``error.detail.results``.
+
+    Template-variable generators (Task 9): one ``memo = {}`` is created per
+    ``results`` call and shared across every spec, so the SAME ``{{token}}``
+    in multiple expectations (or repeated within one) resolves to ONE value.
+    ``template_vars_enabled=False`` (``--no-template-vars``) leaves tokens
+    literal; an unknown generator surfaces as :class:`ConfigError` before any
+    capture-file scan.
 
     Returns:
         ``{"evaluated", "passed", "failed", "results": [ExpectationResult, ...]}``
@@ -964,7 +972,13 @@ def _kafka_listen_results_core(
     cfg = load_config_or_raise(
         config_path, overlay_paths=overlay_paths, env_file=env_file
     )
-    results = evaluate_expectations(rdir, cfg.kafka.patterns)
+    memo: dict[str, str] = {}
+    results = evaluate_expectations(
+        rdir,
+        cfg.kafka.patterns,
+        memo=memo,
+        template_vars_enabled=template_vars_enabled,
+    )
     passed = sum(1 for r in results if r["passed"])
     failed = len(results) - passed
     if failed > 0:
@@ -995,6 +1009,7 @@ def kafka_listen_results(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _kafka_listen_results_envelope(
         run_id,
         pid,
@@ -1002,6 +1017,7 @@ def kafka_listen_results(
         config_path=config_path,
         overlay_paths=list(ovs) if ovs else None,
         env_file=env_file,
+        template_vars_enabled=template_vars_enabled,
     )
 
 
@@ -1021,6 +1037,7 @@ def _kafka_listen_messages_core(
     run_id: str | None,
     pid: int | None,
     state_dir: str,
+    template_vars_enabled: bool = True,
 ) -> dict:
     """Core logic for ``kafka listen messages`` (Task 9).
 
@@ -1031,6 +1048,13 @@ def _kafka_listen_messages_core(
     as a filter. ``matched`` is the total count of matching envelopes in the
     file (independent of ``limit``); ``truncated`` is True iff more matched than
     ``limit`` allowed back.
+
+    Template-variable generators (Task 9): one ``memo = {}`` is created per
+    ``messages`` call and threaded into :func:`fill_placeholders`, so
+    ``{{uuid}}``/``{{ts}}``/``{{rand}}`` tokens in ``--match`` resolve to
+    generated values. ``template_vars_enabled=False`` (``--no-template-vars``)
+    leaves tokens literal; an unknown generator surfaces as :class:`ConfigError`
+    before any capture-file scan.
 
     Returns:
         ``{"topic", "matched", "truncated", "messages": [<CapturedEnvelope>, ...]}``.
@@ -1047,7 +1071,13 @@ def _kafka_listen_messages_core(
 
     predicate = None
     if match is not None:
-        filled = fill_placeholders(match, parse_params(param))
+        memo: dict[str, str] = {}
+        filled = fill_placeholders(
+            match,
+            parse_params(param),
+            memo=memo,
+            template_vars_enabled=template_vars_enabled,
+        )
         # Validate the jq expression up front (loud-on-typo); build_predicate
         # compiles each present expression and raises ConfigError on a malformed one.
         predicate = build_predicate({"match": filled})
@@ -1086,7 +1116,17 @@ def kafka_listen_messages(
     state_dir: str,
 ) -> None:
     """Read up to ``--limit`` captured messages from a running listener's topic."""
-    _kafka_listen_messages_envelope(topic, match, param, limit, run_id, pid, state_dir)
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
+    _kafka_listen_messages_envelope(
+        topic,
+        match,
+        param,
+        limit,
+        run_id,
+        pid,
+        state_dir,
+        template_vars_enabled=template_vars_enabled,
+    )
 
 
 _kafka_listen_messages_envelope = envelope("kafka.listen.messages")(_kafka_listen_messages_core)

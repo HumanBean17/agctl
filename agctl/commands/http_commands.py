@@ -24,11 +24,12 @@ from urllib.parse import urlsplit
 import click
 
 from ..assertions import evaluate_http_assertions, validate_http_assertion_args
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 from ..errors import AgctlError, ConfigError, TemplateNotFound
 from ..output import emit
 from ..params import parse_params
 from ..resolution import deep_merge, fill_placeholders
+from ..template_vars import substitute_generators
 
 __all__ = [
     "http_call",
@@ -118,6 +119,7 @@ def _http_call_core(
     equals: str | None = None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
 
@@ -133,14 +135,27 @@ def _http_call_core(
             {"service": tpl.service},
         )
 
+    # Per-invocation memo (Task 7): one shared map so the SAME ``{{token}}`` in
+    # the template body/path/headers, ``--body``, and ``--header`` resolves to
+    # ONE value within this call. The generator pre-pass inside
+    # ``fill_placeholders`` (active because ``memo`` is provided) replaces
+    # ``{{name}}`` tokens; an unknown generator surfaces as ConfigError (exit 2)
+    # here, BEFORE any request is sent (load-bearing for no-wasted-side-effect).
+    memo: dict[str, str] = {}
     params = parse_params(param)
 
-    path = fill_placeholders(tpl.path, params)
+    path = fill_placeholders(
+        tpl.path, params, memo=memo, template_vars_enabled=template_vars_enabled
+    )
 
     # Body: start from the (filled) template body, then D5-merge --body on top.
-    filled_body = fill_placeholders(tpl.body, params)
+    filled_body = fill_placeholders(
+        tpl.body, params, memo=memo, template_vars_enabled=template_vars_enabled
+    )
     if body is not None:
-        caller_body = json.loads(body)
+        caller_body = json.loads(
+            substitute_generators(body, memo, enabled=template_vars_enabled)
+        )
         if filled_body is None:
             resolved_body = caller_body
         else:
@@ -149,7 +164,14 @@ def _http_call_core(
         resolved_body = filled_body
 
     # Headers: fill template headers, then overlay caller --header (caller wins).
-    base_headers = fill_placeholders(dict(tpl.headers), params)
+    base_headers = fill_placeholders(
+        dict(tpl.headers), params, memo=memo, template_vars_enabled=template_vars_enabled
+    )
+    if header:
+        header = tuple(
+            substitute_generators(h, memo, enabled=template_vars_enabled)
+            for h in header
+        )
     caller_headers = _parse_headers(header)
     resolved_headers = {**base_headers, **caller_headers}
 
@@ -235,6 +257,7 @@ def http_call(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _http_call_envelope(
         config_path,
         template_name,
@@ -249,6 +272,7 @@ def http_call(
         equals,
         overlay_paths=list(ovs) if ovs else None,
         env_file=env_file,
+        template_vars_enabled=template_vars_enabled,
     )
 
 
@@ -273,8 +297,15 @@ def _http_request_core(
     equals: str | None = None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
+
+    # Per-invocation memo (Task 7): shared across --body, --header, the path,
+    # and --url so the SAME ``{{token}}`` resolves to ONE value within this
+    # request. Substitution runs BEFORE the request is dispatched — an unknown
+    # generator surfaces as ConfigError (exit 2) here, with no network call.
+    memo: dict[str, str] = {}
 
     if url is not None:
         # URL mode: a full request URL, no configured service required. This is
@@ -283,6 +314,7 @@ def _http_request_core(
             raise ConfigError(
                 "--url is mutually exclusive with --service and --path", {}
             )
+        url = substitute_generators(url, memo, enabled=template_vars_enabled)
         client_base, client_path = _split_url(url)
         service_timeout = None
     else:
@@ -298,10 +330,20 @@ def _http_request_core(
             )
         service_cfg = cfg.services[service]
         client_base = service_cfg.base_url
-        client_path = path
+        client_path = substitute_generators(
+            path, memo, enabled=template_vars_enabled
+        )
         service_timeout = service_cfg.timeout_seconds
 
+    if body is not None:
+        body = substitute_generators(body, memo, enabled=template_vars_enabled)
     resolved_body = json.loads(body) if body is not None else None
+
+    if header:
+        header = tuple(
+            substitute_generators(h, memo, enabled=template_vars_enabled)
+            for h in header
+        )
     resolved_headers = _parse_headers(header)
 
     effective_timeout = resolve_timeout(
@@ -400,6 +442,7 @@ def http_request(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _http_request_envelope(
         config_path,
         service,
@@ -416,6 +459,7 @@ def http_request(
         equals,
         overlay_paths=list(ovs) if ovs else None,
         env_file=env_file,
+        template_vars_enabled=template_vars_enabled,
     )
 
 
@@ -505,10 +549,17 @@ def _resolve_ping_request(
     url: str | None = None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ):
     """Resolve the request components for a ping (template, URL, or free-form).
 
     Returns ``(client, method, path, headers, body_dict_or_None)``.
+
+    Per-invocation memo (Task 7): one shared map so the SAME ``{{token}}`` in
+    ``--body``, ``--header``, the path/``--url``, and the resolved template
+    body/headers resolves to ONE value. Resolution happens ONCE here, so every
+    ping sends the SAME substituted request. An unknown generator surfaces as
+    ConfigError (exit 2) before any ping line is streamed.
     """
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
 
@@ -521,8 +572,22 @@ def _resolve_ping_request(
             {},
         )
 
+    # Shared memo across every mode. ``--header`` values and ``--body`` are raw
+    # strings used the same way in all three modes, so substitute them once here;
+    # the path/--url and template body/headers are mode-specific and substituted
+    # in their branches below using the SAME memo.
+    memo: dict[str, str] = {}
+    if header:
+        header = tuple(
+            substitute_generators(h, memo, enabled=template_vars_enabled)
+            for h in header
+        )
+    if body is not None:
+        body = substitute_generators(body, memo, enabled=template_vars_enabled)
+
     if url is not None:
         # URL mode: full request URL, no configured service required.
+        url = substitute_generators(url, memo, enabled=template_vars_enabled)
         client_base, resolved_path = _split_url(url)
         resolved_body = json.loads(body) if body is not None else None
         resolved_headers = _parse_headers(header)
@@ -541,9 +606,13 @@ def _resolve_ping_request(
             )
 
         params = parse_params(param)
-        resolved_path = fill_placeholders(tpl.path, params)
+        resolved_path = fill_placeholders(
+            tpl.path, params, memo=memo, template_vars_enabled=template_vars_enabled
+        )
 
-        filled_body = fill_placeholders(tpl.body, params)
+        filled_body = fill_placeholders(
+            tpl.body, params, memo=memo, template_vars_enabled=template_vars_enabled
+        )
         if body is not None:
             caller_body = json.loads(body)
             resolved_body = (
@@ -552,7 +621,12 @@ def _resolve_ping_request(
         else:
             resolved_body = filled_body
 
-        base_headers = fill_placeholders(dict(tpl.headers), params)
+        base_headers = fill_placeholders(
+            dict(tpl.headers),
+            params,
+            memo=memo,
+            template_vars_enabled=template_vars_enabled,
+        )
         caller_headers = _parse_headers(header)
         resolved_headers = {**base_headers, **caller_headers}
 
@@ -571,7 +645,9 @@ def _resolve_ping_request(
 
         resolved_body = json.loads(body) if body is not None else None
         resolved_headers = _parse_headers(header)
-        resolved_path = path
+        resolved_path = substitute_generators(
+            path, memo, enabled=template_vars_enabled
+        )
         resolved_method = method or "GET"
         svc = cfg.services[service]
         client_base = svc.base_url
@@ -646,6 +722,7 @@ def http_ping(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     start = time.monotonic()
 
     if duration is not None and until_stopped:
@@ -676,6 +753,7 @@ def http_ping(
             url=url,
             overlay_paths=list(ovs) if ovs else None,
             env_file=env_file,
+            template_vars_enabled=template_vars_enabled,
         )
     except AgctlError as err:
         # Startup config/template errors (ConfigError, TemplateNotFound) -> structured

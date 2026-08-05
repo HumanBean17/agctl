@@ -57,6 +57,11 @@ rather than returning a single result envelope.*
 - **Command:** `agctl db assert --template find-order --param orderId=$ORDER_ID --expect-value --path .status --equals PENDING`
 - **Expected:** exit 0
 
+### 4. <step name — inline `{{…}}` template vars>
+
+- **Command:** `agctl kafka produce --topic events --key {{uuid}} --message '{"conversation_id":"{{uuid}}","created_at":"{{ts:iso}}"}'`   *(one value per token within the step — `--key` and `conversation_id` resolve to the same UUID)*
+- **Expected:** `ok: true`
+
 ## Cleanup
 
 *Reverse of fixtures.*

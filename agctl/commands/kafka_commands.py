@@ -25,13 +25,14 @@ from typing import TYPE_CHECKING, Any, Callable
 import click
 
 from ..assertions import compile_jq, jq_bool, jq_value, json_subset
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 
 if TYPE_CHECKING:
     from ..config.models import Config, KafkaCluster, KafkaConfig
 from ..errors import AssertionFailure, ConfigError, ConnectionFailure, TemplateNotFound
 from ..params import parse_params
 from ..resolution import fill_placeholders
+from ..template_vars import substitute_generators
 
 __all__ = [
     "kafka_produce",
@@ -374,8 +375,28 @@ def _kafka_produce_core(
     key_format: str | None = None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
+
+    # Per-invocation memo (Task 6): one shared map so the SAME ``{{token}}`` in
+    # ``--key`` / ``--message`` / ``--header`` resolves to ONE value within this
+    # produce. Substitution runs on the RAW ``--message`` string BEFORE the client
+    # parses it as JSON (a generated value must reach the encoder verbatim), and
+    # BEFORE any network call — an unknown generator surfaces as ConfigError
+    # (exit 2) here rather than mid-produce.
+    memo: dict[str, str] = {}
+    message = substitute_generators(
+        message, memo, enabled=template_vars_enabled
+    )
+    if key is not None:
+        key = substitute_generators(key, memo, enabled=template_vars_enabled)
+    if header:
+        header = tuple(
+            substitute_generators(h, memo, enabled=template_vars_enabled)
+            for h in header
+        )
+
     value = json.loads(message)
     headers = parse_params(header) if header else None
 
@@ -432,6 +453,7 @@ def kafka_produce(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _kafka_produce_envelope(
         config_path,
         topic,
@@ -443,6 +465,7 @@ def kafka_produce(
         key_format,
         overlay_paths=list(ovs) if ovs else None,
         env_file=env_file,
+        template_vars_enabled=template_vars_enabled,
     )
 
 
@@ -729,9 +752,17 @@ def _kafka_assert_core(
     key_format: str | None = None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
     params = parse_params(param)
+
+    # Per-invocation memo (Task 6): shared with the ``--pattern`` match fill so a
+    # ``{{token}}`` inside the pattern's match expression resolves to one value
+    # within this assert (and would be shared with ``--key``/``--message`` had
+    # assert carried them). Threading the memo + enable flag into
+    # ``fill_placeholders`` activates the generator pre-pass on the match expr.
+    memo: dict[str, str] = {}
 
     # DESIGN §9.3: a custom assertion mode is mutually exclusive with the
     # built-in match modes.
@@ -781,6 +812,48 @@ def _kafka_assert_core(
     resolved = cfg.kafka.clusters[name]
     group = _resolve_group(consumer_group, resolved)
 
+    # Fill --pattern ONCE here (params + generators) so the predicate and the
+    # no-match failure detail share one source of truth (no double json.loads,
+    # and the detail echoes the exact expr that was evaluated, params filled).
+    #
+    # This MUST run BEFORE _resolve_codec: the generator pre-pass inside
+    # fill_placeholders / substitute_generators can raise ConfigError (unknown
+    # generator), and that error must surface ahead of any codec/SR resolution
+    # or live SR reachability probe — no wasted network call on a mis-tokened
+    # --pattern/--match/--path/--contains. (Mirrors the produce path, which
+    # substitutes before _resolve_codec.)
+    filled_pattern_match = (
+        fill_placeholders(
+            pattern_match,
+            params,
+            memo=memo,
+            template_vars_enabled=template_vars_enabled,
+        )
+        if pattern_match is not None
+        else None
+    )
+
+    # Generator pre-pass on the EXPLICIT --match/--path/--contains so a {{token}}
+    # resolves to a generated value and an unknown generator raises ConfigError
+    # (exit 2) BEFORE compile_jq / json.loads / consume — uniform with --pattern.
+    # Uses substitute_generators DIRECTLY, NOT fill_placeholders: --match/--path
+    # are jq expressions that can contain single-brace {...} object literals, and
+    # fill_placeholders would ALSO activate {name} substitution and could collide
+    # with jq braces. substitute_generators only matches double-brace {{...}}
+    # tokens (with brace-boundary lookarounds), so it is safe on jq. Shares the
+    # memo with --pattern/--contains so a {{token}} used in two of these resolves
+    # to ONE value within this assert.
+    if match is not None:
+        match = substitute_generators(match, memo, enabled=template_vars_enabled)
+    if path is not None:
+        path = substitute_generators(path, memo, enabled=template_vars_enabled)
+    if contains is not None:
+        contains = substitute_generators(
+            contains, memo, enabled=template_vars_enabled
+        )
+
+    needle = json.loads(contains) if contains is not None else None
+
     codec, _value_fmt, _key_fmt = _resolve_codec(
         cfg, inferred_topic, name, value_format, key_format
     )
@@ -809,14 +882,6 @@ def _kafka_assert_core(
         )
         result["decode_errors"] = decode_errors
         return result
-
-    # Parse --contains / fill --pattern ONCE here so the predicate and the
-    # no-match failure detail share one source of truth (no double json.loads,
-    # and the detail echoes the exact expr that was evaluated, params filled).
-    needle = json.loads(contains) if contains is not None else None
-    filled_pattern_match = (
-        fill_placeholders(pattern_match, params) if pattern_match is not None else None
-    )
 
     # Validate jq expressions ONCE up front: the predicate swallows per-message jq
     # errors (returns False, DESIGN §3.2), so a typo'd --match/--path/--pattern
@@ -976,6 +1041,7 @@ def kafka_assert(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _kafka_assert_envelope(
         config_path,
         topic,
@@ -994,6 +1060,7 @@ def kafka_assert(
         key_format,
         overlay_paths=list(ovs) if ovs else None,
         env_file=env_file,
+        template_vars_enabled=template_vars_enabled,
     )
 
 

@@ -19,6 +19,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from agctl.template_vars import substitute_generators
+
 __all__ = [
     "CaptureValue",
     "fill_placeholders",
@@ -35,7 +37,13 @@ _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _SQL_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
 
 
-def fill_placeholders(value, params: dict[str, str]):
+def fill_placeholders(
+    value,
+    params: dict[str, str],
+    *,
+    memo: dict[str, str] | None = None,
+    template_vars_enabled: bool = True,
+):
     """Substitute ``{name}`` placeholders in ``value`` using ``params``.
 
     - Only literal ``{name}`` tokens (name = ``[A-Za-z_][A-Za-z0-9_]*``) are
@@ -44,17 +52,47 @@ def fill_placeholders(value, params: dict[str, str]):
     - Dict values and list elements are recursed into; new containers are
       returned (input is never mutated).
     - Non-string scalars (int, None, ...) pass through unchanged.
+
+    Template-variable generator pre-pass (active only when ``memo`` is
+    provided): each leaf string is first run through
+    :func:`agctl.template_vars.substitute_generators` with ``memo`` and
+    ``enabled=template_vars_enabled``. This replaces ``{{name[:opts]}}`` tokens
+    (double braces) with generated values. The generator pass and the
+    ``{name}`` pass use different brace syntax so they never collide, and a
+    generated value is treated as literal by the ``{name}`` pass (no recursive
+    expansion). When ``memo is None`` (the default) no generator pass runs and
+    behavior is byte-for-byte identical to the no-memo call signature —
+    ``{{name}}`` tokens are left untouched. ``template_vars_enabled=False``
+    makes the generator pass a no-op (tokens pass through) while keeping the
+    ``{name}`` pass active. The same ``memo`` object shared across calls makes
+    a repeated token resolve to one value within a single command (the caller
+    threads it; see Tasks 6–9).
     """
     if isinstance(value, str):
+        if memo is not None:
+            value = substitute_generators(
+                value, memo, enabled=template_vars_enabled
+            )
+
         def _sub(match: re.Match[str]) -> str:
             name = match.group(1)
             return params[name] if name in params else match.group(0)
 
         return _PLACEHOLDER_RE.sub(_sub, value)
     if isinstance(value, dict):
-        return {k: fill_placeholders(v, params) for k, v in value.items()}
+        return {
+            k: fill_placeholders(
+                v, params, memo=memo, template_vars_enabled=template_vars_enabled
+            )
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [fill_placeholders(v, params) for v in value]
+        return [
+            fill_placeholders(
+                v, params, memo=memo, template_vars_enabled=template_vars_enabled
+            )
+            for v in value
+        ]
     return value
 
 

@@ -45,6 +45,7 @@ Before running anything, check the runbook:
 
 - Every step has a **Command** and a non-empty **Expected**.
 - Every `$VAR` used in a Command resolves to a prior **Capture**.
+- Every `{{…}}` token in a Command is a known generator — `{{uuid}}`, `{{ts}}` (optionally `:ms`/`:iso`), or `{{rand}}` (optionally `:N` char count). An unknown token (e.g. `{{uuids}}`) is a validation error.
 - Assertion steps use `Expected: exit 0`.
 
 **Sidecar discovery:** Look for a sibling `<runbook-base>.agctl.yaml` file next to the runbook. If present, run `agctl config validate --overlay <sidecar>` and surface any `overridden by overlay` warnings into the report. Treat the sidecar as active for the entire run if validation succeeds (ok: true). If validation fails, treat as a validation error and do not execute.

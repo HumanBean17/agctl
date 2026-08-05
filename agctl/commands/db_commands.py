@@ -16,9 +16,10 @@ from typing import Any
 import click
 
 from ..assertions import coerce_db_value, jq_value, parse_equals, type_aware_equal
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 from ..errors import AssertionFailure, ConfigError, TemplateNotFound
 from ..params import parse_params
+from ..template_vars import substitute_generators
 
 __all__ = [
     "db_query",
@@ -169,8 +170,21 @@ def _db_query_core(
     connection: str | None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
+    # Per-invocation memo (Task 9): one shared map so the SAME ``{{token}}`` in
+    # a free-form ``--sql`` resolves to ONE value within this query. Substitution
+    # runs BEFORE ``resolve_db_request`` hands the SQL to the driver, so the
+    # driver's ``:paramName`` rewrite sees the post-substitution string. An
+    # unknown generator surfaces as ConfigError (exit 2) here, ahead of any DB
+    # connection. Template SQL (``--template``) is config-defined and validated
+    # by Task 10; its ``{{token}}`` substitution is handled where template SQL
+    # is filled (no such fill site in db_commands today — params bind at the
+    # driver via :paramName, not via {name} placeholders).
+    memo: dict[str, str] = {}
+    if sql is not None:
+        sql = substitute_generators(sql, memo, enabled=template_vars_enabled)
     sql_text, params, conn_name = resolve_db_request(
         cfg,
         template=template,
@@ -200,7 +214,17 @@ def db_query(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    _db_query_envelope(config_path, template, sql, param, connection, overlay_paths=list(ovs) if ovs else None, env_file=env_file)
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
+    _db_query_envelope(
+        config_path,
+        template,
+        sql,
+        param,
+        connection,
+        overlay_paths=list(ovs) if ovs else None,
+        env_file=env_file,
+        template_vars_enabled=template_vars_enabled,
+    )
 
 
 _db_query_envelope = envelope("db.query")(_db_query_core)
@@ -249,8 +273,15 @@ def _db_assert_core(
     assertion: str | None,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
+    # Per-invocation memo (Task 9): see _db_query_core. Substitutes the
+    # free-form ``--sql`` BEFORE ``:paramName`` processing; an unknown generator
+    # surfaces as ConfigError ahead of any DB connection.
+    memo: dict[str, str] = {}
+    if sql is not None:
+        sql = substitute_generators(sql, memo, enabled=template_vars_enabled)
     sql_text, params, conn_name = resolve_db_request(
         cfg,
         template=template,
@@ -376,6 +407,7 @@ def db_assert(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _db_assert_envelope(
         config_path,
         template,
@@ -389,6 +421,7 @@ def db_assert(
         assertion,
         overlay_paths=list(ovs) if ovs else None,
         env_file=env_file,
+        template_vars_enabled=template_vars_enabled,
     )
 
 
@@ -409,9 +442,17 @@ def _db_execute_core(
     write: bool,
     overlay_paths: list[str] | None = None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     # Step 1: Load config
     cfg = load_config_or_raise(config_path, overlay_paths=overlay_paths, env_file=env_file)
+
+    # Per-invocation memo (Task 9): substitute the free-form ``--sql`` BEFORE
+    # ``:paramName`` processing; an unknown generator surfaces as ConfigError
+    # ahead of any write-side gate check or DB call.
+    memo: dict[str, str] = {}
+    if sql is not None:
+        sql = substitute_generators(sql, memo, enabled=template_vars_enabled)
 
     # Step 2: Resolve SQL, params, and connection (enforces template XOR sql,
     # neither-given, unknown template, unknown connection)
@@ -478,7 +519,18 @@ def db_execute(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    _db_execute_envelope(config_path, template, sql, param, connection, write, overlay_paths=list(ovs) if ovs else None, env_file=env_file)
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
+    _db_execute_envelope(
+        config_path,
+        template,
+        sql,
+        param,
+        connection,
+        write,
+        overlay_paths=list(ovs) if ovs else None,
+        env_file=env_file,
+        template_vars_enabled=template_vars_enabled,
+    )
 
 
 _db_execute_envelope = envelope("db.execute")(_db_execute_core)

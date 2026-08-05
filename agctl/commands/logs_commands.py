@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import click
 
 from ..assertions import _parse_iso_datetime, _to_utc, compile_jq
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 from ..errors import AgctlError, AssertionFailure, ConfigError
 from ..output import emit
 from ..params import parse_params
@@ -96,19 +96,30 @@ def _build_log_filter(
     message: str | None,
     match: str | None,
     params: dict[str, str],
+    memo: dict[str, str] | None = None,
+    template_vars_enabled: bool = True,
 ):
     """Build a :class:`LogFilter` from CLI arguments.
 
     - ``level`` is upper-cased if present.
     - ``match`` is filled with ``params`` and compiled via ``compile_jq`` (raises
-      ``ConfigError`` on malformed expression or missing jq).
+      ``ConfigError`` on malformed expression or missing jq). When ``memo`` is
+      provided, the fill also runs the generator pre-pass
+      (:func:`substitute_generators`) so ``{{uuid}}``/``{{ts}}``/``{{rand}}``
+      tokens resolve to generated values; an unknown generator surfaces as
+      ``ConfigError`` here, before any backend call.
     """
     from ..clients.log_backend_protocol import LogFilter
 
     level_norm = level.upper() if level else None
     match_jq: str | None = None
     if match is not None:
-        filled = fill_placeholders(match, params)
+        filled = fill_placeholders(
+            match,
+            params,
+            memo=memo,
+            template_vars_enabled=template_vars_enabled,
+        )
         try:
             compile_jq(filled, label="logs --match")
         except ConfigError as exc:
@@ -161,16 +172,25 @@ def _logs_query_core(
     until: str | None,
     limit: int | None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     cfg = load_config_or_raise(config_path, env_file=env_file)
     src = _resolve_source(cfg, source)
     params = parse_params(param)
+    # Per-invocation memo (Task 9): one shared map so the SAME ``{{token}}`` in
+    # ``--match`` resolves to ONE value within this query. Threading the memo +
+    # enable flag into ``fill_placeholders`` activates the generator pre-pass on
+    # the match expression; an unknown generator surfaces as ConfigError (exit 2)
+    # here, before any backend scan.
+    memo: dict[str, str] = {}
     filt = _build_log_filter(
         level=level,
         logger=logger,
         message=message,
         match=match,
         params=params,
+        memo=memo,
+        template_vars_enabled=template_vars_enabled,
     )
 
     since_dt = _parse_since_until(since) if since else None
@@ -232,6 +252,7 @@ def logs_query(
     if ctx.obj and ctx.obj.get("config_path"):
         config_path_resolved = ctx.obj.get("config_path")
     env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _logs_query_envelope(
         config_path_resolved,
         source,
@@ -244,6 +265,7 @@ def logs_query(
         until,
         limit,
         env_file=env_file,
+        template_vars_enabled=template_vars_enabled,
     )
 
 
@@ -267,16 +289,21 @@ def _logs_assert_core(
     not_: bool,
     timeout: float | None,
     env_file: str | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     cfg = load_config_or_raise(config_path, env_file=env_file)
     src = _resolve_source(cfg, source)
     params = parse_params(param)
+    # Per-invocation memo (Task 9): see _logs_query_core.
+    memo: dict[str, str] = {}
     filt = _build_log_filter(
         level=level,
         logger=logger,
         message=message,
         match=match,
         params=params,
+        memo=memo,
+        template_vars_enabled=template_vars_enabled,
     )
 
     if since is None:
@@ -371,6 +398,7 @@ def logs_assert(
     if ctx.obj and ctx.obj.get("config_path"):
         config_path_resolved = ctx.obj.get("config_path")
     env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _logs_assert_envelope(
         config_path_resolved,
         source,
@@ -383,6 +411,7 @@ def logs_assert(
         not_,
         timeout,
         env_file=env_file,
+        template_vars_enabled=template_vars_enabled,
     )
 
 
@@ -463,6 +492,7 @@ def logs_tail(
     if ctx.obj and ctx.obj.get("config_path"):
         config_path_resolved = ctx.obj.get("config_path")
     env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
 
     start = time.monotonic()
 
@@ -484,12 +514,16 @@ def logs_tail(
         cfg = load_config_or_raise(config_path_resolved, env_file=env_file)
         src = _resolve_source(cfg, source)
         params = parse_params(param)
+        # Per-invocation memo (Task 9): see _logs_query_core.
+        memo: dict[str, str] = {}
         filt = _build_log_filter(
             level=level,
             logger=logger,
             message=None,  # Tail takes no --message per spec §6.4
             match=match,
             params=params,
+            memo=memo,
+            template_vars_enabled=template_vars_enabled,
         )
         # Build the client INSIDE the startup try so a validate-time error from
         # ``LogClient.__init__`` -> ``backend.validate_config()`` (e.g. a Loki

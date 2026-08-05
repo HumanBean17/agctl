@@ -26,11 +26,12 @@ import click
 
 from ..assertions import compile_jq, evaluate_grpc_assertions, jq_bool, validate_grpc_assertion_args
 from ..clients.grpc_client import GrpcStatus
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 from ..errors import AgctlError, AssertionFailure, ConfigError, TemplateNotFound
 from ..output import emit
 from ..params import parse_params
 from ..resolution import deep_merge, fill_placeholders
+from ..template_vars import substitute_generators
 
 if TYPE_CHECKING:
     from ..config.models import GrpcConfig, GrpcTarget, GrpcTemplate
@@ -97,7 +98,11 @@ def _parse_metadata(metadata: tuple[str, ...]) -> dict[str, str]:
     return parse_params(metadata)
 
 
-def _stdin_request_iter(params: dict[str, str]) -> Callable[[], dict]:
+def _stdin_request_iter(
+    params: dict[str, str],
+    memo: dict[str, str] | None = None,
+    template_vars_enabled: bool = True,
+) -> Callable[[], dict]:
     """NDJSON iterator over stdin, filling placeholders per line.
 
     Yields:
@@ -119,7 +124,9 @@ def _stdin_request_iter(params: dict[str, str]) -> Callable[[], dict]:
                     f"Invalid NDJSON on stdin: {exc.msg}",
                     {"line": line, "lineno": getattr(exc, "lineno", None)},
                 ) from exc
-            yield fill_placeholders(msg_dict, params)
+            yield fill_placeholders(
+                msg_dict, params, memo=memo, template_vars_enabled=template_vars_enabled
+            )
 
     return _iter()
 
@@ -150,6 +157,13 @@ class _ResolvedGrpcCall:
     message: str | None  # resolved JSON request string (None for stdin-input call types)
     metadata: tuple[str, ...]
     params: dict[str, str]
+    # Per-invocation template-variable memo (Task 8): one shared map so the SAME
+    # ``{{token}}`` in ``--message``/``--metadata``/template/``--match`` resolves
+    # to ONE value within this call. Created in :func:`_resolve_grpc_call` (which
+    # runs exactly once per invocation) and threaded into every downstream
+    # ``fill_placeholders``/``substitute_generators`` site.
+    memo: dict[str, str]
+    template_vars_enabled: bool
 
 
 def _resolve_grpc_call(
@@ -163,6 +177,7 @@ def _resolve_grpc_call(
     caller_message: str | None = None,
     caller_metadata: tuple[str, ...] = (),
     param: tuple[str, ...] = (),
+    template_vars_enabled: bool = True,
 ) -> _ResolvedGrpcCall:
     """Resolve a gRPC call EXACTLY ONCE: template/free-form, target, client,
     method descriptor, and call type.
@@ -170,6 +185,14 @@ def _resolve_grpc_call(
     Returns a :class:`_ResolvedGrpcCall` carrying the client + resolved
     service/method/message/metadata/params. Raises :class:`ConfigError` /
     :class:`TemplateNotFound` for config errors.
+
+    Per-invocation template-variable memo (Task 8): one shared ``memo = {}`` is
+    created here (this function runs exactly once per invocation) and threaded
+    into every ``fill_placeholders``/``substitute_generators`` site downstream.
+    Generator substitution runs on the RAW ``--message`` string and each
+    ``--metadata`` value BEFORE ``json.loads``/merge and BEFORE any channel
+    build — an unknown generator surfaces as :class:`ConfigError` (exit 2) here,
+    ahead of any reflection round-trip or RPC.
     """
     resolved_target: str | None = target_name
     resolved_address: str | None = address
@@ -177,6 +200,23 @@ def _resolve_grpc_call(
     resolved_method: str | None = method
     resolved_message: str | None = caller_message
     resolved_metadata: tuple[str, ...] = caller_metadata
+
+    # Per-invocation memo (Task 8): shared across --message, each --metadata
+    # value, the template message/metadata, and the downstream assert-side
+    # (--match/--jq-path) fills so the SAME ``{{token}}`` resolves to ONE value
+    # within this call. Substitution on the raw free-form strings runs FIRST so
+    # a generated value reaches the JSON parser/merger verbatim and an unknown
+    # generator fails loudly before any client build or RPC.
+    memo: dict[str, str] = {}
+    if resolved_message is not None:
+        resolved_message = substitute_generators(
+            resolved_message, memo, enabled=template_vars_enabled
+        )
+    if resolved_metadata:
+        resolved_metadata = tuple(
+            substitute_generators(m, memo, enabled=template_vars_enabled)
+            for m in resolved_metadata
+        )
 
     # Mode resolution: template vs free-form
     if template_name is not None:
@@ -209,16 +249,21 @@ def _resolve_grpc_call(
         # Fill placeholders in template message
         params = parse_params(param)
         tpl_message = tpl.message or {}
-        filled_message = fill_placeholders(tpl_message, params)
+        filled_message = fill_placeholders(
+            tpl_message, params, memo=memo, template_vars_enabled=template_vars_enabled
+        )
 
-        # Merge caller --message if provided (caller wins, deep merge)
-        if caller_message is not None:
+        # Merge caller --message if provided (caller wins, deep merge).
+        # ``resolved_message`` already had its ``{{token}}`` generators substituted
+        # at the top of this function (sharing the per-invocation memo with the
+        # template fill above), so the merger sees post-substitution bytes.
+        if resolved_message is not None:
             try:
-                caller_msg_dict = json.loads(caller_message)
+                caller_msg_dict = json.loads(resolved_message)
             except json.JSONDecodeError as exc:
                 raise ConfigError(
                     f"Invalid JSON in --message: {exc.msg}",
-                    {"message": caller_message},
+                    {"message": resolved_message},
                 ) from exc
             resolved_message_dict = deep_merge(filled_message, caller_msg_dict)
         else:
@@ -226,10 +271,14 @@ def _resolve_grpc_call(
 
         # Fill metadata placeholders
         tpl_metadata = tpl.metadata or {}
-        filled_metadata = fill_placeholders(dict(tpl_metadata), params)
+        filled_metadata = fill_placeholders(
+            dict(tpl_metadata), params, memo=memo, template_vars_enabled=template_vars_enabled
+        )
 
-        # Overlay caller --metadata (caller wins)
-        caller_metadata_dict = _parse_metadata(caller_metadata)
+        # Overlay caller --metadata (caller wins). ``resolved_metadata`` already
+        # had its ``{{token}}`` generators substituted at the top of this function
+        # (shared memo), so the overlay sees post-substitution values.
+        caller_metadata_dict = _parse_metadata(resolved_metadata)
         resolved_metadata_dict = {**filled_metadata, **caller_metadata_dict}
 
         # Serialize message back to JSON string
@@ -264,6 +313,8 @@ def _resolve_grpc_call(
         message=resolved_message,
         metadata=resolved_metadata,
         params=params,
+        memo=memo,
+        template_vars_enabled=template_vars_enabled,
     )
 
 
@@ -281,6 +332,8 @@ def _grpc_stream_run(
     stop_event: threading.Event,
     emit_line: Callable[[dict], None],
     stats: dict[str, int],
+    memo: dict[str, str] | None = None,
+    template_vars_enabled: bool = True,
 ) -> dict:
     """Drive a streaming gRPC call (server-streaming or bidi).
 
@@ -309,7 +362,9 @@ def _grpc_stream_run(
     # Build the match filter if provided
     match_filter = None
     if match is not None:
-        filled_match = fill_placeholders(match, params)
+        filled_match = fill_placeholders(
+            match, params, memo=memo, template_vars_enabled=template_vars_enabled
+        )
 
         def match_filter(msg_dict: dict) -> bool:
             return jq_bool(msg_dict, filled_match)
@@ -498,7 +553,12 @@ def _grpc_call_core(
                     f"Invalid JSON in --message: {exc.msg}",
                     {"message": resolved.message},
                 ) from exc
-            message_json = fill_placeholders(message_json, resolved.params)
+            message_json = fill_placeholders(
+                message_json,
+                resolved.params,
+                memo=resolved.memo,
+                template_vars_enabled=resolved.template_vars_enabled,
+            )
         else:
             message_json = {}
     elif call_type == "client_stream":
@@ -524,7 +584,15 @@ def _grpc_call_core(
         result = client.call_unary(resolved.service, resolved.method, message_json, metadata=metadata_dict, timeout=timeout)
     else:  # client_stream
         result = client.call_client_stream(
-            resolved.service, resolved.method, _stdin_request_iter(resolved.params), metadata=metadata_dict, timeout=timeout
+            resolved.service,
+            resolved.method,
+            _stdin_request_iter(
+                resolved.params,
+                memo=resolved.memo,
+                template_vars_enabled=resolved.template_vars_enabled,
+            ),
+            metadata=metadata_dict,
+            timeout=timeout,
         )
 
     # Build the grpc.call result dict
@@ -605,6 +673,7 @@ def grpc_call(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     start = time.monotonic()
 
     # Step 1: Resolve EXACTLY ONCE — config load, target/template resolution,
@@ -623,6 +692,7 @@ def grpc_call(
             caller_message=message,
             caller_metadata=metadata,
             param=param,
+            template_vars_enabled=template_vars_enabled,
         )
     except AgctlError as err:
         # Startup config errors -> structured envelope + exit code
@@ -699,7 +769,12 @@ def grpc_call(
         # Validate and compile --match if provided
         compiled_match = None
         if match is not None:
-            filled_match = fill_placeholders(match, resolved.params)
+            filled_match = fill_placeholders(
+                match,
+                resolved.params,
+                memo=resolved.memo,
+                template_vars_enabled=resolved.template_vars_enabled,
+            )
             try:
                 compile_jq(filled_match, label="grpc --match")
                 compiled_match = filled_match
@@ -717,7 +792,12 @@ def grpc_call(
             # Parse the single message
             try:
                 request_input = json.loads(resolved.message) if resolved.message else {}
-                request_input = fill_placeholders(request_input, resolved.params)
+                request_input = fill_placeholders(
+                    request_input,
+                    resolved.params,
+                    memo=resolved.memo,
+                    template_vars_enabled=resolved.template_vars_enabled,
+                )
             except json.JSONDecodeError as exc:
                 emit(
                     ok=False,
@@ -728,7 +808,11 @@ def grpc_call(
                 raise SystemExit(2)
         else:  # bidi
             # Bidi uses stdin iterator
-            request_input = _stdin_request_iter(resolved.params)
+            request_input = _stdin_request_iter(
+                resolved.params,
+                memo=resolved.memo,
+                template_vars_enabled=resolved.template_vars_enabled,
+            )
 
         # Build metadata dict
         metadata_dict = _parse_metadata(resolved.metadata) if resolved.metadata else None
@@ -768,6 +852,8 @@ def grpc_call(
                 stop_event=stop_event,
                 emit_line=_emit_stdout_line,
                 stats=stats,
+                memo=resolved.memo,
+                template_vars_enabled=resolved.template_vars_enabled,
             )
 
             # Emit summary

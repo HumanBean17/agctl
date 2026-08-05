@@ -71,6 +71,75 @@ def test_fill_placeholders_regression_sanity():
     assert fill_placeholders({"k": "{id}"}, {"id": "o9"}) == {"k": "o9"}
 
 
+# --- fill_placeholders with template-var generator pre-pass (memo) ---
+# Generator pass runs substitute_generators on each leaf string BEFORE the
+# existing {name} pass. The two passes use different braces ({{...}} vs
+# {...}) so they never collide; generated values are treated as literal by
+# the {name} pass (no recursive expansion).
+
+
+def test_fill_with_memo_runs_generator_pass_uuid():
+    # {{uuid}} is replaced with a 36-char RFC-4122 UUID (32 hex + 4 dashes).
+    out = fill_placeholders("{{uuid}}", {}, memo={})
+    assert isinstance(out, str)
+    assert len(out) == 36
+    assert out.count("-") == 4
+
+
+def test_fill_with_memo_existing_name_substitution_still_works():
+    # The {name} pass still runs after the generator pass.
+    assert fill_placeholders("{name}", {"name": "x"}, memo={}) == "x"
+
+
+def test_fill_with_memo_generator_and_name_pass_coexist():
+    # {{uuid}} -> generated; {name} -> param. Different braces, no collision.
+    m: dict[str, str] = {}
+    out = fill_placeholders("id={{uuid}} name={name}", {"name": "n"}, memo=m)
+    assert out.startswith("id=") and out.endswith(" name=n")
+    generated = out[len("id=") : out.index(" ")]
+    # Prove the generator pass actually ran: the no-op output
+    # "id={{uuid}} name=n" would yield generated="{{uuid}}" (len 9), not a
+    # 36-char UUID. Without this the test is a false green on the no-op.
+    assert len(generated) == 36
+    assert generated.count("-") == 4
+
+
+def test_fill_with_memo_shared_memo_reuses_value_across_calls():
+    # A second call sharing the same memo must return the SAME uuid, since
+    # the memo caches the generated value by full token text. We re-create
+    # the shared-memo scenario from scratch so the test is self-contained.
+    m: dict[str, str] = {}
+    first = fill_placeholders("id={{uuid}} name={name}", {"name": "n"}, memo=m)
+    first_uuid = first[len("id=") : first.index(" ")]
+    # Prove generation happened (not just that two reads of "{{uuid}}" match):
+    # if the generator pass were skipped, first_uuid would be the literal
+    # "{{uuid}}" (len 9) and the equality below would still hold (false green).
+    assert len(first_uuid) == 36
+    again = fill_placeholders("{{uuid}}", {}, memo=m)
+    assert again == first_uuid
+
+
+def test_fill_with_memo_disabled_flag_passes_through():
+    # template_vars_enabled=False → generator pass is a no-op (token unchanged).
+    assert (
+        fill_placeholders("{{uuid}}", {}, memo={}, template_vars_enabled=False)
+        == "{{uuid}}"
+    )
+
+
+def test_fill_without_memo_leaves_generator_token_unchanged():
+    # memo is None → no generator pass at all (backward-compat default).
+    assert fill_placeholders("{{uuid}}", {}) == "{{uuid}}"
+
+
+def test_fill_with_memo_recurses_into_dict():
+    # Generator pass walks containers just like the {name} pass.
+    out = fill_placeholders({"k": "{{ts}}"}, {}, memo={})
+    assert isinstance(out, dict)
+    assert isinstance(out["k"], str)
+    assert out["k"].isdigit()
+
+
 # --- render_typed (typed CaptureValue renderer) ---
 
 

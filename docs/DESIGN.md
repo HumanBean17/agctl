@@ -11,7 +11,7 @@
 
 1. [Goals & Non-Goals](#1-goals--non-goals)
 2. [Configuration Schema](#2-configuration-schema)
-3. [CLI Command Design](#3-cli-command-design) *(includes `agctl discover` §3.9)*
+3. [CLI Command Design](#3-cli-command-design) *(includes `agctl discover` §3.9, `agctl gen` §3.10)*
 4. [Output Schema](#4-output-schema)
 5. [Configuration Resolution Order](#5-configuration-resolution-order)
 6. [AGENTS.md Template](#6-agentsmd-template)
@@ -628,6 +628,22 @@ An overlay is a partial config file layered on top of the base `agctl.yaml` to p
 
 **Precedence:** Base config < overlays (in flag order) < `AGCTL_*` environment variable overrides. This is not a schema version change — overlays load over v2 and do not bump the dialect.
 
+### 2.5 Value Generator Tokens
+
+Template bodies (HTTP path/body, Kafka pattern `match`, free-form DB `--sql`, mock responses, gRPC messages) and CLI string args may embed **runtime value generators** — `{{name[:opts]}}` tokens (double braces) expanded at fill time into a freshly generated value. They are distinct from `${ENV}` (load-time, §2.2) and `{name}` (call-time `--param`, §2.3): double braces, resolved without any `--param`. The same token text resolves to **one value within a single invocation** (two `{{uuid}}` in one fill produce the same UUID).
+
+| Token | Produces | Example |
+|---|---|---|
+| `{{uuid}}` | One RFC-4122 v4 UUID (lowercase). | `7f3a1c9e-8b2d-4a1f-9c3e-0a1b2c3d4e5f` |
+| `{{uuid:N}}` | N space-separated UUIDs (N ≥ 1). | |
+| `{{ts}}` | Unix seconds. | `1722859200` |
+| `{{ts:ms}}` | Unix milliseconds. | `1722859200000` |
+| `{{ts:iso}}` | ISO-8601 UTC. | `2026-08-05T12:00:00Z` |
+| `{{rand}}` | 16 lowercase hex chars. | `a1b2c3d4e5f60718` |
+| `{{rand:N}}` | N lowercase hex chars (N ≥ 1). | |
+
+Generator output is charset-restricted (injection-safe by construction). An unknown generator name (e.g. `{{foo}}`) is a `ConfigError` at both `config validate` and fill time. The global `--no-template-vars` flag (§3) is an escape hatch that leaves `{{...}}` tokens literal everywhere; the `agctl gen uuid|ts|rand` group (§3.10) generates standalone values for cross-step sharing. **Known limitation:** DB *template* SQL (`database.templates.<t>.sql`) is not yet a generator fill site — generators substitute in free-form `--sql` only; template SQL binds parameters via `:paramName`.
+
 ---
 
 ## 3. CLI Command Design
@@ -640,6 +656,7 @@ All commands share these global flags:
 | `--env-file <path>` | `.env` next to resolved config | Explicit path to a `.env` file; values are defaults, real env wins (precedence: `--env-file` > `AGCTL_ENV_FILE` > sibling `.env`) |
 | `--overlay <path>` | — | Overlay config fragment (repeatable; later wins); layered on base config |
 | `--timeout <seconds>` | from config `defaults` | Override request/operation timeout |
+| `--no-template-vars` | off | Disable `{{...}}` value-generator substitution globally; leave generator tokens literal (escape hatch; see §2.5). `agctl gen` ignores it |
 | `--version` | — | Print version and exit |
 
 ### 3.1 `agctl http` — HTTP Requests
@@ -2158,6 +2175,62 @@ Every template and pattern in `agctl.yaml` should have a `description` field. `a
 
 ---
 
+### 3.10 `agctl gen` — Value Generators
+
+Config-free group that generates standalone template-variable values — the same generators expanded inline as `{{...}}` tokens (§2.5). Each subcommand is `@envelope`-wrapped (command tags `gen.uuid` / `gen.ts` / `gen.rand`), succeeds with **no `agctl.yaml` present**, and ignores `--no-template-vars` (these commands *are* generation). Output charset is restricted (injection-safe by construction). Bad flags (`--count` / `--length` non-integer or `< 1`; `--ms` together with `--iso`) → `ConfigError` (exit 2).
+
+Use `agctl gen` to mint a value once and thread it across steps (e.g. one UUID for both an HTTP `--param` and a downstream `kafka assert --contains`) via the runbook skill's existing `$VAR` Capture — the cross-step sharing mechanism. There is no `{{$NAME}}` or `--capture-as` plumbing.
+
+#### `agctl gen uuid`
+
+```
+agctl gen uuid [--count <n>] [--upper]
+```
+
+Generates RFC-4122 v4 UUID(s). `--count 1` (default) → `result.value` (string); `--count N>1` → `result.values` (string array). `--upper` uppercases each UUID.
+
+**Result shape (`gen.uuid`, count=1):**
+
+```json
+{ "value": "7f3a1c9e-8b2d-4a1f-9c3e-0a1b2c3d4e5f" }
+```
+
+**Result shape (`gen.uuid`, count>1):**
+
+```json
+{ "values": ["...uuid1...", "...uuid2..."] }
+```
+
+#### `agctl gen ts`
+
+```
+agctl gen ts [--ms | --iso]
+```
+
+Generates one current timestamp (always a single `result.value`). Default → Unix seconds; `--ms` → Unix milliseconds; `--iso` → ISO-8601 UTC (e.g. `2026-08-05T12:00:00Z`). `--ms` and `--iso` are mutually exclusive.
+
+**Result shape (`gen.ts`):**
+
+```json
+{ "value": "1722859200" }
+```
+
+#### `agctl gen rand`
+
+```
+agctl gen rand [--length <n>]
+```
+
+Generates one lowercase hex string of `--length` chars (default 16) → `result.value`. `--length` is the character count (not a value count).
+
+**Result shape (`gen.rand`):**
+
+```json
+{ "value": "a1b2c3d4e5f60718" }
+```
+
+---
+
 ## 4. Output Schema
 
 ### 4.1 Envelope
@@ -3267,6 +3340,11 @@ These items are intentionally deferred. Do not implement them until the core des
 | **MCP server wrapper** | Expose `agctl` as an MCP (Model Context Protocol) tool server so agents that support MCP can call it without shell access. The JSON output schema maps cleanly to MCP tool results. |
 | **Retry / polling DSL** | `agctl db assert --retry-until-pass --max-attempts 5 --interval-ms 500` for assertions against eventually-consistent state. Currently, callers must implement polling themselves. |
 | **Template variable validation** | Warn (or error) at call time if a template defines `{placeholder}` variables that are not supplied via `--param`. Currently, unsupplied placeholders are left as literal strings. |
+| **Generated-values audit trail** | Surface the resolved `{{uuid}}`/`{{ts}}`/`{{rand}}` values in `runbook.results.md` so a run that used runtime generators is reproducible from its artifact. Today the values are emitted only inline in the commands that consumed them. |
+| **Replay / seed mode** | A `--seed` (or equivalent) that makes the `{{rand}}`/`{{uuid}}` generators deterministic so a flaky-test run can be reproduced. Today every value is freshly random per invocation. |
+| **Pluggable custom generators** | An `agctl.template_vars` entry point so third-party packages can register `{{name}}` generators beyond the built-in `uuid`/`ts`/`rand`. Today the registry is closed (a `ConfigError` on unknown names). |
+| **Relative timestamps** | `{{now -1h}}` / `{{now:+30m}}` for past/future offsets, so tests can pin a window without precomputing. Today `{{ts}}`/`{{ts:iso}}` resolve to "now" only. |
+| **`{{env:NAME}}` generator** | Read an env var into a generator token. Likely redundant with `${ENV}` (config-load interpolation, §2.2) and `--param key=$VAR` (shell expansion) and may not warrant a new token. |
 | **Secret backends** | Pull secrets from Vault or AWS Secrets Manager instead of environment variables. Would be implemented as a resolver plugin hooked into the config resolution pipeline (§5). |
 | **Parallel command execution** | `agctl run --parallel step1.sh step2.sh` for agents that want to fire multiple requests concurrently and assert on all results. |
 | **OpenTelemetry trace propagation** | Inject `traceparent` headers automatically when a trace context is available, enabling distributed traces that span `agctl` invocations. |

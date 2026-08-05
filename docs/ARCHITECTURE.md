@@ -104,7 +104,8 @@ agctl/
 ├── output.py                   # emit() (one-shot envelope) + emit_ndjson_line() (streaming event sink) — the only permitted stdout write paths
 ├── errors.py                   # typed AgctlError hierarchy
 ├── params.py                   # --param k=v  →  dict[str,str]
-├── resolution.py               # {placeholder} fill, body deep_merge, :name→%(name)s
+├── resolution.py               # {placeholder} fill (+ {{generator}} pre-pass via memo), body deep_merge, :name→%(name)s
+├── template_vars.py            # {{uuid}}/{{ts}}/{{rand}} generators + substitute_generators / find_unknown_templates
 ├── assertions.py               # jq / subset / equals / coercion primitives
 ├── assertion_registry.py       # pluggable assertion-mode registry + entry-point discovery
 ├── plugin_protocol.py          # Protocol contract for protocol plugins
@@ -123,6 +124,7 @@ agctl/
 │   ├── check_commands.py       # check ready
 │   ├── config_commands.py      # config validate / show / init / migrate
 │   ├── discover_commands.py    # discover summary / category / item / search
+│   ├── gen_commands.py         # gen uuid / ts / rand (config-free, @envelope-wrapped; tags gen.*)
 │   ├── grpc_commands.py        # grpc call / healthcheck
 │   └── mock_commands.py        # mock run / start / stop / status (HTTP mock + Kafka reactors)
 ├── mock/                       # mock server implementation (HTTP + Kafka + gRPC)
@@ -436,7 +438,15 @@ catching what Pydantic cannot:
 `agctl config validate` (plus plugin validation, §10, and mock jq compile checks
 via `collect_jq_compile_errors` in `mock/jq_precompile.py`, invoked from the
 command layer — not `validator.py` — so `config/*` stays free of an `assertions`
-dependency).
+dependency). `agctl config validate` additionally rejects **unknown `{{...}}`
+generator tokens** in config-defined string fields via
+`collect_unknown_template_errors` (in `commands/config_commands.py`, built on
+`template_vars.find_unknown_templates`): it walks HTTP template path/headers/body,
+DB template SQL, gRPC template metadata/message, Kafka pattern `match`, and mock
+stub/reactor bodies/keys/values/headers/match, appending a `{"path","message"}`
+error per unknown token naming the valid generators. It is a pure typo-catching
+scan — never raises, and a known generator in a non-runtime-substituted field
+still passes (the validator does not model which fields are fill-substituted).
 
 ---
 
@@ -1237,11 +1247,20 @@ Terms used throughout, not already defined inline:
   seeks to the earliest offset.
 - **Send-then-assert** — the reliability property that follows: `produce` (or an
   HTTP call) then `kafka assert` works without subscribe-before-produce gymnastics.
-- **Three substitution syntaxes** (do not conflate): `${VAR}` — env, resolved at
-  config load (§5); `{name}` — HTTP path/body & Kafka-pattern placeholders,
-  filled at call time from `--param`; `:name` — JDBC-style SQL params, rewritten
-  to `%(name)s` at execute time (chosen over `{...}` in SQL to avoid colliding
-  with JSON literals).
+- **Four substitution syntaxes** (do not conflate): `${VAR}` — env, resolved at
+  config load (§5); `{{name[:opts]}}` — value generators (`uuid`/`ts`/`rand`),
+  expanded at fill time by `template_vars.substitute_generators`; `{name}` —
+  HTTP path/body & Kafka-pattern placeholders, filled at call time from
+  `--param`; `:name` — JDBC-style SQL params, rewritten to `%(name)s` at execute
+  time (chosen over `{...}` in SQL to avoid colliding with JSON literals). The
+  generator pass runs inside `resolution.fill_placeholders` **before** the
+  `{name}` pass and only when the caller threads a `memo` dict (per-invocation;
+  memo key is the full token text so the same `{{uuid}}` resolves to one value
+  within a command); `memo=None` is byte-for-byte the legacy behavior, and
+  `--no-template-vars` makes the generator pass a no-op. The two brace syntaxes
+  never collide (double vs. single), and a generated value is treated as literal
+  by the `{name}` pass. `template_vars.find_unknown_templates` is the pure scan
+  `agctl config validate` uses to reject unknown `{{...}}` names (never raises).
 - **Secret masking** — `config show` masks values whose key contains
   `password`/`token`/`secret`, or is a bare `key`/`*_key` suffix, to `"***"`
   unless `--unmask`.

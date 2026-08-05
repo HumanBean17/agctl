@@ -24,6 +24,7 @@ from .commands.config_commands import (
 )
 from .commands.db_commands import db_assert, db_execute, db_query, db_schema
 from .commands.discover_commands import discover
+from .commands.gen_commands import gen_group
 from .commands.grpc_commands import grpc_call, grpc_healthcheck
 from .commands.http_commands import http_call, http_ping, http_request
 from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
@@ -114,12 +115,20 @@ def _ensure_utf8_streams() -> None:
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
 @click.option("--overlay", "overlay_paths", multiple=True, help="Overlay config fragment (repeatable; later wins)")
 @click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
+@click.option(
+    "--no-template-vars",
+    "no_template_vars",
+    is_flag=True,
+    default=False,
+    help="Disable {{uuid}}/{{ts}}/{{rand}} value-generator substitution everywhere (global). Does not affect ${...} env interpolation.",
+)
 @click.pass_context
 def cli(
     ctx: click.Context,
     config_path: str | None,
     overlay_paths: tuple[str, ...],
     env_file: str | None,
+    no_template_vars: bool,
 ) -> None:
     """agctl — agent-facing CLI harness for testing distributed systems."""
     _ensure_utf8_streams()
@@ -127,6 +136,7 @@ def cli(
     ctx.obj["config_path"] = config_path
     ctx.obj["overlay_paths"] = tuple(overlay_paths) or None
     ctx.obj["env_file"] = env_file
+    ctx.obj["no_template_vars"] = no_template_vars
 
 
 @cli.group(name="config")
@@ -221,6 +231,9 @@ mock_group.add_command(mock_status)
 
 # Register the top-level `discover` command directly on the root group.
 cli.add_command(discover)
+
+# Register the config-free `gen` group (template-vars Task 3).
+cli.add_command(gen_group)
 
 
 # Bridge config validation to the live loaded-plugins list. The thunk reads this
