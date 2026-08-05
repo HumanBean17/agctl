@@ -3,8 +3,9 @@
 Releases are **tag-driven**. There is exactly one way a version reaches PyPI:
 someone pushes a `v*` git tag, which triggers `.github/workflows/release.yml`.
 That workflow builds the package, publishes to PyPI via **trusted publishing**
-(OIDC — no stored tokens), regenerates `CHANGELOG.md` on `main`, and opens a
-GitHub Release.
+(OIDC — no stored tokens) and opens a GitHub Release whose notes git-cliff
+writes from Conventional Commits. **The GitHub Releases page is the changelog**
+— `main` is PR-protected, so there is no in-repo `CHANGELOG.md` to keep in sync.
 
 The package version is **derived from the tag** by `hatch-vcs` (see
 `pyproject.toml` `[tool.hatch.version]`). Because the release fires *on* the tag
@@ -66,7 +67,7 @@ git push origin v3.0.0  # ← this fires release.yml
 
 Then watch the **Actions** tab. The workflow logs the built version and asserts
 it equals the tag before uploading. Expected order: build → `twine check` →
-version-match → PyPI upload → `CHANGELOG.md` commit → GitHub Release.
+version-match → PyPI upload → GitHub Release (git-cliff writes the notes).
 
 A new **minor/patch** release is the same flow with `v3.1.0` / `v3.0.1`.
 

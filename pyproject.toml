@@ -66,7 +66,7 @@ integration = [
 Homepage = "https://github.com/HumanBean17/agctl"
 Repository = "https://github.com/HumanBean17/agctl"
 Issues = "https://github.com/HumanBean17/agctl/issues"
-Changelog = "https://github.com/HumanBean17/agctl/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/HumanBean17/agctl/releases"
 
 [project.scripts]
 agctl = "agctl.cli:cli"
