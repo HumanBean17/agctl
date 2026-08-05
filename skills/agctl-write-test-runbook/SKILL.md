@@ -87,6 +87,40 @@ Sequence the steps. For each step decide:
   assert absence ("no ERROR logs in the window"). The source must resolve in
   `discover --category log-sources`.
 
+**Template variables (`{{…}}` and `agctl gen`):** agctl expands inline tokens in
+any string argument, so prefer these over the `bash -c '…$(uuidgen)…'`
+anti-pattern when a step needs a unique value:
+
+| Token | Produces |
+|---|---|
+| `{{uuid}}` | RFC-4122 v4 UUID (lowercase) |
+| `{{ts}}`, `{{ts:ms}}`, `{{ts:iso}}` | Unix seconds / milliseconds / ISO-8601 UTC |
+| `{{rand}}`, `{{rand:N}}` | random lowercase hex (default 16 chars; `N` = char count) |
+
+The **same token text resolves to one value within a step** (memoized per
+invocation): `{{uuid}}` placed in both `--key` and the message body yields a
+single UUID echoed across both fields. (`{{uuid}}` and `{{uuid:2}}` are
+different tokens → independent values.) Two patterns cover every case:
+
+- **(A) Inline, single-step, same value in several fields** — drop the token
+  straight into each field that needs it:
+  ```
+  agctl kafka produce --topic t --key {{uuid}} --message '{"conversation_id":"{{uuid}}","case_id":"CASE-{{ts}}"}'
+  ```
+- **(B) Cross-step via `gen` + Capture** — generate up front, capture, then
+  reuse through the existing `$VAR` mechanism:
+  ```
+  agctl gen uuid --count 2          # config-free; result.values = ["<id>", "<id>"]
+  # Capture: CID=result.values[0], MID=result.values[1]
+  # later step: agctl kafka produce --key $CID --message "{\"id\":\"$MID\"}"
+  ```
+
+`agctl gen uuid|ts|rand` is **config-free** (no `agctl.yaml` needed) and emits
+`result.value` (single) or `result.values[]` (with `--count N`); it ignores
+`--no-template-vars` since it *is* generation. For a **literal** `{{…}}` payload
+(the string must reach the SUT untouched — e.g. testing a mustache/Jinja body),
+add the global `--no-template-vars` flag to leave tokens unsubstituted.
+
 Identify the fixtures and the cleanup that reverses them:
 
 - **Seed data** when the test needs specific DB state (`agctl db execute --write`).
