@@ -1,0 +1,27 @@
+name: conventional-pr
+
+# Enforces Conventional Commit PR titles so git-cliff can derive the changelog
+# and the version bump: feat→minor, fix→patch, feat!/BREAKING CHANGE→major.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+jobs:
+  title:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+          requireScope: false

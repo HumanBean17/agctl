@@ -3034,12 +3034,12 @@ agctl/                         # Repository root
 
 ```toml
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "agctl"
-version = "1.1.1"
+dynamic = ["version"]   # derived from git tags — see docs/RELEASING.md
 description = "Agent-facing CLI harness for testing distributed systems"
 requires-python = ">=3.11"
 dependencies = [

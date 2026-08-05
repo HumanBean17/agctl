@@ -1145,7 +1145,7 @@ so the common case is fixed by `pip install 'agctl[kafka]'`). The codecs and the
 SR client lazy-import inside the function that needs them, so importing
 `agctl.serialization.*` is extra-free.
 
-**Build & entry points:** hatchling backend, wheel target `agctl`; console
+**Build & entry points:** hatchling backend (version derived from git tags via `hatch-vcs` — tag-driven releases, see `docs/RELEASING.md`), wheel target `agctl`; console
 scripts `agctl`/`agt` → `agctl.cli:cli`; entry-point groups `agctl.db_drivers`
 (registers built-in `mysql`, `postgresql`, `sqlite`), `agctl.logs_backends` (third-party
 backends; built-in `file`/`loki` are hardcoded in `BUILTIN_BACKENDS`, not entry points),

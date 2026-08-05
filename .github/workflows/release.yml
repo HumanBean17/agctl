@@ -1,0 +1,81 @@
+name: release
+
+# Tag-driven release. Pushing a v* tag builds the package, publishes to PyPI via
+# trusted publishing (OIDC — no stored tokens), regenerates CHANGELOG.md on main,
+# and opens a GitHub Release whose body git-cliff generates from Conventional
+# Commits. The version is derived from the tag by hatch-vcs, so version and tag
+# can never drift. See docs/RELEASING.md.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write    # commit CHANGELOG.md back + create the GitHub Release
+  id-token: write    # PyPI trusted publishing (OIDC)
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: pypi   # the PyPI trusted publisher is scoped to this environment
+    steps:
+      - name: Checkout (full history — hatch-vcs + git-cliff read tag history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install build tooling
+        run: pip install -U build twine git-cliff
+
+      - name: Generate GitHub Release body (this tag's Conventional Commits)
+        run: git-cliff --latest --strip header --output RELEASE_BODY.md
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: twine check (metadata renders; catches a permanently-blank PyPI page)
+        run: twine check dist/*
+
+      - name: Verify the built version equals the tag
+        run: |
+          python - <<'PY'
+          import glob, os, sys
+          from pathlib import Path
+          whl = next(iter(glob.glob("dist/agctl-*.whl")))
+          built = Path(whl).name.split("-")[1]
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          print(f"built={built} tag={tag}")
+          sys.exit(0 if built == tag else 1)
+          PY
+
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      # Best-effort: a push race here must never fail the workflow AFTER an
+      # irreversible PyPI upload. The next release regenerates the full history,
+      # so a missed commit self-heals.
+      - name: Regenerate CHANGELOG.md on main
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git-cliff --output CHANGELOG.md
+          git add CHANGELOG.md
+          git commit -m "docs(changelog): $GITHUB_REF_NAME" || echo "no changelog changes"
+          git push origin main || echo "WARN: changelog push failed; PyPI publish already succeeded"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_BODY.md
+          files: dist/*

@@ -48,7 +48,16 @@ source of truth in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 The managed mock daemon (`mock start`/`stop`/`status`) is Linux/macOS/WSL-only —
 on native Windows use `mock run` (foreground) or run inside WSL.
 
-Install `agctl` into your project (this repo uses `uv` — `pip` works too):
+### From PyPI (users)
+
+```bash
+pip install agctl                       # core: click, pyyaml, pydantic
+pip install 'agctl[kafka,db,http]'      # only the protocols you need
+```
+
+### From source (development)
+
+This repo uses `uv` — `pip` works too:
 
 ```bash
 # with uv (recommended — this repo ships a uv.lock)
@@ -73,6 +82,15 @@ pip install -e ".[logs]"            # logs query / assert / tail (includes jq)
 pip install -e ".[http,kafka,db]"   # everything except logs/grpc (typical — bundles jq)
 pip install -e ".[http,kafka,db,grpc,logs]"   # everything
 ```
+
+### Versioning & stability
+
+`agctl` follows [Semantic Versioning](https://semver.org/) and
+[Conventional Commits](https://www.conventionalcommits.org/). From `3.0.0` the
+CLI surface, the `agctl.yaml` runbook schema, and the plugin entry-point groups
+(`agctl.db_drivers`, `agctl.plugins`, `agctl.assertions`, `agctl.logs_backends`)
+are stable — a breaking change to any of them bumps the major version. See
+[`docs/RELEASING.md`](./docs/RELEASING.md) for the release process.
 
 Verify the install — both binary names work:
 
