@@ -115,12 +115,20 @@ def _ensure_utf8_streams() -> None:
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
 @click.option("--overlay", "overlay_paths", multiple=True, help="Overlay config fragment (repeatable; later wins)")
 @click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
+@click.option(
+    "--no-template-vars",
+    "no_template_vars",
+    is_flag=True,
+    default=False,
+    help="Disable ${...} template-variable substitution everywhere (global).",
+)
 @click.pass_context
 def cli(
     ctx: click.Context,
     config_path: str | None,
     overlay_paths: tuple[str, ...],
     env_file: str | None,
+    no_template_vars: bool,
 ) -> None:
     """agctl — agent-facing CLI harness for testing distributed systems."""
     _ensure_utf8_streams()
@@ -128,6 +136,7 @@ def cli(
     ctx.obj["config_path"] = config_path
     ctx.obj["overlay_paths"] = tuple(overlay_paths) or None
     ctx.obj["env_file"] = env_file
+    ctx.obj["no_template_vars"] = no_template_vars
 
 
 @cli.group(name="config")
