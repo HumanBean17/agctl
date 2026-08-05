@@ -24,6 +24,7 @@ from .commands.config_commands import (
 )
 from .commands.db_commands import db_assert, db_execute, db_query, db_schema
 from .commands.discover_commands import discover
+from .commands.gen_commands import gen_group
 from .commands.grpc_commands import grpc_call, grpc_healthcheck
 from .commands.http_commands import http_call, http_ping, http_request
 from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
@@ -221,6 +222,9 @@ mock_group.add_command(mock_status)
 
 # Register the top-level `discover` command directly on the root group.
 cli.add_command(discover)
+
+# Register the config-free `gen` group (template-vars Task 3).
+cli.add_command(gen_group)
 
 
 # Bridge config validation to the live loaded-plugins list. The thunk reads this
