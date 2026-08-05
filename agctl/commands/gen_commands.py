@@ -23,7 +23,7 @@ from ..command import envelope
 from ..errors import ConfigError
 from ..template_vars import BUILTIN_GENERATORS
 
-__all__ = ["gen_group", "gen_uuid", "gen_ts", "gen_rand"]
+__all__ = ["gen_group"]
 
 
 # --- cores (pure; no config, no I/O beyond generation) --------------------- #
@@ -36,7 +36,7 @@ def _gen_uuid_core(count: str, upper: bool) -> dict:
     validates it (raising :class:`ConfigError` on non-int / ``< 1``).
     ``upper`` uppercases each UUID (command-only convenience).
     """
-    parts = BUILTIN_GENERATORS["uuid"](str(count))
+    parts = BUILTIN_GENERATORS["uuid"](count)
     if upper:
         parts = [p.upper() for p in parts]
     if len(parts) == 1:
@@ -47,7 +47,7 @@ def _gen_uuid_core(count: str, upper: bool) -> dict:
 def _gen_ts_core(ms: bool, iso: bool) -> dict:
     """Generate one timestamp; ``--ms`` and ``--iso`` are mutually exclusive."""
     if ms and iso:
-        raise ConfigError("Specify at most one of --ms and --iso", {})
+        raise ConfigError("Specify at most one of --ms and --iso")
     opts = "ms" if ms else ("iso" if iso else None)
     parts = BUILTIN_GENERATORS["ts"](opts)
     return {"value": parts[0]}
@@ -59,7 +59,7 @@ def _gen_rand_core(length: str) -> dict:
     ``length`` is the raw string from Click; ``BUILTIN_GENERATORS["rand"]``
     validates it (raising :class:`ConfigError` on non-int / ``< 1``).
     """
-    parts = BUILTIN_GENERATORS["rand"](str(length))
+    parts = BUILTIN_GENERATORS["rand"](length)
     return {"value": parts[0]}
 
 

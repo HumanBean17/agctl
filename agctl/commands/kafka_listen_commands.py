@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 import click
 
 from ..assertions import compile_jq
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 from ..daemon import (
     is_alive,
     read_pidfile,
@@ -1009,9 +1009,7 @@ def kafka_listen_results(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _kafka_listen_results_envelope(
         run_id,
         pid,
@@ -1118,9 +1116,7 @@ def kafka_listen_messages(
     state_dir: str,
 ) -> None:
     """Read up to ``--limit`` captured messages from a running listener's topic."""
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _kafka_listen_messages_envelope(
         topic,
         match,

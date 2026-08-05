@@ -26,7 +26,7 @@ import click
 
 from ..assertions import compile_jq, evaluate_grpc_assertions, jq_bool, validate_grpc_assertion_args
 from ..clients.grpc_client import GrpcStatus
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 from ..errors import AgctlError, AssertionFailure, ConfigError, TemplateNotFound
 from ..output import emit
 from ..params import parse_params
@@ -673,9 +673,7 @@ def grpc_call(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     start = time.monotonic()
 
     # Step 1: Resolve EXACTLY ONCE — config load, target/template resolution,

@@ -16,7 +16,7 @@ from typing import Any
 import click
 
 from ..assertions import coerce_db_value, jq_value, parse_equals, type_aware_equal
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 from ..errors import AssertionFailure, ConfigError, TemplateNotFound
 from ..params import parse_params
 from ..template_vars import substitute_generators
@@ -214,9 +214,7 @@ def db_query(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _db_query_envelope(
         config_path,
         template,
@@ -409,9 +407,7 @@ def db_assert(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _db_assert_envelope(
         config_path,
         template,
@@ -523,9 +519,7 @@ def db_execute(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _db_execute_envelope(
         config_path,
         template,

@@ -76,3 +76,16 @@ def load_config_or_raise(
     from .config import load_config
 
     return load_config(config_path, overlays=overlay_paths, env_file=env_file)
+
+
+def template_vars_enabled_from_ctx(ctx: Any) -> bool:
+    """Read the global ``--no-template-vars`` flag from a Click context.
+
+    Returns ``True`` (generator substitution enabled) unless the root
+    ``--no-template-vars`` flag was set. Centralizes the
+    ``not (ctx.obj.get("no_template_vars", False) if ctx.obj else False)``
+    read so every command wrapper computes it identically. ``ctx.obj`` may be
+    ``None`` (e.g. when a command is invoked without the root group).
+    """
+    obj = ctx.obj
+    return not (obj.get("no_template_vars", False) if obj else False)

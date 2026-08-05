@@ -120,7 +120,7 @@ def _ensure_utf8_streams() -> None:
     "no_template_vars",
     is_flag=True,
     default=False,
-    help="Disable ${...} template-variable substitution everywhere (global).",
+    help="Disable {{uuid}}/{{ts}}/{{rand}} value-generator substitution everywhere (global). Does not affect ${...} env interpolation.",
 )
 @click.pass_context
 def cli(

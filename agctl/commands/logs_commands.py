@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import click
 
 from ..assertions import _parse_iso_datetime, _to_utc, compile_jq
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 from ..errors import AgctlError, AssertionFailure, ConfigError
 from ..output import emit
 from ..params import parse_params
@@ -252,9 +252,7 @@ def logs_query(
     if ctx.obj and ctx.obj.get("config_path"):
         config_path_resolved = ctx.obj.get("config_path")
     env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _logs_query_envelope(
         config_path_resolved,
         source,
@@ -400,9 +398,7 @@ def logs_assert(
     if ctx.obj and ctx.obj.get("config_path"):
         config_path_resolved = ctx.obj.get("config_path")
     env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _logs_assert_envelope(
         config_path_resolved,
         source,
@@ -496,9 +492,7 @@ def logs_tail(
     if ctx.obj and ctx.obj.get("config_path"):
         config_path_resolved = ctx.obj.get("config_path")
     env_file = env_file or (ctx.obj.get("env_file") if ctx.obj else None)
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
 
     start = time.monotonic()
 

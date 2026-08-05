@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 import click
 
 from ..assertions import evaluate_http_assertions, validate_http_assertion_args
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 from ..errors import AgctlError, ConfigError, TemplateNotFound
 from ..output import emit
 from ..params import parse_params
@@ -257,9 +257,7 @@ def http_call(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _http_call_envelope(
         config_path,
         template_name,
@@ -444,9 +442,7 @@ def http_request(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _http_request_envelope(
         config_path,
         service,
@@ -726,9 +722,7 @@ def http_ping(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     start = time.monotonic()
 
     if duration is not None and until_stopped:

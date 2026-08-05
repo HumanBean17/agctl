@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import click
 
 from ..assertions import compile_jq, jq_bool, jq_value, json_subset
-from ..command import envelope, load_config_or_raise
+from ..command import envelope, load_config_or_raise, template_vars_enabled_from_ctx
 
 if TYPE_CHECKING:
     from ..config.models import Config, KafkaCluster, KafkaConfig
@@ -453,9 +453,7 @@ def kafka_produce(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _kafka_produce_envelope(
         config_path,
         topic,
@@ -1022,9 +1020,7 @@ def kafka_assert(
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
-    template_vars_enabled = not (
-        ctx.obj.get("no_template_vars", False) if ctx.obj else False
-    )
+    template_vars_enabled = template_vars_enabled_from_ctx(ctx)
     _kafka_assert_envelope(
         config_path,
         topic,
