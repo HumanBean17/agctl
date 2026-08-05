@@ -30,10 +30,12 @@ import yaml
 from ..config import ConfigError, load_config
 from ..config.loader import compose_config, discover_config_path
 from ..config.migrate import migrate_config
+from ..config.models import Config
 from ..config.validator import validate_config
 from ..mock.capture_validate import collect_capture_placement_errors
 from ..mock.jq_precompile import collect_jq_compile_errors
 from ..output import emit
+from ..template_vars import BUILTIN_GENERATORS, find_unknown_templates
 
 __all__ = ["config_init", "config_validate", "config_show", "config_migrate", "set_plugins_provider"]
 
@@ -126,6 +128,112 @@ def _emit_config_error(command: str, err: ConfigError, start: float) -> None:
 # --- config validate -------------------------------------------------------
 
 
+def _template_token_message(token: str) -> str:
+    """Format the error message for an unknown ``{{...}}`` token.
+
+    Names the offending token (full text, e.g. ``{{uuids}}``) and lists the
+    valid generator names (sorted) so the operator can fix the typo. Mirrors the
+    message shape used by :func:`agctl.template_vars._substitute_str` at runtime.
+    """
+    valid = ", ".join(sorted(BUILTIN_GENERATORS))
+    return f"unknown template token {token!r}; valid generators: {valid}"
+
+
+def collect_unknown_template_errors(cfg: Config) -> list[dict]:
+    """Scan config-defined string fields for unknown ``{{...}}`` tokens.
+
+    Walks the resolved :class:`Config`'s string-bearing fields (HTTP template
+    path/headers/body, DB template SQL, gRPC template metadata/message, kafka
+    pattern match expressions, and the mock stub/reactor bodies/keys/values/
+    headers/match expressions) and calls :func:`find_unknown_templates` on each.
+    Each unknown token is appended as a ``{"path", "message"}`` error attributed
+    at its config path. Never raises — :func:`find_unknown_templates` is a pure
+    scan. A valid generator (``{{uuid}}``) or non-matching text
+    (``{{user.name}}``) contributes nothing.
+
+    Validate's job here is typo-catching: a known generator in a field that is
+    not substituted at runtime still passes, which is acceptable — we do not
+    model which fields are runtime-substituted.
+    """
+    errors: list[dict] = []
+
+    def check(path: str, value: Any) -> None:
+        for token in find_unknown_templates(value):
+            errors.append({"path": path, "message": _template_token_message(token)})
+
+    # Top-level HTTP templates.
+    for name, tpl in cfg.templates.items():
+        check(f"templates.{name}.path", tpl.path)
+        check(f"templates.{name}.headers", tpl.headers)
+        check(f"templates.{name}.body", tpl.body)
+
+    # Database templates.
+    for name, tpl in cfg.database.templates.items():
+        check(f"database.templates.{name}.sql", tpl.sql)
+
+    # gRPC templates.
+    for name, tpl in cfg.grpc.templates.items():
+        check(f"grpc.templates.{name}.metadata", tpl.metadata)
+        check(f"grpc.templates.{name}.message", tpl.message)
+
+    # Kafka patterns.
+    for name, pat in cfg.kafka.patterns.items():
+        check(f"kafka.patterns.{name}.match", pat.match)
+
+    # Mocks: HTTP stubs, Kafka reactors, gRPC stubs.
+    mocks = cfg.mocks
+    if mocks is not None:
+        if mocks.http is not None:
+            for name, stub in mocks.http.stubs.items():
+                if stub.match is not None:
+                    check(f"mocks.http.stubs.{name}.match.body", stub.match.body)
+                    check(f"mocks.http.stubs.{name}.match.jq", stub.match.jq)
+                check(f"mocks.http.stubs.{name}.response.body", stub.response.body)
+                if stub.response.headers is not None:
+                    check(
+                        f"mocks.http.stubs.{name}.response.headers",
+                        stub.response.headers,
+                    )
+        if mocks.kafka is not None:
+            for name, reactor in mocks.kafka.reactors.items():
+                check(f"mocks.kafka.reactors.{name}.match", reactor.match)
+                check(
+                    f"mocks.kafka.reactors.{name}.reaction.key",
+                    reactor.reaction.key,
+                )
+                check(
+                    f"mocks.kafka.reactors.{name}.reaction.value",
+                    reactor.reaction.value,
+                )
+                if reactor.reaction.headers is not None:
+                    check(
+                        f"mocks.kafka.reactors.{name}.reaction.headers",
+                        reactor.reaction.headers,
+                    )
+        if mocks.grpc is not None:
+            for name, stub in mocks.grpc.stubs.items():
+                if stub.match is not None:
+                    check(f"mocks.grpc.stubs.{name}.match.body", stub.match.body)
+                    check(f"mocks.grpc.stubs.{name}.match.jq", stub.match.jq)
+                check(
+                    f"mocks.grpc.stubs.{name}.response.message",
+                    stub.response.message,
+                )
+                if stub.response.messages is not None:
+                    for i, msg in enumerate(stub.response.messages):
+                        check(
+                            f"mocks.grpc.stubs.{name}.response.messages[{i}].message",
+                            msg.message,
+                        )
+                if stub.response.metadata is not None:
+                    check(
+                        f"mocks.grpc.stubs.{name}.response.metadata",
+                        stub.response.metadata,
+                    )
+
+    return errors
+
+
 @click.command("validate")
 @click.option("--config", "config_path", default=None)
 @click.option("--overlay", "overlay_paths", multiple=True, default=None)
@@ -160,6 +268,11 @@ def config_validate(ctx: click.Context, config_path: str | None, overlay_paths: 
     # capture used inline / in a string-only slot has no honest render. Same
     # pure-Python, no-assertions constraint as the jq collector above.
     errors = errors + collect_capture_placement_errors(cfg.mocks)
+    # Surface unknown ``{{...}}`` template tokens (template-vars, Task 10):
+    # walks config-defined string fields and flags typos (e.g. ``{{uuids}}``)
+    # against the known generator registry. Valid generators and non-matching
+    # text (dots/spaces) are not flagged.
+    errors = errors + collect_unknown_template_errors(cfg)
     if errors:
         summary = f"Configuration has {len(errors)} error(s)"
         emit(
