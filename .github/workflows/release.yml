@@ -1,10 +1,11 @@
 name: release
 
 # Tag-driven release. Pushing a v* tag builds the package, publishes to PyPI via
-# trusted publishing (OIDC — no stored tokens), regenerates CHANGELOG.md on main,
-# and opens a GitHub Release whose body git-cliff generates from Conventional
-# Commits. The version is derived from the tag by hatch-vcs, so version and tag
-# can never drift. See docs/RELEASING.md.
+# trusted publishing (OIDC — no stored tokens) and opens a GitHub Release whose
+# body git-cliff generates from Conventional Commits. The version is derived
+# from the tag by hatch-vcs, so version and tag can never drift. The GitHub
+# Releases page is the changelog (main is PR-protected — no in-repo CHANGELOG).
+# See docs/RELEASING.md.
 on:
   push:
     tags:
@@ -59,20 +60,6 @@ jobs:
 
       - name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
-
-      # Best-effort: a push race here must never fail the workflow AFTER an
-      # irreversible PyPI upload. The next release regenerates the full history,
-      # so a missed commit self-heals.
-      - name: Regenerate CHANGELOG.md on main
-        run: |
-          git fetch origin main
-          git checkout -B main origin/main
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git-cliff --output CHANGELOG.md
-          git add CHANGELOG.md
-          git commit -m "docs(changelog): $GITHUB_REF_NAME" || echo "no changelog changes"
-          git push origin main || echo "WARN: changelog push failed; PyPI publish already succeeded"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
