@@ -160,8 +160,10 @@ agctl/
     ├── grpc_client.py          # grpcio wrapper (lazy import); reflection-resolution + JSON↔protobuf via the shared kernel
     ├── grpc_descriptors.py     # shared gRPC proto kernel: build_descriptor_pool, find_method, call_type_of, message_class, serialize, deserialize (grpcio-free at module top; lazy imports)
     ├── log_client.py           # log backend dispatch via agctl.logs_backends entry points
+    ├── log_common.py           # shared normalize_dict / entry_matches / infer_schema (file + loki)
     ├── log_backend_protocol.py # LogBackend Protocol + CanonicalEntry DTOs
-    └── log_backends/ndjson_file.py  # built-in NDJSON file backend (lazy import)
+    ├── log_backends/ndjson_file.py  # built-in NDJSON file backend (lazy import; delegates to log_common)
+    └── log_backends/loki.py         # built-in Loki HTTP backend (query_range; lazy httpx)
 ```
 
 > DESIGN §7's structure sketch predates several modules; §14 lists the deltas.
@@ -664,9 +666,9 @@ reactors sharing a cluster reuse a single client built via `clients_by_cluster`)
   `on_assign`/`on_revoke`; `store_offsets` — plural — is the only offset-store
   method). Keep the fakes honest against the real binding or regressions hide.
 
-### LogClient + backend (`clients/log_client.py`, `clients/log_backends/ndjson_file.py`)
+### LogClient + backend (`clients/log_client.py`, `clients/log_common.py`, `clients/log_backends/ndjson_file.py`, `clients/log_backends/loki.py`)
 
-`LogClient` dispatches to a `LogBackend` selected by the source's `type`: discovery merges entry points (`agctl.logs_backends`, §10) over the always-present built-in `{"file": NdjsonFileBackend}`; broken third-party backends are skipped. The client delegates `scan`/`await_one`/`follow`/`sample_schema` and exposes DI seams (`backend`/`backends`).
+`LogClient` dispatches to a `LogBackend` selected by the source's `type`: discovery merges entry points (`agctl.logs_backends`, §10) over the always-present built-ins `{"file": NdjsonFileBackend, "loki": LokiBackend}`; broken third-party backends are skipped. The client delegates `scan`/`await_one`/`follow`/`sample_schema` and exposes DI seams (`backend`/`backends`).
 
 `NdjsonFileBackend` lazy-imports `jq` in `scan`/`await_one`/`follow` (missing → `ConfigError`, `logs` extra). The backend reads NDJSON files in logstash format (one JSON object per line), normalizes to the canonical entry model, and applies client-side filters (level, logger glob, message substring, jq predicate). It supports three operations:
 
@@ -678,6 +680,17 @@ reactors sharing a cluster reuse a single client built via `clients_by_cluster`)
 **File-tail implementation** (`_tail_lines`) — reads the last N lines without loading the entire file, using a loop-growing read window that handles long lines robustly. Starts with an estimate and doubles the window until either N lines are captured or the start of the file is reached. Discards partial leading fragment when seeking from a non-zero offset.
 
 **Lazy-jq rule** — `jq` is imported only when `--match` is used; a missing library surfaces as `ConfigError` (exit 2) pointing at `pip install 'agctl[logs]'`, not a crash. This keeps the zero-dep log query path working without `jq`.
+
+**Shared helpers** (`clients/log_common.py`) — `normalize_dict`, `entry_matches`, and `infer_schema` were extracted from `NdjsonFileBackend` so both built-in backends share one slot-mapping (logstash keys → `CanonicalEntry`), one AND-filter (level / logger-glob / message-substring / jq), and one field-presence schema inference. `NdjsonFileBackend` now delegates to these (behavior byte-for-byte unchanged); `normalize_dict` gains optional `service` / `ts_override` overrides a backend with its own timestamp/service source can inject.
+
+`LokiBackend` (`clients/log_backends/loki.py`, type `"loki"`) reads a remote Loki HTTP endpoint. The single read path is `_fetch_entries` → `GET {url}/loki/api/v1/query_range` (params `query`/`start`/`end`/`limit`/`direction`); `httpx` is lazy-imported inside methods (module top stays stdlib-only), cached as one `httpx.Client` for connection pooling, and a missing library raises `ConfigError` (exit 2) pointing at `pip install 'agctl[loki]'`. `validate_config` enforces `url` (http/https) + `query` required and basic/bearer-auth mutual exclusion. Auth/transport knobs (`username`/`password`/`token`/`org_id`/`verify_tls`/`fetch_limit`/`direction`) come from `LogSource.options`; `LogSource` is `extra="forbid"`, so backend-specific keys must live under `options`. Operations mirror the file backend's contract but are fetch/poll-based over a time window:
+
+- **`scan`** — one `query_range` over `[since, until]` (defaults now / now-1h), then client-side `entry_matches`; truncation is reported honestly via two independent signals (`matched > limit` OR `scanned == fetch_limit` — the server cap may have been hit).
+- **`await_one`** — Phase 1 is a backward historical read (both modes); poll mode (timeout > 0) adds a fetch-first forward loop keyed on the last-seen Loki timestamp high-water (RFC3339Nano strings sort lexically), with client-side dedup so `scanned` never double-counts an entry re-included at the window edge.
+- **`follow`** — a poll generator (NOT websocket `/tail`): forward `query_range` cycles advancing `start` to the newest emitted timestamp, a `(timestamp, message)` dedup set, and an interruptible chunked sleep. The first fetch lets ALL errors propagate (streaming startup-error path); on subsequent fetches `ConnectionFailure`/`OperationTimeout` are swallowed to stderr and retried (transient blip), while `ConfigError` (bad query / non-stream result) ALWAYS propagates.
+- **`sample_schema`** — a backward fetch of the last hour, delegated to `log_common.infer_schema`.
+
+Filtering is client-side (applied after fetch); LogQL push-down is deferred (§15). **Error mapping:** 400 / non-stream `resultType` → `ConfigError` (2); 401/403/5xx/`ConnectError`/`ConnectTimeout` → `ConnectionFailure` (2); `ReadTimeout` / other `httpx.TimeoutException` → `OperationTimeout` (1); non-httpx errors surface unchanged.
 
 ---
 
@@ -1045,10 +1058,12 @@ and **skipped** — it never bricks the CLI, the registry, or driver discovery.
   mysql = "agctl_mysql:MySQLDriver"
   ```
 - **Log backends** — `LogClient` selects by `source["type"]`; unknown →
-  `ConfigError`. Built-in `file` always wins over a registration gap.
+  `ConfigError`. Built-ins `file` and `loki` always win over a registration gap.
   The `LogBackend` protocol requires `validate_config`/`scan`/`await_one`/
   `follow`/`sample_schema`. All methods are mandatory. Built-in `file`
-  implements the protocol for NDJSON files in logstash format. Third-party
+  implements the protocol for NDJSON files in logstash format; built-in `loki`
+  implements it for a remote Loki HTTP endpoint (`query_range`; lazy `httpx`,
+  `loki` extra). Third-party
   backends can add journald, syslog, ELasticsearch, etc. Register in another
   package's `pyproject.toml`:
   ```toml
@@ -1092,6 +1107,7 @@ extras, so a user installs only what they need and the package imports fast:
 | `kafka` | `confluent-kafka[schemaregistry]`, `jq` | `kafka *` (the `[schemaregistry]` sub-extra pulls `authlib`/`cachetools`/`attrs`/`certifi`/`httpx` that `confluent_kafka.schema_registry` imports at module load; without it `pip install 'agctl[kafka]'` leaves SR import-broken) |
 | `db` | `psycopg[binary]`, `jq` | `db *` |
 | `logs` | `jq` | `logs *` (`--match` on logs query/assert/tail) |
+| `loki` | `httpx`, `jq` | `logs *` against a `type: loki` source (Loki HTTP `query_range`; lazy-imported, missing → `ConfigError`) |
 | `grpc` | `grpcio`, `grpcio-tools`, `grpcio-health-checking`, `grpcio-reflection`, `protobuf`, `jq` | `grpc *`, `mock run --only grpc` / `mocks.grpc` engine |
 | `avro` | `fastavro` | Avro decode/encode on `kafka.clusters.<c>.value_format: avro` topics (`agctl/serialization/avro_codec.py`) |
 | `protobuf` | `protobuf` | Protobuf decode/encode on `kafka.clusters.<c>.value_format: protobuf` topics (`agctl/serialization/protobuf_codec.py`); deliberately standalone — does NOT pull `grpcio` |
@@ -1121,7 +1137,8 @@ SR client lazy-import inside the function that needs them, so importing
 
 **Build & entry points:** hatchling backend, wheel target `agctl`; console
 scripts `agctl`/`agt` → `agctl.cli:cli`; entry-point groups `agctl.db_drivers`
-(registers built-in `mysql`, `postgresql`, `sqlite`), `agctl.logs_backends` (registers built-in `file`),
+(registers built-in `mysql`, `postgresql`, `sqlite`), `agctl.logs_backends` (third-party
+backends; built-in `file`/`loki` are hardcoded in `BUILTIN_BACKENDS`, not entry points),
 `agctl.plugins`, `agctl.assertions` (§10); requires Python `>=3.11`.
 
 ---
@@ -1289,6 +1306,15 @@ What the system does **not** do today (as-built; see DESIGN §10 for the roadmap
   `SIGTERM`-driven graceful-stop (and the daemon's `SIGTERM`-based shutdown
   that `mock stop`/`kafka listen stop` drive) is POSIX/WSL — the reason both
   daemons are gated there.
+- **Loki backend limitations** (v1 boundaries of the second built-in log
+  backend) — `loki` is an HTTP `query_range` poller, not a websocket `/tail`
+  client: `follow`/poll latency is bounded by the poll interval, and a
+  mid-stream auth change (401 after a successful start) is swallowed and
+  retried rather than surfaced. Filtering is client-side (after fetch), not
+  pushed down to LogQL. mTLS client certs are unsupported (`verify_tls: false`
+  skips verification; there is no cert/key path). The other candidate backends
+  (docker/journald/syslog/ELK/CloudWatch) are not built-in — add them via the
+  `agctl.logs_backends` entry point (§10).
 
 **Mock server MVP limitations** (see DESIGN §10 "Known-wrong-result / Not Covered" for the full list with failure-mode analysis):
 

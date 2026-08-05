@@ -491,6 +491,11 @@ def logs_tail(
             match=match,
             params=params,
         )
+        # Build the client INSIDE the startup try so a validate-time error from
+        # ``LogClient.__init__`` -> ``backend.validate_config()`` (e.g. a Loki
+        # source missing its ``query``) is caught and emitted as a startup
+        # envelope rather than leaking a traceback (DESIGN §10).
+        client = new_logs_client(src)
     except AgctlError as err:
         # Startup config errors -> structured envelope + exit code (mirrors http_ping)
         emit(
@@ -509,8 +514,6 @@ def logs_tail(
             duration_ms=int((time.monotonic() - start) * 1000),
         )
         raise SystemExit(2)
-
-    client = new_logs_client(src)
 
     # Signal handling: install SIGTERM/SIGINT handlers that set a stop event.
     # Guard for non-main-thread contexts (degrades gracefully).
@@ -544,6 +547,19 @@ def logs_tail(
             emit_line=_emit_stdout_line,
             poll_interval_ms=cfg.logs.defaults.poll_interval_ms,
         )
+    except AgctlError as err:
+        # A streaming error raised inside ``_tail_run`` (notably the FIRST
+        # ``follow()`` fetch, which deliberately propagates startup errors --
+        # bad auth / unreachable / bad LogQL) must emit a structured
+        # ``logs.tail`` envelope + exit code, NOT leak a traceback. Mirrors the
+        # startup-error handlers above; one-envelope contract (DESIGN §10).
+        emit(
+            ok=False,
+            command="logs.tail",
+            error=err.to_dict(),
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        raise SystemExit(err.exit_code)
     finally:
         # Restore previous signal handlers (mirrors http_ping).
         try:

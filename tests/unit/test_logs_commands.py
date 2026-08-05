@@ -49,10 +49,14 @@ class _FakeLogsClient:
         scan: ScanResult | None = None,
         await_one: AwaitResult | None = None,
         follow_entries: list[CanonicalEntry] | None = None,
+        follow_exc: Exception | None = None,
     ):
         self._scan_result = scan
         self._await_one_result = await_one
         self._follow_entries = follow_entries or []
+        # Optional exception raised by follow() on first advance (mirrors the
+        # real LokiBackend.follow first-fetch startup-error propagation path).
+        self._follow_exc = follow_exc
         self.scan_calls = []
         self.await_one_calls = []
         self.follow_calls = []
@@ -109,6 +113,10 @@ class _FakeLogsClient:
                 "poll_interval_ms": poll_interval_ms,
             }
         )
+        # Mirror LokiBackend.follow's startup-error path: the FIRST advance of
+        # the generator raises (before any yield) when follow_exc is set.
+        if self._follow_exc is not None:
+            raise self._follow_exc
         # Yield each entry, then check stop_event and return (never hangs).
         for entry in self._follow_entries:
             yield entry
@@ -131,8 +139,14 @@ def install_fake(monkeypatch):
         scan: ScanResult | None = None,
         await_one: AwaitResult | None = None,
         follow_entries: list[CanonicalEntry] | None = None,
+        follow_exc: Exception | None = None,
     ):
-        fake = _FakeLogsClient(scan=scan, await_one=await_one, follow_entries=follow_entries)
+        fake = _FakeLogsClient(
+            scan=scan,
+            await_one=await_one,
+            follow_entries=follow_entries,
+            follow_exc=follow_exc,
+        )
         captured["fake"] = fake
 
         def factory(src):
@@ -685,3 +699,83 @@ def test_logs_tail_match_compile_loud_fail(install_fake):
     assert payload["command"] == "logs.tail"
     assert payload["error"]["type"] == "ConfigError"
     assert "jq" in payload["error"]["message"].lower()
+
+
+def test_logs_tail_loki_validate_error_emits_envelope(tmp_path):
+    """Real Loki source missing 'query' -> ConfigError startup envelope (exit 2),
+    NOT a raw traceback + exit 1.
+
+    Uses a REAL LogClient (no fake) so the validate-time ConfigError from
+    ``LokiBackend.validate_config`` surfaces through ``logs_tail``'s startup
+    guard. Exercises the ``new_logs_client``-inside-the-startup-try path: a
+    client-construction-time AgctlError must be caught and emitted as a
+    ``logs.tail`` envelope (DESIGN §10 startup-error-before-NDJSON contract).
+    """
+    import json
+
+    config = tmp_path / "agctl.yaml"
+    config.write_text(
+        'version: "3"\n'
+        "logs:\n"
+        "  sources:\n"
+        "    loki-no-query:\n"
+        '      type: loki\n'
+        '      url: "http://loki:3100"\n'
+    )
+
+    result = _run(
+        [
+            "--config",
+            str(config),
+            "logs",
+            "tail",
+            "--source",
+            "loki-no-query",
+        ],
+        env={},
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output.strip())
+    assert payload["ok"] is False
+    assert payload["command"] == "logs.tail"
+    assert payload["error"]["type"] == "ConfigError"
+    assert "query" in payload["error"]["message"].lower()
+    # No traceback leaked (one-envelope contract: structured error, not a crash).
+    assert "Traceback (most recent call last)" not in result.output
+
+
+def test_logs_tail_follow_startup_connection_error_emits_envelope(install_fake):
+    """A follow() whose first fetch raises ConnectionFailure emits a ``logs.tail``
+    envelope (error.type == ConnectionError, exit 2), NOT a raw traceback.
+
+    Exercises the ``_tail_run`` except-AgctlError path: ``LokiBackend.follow``
+    deliberately propagates first-fetch errors (startup-error design), so a
+    ConnectionFailure escaping ``_tail_run`` must be caught and emitted as a
+    structured envelope rather than leaking a traceback.
+    """
+    import json
+
+    from agctl.errors import ConnectionFailure
+
+    install_fake(follow_exc=ConnectionFailure("Loki unreachable: boom", {}))
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "logs",
+            "tail",
+            "--source",
+            "order-service",
+            "--until-stopped",
+        ]
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output.strip())
+    assert payload["ok"] is False
+    assert payload["command"] == "logs.tail"
+    assert payload["error"]["type"] == "ConnectionError"
+    assert "boom" in payload["error"]["message"]
+    assert "Traceback (most recent call last)" not in result.output

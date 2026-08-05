@@ -1239,3 +1239,141 @@ def test_validates_logs_sources_with_wellformed_source():
     # Should have no error for logs.sources.svc
     log_errors = [e for e in errors if e["path"] == "logs.sources.svc"]
     assert len(log_errors) == 0, f"Expected no error for logs.sources.svc, got {log_errors}"
+
+
+# ============================================================================
+# Task 8: loki built-in registration + dispatch
+# ============================================================================
+
+
+def test_log_client_selects_loki_backend():
+    """LogClient selects LokiBackend for type='loki' and validates config."""
+    from agctl.clients.log_client import LogClient
+    from agctl.clients.log_backends.loki import LokiBackend
+
+    source = LogSource(type="loki", url="http://loki:3100", query='{app="x"}')
+    client = LogClient(source)
+
+    # Dispatch selected the built-in LokiBackend (no entry-point needed)
+    assert isinstance(client._backend, LokiBackend)
+    # validate_config passes for a minimal valid loki source
+    assert client.validate_config() is None
+
+
+def test_log_client_unknown_type_bogus_raises():
+    """LogClient raises ConfigError for unknown type='bogus' (regression).
+
+    After registering the ``loki`` built-in, an unrelated unknown type must
+    still be rejected with the same ConfigError path.
+    """
+    from agctl.clients.log_client import LogClient
+    from agctl.errors import ConfigError
+
+    source = LogSource(type="bogus")
+    try:
+        LogClient(source)
+        assert False, "Should have raised ConfigError"
+    except ConfigError as e:
+        assert "Unknown logs backend type" in str(e)
+        assert "bogus" in str(e)
+        assert e.detail.get("type") == "bogus"
+
+
+def test_load_backends_includes_file_and_loki():
+    """load_backends() returns both 'file' and 'loki' built-ins."""
+    from agctl.clients.log_client import LogClient
+    from agctl.clients.log_backends.loki import LokiBackend
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    backends = LogClient.load_backends()
+
+    assert "file" in backends
+    assert "loki" in backends
+    assert backends["file"] is NdjsonFileBackend
+    assert backends["loki"] is LokiBackend
+
+
+def test_load_backends_builtin_loki_wins_over_entry_point():
+    """A third-party 'loki' entry-point does NOT override the built-in.
+
+    Built-ins are merged last (``backends.update(BUILTIN_BACKENDS)``) so a
+    third-party registration under the same name loses. Mirrors the existing
+    file-backend entry-point test.
+    """
+    from agctl.clients.log_client import LogClient
+    from agctl.clients.log_backends.loki import LokiBackend
+    import importlib.metadata
+
+    class FakeLokiBackend:
+        """Third-party imposter that must NOT win over the built-in."""
+
+    original_entry_points = importlib.metadata.entry_points
+
+    def fake_entry_points():
+        class FakeEntryPoint:
+            name = "loki"
+
+            def load(self):
+                return FakeLokiBackend
+
+        class MockGroup:
+            def __iter__(self):
+                return iter([FakeEntryPoint()])
+
+        class MockEPS:
+            def select(self, group=None):
+                return MockGroup()
+
+        return MockEPS()
+
+    importlib.metadata.entry_points = fake_entry_points
+    try:
+        backends = LogClient.load_backends()
+        # Built-in LokiBackend wins over the fake entry-point registration.
+        assert backends["loki"] is LokiBackend
+        assert backends["loki"] is not FakeLokiBackend
+    finally:
+        importlib.metadata.entry_points = original_entry_points
+
+
+def test_config_validate_loki_source_missing_query():
+    """validate_config() reports error at logs.sources.x for loki missing query.
+
+    A ``type: loki`` source without ``query`` surfaces a ConfigError at path
+    ``logs.sources.x`` (the validator constructs a LogClient per source, which
+    runs the backend's validate_config). This is the ``agctl config validate``
+    exit-2 path driven directly through the validator.
+    """
+    from agctl.config.models import (
+        Config,
+        DatabaseConfig,
+        Defaults,
+        KafkaConfig,
+        LogSource,
+        LogsConfig,
+    )
+    from agctl.config.validator import validate_config
+
+    cfg = Config.model_validate(
+        dict(
+            version="1",
+            services={},
+            kafka=KafkaConfig(),
+            database=DatabaseConfig(),
+            templates={},
+            defaults=Defaults(),
+            logs=LogsConfig(
+                sources={
+                    "x": LogSource(type="loki", url="http://loki:3100", query=None)
+                }
+            ),
+        )
+    )
+
+    errors, warnings = validate_config(cfg)
+
+    log_errors = [e for e in errors if e["path"] == "logs.sources.x"]
+    assert len(log_errors) == 1, (
+        f"Expected 1 error for logs.sources.x, got {len(log_errors)}"
+    )
+    assert "query" in log_errors[0]["message"].lower()

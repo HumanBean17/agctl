@@ -1,20 +1,20 @@
 # `logs` mode — configure log sources
 
-Point at a service log file or logging config; produce a `logs.sources.<name>` block. The
+Point at a service log file or a remote log backend (e.g. Loki); produce a `logs.sources.<name>` block. The
 non-negotiable contract (canonical entry model, placeholder syntax, one-shot+poll semantics)
 lives in `SKILL.md` — this file is the extraction detail.
 
 ## Inputs
 
 - The config path.
-- The artifact: a log file path, a logback/log4j XML config, or a description of where logs are written.
+- The artifact: a log file path (for `type: file`), a Loki URL + LogQL query (for `type: loki`), a logback/log4j XML config, or a description of where logs are written.
 
 ## Extraction
 
 1. **path** — the log file path. Use an absolute path or a path relative to the project root.
 2. **format** — the log format. Default: `logstash` (NDJSON with `@timestamp`, `level`, `message`, `logger`, `thread`, `stack_trace`, `tags`, `fields`). If the app uses a custom format, ask for a sample line and whether a custom backend exists.
 3. **service** — optional; the service name for `discover log-sources` grouping. Omit if the log isn't tied to a single service or if the source name already makes this clear.
-4. **type** — default: `file`. Only change this if a custom backend plugin exists (e.g., `syslog`, `journald`).
+4. **type** — default: `file`. Also built-in: `loki` (remote Loki HTTP endpoint; needs `url` + `query`, and the `loki` extra). Other types (e.g. `syslog`, `journald`) need a custom backend plugin via `agctl.logs_backends`.
 5. **name** — kebab-case from the service or log file (`order-service.log` → `order-service`).
 
 A log source answers "where do I find logs for this service?" — the entry point for `logs query`, `logs assert`, and `logs tail`.
@@ -37,7 +37,7 @@ A log source answers "where do I find logs for this service?" — the entry poin
 
 ## Canonical entry model
 
-All log entries are normalized to a **canonical shape** before filtering/asserting. Built-in backends (e.g., `file`) produce entries with these fields:
+All log entries are normalized to a **canonical shape** before filtering/asserting. Built-in backends (`file`, `loki`) produce entries with these fields:
 
 - `timestamp` — ISO-8601 datetime string.
 - `level` — uppercase log level (`DEBUG`, `INFO`, `WARN`, `ERROR`).
@@ -86,6 +86,23 @@ logs:
 
 The `logs.defaults` block sets fallback values for command flags (`--limit`, `--timeout`, `--poll-interval`, `--tail-lines`). Omit it if the core defaults are fine.
 
+### Remote Loki source
+
+```yaml
+logs:
+  sources:
+    order-service:
+      type: loki
+      url: "${LOKI_URL:-http://loki:3100}"
+      query: '{app="order-service"}'        # LogQL log selector; required
+      service: order-service
+      options:                               # backend-specific extras
+        org_id: "${LOKI_ORG_ID:-}"           # multi-tenant scope (X-Scope-OrgID)
+        fetch_limit: 1000                    # max lines per query_range (default 500)
+```
+
+`type: loki` reads a remote Loki HTTP endpoint (`{url}/loki/api/v1/query_range`). `url` and `query` are required; `service` overrides the canonical entry's service (otherwise taken from the log line). Backend-specific knobs (auth, TLS, fetch tuning) live under `options` — the model rejects unknown **top-level** keys (`extra="forbid"`), so never put them next to `type`/`url`. Requires `pip install 'agctl[loki]'`.
+
 ## What to clarify
 
 - The **exact file path** (absolute or relative to project root). If the service uses rolling files (e.g., `order-service.log.2024-01-01`), point at the current file — agctl reads only the live file, not historical rolls.
@@ -106,4 +123,5 @@ Under `logs.sources:` (nested under `logs:`). The file also needs `logs.defaults
   - **poll** (`--timeout N>0`): scan repeatedly until a match or timeout (default poll interval is `logs.defaults.poll_interval_ms`).
 - Use `--not` with `logs assert` to invert the condition ("no error logs in the last 5 minutes").
 - `--match` uses jq over the canonical entry (fill `{placeholder}` via `--param`). If jq is missing, install the extra: `pip install 'agctl[logs]'`.
-- Custom backends (non-`file` types) require a plugin installed via the `agctl.logs_backends` entry point — analogous to `agctl.db_drivers`.
+- `type: loki` needs `pip install 'agctl[loki]'` (httpx); a missing extra is a `ConfigError` (exit 2). `logs tail`/`assert` poll Loki over HTTP (query_range) — it is not a websocket `/tail`, so follow latency is bounded by the poll interval. Auth/TLS/fetch knobs go under `options` (unknown top-level keys are rejected).
+- Built-in types are `file` (default) and `loki`. Other types require a plugin installed via the `agctl.logs_backends` entry point — analogous to `agctl.db_drivers`.

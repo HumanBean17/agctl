@@ -425,10 +425,21 @@ database:
 # ---------------------------------------------------------------------------
 # logs — log source configuration for log query/assert/tail.
 #   sources.<name>: named log source definitions
-#     type: backend type (default "file"; extensible via agctl.logs_backends entry point)
+#     type: backend type. Built-ins: "file" (local NDJSON, default) and "loki"
+#           (remote Loki HTTP endpoint); extensible via agctl.logs_backends
+#           entry point (see §9). Other types (journald, syslog, ELK, …) need
+#           a third-party backend plugin.
 #     path: file path (required for type "file")
 #     format: log format (default "logstash"; "logstash" = NDJSON with @timestamp)
 #     service: optional service name override (defaults to source name)
+#     url: remote-backend endpoint (e.g. "http://loki:3100"); required for "loki"
+#     query: remote-backend query expression (e.g. Loki LogQL '{app="x"}');
+#            required for "loki"
+#     options: backend-specific extras (auth/transport knobs); default empty.
+#              For "loki": username/password (basic), token (bearer), org_id,
+#              verify_tls (default true), fetch_limit, direction. The model
+#              rejects unknown top-level keys (extra="forbid") so backend-specific
+#              keys must live under options, never next to type/url.
 #   defaults: fallback values for logs commands
 #     tail_lines: number of trailing lines to read (default 200)
 #     limit: max entries to return from query (default 50)
@@ -448,6 +459,18 @@ logs:
       path: "/var/log/payment-service/app.log"
       format: logstash
       service: payment-service
+
+    # A remote Loki source (requires the `loki` extra:
+    # pip install 'agctl[loki]'). `query` is a LogQL log selector; auth/transport
+    # knobs live under `options` (unknown top-level keys are rejected).
+    order-service-loki:
+      type: loki
+      url: "${LOKI_URL:-http://loki:3100}"
+      query: '{app="order-service"}'
+      service: order-service
+      options:
+        org_id: "${LOKI_ORG_ID:-}"
+        fetch_limit: 1000
 
   defaults:
     tail_lines: 200
@@ -3185,7 +3208,7 @@ class LogBackend(Protocol):
     def sample_schema(self, *, sample_lines: int = 100) -> SchemaDescriptor: ...
 ```
 
-The built-in `file` backend (type `"file"`) reads NDJSON files in logstash format. Third-party backends can add support for journald, syslog, ELasticsearch, etc. To add a journald backend:
+Two backends ship built-in: `file` (type `"file"`, local NDJSON in logstash format) and `loki` (type `"loki"`, a remote Loki HTTP endpoint selected by `url` + a LogQL `query`, with auth/transport knobs under `options`; requires the `loki` extra). Third-party backends can add support for journald, syslog, ELasticsearch, etc. To add a journald backend:
 
 ```toml
 # In agctl-logs-journald/pyproject.toml
