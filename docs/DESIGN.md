@@ -630,7 +630,7 @@ An overlay is a partial config file layered on top of the base `agctl.yaml` to p
 
 ### 2.5 Value Generator Tokens
 
-Template bodies (HTTP path/body, Kafka pattern `match`, SQL, mock responses, gRPC messages) and CLI string args may embed **runtime value generators** — `{{name[:opts]}}` tokens (double braces) expanded at fill time into a freshly generated value. They are distinct from `${ENV}` (load-time, §2.2) and `{name}` (call-time `--param`, §2.3): double braces, resolved without any `--param`. The same token text resolves to **one value within a single invocation** (two `{{uuid}}` in one fill produce the same UUID).
+Template bodies (HTTP path/body, Kafka pattern `match`, free-form DB `--sql`, mock responses, gRPC messages) and CLI string args may embed **runtime value generators** — `{{name[:opts]}}` tokens (double braces) expanded at fill time into a freshly generated value. They are distinct from `${ENV}` (load-time, §2.2) and `{name}` (call-time `--param`, §2.3): double braces, resolved without any `--param`. The same token text resolves to **one value within a single invocation** (two `{{uuid}}` in one fill produce the same UUID).
 
 | Token | Produces | Example |
 |---|---|---|
@@ -642,7 +642,7 @@ Template bodies (HTTP path/body, Kafka pattern `match`, SQL, mock responses, gRP
 | `{{rand}}` | 16 lowercase hex chars. | `a1b2c3d4e5f60718` |
 | `{{rand:N}}` | N lowercase hex chars (N ≥ 1). | |
 
-Generator output is charset-restricted (injection-safe by construction). An unknown generator name (e.g. `{{foo}}`) is a `ConfigError` at both `config validate` and fill time. The global `--no-template-vars` flag (§3) is an escape hatch that leaves `{{...}}` tokens literal everywhere; the `agctl gen uuid|ts|rand` group (§3.10) generates standalone values for cross-step sharing.
+Generator output is charset-restricted (injection-safe by construction). An unknown generator name (e.g. `{{foo}}`) is a `ConfigError` at both `config validate` and fill time. The global `--no-template-vars` flag (§3) is an escape hatch that leaves `{{...}}` tokens literal everywhere; the `agctl gen uuid|ts|rand` group (§3.10) generates standalone values for cross-step sharing. **Known limitation:** DB *template* SQL (`database.templates.<t>.sql`) is not yet a generator fill site — generators substitute in free-form `--sql` only; template SQL binds parameters via `:paramName`.
 
 ---
 

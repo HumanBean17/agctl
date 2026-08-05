@@ -541,3 +541,121 @@ def test_assert_pattern_unknown_generator_is_config_error_before_sr_probe(
     # And the consume path was never reached either.
     assert cap["producer"].calls == []
 
+
+# ---------------------------------------------------------------------------
+# kafka assert: explicit --match/--path/--contains honor {{...}} generators
+# (review fix — uniform with --pattern; fail-loud on unknown generators).
+# ---------------------------------------------------------------------------
+
+
+def test_assert_match_substitutes_uuid_and_shares_memo_with_contains(
+    install_fake_consumer,
+):
+    """Explicit ``--match '.value.id == "{{uuid}}"'`` and ``--contains
+    '{"id":"{{uuid}}"}'`` have their ``{{uuid}}`` tokens substituted BEFORE
+    compile_jq / json.loads, and BOTH resolve to the SAME value (shared
+    per-invocation memo — uniform with ``--pattern``).
+
+    Verified via the no-match failure detail, which echoes the FILLED match
+    expr (``modes[].expr``) and the parsed contains ``needle`` — so the test
+    sees exactly what the predicate evaluated without predicting the uuid.
+    """
+    # Canned message that will NOT match the generated uuid -> no-match echoes
+    # the filled expr + needle.
+    install_fake_consumer([_cmsg("t", {"id": "no-match"}, "k1")])
+
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "kafka", "assert",
+            "--topic", "t",
+            "--match", '.value.id == "{{uuid}}"',
+            "--contains", '{"id": "{{uuid}}"}',
+            "--lookback", "10",
+            "--timeout", "0.02",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    # No match (the canned id is not the generated uuid).
+    assert result.exit_code == 1
+    assert payload["error"]["type"] == "AssertionError"
+    modes = payload["error"]["detail"]["modes"]
+    by_mode = {m["mode"]: m for m in modes}
+
+    # --match expr: literal token gone, holds ONE valid uuid.
+    match_expr = by_mode["match"]["expr"]
+    assert "{{uuid}}" not in match_expr
+    match_uuids = re.findall(r'"([0-9a-fA-F-]{36})"', match_expr)
+    assert len(match_uuids) == 1
+    uuidlib.UUID(match_uuids[0])
+
+    # --contains needle: literal token gone, holds ONE valid uuid.
+    needle = by_mode["contains"]["needle"]
+    assert "{{uuid}}" not in json.dumps(needle)
+    contains_uuid = needle["id"]
+    uuidlib.UUID(contains_uuid)
+
+    # Shared memo: both positions hold the SAME uuid.
+    assert match_uuids[0] == contains_uuid
+
+
+def test_assert_match_unknown_generator_is_config_error_before_consume(
+    install_fake_consumer,
+):
+    """``--match '.value.id == "{{nope}}"'`` (unknown generator) surfaces as
+    ``ConfigError`` (exit 2) BEFORE any consume — ``substitute_generators`` runs
+    ahead of compile_jq / ``_resolve_codec`` / ``find_in_window``. The consumer
+    seam records nothing (no seek offsets set), restoring the fail-loud promise
+    that a typo'd generator can't silently match nothing.
+    """
+    cap = install_fake_consumer([_cmsg("t", {"id": "x"}, "k1")])
+
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "kafka", "assert",
+            "--topic", "t",
+            "--match", '.value.id == "{{nope}}"',
+            "--lookback", "10",
+            "--timeout", "0.02",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 2
+    assert payload["error"]["type"] == "ConfigError"
+    # The consume path was never entered: the consumer double recorded no seeks.
+    assert cap["consumer"]._seek_offsets == {}
+
+
+def test_assert_match_substitutes_timestamp(install_fake_consumer):
+    """``--match '{{ts}}'`` has the token substituted with a Unix-second timestamp
+    BEFORE compile_jq — so the jq expression is a valid number literal rather than
+    the invalid-jq ``{{ts}}`` (which ``compile_jq`` rejects as a syntax error).
+
+    Verified via the no-match failure detail's ``expr`` against an empty window.
+    """
+    install_fake_consumer([])  # empty window -> no match -> expr echoed
+
+    result = _run(
+        [
+            "--config", str(FIXTURE),
+            "kafka", "assert",
+            "--topic", "t",
+            "--match", "{{ts}}",
+            "--lookback", "10",
+            "--timeout", "0.02",
+        ]
+    )
+    payload = json.loads(result.output)
+
+    assert result.exit_code == 1
+    assert payload["error"]["type"] == "AssertionError"
+    modes = payload["error"]["detail"]["modes"]
+    assert len(modes) == 1 and modes[0]["mode"] == "match"
+    expr = modes[0]["expr"]
+    # Literal token gone, replaced by a Unix-second timestamp (digits only).
+    assert "{{ts}}" not in expr
+    assert re.fullmatch(r"\d+", expr)
+

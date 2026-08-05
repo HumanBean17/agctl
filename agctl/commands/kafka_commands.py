@@ -812,16 +812,16 @@ def _kafka_assert_core(
     resolved = cfg.kafka.clusters[name]
     group = _resolve_group(consumer_group, resolved)
 
-    # Parse --contains / fill --pattern ONCE here so the predicate and the
+    # Fill --pattern ONCE here (params + generators) so the predicate and the
     # no-match failure detail share one source of truth (no double json.loads,
     # and the detail echoes the exact expr that was evaluated, params filled).
     #
     # This MUST run BEFORE _resolve_codec: the generator pre-pass inside
-    # fill_placeholders can raise ConfigError (unknown generator), and that
-    # error must surface ahead of any codec/SR resolution or live SR reachability
-    # probe — no wasted network call on a mis-tokened --pattern. (Mirrors the
-    # produce path, which substitutes before _resolve_codec.)
-    needle = json.loads(contains) if contains is not None else None
+    # fill_placeholders / substitute_generators can raise ConfigError (unknown
+    # generator), and that error must surface ahead of any codec/SR resolution
+    # or live SR reachability probe — no wasted network call on a mis-tokened
+    # --pattern/--match/--path/--contains. (Mirrors the produce path, which
+    # substitutes before _resolve_codec.)
     filled_pattern_match = (
         fill_placeholders(
             pattern_match,
@@ -832,6 +832,27 @@ def _kafka_assert_core(
         if pattern_match is not None
         else None
     )
+
+    # Generator pre-pass on the EXPLICIT --match/--path/--contains so a {{token}}
+    # resolves to a generated value and an unknown generator raises ConfigError
+    # (exit 2) BEFORE compile_jq / json.loads / consume — uniform with --pattern.
+    # Uses substitute_generators DIRECTLY, NOT fill_placeholders: --match/--path
+    # are jq expressions that can contain single-brace {...} object literals, and
+    # fill_placeholders would ALSO activate {name} substitution and could collide
+    # with jq braces. substitute_generators only matches double-brace {{...}}
+    # tokens (with brace-boundary lookarounds), so it is safe on jq. Shares the
+    # memo with --pattern/--contains so a {{token}} used in two of these resolves
+    # to ONE value within this assert.
+    if match is not None:
+        match = substitute_generators(match, memo, enabled=template_vars_enabled)
+    if path is not None:
+        path = substitute_generators(path, memo, enabled=template_vars_enabled)
+    if contains is not None:
+        contains = substitute_generators(
+            contains, memo, enabled=template_vars_enabled
+        )
+
+    needle = json.loads(contains) if contains is not None else None
 
     codec, _value_fmt, _key_fmt = _resolve_codec(
         cfg, inferred_topic, name, value_format, key_format
