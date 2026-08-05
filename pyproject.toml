@@ -1,11 +1,11 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "agctl"
-version = "2.3.0"
 description = "Agent-facing CLI harness for testing distributed systems"
+dynamic = ["version"]
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["cli", "testing", "agent", "distributed-systems", "kafka", "http", "database"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
@@ -66,7 +66,7 @@ integration = [
 Homepage = "https://github.com/HumanBean17/agctl"
 Repository = "https://github.com/HumanBean17/agctl"
 Issues = "https://github.com/HumanBean17/agctl/issues"
-Changelog = "https://github.com/HumanBean17/agctl/releases"
+Changelog = "https://github.com/HumanBean17/agctl/blob/main/CHANGELOG.md"
 
 [project.scripts]
 agctl = "agctl.cli:cli"
@@ -91,6 +91,16 @@ sqlite = "agctl.clients.db_drivers.sqlite:SQLiteDriver"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agctl"]
+
+# Single source of truth for the version is the git tag. hatch-vcs derives the
+# package version from tag history: released tag v3.0.0 -> 3.0.0; between tags a
+# dev version (3.0.1.devN). local_scheme=no-local-version keeps dev builds PEP 440
+# (pip-installable). See docs/RELEASING.md.
+[tool.hatch.version]
+source = "vcs"
+# local_scheme=no-local-version keeps dev builds PEP 440 (pip-installable);
+# the default setuptools-scm tag regex already matches the v<major>.<minor>.<patch> scheme.
+raw-options = { local_scheme = "no-local-version" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
