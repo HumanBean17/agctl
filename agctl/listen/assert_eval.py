@@ -39,7 +39,13 @@ from .daemon import capture_path, read_expectations
 __all__ = ["resolve_spec_modes", "evaluate_expectations"]
 
 
-def resolve_spec_modes(spec: dict[str, Any], patterns: dict[str, KafkaPattern]) -> dict[str, Any]:
+def resolve_spec_modes(
+    spec: dict[str, Any],
+    patterns: dict[str, KafkaPattern],
+    *,
+    memo: dict[str, str] | None = None,
+    template_vars_enabled: bool = True,
+) -> dict[str, Any]:
     """Expand one ExpectationSpec into the mode dict :func:`build_predicate` expects.
 
     If ``spec["modes"]["pattern"]`` names a pattern, it is looked up in
@@ -51,10 +57,23 @@ def resolve_spec_modes(spec: dict[str, Any], patterns: dict[str, KafkaPattern]) 
     — they occupy different keys than ``filled_pattern_match``, so the two modes
     coexist and are AND-ed by the predicate, exactly as in ``kafka assert``).
 
+    Template-variable generators (Task 9): when ``memo`` is provided, the
+    pattern fill AND the explicit ``--match`` / ``--contains`` strings run the
+    generator pre-pass (:func:`substitute_generators`) via :func:`fill_placeholders`,
+    so ``{{uuid}}``/``{{ts}}``/``{{rand}}`` tokens resolve to generated values.
+    The same ``memo`` shared across the whole ``evaluate_expectations`` call
+    makes a repeated token resolve to ONE value within one ``results`` call (the
+    per-invocation memo created by ``_kafka_listen_results_core``). An unknown
+    generator surfaces as :class:`ConfigError` here, before any capture-file
+    scan. ``template_vars_enabled=False`` leaves tokens literal.
+
     Args:
         spec: An ExpectationSpec dict (``{id, topic, modes, params, expect_count}``)
             as read from ``asserts.jsonl``.
         patterns: Mapping of pattern name → :class:`KafkaPattern`.
+        memo: Shared generator-value memo (Task 9); ``None`` keeps the legacy
+            byte-for-byte behavior (no generator pre-pass).
+        template_vars_enabled: When False, generator tokens pass through literal.
 
     Returns:
         ``{contains, match, path, filled_pattern_match}`` ready for
@@ -63,6 +82,8 @@ def resolve_spec_modes(spec: dict[str, Any], patterns: dict[str, KafkaPattern]) 
 
     Raises:
         TemplateNotFound: If ``spec["modes"]["pattern"]`` is not in ``patterns``.
+        ConfigError: If a ``{{token}}`` names an unknown generator (via
+            :func:`substitute_generators` inside :func:`fill_placeholders`).
     """
     modes = spec.get("modes") or {}
     params = spec.get("params") or {}
@@ -80,11 +101,44 @@ def resolve_spec_modes(spec: dict[str, Any], patterns: dict[str, KafkaPattern]) 
         # accepted so tests/config payloads can pass either shape.
         pat_match = pat.match if hasattr(pat, "match") else pat.get("match")
         if pat_match is not None:
-            filled_pattern_match = fill_placeholders(pat_match, params)
+            filled_pattern_match = fill_placeholders(
+                pat_match,
+                params,
+                memo=memo,
+                template_vars_enabled=template_vars_enabled,
+            )
+
+    # Explicit --match / --contains: fill {name} placeholders from params AND
+    # run the generator pre-pass (Task 9) so {{uuid}}/{{ts}}/{{rand}} resolve
+    # to generated values. Consistent with how the live ``kafka listen
+    # messages`` path fills its --match. ``--contains`` is a JSON string; the
+    # fill happens on the raw string BEFORE the caller json.loads it.
+    raw_match = modes.get("match")
+    filled_match = (
+        fill_placeholders(
+            raw_match,
+            params,
+            memo=memo,
+            template_vars_enabled=template_vars_enabled,
+        )
+        if raw_match is not None
+        else None
+    )
+    raw_contains = modes.get("contains")
+    filled_contains = (
+        fill_placeholders(
+            raw_contains,
+            params,
+            memo=memo,
+            template_vars_enabled=template_vars_enabled,
+        )
+        if raw_contains is not None
+        else None
+    )
 
     return {
-        "contains": modes.get("contains"),
-        "match": modes.get("match"),
+        "contains": filled_contains,
+        "match": filled_match,
         "path": modes.get("path"),
         "filled_pattern_match": filled_pattern_match,
     }
@@ -133,7 +187,13 @@ def _build_modes_debug(
     return modes
 
 
-def evaluate_expectations(run_dir: Path, patterns: dict[str, KafkaPattern]) -> list[dict[str, Any]]:
+def evaluate_expectations(
+    run_dir: Path,
+    patterns: dict[str, KafkaPattern],
+    *,
+    memo: dict[str, str] | None = None,
+    template_vars_enabled: bool = True,
+) -> list[dict[str, Any]]:
     """Evaluate every attached expectation against its topic's captured file.
 
     Reads ``asserts.jsonl``; for each spec: resolves its modes, builds the
@@ -147,9 +207,20 @@ def evaluate_expectations(run_dir: Path, patterns: dict[str, KafkaPattern]) -> l
 
     There is no wall-clock cutoff: the scan is bounded by file size only.
 
+    Template-variable generators (Task 9): when ``memo`` is provided, every
+    spec's modes (``--match``, ``--contains``, named pattern) run the generator
+    pre-pass via :func:`resolve_spec_modes` so ``{{uuid}}``/``{{ts}}``/``{{rand}}``
+    tokens resolve to generated values. The SAME ``memo`` shared across all specs
+    in this call makes a repeated token resolve to ONE value within one
+    ``results`` invocation. ``template_vars_enabled=False`` leaves tokens literal.
+    An unknown generator surfaces as :class:`ConfigError` before any capture-file
+    scan.
+
     Args:
         run_dir: The run directory (``<state_dir>/listen-<run_id>``).
         patterns: Mapping of pattern name → :class:`KafkaPattern`.
+        memo: Shared generator-value memo (Task 9); ``None`` keeps legacy behavior.
+        template_vars_enabled: When False, generator tokens pass through literal.
 
     Returns:
         One ``ExpectationResult`` dict per spec, in file order:
@@ -159,7 +230,12 @@ def evaluate_expectations(run_dir: Path, patterns: dict[str, KafkaPattern]) -> l
     results: list[dict[str, Any]] = []
 
     for spec in read_expectations(run_dir):
-        resolved = resolve_spec_modes(spec, patterns)
+        resolved = resolve_spec_modes(
+            spec,
+            patterns,
+            memo=memo,
+            template_vars_enabled=template_vars_enabled,
+        )
 
         # Parse --contains into the needle ONCE so the predicate and the
         # self-debugging modes list share one source of truth (no double
