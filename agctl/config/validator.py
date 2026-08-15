@@ -404,6 +404,133 @@ def validate_config(cfg: Config) -> tuple[list[dict], list[dict]]:
                 }
             )
 
+    # --- mock effects cross-ref validation --------------------------------------
+    # (DESIGN: mock effects) Walk every effect across HTTP stubs and Kafka
+    # reactors: http effects must name a known service; kafka effects must
+    # resolve a cluster with non-empty brokers whose resolved formats are
+    # SR-backed when avro/protobuf. Mirrors mock_run's Guard 5b walk but
+    # reports (errors, warnings) instead of raising. Cluster resolution
+    # mirrors resolve_cluster_name (effect.cluster -> the effect topic's
+    # declared kafka.topics.<topic>.cluster -> default_cluster ->
+    # single-cluster auto-default) but is inlined here so config/ stays free
+    # of a commands/ import (ARCHITECTURE §3).
+    if cfg.mocks is not None:
+        effect_carriers: list[tuple[str, str, list]] = []
+        if cfg.mocks.http is not None:
+            for name, stub in cfg.mocks.http.stubs.items():
+                effect_carriers.append(("http.stubs", name, stub.effects or []))
+        if cfg.mocks.kafka is not None:
+            for name, reactor in cfg.mocks.kafka.reactors.items():
+                effect_carriers.append(
+                    ("kafka.reactors", name, reactor.effects or [])
+                )
+
+        for owner_kind, owner_name, effect_list in effect_carriers:
+            for i, effect in enumerate(effect_list):
+                path_prefix = f"mocks.{owner_kind}.{owner_name}.effects[{i}]"
+                if effect.type == "http":
+                    # http effect -> known service (url-only effects skip).
+                    if (
+                        effect.service is not None
+                        and effect.service not in services
+                    ):
+                        errors.append(
+                            {
+                                "path": f"{path_prefix}.service",
+                                "message": (
+                                    f"http effect references unknown service "
+                                    f"'{effect.service}'"
+                                ),
+                            }
+                        )
+                    continue
+
+                # kafka effect -> resolve cluster name with the same
+                # precedence as resolve_cluster_name (explicit -> topic
+                # binding -> default -> single-cluster auto-default).
+                resolved = effect.cluster
+                if resolved is None:
+                    topic_cfg = cfg.kafka.topics.get(effect.topic)
+                    resolved = (
+                        topic_cfg.cluster if topic_cfg is not None else None
+                    )
+                if resolved is None:
+                    resolved = cfg.kafka.default_cluster
+                if resolved is None and len(cfg.kafka.clusters) == 1:
+                    resolved = next(iter(cfg.kafka.clusters))
+
+                if resolved is None or resolved not in cfg.kafka.clusters:
+                    errors.append(
+                        {
+                            "path": path_prefix,
+                            "message": "kafka effect requires a resolvable cluster",
+                        }
+                    )
+                    continue  # cannot check brokers/formats for an unknown cluster
+
+                cluster = cfg.kafka.clusters[resolved]
+                if not cluster.brokers:
+                    errors.append(
+                        {
+                            "path": path_prefix,
+                            "message": (
+                                f"kafka effect requires "
+                                f"kafka.clusters.{resolved}.brokers"
+                            ),
+                        }
+                    )
+
+                # SR-dependent format check, mirroring the kafka.topics check
+                # above: resolved format = effect override -> topic override
+                # -> cluster default.
+                topic_cfg = cfg.kafka.topics.get(effect.topic)
+                resolved_value_format = (
+                    effect.value_format
+                    or (topic_cfg.value_format if topic_cfg is not None else None)
+                    or cluster.value_format
+                )
+                resolved_key_format = (
+                    effect.key_format
+                    or (topic_cfg.key_format if topic_cfg is not None else None)
+                    or cluster.key_format
+                )
+                sr_needs: list[str] = []
+                if resolved_value_format in {"avro", "protobuf"}:
+                    sr_needs.append(f"value={resolved_value_format}")
+                if resolved_key_format in {"avro", "protobuf"}:
+                    sr_needs.append(f"key={resolved_key_format}")
+                sr_url = cluster.schema_registry_url
+                if sr_needs and not (sr_url and sr_url.strip()):
+                    # Path: effect-level when an override (effect or topic)
+                    # drove the need, else cluster-level (the need arises only
+                    # from a cluster default).
+                    override_drove = (
+                        effect.value_format in {"avro", "protobuf"}
+                        or effect.key_format in {"avro", "protobuf"}
+                        or (
+                            topic_cfg is not None
+                            and (
+                                topic_cfg.value_format in {"avro", "protobuf"}
+                                or topic_cfg.key_format in {"avro", "protobuf"}
+                            )
+                        )
+                    )
+                    errors.append(
+                        {
+                            "path": (
+                                path_prefix
+                                if override_drove
+                                else f"kafka.clusters.{resolved}"
+                            ),
+                            "message": (
+                                f"Kafka effect on topic '{effect.topic}' format "
+                                f"({', '.join(sr_needs)}) requires a schema "
+                                f"registry but cluster '{resolved}' has no "
+                                f"schema_registry_url"
+                            ),
+                        }
+                    )
+
     return errors, warnings
 
 
