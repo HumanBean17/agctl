@@ -1,6 +1,6 @@
 # Design: `agctl mock` — Cross-Transport Effects (HTTP ↔ Kafka)
 
-**Status:** in_progress
+**Status:** implemented
 **Date:** 2026-08-07
 **Branch:** `feat/mock-cross-transport-effects`
 **Affects:** `agctl/config/models.py`; `agctl/mock/effects.py` (new); `agctl/mock/engine.py`; `agctl/mock/http_server.py`; `agctl/mock/kafka_reactor.py`; `agctl/mock/daemon.py`; `agctl/mock/capture_validate.py`; `agctl/commands/mock_commands.py`; `agctl/commands/config_commands.py`; `agctl/config/validator.py`; DESIGN.md §2.1 / §3.6 / §10; ARCHITECTURE.md §3 / §4 / §6 / §10
