@@ -8,7 +8,9 @@ ALL errors for a single report):
   for every HTTP stub with a non-None ``match.jq``, every Kafka reactor with
   a non-None ``match``, and every gRPC stub with a non-None ``match.jq``.
   HTTP stubs are yielded first (in dict order), then Kafka reactors, then
-  gRPC stubs.
+  gRPC stubs. HTTP effects riding on a stub/reactor contribute one
+  ``effects[i].capture.{cap}.from`` label per capture (kafka effects have no
+  capture).
 - :func:`collect_jq_compile_errors` — drives :func:`compile_jq` over every
   expression the walker emits, catching :class:`ConfigError` so a single pass
   surfaces every authoring typo (rather than stopping at the first).
@@ -21,7 +23,7 @@ but neither of those depends on ``mock``.
 from collections.abc import Iterator
 
 from ..assertions import compile_jq
-from ..config.models import MocksConfig
+from ..config.models import Effect, MocksConfig
 from ..errors import ConfigError
 
 
@@ -38,6 +40,13 @@ def iter_mock_jq_expressions(
     gRPC stubs mirror HTTP stubs: ``match.jq`` first, then each
     ``capture.{cap}.from``. A stub/reactor with ``capture=None`` (or no match)
     contributes no capture labels.
+
+    Each HTTP effect in a stub/reactor's ``effects`` list (in list order)
+    appends one ``effects[i].capture.{cap}.from`` label per capture (in dict
+    order) after the carrier's own labels — an HTTP effect's capture ``from``
+    is a jq expression rooted in the call's response envelope, so a malformed
+    one must fail at startup, not silently capture empty. Kafka effects carry
+    no capture and contribute nothing; an ``effects`` of None is skipped.
 
     Walking the capture ``from`` here means :func:`collect_jq_compile_errors`
     (used by ``config validate``) and the engine's Step 0 pre-compile (used by
@@ -58,6 +67,9 @@ def iter_mock_jq_expressions(
             if stub.capture is not None:
                 for cap, spec in stub.capture.items():
                     yield f"mocks.http.stubs.{name}.capture.{cap}.from", spec.from_
+            yield from _iter_http_effect_expressions(
+                f"mocks.http.stubs.{name}", stub.effects
+            )
 
     if mocks.kafka is not None:
         for name, reactor in mocks.kafka.reactors.items():
@@ -69,6 +81,9 @@ def iter_mock_jq_expressions(
                         f"mocks.kafka.reactors.{name}.capture.{cap}.from",
                         spec.from_,
                     )
+            yield from _iter_http_effect_expressions(
+                f"mocks.kafka.reactors.{name}", reactor.effects
+            )
 
     if mocks.grpc is not None:
         for name, stub in mocks.grpc.stubs.items():
@@ -77,6 +92,31 @@ def iter_mock_jq_expressions(
             if stub.capture is not None:
                 for cap, spec in stub.capture.items():
                     yield f"mocks.grpc.stubs.{name}.capture.{cap}.from", spec.from_
+
+
+def _iter_http_effect_expressions(
+    carrier_label: str,
+    effects: list[Effect] | None,
+) -> Iterator[tuple[str, str]]:
+    """Yield ``(label, expr)`` for every HTTP effect capture on one carrier.
+
+    ``carrier_label`` is the owning stub/reactor path (e.g.
+    ``mocks.http.stubs.s``); each HTTP effect at index ``i`` contributes one
+    ``{carrier}.effects[i].capture.{cap}.from`` per capture, in list/dict
+    order. Kafka effects have no ``capture`` field and contribute nothing;
+    ``effects is None`` yields nothing. Shared by both carriers so the label
+    format stays identical (DESIGN: mock effects).
+    """
+    if effects is None:
+        return
+    for i, effect in enumerate(effects):
+        if effect.type != "http" or effect.capture is None:
+            continue
+        for cap, spec in effect.capture.items():
+            yield (
+                f"{carrier_label}.effects[{i}].capture.{cap}.from",
+                spec.from_,
+            )
 
 
 def collect_jq_compile_errors(mocks: MocksConfig | None) -> list[dict]:

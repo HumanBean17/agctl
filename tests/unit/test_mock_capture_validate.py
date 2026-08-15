@@ -20,9 +20,12 @@ from agctl.config.models import (
     GrpcResponse,
     GrpcResponseMessage,
     GrpcStub,
+    HttpEffect,
     HttpMockConfig,
     HttpResponse,
     HttpStub,
+    KafkaEffect,
+    KafkaEffectMessage,
     KafkaMockConfig,
     KafkaReaction,
     KafkaReactor,
@@ -330,6 +333,370 @@ def test_grpc_stub_without_capture_is_skipped():
                     service="pkg.Svc",
                     method="Do",
                     response=GrpcResponse(message={"msg": "{ctx}"}),
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+# --- http-effect object captures: placement vs SUBSEQUENT effects (Task 8) ----
+def test_http_effect_object_capture_whole_field_in_later_body_is_valid():
+    """An object capture on an http effect, used as the whole ``{ctx}`` field in
+    a LATER effect's body, is valid — no error (mirrors the response.body rule)."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "chain": HttpStub(
+                    method="POST",
+                    path="/o",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        HttpEffect(
+                            type="http",
+                            url="https://x/use",
+                            body={"context": "{ctx}"},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+def test_http_effect_object_capture_whole_field_in_later_kafka_value_valid():
+    """Same whole-field rule holds when the later effect is a kafka effect's
+    ``value`` (values item) — valid, no error."""
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "tap": KafkaReactor(
+                    topic="in",
+                    match=".v",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        KafkaEffect(
+                            type="kafka",
+                            topic="out",
+                            values=[
+                                KafkaEffectMessage(value={"context": "{ctx}"}),
+                            ],
+                        ),
+                    ],
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+def test_http_effect_object_capture_unused_by_later_effects_is_allowed():
+    """An object capture no later effect references is NOT an error — chained
+    captures may be consumed only by events / go unused (soft posture)."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "s": HttpStub(
+                    method="POST",
+                    path="/o",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        HttpEffect(
+                            type="http",
+                            url="https://x/other",
+                            body={"unrelated": True},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+def test_http_effect_object_capture_inline_in_later_body_is_flagged():
+    """An object capture used INLINE within a larger string in a later
+    effect's body ('pre={ctx}') -> one placement error at the capture path."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "chain": HttpStub(
+                    method="POST",
+                    path="/o",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        HttpEffect(
+                            type="http",
+                            url="https://x/use",
+                            body={"msg": "pre={ctx}"},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.http.stubs.chain.effects[0].capture.ctx"
+    assert "{ctx}" in errors[0]["message"]
+    assert set(errors[0].keys()) == {"path", "message"}
+
+
+def test_http_effect_object_capture_nested_placeholder_is_flagged():
+    """A nested position (e.g. "v": "{ctx.inner}") is a placement error: the
+    placeholder regex does not match dotted names, so the token would render
+    literally (a silent miss). One error at the capture path."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "chain": HttpStub(
+                    method="POST",
+                    path="/o",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        HttpEffect(
+                            type="http",
+                            url="https://x/use",
+                            body={"v": "{ctx.inner}"},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.http.stubs.chain.effects[0].capture.ctx"
+
+
+def test_http_effect_object_capture_whole_in_later_kafka_key_headers_valid():
+    """The whole-object placeholder may appear in a later effect's
+    value/key/headers (any of the enumerated slot kinds) — whole-field is the
+    valid placement everywhere in the effects walk; only non-whole occurrences
+    are violations."""
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "tap": KafkaReactor(
+                    topic="in",
+                    match=".v",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        KafkaEffect(
+                            type="kafka",
+                            topic="out",
+                            value={"context": "{ctx}"},
+                            key="{ctx}",
+                            headers={"x-trace": "{ctx}"},
+                        ),
+                    ],
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+def test_http_effect_object_capture_inline_in_later_key_flagged():
+    """An inline occurrence in a later kafka effect's key ('pre={ctx}') -> one
+    placement error at the capture path (key is one of the scanned slots)."""
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "tap": KafkaReactor(
+                    topic="in",
+                    match=".v",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        KafkaEffect(
+                            type="kafka",
+                            topic="out",
+                            value={},
+                            key="pre={ctx}",
+                        ),
+                    ],
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.kafka.reactors.tap.effects[0].capture.ctx"
+
+
+def test_http_effect_object_capture_in_later_headers_and_path_flagged():
+    """Inline/nested occurrences in a later http effect's headers value and
+    path are each violations; whole-field '{ctx}' in the same slots is not.
+    Two stubs isolate the flagged case from the whole-field case."""
+    flagged = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "s": HttpStub(
+                    method="POST",
+                    path="/o",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        HttpEffect(
+                            type="http",
+                            url="https://x/use",
+                            path="/items/{ctx.inner}",
+                            headers={"x-ctx": "pre={ctx}"},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(flagged)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.http.stubs.s.effects[0].capture.ctx"
+
+    whole = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "s": HttpStub(
+                    method="POST",
+                    path="/o",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        HttpEffect(
+                            type="http",
+                            url="https://x/use",
+                            path="{ctx}",
+                            headers={"x-ctx": "{ctx}"},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(whole) == []
+
+
+def test_http_effect_object_capture_earlier_effect_use_is_ignored():
+    """Placement is checked against SUBSEQUENT effects only — a use in an
+    EARLIER effect (which runs before the capture exists) is not this check's
+    business (the runtime renders it literally; the jq walk catches nothing
+    here). No error is reported by the placement walk."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "s": HttpStub(
+                    method="POST",
+                    path="/o",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/early",
+                            body={"context": "{ctx}"},
+                        ),
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+def test_http_effect_scalar_capture_never_flagged():
+    """scalar/json captures on http effects are subject to no placement rule —
+    inline use in later effects is fine."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "s": HttpStub(
+                    method="POST",
+                    path="/o",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={
+                                "id": CaptureSpec(from_=".body.id", type="scalar"),
+                                "ctx": CaptureSpec(from_=".body.ctx", type="json"),
+                            },
+                        ),
+                        HttpEffect(
+                            type="http",
+                            url="https://x/use",
+                            body={"msg": "pre={id}", "raw": "{ctx}"},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+def test_kafka_reactor_effects_only_with_capture_does_not_raise():
+    """REGRESSION (T1 ledger): an effects-only reactor (reaction=None) carrying
+    a capture must not crash the reactor walk — the reaction-placement checks
+    are skipped when there is no reaction to misplace captures in."""
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "tap": KafkaReactor(
+                    topic="in",
+                    match=".v",
+                    capture={"ctx": _obj_cap(".value.ctx")},
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/notify",
+                            body={"context": "{ctx}"},
+                        ),
+                    ],
                 ),
             },
         ),
