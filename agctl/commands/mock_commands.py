@@ -726,7 +726,8 @@ def mock_run(
                 Service mode takes base_url/timeout from the named
                 ``services.*`` entry; url mode splits the literal url. Timeout
                 precedence: effect.timeout → service.timeout_seconds (service
-                mode only) → defaults.timeout_seconds.
+                mode only) → defaults.timeout_seconds → 10s hard fallback
+                (httpx timeout=None would disable timeouts entirely).
                 """
                 if effect.service is not None:
                     service = cfg.services[effect.service]
@@ -736,10 +737,11 @@ def mock_run(
                         effect.timeout
                         or service.timeout_seconds
                         or cfg.defaults.timeout_seconds
+                        or 10
                     )
                 else:
                     base_url, path = _split_url(effect.url)
-                    timeout = effect.timeout or cfg.defaults.timeout_seconds
+                    timeout = effect.timeout or cfg.defaults.timeout_seconds or 10
                 if base_url not in effect_clients:
                     effect_clients[base_url] = HttpClient(base_url, timeout)
                 return effect_clients[base_url], path

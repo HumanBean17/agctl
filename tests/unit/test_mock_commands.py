@@ -1225,6 +1225,251 @@ mocks:
             assert ("main:9092",) in recorded
             assert ("effects:9092",) in recorded
 
+    # -- http effect timeout fallback (resolve_timeout parity: ... or 10s) --
+
+    def test_http_effect_url_mode_timeout_falls_back_to_10(
+        self, temp_config, fake_engine
+    ):
+        """url-mode effect with no timeout anywhere (effect.timeout,
+        defaults.timeout_seconds all unset — the common case) -> the client
+        gets a 10s hard timeout, NOT httpx's timeout=None (timeouts off)."""
+        config_content = """
+version: "3"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            url: http://legacy.internal:9999/legacy/path
+            method: GET
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            effect = HttpEffect(
+                type="http", url="http://legacy.internal:9999/legacy/path"
+            )
+            client, _path = http_resolver(effect)
+            assert client._client.timeout == httpx.Timeout(10)
+
+    def test_http_effect_service_mode_timeout_falls_back_to_10(
+        self, temp_config, fake_engine
+    ):
+        """service-mode effect with no timeout anywhere (service has no
+        timeout_seconds, defaults.timeout_seconds unset) -> 10s."""
+        config_content = """
+version: "3"
+services:
+  order-service:
+    base_url: http://orders.internal:8080
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            service: order-service
+            path: /notify
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            client, _path = http_resolver(
+                HttpEffect(type="http", service="order-service", path="/notify")
+            )
+            assert client._client.timeout == httpx.Timeout(10)
+
+    def test_http_effect_explicit_timeout_wins(self, temp_config, fake_engine):
+        """effect.timeout beats both defaults.timeout_seconds and the 10s
+        fallback (both modes; distinct base_urls so per-host caching doesn't
+        mask the difference)."""
+        config_content = """
+version: "3"
+defaults:
+  timeout_seconds: 9
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            url: http://a.internal:1/x
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            # url mode: explicit timeout beats defaults (9) and the 10s fallback
+            client, _path = http_resolver(
+                HttpEffect(type="http", url="http://a.internal:1/x", timeout=3.5)
+            )
+            assert client._client.timeout == httpx.Timeout(3.5)
+
+    def test_http_effect_defaults_timeout_used_when_no_effect_timeout(
+        self, temp_config, fake_engine
+    ):
+        """url mode, effect.timeout unset but defaults.timeout_seconds set ->
+        defaults wins over the 10s fallback."""
+        config_content = """
+version: "3"
+defaults:
+  timeout_seconds: 9
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            url: http://legacy.internal:9999/legacy/path
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            client, _path = http_resolver(
+                HttpEffect(type="http", url="http://legacy.internal:9999/x")
+            )
+            assert client._client.timeout == httpx.Timeout(9)
+
+    def test_http_effect_service_timeout_beats_defaults(
+        self, temp_config, fake_engine
+    ):
+        """service.timeout_seconds (7) beats defaults.timeout_seconds (9);
+        the 10s fallback only fires when both are unset."""
+        config_content = """
+version: "3"
+defaults:
+  timeout_seconds: 9
+services:
+  order-service:
+    base_url: http://orders.internal:8080
+    timeout_seconds: 7
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            service: order-service
+            path: /notify
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            client, _path = http_resolver(
+                HttpEffect(type="http", service="order-service", path="/notify")
+            )
+            assert client._client.timeout == httpx.Timeout(7)
+
 
 # Task 7: mock start daemon argv forwards --overlay
 @pytest.mark.skipif(
