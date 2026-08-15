@@ -41,10 +41,11 @@ class FakeHTTPServer:
     The bind call can be configured to raise EADDRINUSE to test port-in-use errors.
     """
 
-    def __init__(self, server_address, RequestHandlerClass, *, stubs, emit_event, concurrency_cap=64):
+    def __init__(self, server_address, RequestHandlerClass, *, stubs, emit_event, concurrency_cap=64, effect_executor=None):
         self.server_address = server_address
         self.stubs = stubs
         self.emit_event = emit_event
+        self.effect_executor = effect_executor  # stub-effects executor forwarded by the engine (Task 4)
         self.bind_called = True  # Binding happens in __init__ for ThreadingHTTPServer
         self.serve_called = False
         self.shutdown_called = False
@@ -1915,6 +1916,45 @@ def test_effect_executor_built_when_http_resolver_present():
 
     engine = _effect_engine(lambda _line: None, http_resolver=_fake_http_resolver)
     assert isinstance(engine._effect_executor, EffectExecutor)
+
+
+def test_effect_executor_forwarded_to_http_server():
+    """The engine's executor is threaded into the MockHTTPServer it binds (Task 4)."""
+    captured_lines = []
+    fake_http_instances = []
+
+    def make_fake_http(*args, **kwargs):
+        server = FakeHTTPServer(*args, **kwargs)
+        fake_http_instances.append(server)
+        return server
+
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            listen="127.0.0.1:0",
+            stubs={"stub1": HttpStub(method="GET", path="/test", response=HttpResponse(status=200))},
+        ),
+    )
+
+    with patch("agctl.mock.engine.MockHTTPServer", side_effect=make_fake_http):
+        engine = MockEngine(
+            mocks=mocks,
+            run_http=True,
+            run_kafka=False,
+            http_listen="127.0.0.1:0",
+            kafka_clients=None,
+            emit_fn=captured_lines.append,
+            run_id="test-run-effects-fwd",
+            kafka_resolver=_fake_kafka_resolver,
+        )
+        engine.start()
+
+        # The bound server received the engine's executor instance verbatim.
+        assert len(fake_http_instances) == 1
+        assert fake_http_instances[0].effect_executor is engine._effect_executor
+
+        engine._stop.set()
+        engine.run()
+        engine.shutdown()
 
 
 def test_effect_events_tally_and_effect_error_sets_runtime_error_exit_1():

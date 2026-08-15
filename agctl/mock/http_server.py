@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from agctl.assertions import jq_bool, json_subset
 from agctl.mock.capture import resolve_captures
+from agctl.mock.effects import EffectExecutor
 from agctl.mock.routing import match_path
 from agctl.resolution import CaptureValue, render_typed
 
@@ -60,6 +61,8 @@ def make_handler(
     stubs: dict[str, Any],
     emit_event: Callable[[dict[str, Any]], None],
     semaphore: threading.Semaphore,
+    *,
+    effect_executor: EffectExecutor | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Factory that creates a BaseHTTPRequestHandler bound to stubs/emit_event/semaphore.
 
@@ -67,6 +70,9 @@ def make_handler(
         stubs: Ordered dict of stub_name -> HttpStub (insertion order matters)
         emit_event: Engine's single-writer event callable (already locked)
         semaphore: Concurrency cap semaphore (acquire before delay_ms)
+        effect_executor: Runs a matched stub's ``effects`` inside the
+            semaphore-held block, before the response is sent. ``None``
+            (or a stub without ``effects``) skips the effect path entirely.
 
     Returns:
         A BaseHTTPRequestHandler subclass configured for the mock server.
@@ -344,6 +350,17 @@ def make_handler(
                     if stub.delay_ms > 0:
                         time.sleep(stub.delay_ms / 1000.0)
 
+                    # Run the stub's cross-transport effects BEFORE the
+                    # response (and before http.hit): the trigger's full side
+                    # work — delay + effects — is what the caller waits on, so
+                    # duration_ms honestly includes effect latency. The
+                    # executor never raises (it emits effect.error itself) and
+                    # its outcome does not alter this response: in default
+                    # mode the failure surfaces at the run level (T3), and the
+                    # request still completes normally.
+                    if effect_executor is not None and stub.effects:
+                        effect_executor.run(stub.effects, captures, stub_name)
+
                     # Emit BEFORE sending the response (see the 404 path): the
                     # handler thread runs emit -> send, so the event is appended
                     # before the client can receive the response. duration_ms is
@@ -386,6 +403,8 @@ class MockHTTPServer(ThreadingHTTPServer):
         stubs: Ordered dict of stub_name -> HttpStub.
         emit_event: Engine's single-writer event callable.
         concurrency_cap: Max concurrent requests (default 64).
+        effect_executor: Runs matched stubs' ``effects`` before the response
+            (forwarded to make_handler; None disables the effect path).
     """
 
     def __init__(
@@ -396,13 +415,17 @@ class MockHTTPServer(ThreadingHTTPServer):
         stubs: dict[str, Any],
         emit_event: Callable[[dict[str, Any]], None],
         concurrency_cap: int = 64,
+        effect_executor: EffectExecutor | None = None,
     ):
         self.stubs = stubs
         self.emit_event = emit_event
         self.semaphore = threading.Semaphore(concurrency_cap)
+        self.effect_executor = effect_executor
 
         # Auto-create handler if not provided
         if RequestHandlerClass is None:
-            RequestHandlerClass = make_handler(stubs, emit_event, self.semaphore)
+            RequestHandlerClass = make_handler(
+                stubs, emit_event, self.semaphore, effect_executor=effect_executor
+            )
 
         super().__init__(server_address, RequestHandlerClass)

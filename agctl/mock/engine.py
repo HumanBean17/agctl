@@ -139,8 +139,8 @@ class MockEngine:
         # least one resolver is injected — a resolver-less engine (e.g. today's
         # new_mock_engine call site, updated in Task 6) keeps pre-effects
         # behavior exactly. Events flow back through self.emit_event so the
-        # executor needs no counters of its own. The executor is NOT yet
-        # threaded into the HTTP server / reactor constructions (Tasks 4-5).
+        # executor needs no counters of its own. The executor is threaded
+        # into the HTTP server construction (Task 4); reactors follow (Task 5).
         if kafka_resolver is not None or http_resolver is not None:
             self._effect_executor: EffectExecutor | None = EffectExecutor(
                 kafka_resolver=kafka_resolver,
@@ -376,6 +376,7 @@ class MockEngine:
                         stubs=stubs,
                         emit_event=self.emit_event,
                         concurrency_cap=64,
+                        effect_executor=self._effect_executor,
                     )
                 except OSError as e:
                     # Check for EADDRINUSE (port already in use)
