@@ -24,6 +24,7 @@ from ..assertions import compile_jq
 from ..config.models import GrpcDescriptorSource, MocksConfig, parse_listen
 from ..errors import ConfigError
 from .capture_validate import collect_capture_placement_errors
+from .effects import EffectExecutor
 from .http_server import MockHTTPServer
 from .jq_precompile import iter_mock_jq_expressions
 from .kafka_reactor import KafkaReactor as KafkaReactorClass
@@ -69,6 +70,8 @@ class MockEngine:
         grpc_server_factory: Callable[..., Any] | None = None,
         top_level_descriptors: list[GrpcDescriptorSource] | None = None,
         reaction_codecs: dict[str, Any] | None = None,  # reactor name -> codec dict (Task 12)
+        kafka_resolver: Callable | None = None,  # EffectExecutor kafka resolver (Task 3)
+        http_resolver: Callable | None = None,  # EffectExecutor http resolver (Task 3)
     ):
         """Initialize the mock engine.
 
@@ -108,6 +111,15 @@ class MockEngine:
                 (today's byte-identical JSON path). ``None`` (the default)
                 means no reactor has a reaction codec — preserves pre-Task-12
                 behavior across every reactor.
+            kafka_resolver: DI seam returning ``(client, codec)`` for a
+                kafka effect (Task 3, cross-transport effects). Resolved by
+                the command layer from the effect's cluster+topic+format.
+            http_resolver: DI seam returning ``(client, path)`` for an http
+                effect (Task 3). Resolved by the command layer from the
+                effect's service/url. When at least one resolver is not None
+                the engine constructs its :class:`EffectExecutor`; the
+                executor is threaded into the HTTP server / reactors in
+                Tasks 4-5.
         """
         self._mocks = mocks
         self._run_http = run_http
@@ -122,6 +134,21 @@ class MockEngine:
         self._grpc_listen = grpc_listen
         self._top_level_descriptors = top_level_descriptors
         self._reaction_codecs = reaction_codecs
+
+        # Cross-transport effect executor (Task 3). Constructed only when at
+        # least one resolver is injected — a resolver-less engine (e.g. today's
+        # new_mock_engine call site, updated in Task 6) keeps pre-effects
+        # behavior exactly. Events flow back through self.emit_event so the
+        # executor needs no counters of its own. The executor is NOT yet
+        # threaded into the HTTP server / reactor constructions (Tasks 4-5).
+        if kafka_resolver is not None or http_resolver is not None:
+            self._effect_executor: EffectExecutor | None = EffectExecutor(
+                kafka_resolver=kafka_resolver,
+                http_resolver=http_resolver,
+                emit_event=self.emit_event,
+            )
+        else:
+            self._effect_executor = None
 
         # DI seam. The default lazy-imports the real MockGrpcServer INSIDE the
         # closure body so the engine module stays grpcio-free at import time
@@ -162,6 +189,9 @@ class MockEngine:
         self._grpc_hits = 0
         self._grpc_unmatched = 0
         self._grpc_errors = 0
+        self._kafka_produced = 0
+        self._http_called = 0
+        self._effect_errors = 0
         self._runtime_error = False  # Track if any runtime error occurred
         # Set True only after the started line is emitted; gates summary so a
         # failed start (which never emitted started) cannot emit a spurious
@@ -229,6 +259,19 @@ class MockEngine:
                 # emits it with fatal=True; treat it as such unconditionally,
                 # mirroring kafka.error's fatal branch).
                 self._grpc_errors += 1
+                self._runtime_error = True
+            elif event_name == "kafka.produced":
+                # Cross-transport effect: one kafka message produced (Task 3).
+                self._kafka_produced += 1
+            elif event_name == "http.called":
+                # Cross-transport effect: one outbound http call (Task 3).
+                self._http_called += 1
+            elif event_name == "effect.error":
+                # Effect failure — always fatal (the executor emits it with
+                # fatal=True; treat it as such unconditionally, mirroring
+                # grpc.error above), so a failed effect fails the run
+                # regardless of --fail-fast.
+                self._effect_errors += 1
                 self._runtime_error = True
             # capture.missing needs no new counter (informational only).
 
@@ -687,6 +730,9 @@ class MockEngine:
             grpc_hits = self._grpc_hits
             grpc_unmatched = self._grpc_unmatched
             grpc_errors = self._grpc_errors
+            kafka_produced = self._kafka_produced
+            http_called = self._http_called
+            effect_errors = self._effect_errors
 
         summary_line = {
             "event": "summary",
@@ -699,6 +745,9 @@ class MockEngine:
             "grpc_hits": grpc_hits,
             "grpc_unmatched": grpc_unmatched,
             "grpc_errors": grpc_errors,
+            "kafka_produced": kafka_produced,
+            "http_called": http_called,
+            "effect_errors": effect_errors,
             "duration_ms": duration_ms,
         }
 

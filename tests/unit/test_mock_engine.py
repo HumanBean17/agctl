@@ -1864,6 +1864,125 @@ def test_run_grpc_without_mocks_grpc_raises_config_error():
         engine.start()
 
 
+# =============================================================================
+# Cross-transport effect executor wiring (Task 3): resolver params, executor
+# construction, effect.* event taxonomy, summary counters
+# =============================================================================
+
+
+def _fake_kafka_resolver(effect):
+    """Fake kafka_resolver handoff — returns a client/codec pair."""
+    return (object(), None)
+
+
+def _fake_http_resolver(effect):
+    """Fake http_resolver handoff — returns a client/path pair."""
+    return (object(), "/x")
+
+
+def _effect_engine(capture_emit, *, kafka_resolver=None, http_resolver=None):
+    """No-op engine with the effect resolvers wired (no transports started)."""
+    return MockEngine(
+        mocks=None,
+        run_http=False,
+        run_kafka=False,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        emit_fn=capture_emit,
+        run_id="test-run-effects",
+        kafka_resolver=kafka_resolver,
+        http_resolver=http_resolver,
+    )
+
+
+def test_effect_executor_none_without_resolvers():
+    """No resolvers → no executor (the engine preserves pre-effects behavior)."""
+    engine = _effect_engine(lambda _line: None)
+    assert engine._effect_executor is None
+
+
+def test_effect_executor_built_when_kafka_resolver_present():
+    """A kafka resolver alone is enough to construct the executor."""
+    from agctl.mock.effects import EffectExecutor
+
+    engine = _effect_engine(lambda _line: None, kafka_resolver=_fake_kafka_resolver)
+    assert isinstance(engine._effect_executor, EffectExecutor)
+
+
+def test_effect_executor_built_when_http_resolver_present():
+    """An http resolver alone is enough to construct the executor."""
+    from agctl.mock.effects import EffectExecutor
+
+    engine = _effect_engine(lambda _line: None, http_resolver=_fake_http_resolver)
+    assert isinstance(engine._effect_executor, EffectExecutor)
+
+
+def test_effect_events_tally_and_effect_error_sets_runtime_error_exit_1():
+    """``kafka.produced``/``http.called`` tally; ``effect.error`` tallies AND
+    sets the runtime-error flag UNCONDITIONALLY (mirroring grpc.unmatched /
+    grpc.error), so a failed effect fails the run even without --fail-fast."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    engine = _effect_engine(
+        capture_emit,
+        kafka_resolver=_fake_kafka_resolver,
+        http_resolver=_fake_http_resolver,
+    )
+    engine.start()
+
+    for _ in range(2):
+        engine.emit_event({"event": "kafka.produced", "trigger": "s", "topic": "t"})
+    engine.emit_event({"event": "http.called", "trigger": "s", "url": "http://x", "status_code": 200})
+    engine.emit_event(
+        {
+            "event": "effect.error",
+            "trigger": "s",
+            "effect_type": "kafka",
+            "error": "x",
+            "fatal": True,
+        }
+    )
+
+    assert engine._kafka_produced == 2
+    assert engine._http_called == 1
+    assert engine._effect_errors == 1
+    assert engine._runtime_error is True
+
+    engine._stop.set()
+    exit_code = engine.run()
+    assert exit_code == 1, "effect.error sets _runtime_error → exit 1"
+
+    engine.shutdown()
+
+    summary = [l for l in captured_lines if l.get("event") == "summary"][0]
+    assert summary["kafka_produced"] == 2
+    assert summary["http_called"] == 1
+    assert summary["effect_errors"] == 1
+
+
+def test_summary_line_contains_effect_counter_keys():
+    """The summary line carries the three new effect counter keys (zero-valued
+    when no effect events were emitted)."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    engine = _effect_engine(capture_emit)
+    engine.start()
+    engine._stop.set()
+    engine.run()
+    engine.shutdown()
+
+    summary = [l for l in captured_lines if l.get("event") == "summary"][0]
+    assert summary["kafka_produced"] == 0
+    assert summary["http_called"] == 0
+    assert summary["effect_errors"] == 0
+
+
 def test_default_grpc_server_factory_lazy_imports_real_server():
     """The default ``grpc_server_factory`` (None) lazy-imports ``MockGrpcServer``
     from ``agctl.mock.grpc_server`` so the engine module itself stays grpcio-free
