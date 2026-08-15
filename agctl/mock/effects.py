@@ -1,11 +1,12 @@
 """Cross-transport effect executor (DESIGN: mock effects, Task 2).
 
 The executor is the pure dispatch core behind a stub's/reactor's ``effects``
-list: render each effect's templates against the live capture namespace,
-dispatch to a transport client, chain HTTP response captures back into the
-namespace, and stop at the first failure. It is dependency-injected and
-extra-free — the resolvers hand in the real clients (Kafka/HTTP), so this
-module imports no ``confluent_kafka``/``httpx`` anywhere.
+list: resolve ``{{gen}}`` tokens (one memo per run), render each effect's
+templates against the live capture namespace, dispatch to a transport client,
+chain HTTP response captures back into the namespace, and stop at the first
+failure. It is dependency-injected and extra-free — the resolvers hand in the
+real clients (Kafka/HTTP), so this module imports no
+``confluent_kafka``/``httpx`` anywhere.
 
 Events (shapes are contracts; downstream consumers grep them):
 
@@ -30,6 +31,7 @@ from typing import Any, Callable
 from ..clients.kafka_client import _encode_payload_with_codec
 from ..config.models import HttpEffect, KafkaEffect, KafkaEffectMessage
 from ..resolution import CaptureValue, render_typed
+from ..template_vars import substitute_generators
 from .capture import resolve_captures
 
 
@@ -103,8 +105,22 @@ class EffectExecutor:
         if not effects:
             return EffectOutcome(ok=True)
 
+        # Generator pre-pass (per-run memo): resolve ``{{gen}}`` tokens across
+        # every effect's renderable fields BEFORE the ``{capture}`` pass. One
+        # memo per run() call = the same token resolves to one value within one
+        # trigger's effect list (§2.5 single-invocation semantics). The two
+        # brace syntaxes never collide; a generated value is then literal to
+        # render_typed. Done as a copy-pass over the model fields rather than
+        # mutating the config models — effects may run on every trigger.
+        memo: dict[str, str] = {}
         for effect in effects:
             try:
+                if effect.type == "kafka":
+                    effect = self._pregen_kafka(effect, memo)
+                elif effect.type == "http":
+                    effect = self._pregen_http(effect, memo)
+                else:  # pragma: no cover - discriminated union admits no else
+                    continue
                 if effect.type == "kafka":
                     self._run_kafka(effect, namespace, trigger_label)
                 elif effect.type == "http":
@@ -124,6 +140,64 @@ class EffectExecutor:
         return EffectOutcome(ok=True)
 
     # ------------------------------------------------------------------
+    # generator pre-pass ({{gen}} tokens)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pregen_kafka(effect: KafkaEffect, memo: dict[str, str]) -> KafkaEffect:
+        """Return a copy of ``effect`` with ``{{gen}}`` tokens resolved.
+
+        Scans the renderable payload fields: ``value`` / ``values[*].value`` /
+        ``key`` / ``headers`` (top-level and per-item). ``topic`` / ``cluster``
+        / format fields are targeting metadata, not payload — left verbatim.
+        """
+        updates: dict[str, Any] = {}
+        if effect.values is not None:
+            updates["values"] = [
+                KafkaEffectMessage(
+                    value=substitute_generators(item.value, memo),
+                    key=(
+                        substitute_generators(item.key, memo)
+                        if item.key is not None
+                        else None
+                    ),
+                    headers=(
+                        substitute_generators(item.headers, memo)
+                        if item.headers is not None
+                        else None
+                    ),
+                )
+                for item in effect.values
+            ]
+        else:
+            updates["value"] = substitute_generators(effect.value, memo)
+            if effect.key is not None:
+                updates["key"] = substitute_generators(effect.key, memo)
+        if effect.headers is not None:
+            updates["headers"] = substitute_generators(effect.headers, memo)
+        return effect.model_copy(update=updates)
+
+    @staticmethod
+    def _pregen_http(effect: HttpEffect, memo: dict[str, str]) -> HttpEffect:
+        """Return a copy of ``effect`` with ``{{gen}}`` tokens resolved.
+
+        Scans ``body`` / ``headers`` / and ``path`` in service mode (service
+        mode's path is rendered against the namespace at dispatch, so a token
+        there is meaningful); url mode's ``url`` is a literal base and its path
+        is split from it — left verbatim.
+        """
+        updates: dict[str, Any] = {}
+        if effect.body is not None:
+            updates["body"] = substitute_generators(effect.body, memo)
+        if effect.headers is not None:
+            updates["headers"] = substitute_generators(effect.headers, memo)
+        if effect.service is not None:
+            updates["path"] = substitute_generators(effect.path, memo)
+        if not updates:
+            return effect
+        return effect.model_copy(update=updates)
+
+    # ------------------------------------------------------------------
     # kafka
     # ------------------------------------------------------------------
 
@@ -136,7 +210,18 @@ class EffectExecutor:
         """Render and produce one kafka effect (one message per element)."""
         client, codec = self._kafka_resolver(effect)
         if effect.values is not None:
-            messages = effect.values
+            # Spec §6.1: top-level key/headers are per-message defaults —
+            # a values item that omits its own falls back to the top-level one.
+            messages = [
+                KafkaEffectMessage(
+                    value=item.value,
+                    key=item.key if item.key is not None else effect.key,
+                    headers=(
+                        item.headers if item.headers is not None else effect.headers
+                    ),
+                )
+                for item in effect.values
+            ]
         else:
             messages = [
                 KafkaEffectMessage(
@@ -188,6 +273,10 @@ class EffectExecutor:
     ) -> None:
         """Render, call, and capture-chain one http effect."""
         client, path = self._http_resolver(effect)
+        # Service-mode path carries {placeholder}s (spec §6.2); url mode's path
+        # was split from the literal url and stays fully literal.
+        if effect.service is not None:
+            path = render_typed(path, namespace)
         rendered_headers = (
             render_typed(effect.headers, namespace)
             if effect.headers is not None

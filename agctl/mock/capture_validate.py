@@ -140,11 +140,12 @@ def _effect_slot_values(later: Effect) -> list[tuple[Any, bool]]:
     ``string_only`` marks slots that cannot carry an object at all — ``key`` /
     ``headers`` (top-level and per-``values[*]``-item), mirroring
     ``reaction.key`` / ``reaction.headers``. kafka effect: ``value`` plus every
-    ``values[*]`` item's ``value``/``key``/``headers`` (when ``values`` is set,
-    top-level ``key``/``headers`` are defaults, not rendered slots — the
-    per-item ones are). http effect: ``body``, ``path``, ``headers`` (``url``
-    is a literal base — placeholders ride on ``path``). Trees may be None; the
-    walker ignores non-str leaves.
+    ``values[*]`` item's ``value``/``key``/``headers`` plus the top-level
+    ``key``/``headers`` (they are the per-message fallback for ``values`` items
+    that omit their own, so a whole-object placeholder there would render into
+    a live item). http effect: ``body``, ``path``, ``headers`` (``path``
+    placeholders render in service mode; ``url`` is a literal base). Trees may
+    be None; the walker ignores non-str leaves.
     """
     if later.type == "kafka":
         slots: list[tuple[Any, bool]] = [(later.key, True), (later.headers, True)]

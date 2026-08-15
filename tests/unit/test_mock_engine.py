@@ -41,11 +41,12 @@ class FakeHTTPServer:
     The bind call can be configured to raise EADDRINUSE to test port-in-use errors.
     """
 
-    def __init__(self, server_address, RequestHandlerClass, *, stubs, emit_event, concurrency_cap=64, effect_executor=None):
+    def __init__(self, server_address, RequestHandlerClass, *, stubs, emit_event, concurrency_cap=64, effect_executor=None, fail_fast=False):
         self.server_address = server_address
         self.stubs = stubs
         self.emit_event = emit_event
         self.effect_executor = effect_executor  # stub-effects executor forwarded by the engine (Task 4)
+        self.fail_fast = fail_fast  # response-abort flag forwarded by the engine (fix wave I5)
         self.bind_called = True  # Binding happens in __init__ for ThreadingHTTPServer
         self.serve_called = False
         self.shutdown_called = False

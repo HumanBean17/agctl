@@ -180,6 +180,36 @@ def test_kafka_multi_message_two_produces_in_order(emit_event):
     assert produced[1]["key"] == "k9"
 
 
+def test_kafka_values_item_falls_back_to_top_level_key_and_headers(emit_event):
+    """Spec §6.1 fallback: a values item omitting key/headers inherits the
+    top-level ones; an item with its own keeps its own."""
+    client = FakeKafkaClient()
+    executor = EffectExecutor(
+        kafka_resolver=lambda effect: (client, None),
+        http_resolver=_no_http,
+        emit_event=emit_event,
+    )
+
+    effect = KafkaEffect(
+        type="kafka",
+        topic="t",
+        key="{x}",
+        headers={"src": "mock"},
+        values=[
+            KafkaEffectMessage(value={"n": 1}),  # omits both -> top-level
+            KafkaEffectMessage(value={"n": 2}, key="own", headers={"h": "own"}),
+        ],
+    )
+    outcome = executor.run([effect], {"x": CaptureValue("k9", "scalar")}, "s")
+
+    assert outcome.ok is True
+    first, second = client.produce_calls
+    assert first["key"] == b"k9"  # rendered top-level fallback
+    assert first["headers"] == {"src": "mock"}
+    assert second["key"] == b"own"  # item's own wins
+    assert second["headers"] == {"h": "own"}
+
+
 # ---------------------------------------------------------------------------
 # HTTP effects + capture chaining
 # ---------------------------------------------------------------------------
@@ -262,6 +292,49 @@ def test_http_service_event_carries_service_not_url(emit_event):
     assert len(called) == 1
     assert called[0]["service"] == "orders"
     assert "url" not in called[0]
+
+
+def test_http_service_mode_path_renders_placeholders(emit_event):
+    """Spec §6.2: a service-mode path's ``{placeholder}`` renders from the
+    namespace before the request (the resolver hands back effect.path verbatim;
+    the executor renders it)."""
+    http_client = FakeHttpClient()
+    executor = EffectExecutor(
+        kafka_resolver=_no_kafka,
+        http_resolver=lambda effect: (http_client, effect.path),
+        emit_event=emit_event,
+    )
+
+    outcome = executor.run(
+        [HttpEffect(type="http", service="orders", path="/orders/{orderId}")],
+        {"orderId": CaptureValue("o-42", "scalar")},
+        "s",
+    )
+
+    assert outcome.ok is True
+    assert http_client.request_calls[0]["path"] == "/orders/o-42"
+    called = [e for e in emit_event.events if e["event"] == "http.called"]
+    assert called[0]["path"] == "/orders/o-42"
+
+
+def test_http_url_mode_path_stays_literal(emit_event):
+    """Url mode: the path was split from the literal url — no rendering."""
+    http_client = FakeHttpClient()
+    executor = EffectExecutor(
+        kafka_resolver=_no_kafka,
+        http_resolver=lambda effect: (http_client, "/legacy/{orderId}"),
+        emit_event=emit_event,
+    )
+
+    outcome = executor.run(
+        [HttpEffect(type="http", url="http://svc/legacy/{orderId}")],
+        {"orderId": CaptureValue("o-42", "scalar")},
+        "s",
+    )
+
+    assert outcome.ok is True
+    # The literal braces survive (nothing in url mode renders).
+    assert http_client.request_calls[0]["path"] == "/legacy/{orderId}"
 
 
 def test_http_capture_last_wins(emit_event):
@@ -350,8 +423,91 @@ def test_http_capture_missing_emits_event_and_empty_slot(emit_event):
 
 
 # ---------------------------------------------------------------------------
-# Failure short-circuit
+# Generator pre-pass ({{gen}} tokens)
 # ---------------------------------------------------------------------------
+
+
+_UUID_RE = __import__("re").compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+def test_generator_token_in_kafka_value_resolves(emit_event):
+    """``{{uuid}}`` in a kafka effect's value produces a UUID-shaped value —
+    not the literal token."""
+    client = FakeKafkaClient()
+    executor = EffectExecutor(
+        kafka_resolver=lambda effect: (client, None),
+        http_resolver=_no_http,
+        emit_event=emit_event,
+    )
+
+    outcome = executor.run(
+        [KafkaEffect(type="kafka", topic="t", value={"id": "{{uuid}}"})],
+        {},
+        "s",
+    )
+
+    assert outcome.ok is True
+    produced_value = json.loads(client.produce_calls[0]["value"])
+    assert _UUID_RE.match(produced_value["id"]) is not None
+
+
+def test_generator_token_resolves_once_per_run(emit_event):
+    """The same ``{{uuid}}`` token in two effects of one run resolves to ONE
+    value (per-run memo, single-invocation semantics)."""
+    client = FakeKafkaClient()
+    http_client = FakeHttpClient()
+    executor = EffectExecutor(
+        kafka_resolver=lambda effect: (client, None),
+        http_resolver=lambda effect: (http_client, effect.path),
+        emit_event=emit_event,
+    )
+
+    outcome = executor.run(
+        [
+            KafkaEffect(type="kafka", topic="t1", value={"id": "{{uuid}}"}),
+            KafkaEffect(type="kafka", topic="t2", key="{{uuid}}", value=1),
+        ],
+        {},
+        "s",
+    )
+
+    assert outcome.ok is True
+    first = json.loads(client.produce_calls[0]["value"])
+    second_key = client.produce_calls[1]["key"].decode()
+    assert first["id"] == second_key
+
+
+def test_generator_token_in_http_body_and_service_path(emit_event):
+    """``{{rand}}`` renders in an http effect's body and service-mode path."""
+    http_client = FakeHttpClient()
+    executor = EffectExecutor(
+        kafka_resolver=_no_kafka,
+        http_resolver=lambda effect: (http_client, effect.path),
+        emit_event=emit_event,
+    )
+
+    outcome = executor.run(
+        [
+            HttpEffect(
+                type="http",
+                service="orders",
+                path="/t/{{rand:4}}",
+                body={"nonce": "{{rand:4}}"},
+            )
+        ],
+        {},
+        "s",
+    )
+
+    assert outcome.ok is True
+    call = http_client.request_calls[0]
+    # Both tokens resolved (4 hex chars each), and per-run memoing means the
+    # SAME token text resolved to one value in both fields.
+    assert call["path"] != "/t/{{rand:4}}"
+    assert call["body"]["nonce"] != "{{rand:4}}"
+    assert call["path"].endswith(call["body"]["nonce"])
 
 
 def test_kafka_failure_short_circuits_remaining_effects(emit_event):

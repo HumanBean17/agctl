@@ -716,9 +716,12 @@ def mock_run(
                 return resolved
 
         if has_http_effects:
-            # base_url -> HttpClient: effects targeting the same host share
-            # one pooled client (connection reuse), built lazily on first use.
-            effect_clients: dict[str, HttpClient] = {}
+            # (base_url, timeout) -> HttpClient: effects targeting the same
+            # host AND timeout share one pooled client (connection reuse),
+            # built lazily on first use. Timeout is part of the key so a
+            # per-effect ``timeout`` is never discarded by an earlier client
+            # built for the same base_url with a different timeout.
+            effect_clients: dict[tuple[str, float], HttpClient] = {}
 
             def http_resolver(effect: HttpEffect):
                 """Resolve an http effect to ``(HttpClient, path)``.
@@ -742,9 +745,10 @@ def mock_run(
                 else:
                     base_url, path = _split_url(effect.url)
                     timeout = effect.timeout or cfg.defaults.timeout_seconds or 10
-                if base_url not in effect_clients:
-                    effect_clients[base_url] = HttpClient(base_url, timeout)
-                return effect_clients[base_url], path
+                cache_key = (base_url, timeout)
+                if cache_key not in effect_clients:
+                    effect_clients[cache_key] = HttpClient(base_url, timeout)
+                return effect_clients[cache_key], path
 
         # Guard 6: Resolve http_listen
         if http_listen is not None:

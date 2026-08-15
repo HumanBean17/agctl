@@ -966,6 +966,69 @@ mocks:
             assert c1 is c2
             assert (p1, p2) == ("/a", "/b")
 
+    def test_http_effect_resolver_timeout_joins_cache_key(
+        self, temp_config, fake_engine
+    ):
+        """The client cache keys on (base_url, timeout): two effects on the
+        same service with different ``timeout`` values get DIFFERENT clients,
+        so a per-effect timeout is never discarded by an earlier build."""
+        config_content = """
+version: "3"
+services:
+  order-service:
+    base_url: http://orders.internal:8080
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            service: order-service
+            path: /a
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            c1, _ = http_resolver(
+                HttpEffect(type="http", service="order-service", path="/a")
+            )
+            c2, _ = http_resolver(
+                HttpEffect(
+                    type="http", service="order-service", path="/b", timeout=2
+                )
+            )
+            c3, _ = http_resolver(
+                HttpEffect(type="http", service="order-service", path="/c")
+            )
+            # Same (base_url, resolved-timeout) -> same client; a different
+            # timeout -> a distinct client carrying that timeout.
+            assert c1 is c3
+            assert c1 is not c2
+            assert c1._client.timeout == httpx.Timeout(10)
+            assert c2._client.timeout == httpx.Timeout(2)
+
     def test_http_effect_resolver_url_mode(self, temp_config, fake_engine):
         """An http effect with a literal url -> resolver splits base_url/path
         from the url (no configured service needed)."""

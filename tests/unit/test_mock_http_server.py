@@ -45,6 +45,7 @@ def start_server(
     emit_event: callable,
     concurrency_cap: int = 64,
     effect_executor: Any = None,
+    fail_fast: bool = False,
 ) -> MockHTTPServer:
     """Start a MockHTTPServer in a background thread and return it."""
     server = MockHTTPServer(
@@ -53,6 +54,7 @@ def start_server(
         emit_event=emit_event,
         concurrency_cap=concurrency_cap,
         effect_executor=effect_executor,
+        fail_fast=fail_fast,
     )
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1161,6 +1163,55 @@ class TestStubEffects:
             assert response.status_code == 201
             assert response.json() == {"ok": True}
             assert len(executor.calls) == 1
+            assert [e["event"] for e in event_sink] == ["http.hit"]
+        finally:
+            server.shutdown()
+
+    def test_fail_fast_effect_failure_aborts_response(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """Spec §5.9: under fail_fast, an ok=False effect outcome aborts BEFORE
+        the response is written — the client sees a connection-level failure,
+        not the stub's 201, and no http.hit is emitted."""
+        executor = FakeEffectExecutor(outcome=EffectOutcome(ok=False, error="boom"))
+        server = start_server(
+            {"notify-order": self._stub()},
+            emit_event,
+            effect_executor=executor,
+            fail_fast=True,
+        )
+        port = server.server_port
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                with pytest.raises(httpx.HTTPError):
+                    client.post(f"http://127.0.0.1:{port}/notify", json={"id": "c1"})
+
+            assert len(executor.calls) == 1
+            # No response was served -> no http.hit on the stream.
+            assert [e["event"] for e in event_sink] == []
+        finally:
+            server.shutdown()
+
+    def test_fail_fast_ok_effect_still_responds(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """fail_fast only changes the FAILURE path: a successful effect run
+        still serves the stub response under --fail-fast."""
+        executor = FakeEffectExecutor()  # ok=True
+        server = start_server(
+            {"notify-order": self._stub()},
+            emit_event,
+            effect_executor=executor,
+            fail_fast=True,
+        )
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/notify", json={"id": "c1"}
+                )
+
+            assert response.status_code == 201
             assert [e["event"] for e in event_sink] == ["http.hit"]
         finally:
             server.shutdown()

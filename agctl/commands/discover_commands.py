@@ -182,12 +182,29 @@ def _mock_http_example(stub, listen: str) -> str:
     return f"curl -i -X {stub.method} http://{bracketed}:{port}{stub.path}"
 
 
+def _reactor_target(reactor) -> str:
+    """Where a reactor's output goes: ``reaction.topic`` or an effect target.
+
+    A reaction-mode reactor names its topic. An effects-only reactor has no
+    ``reaction`` (legal since the cross-transport effects feature): show the
+    first kafka effect's topic, or ``<effects>`` when its effects are all http
+    calls (no kafka target to name).
+    """
+    if reactor.reaction is not None:
+        return reactor.reaction.topic
+    for effect in reactor.effects or []:
+        if effect.type == "kafka":
+            return effect.topic
+    return "<effects>"
+
+
 def _mock_kafka_example(reactor) -> str:
     # Reactors consume from ``topic``; trigger by producing, then the reactor
-    # emits to ``reaction.topic``. ``--message`` is required by kafka produce.
+    # emits to ``reaction.topic`` (or its effects' target — see
+    # ``_reactor_target``). ``--message`` is required by kafka produce.
     return (
         f"agctl kafka produce --topic {reactor.topic} --message '<json>'"
-        f"  # reactor emits to {reactor.reaction.topic}"
+        f"  # reactor emits to {_reactor_target(reactor)}"
     )
 
 
@@ -478,10 +495,22 @@ def _item_core(config_path: str | None, category: str, name: str, overlay_paths:
             "description": reactor.description,
             "topic": reactor.topic,
             "consumer_group": reactor.consumer_group,
-            "reaction": reactor.reaction.model_dump(by_alias=True, exclude_none=True),
+            # Reaction-mode reactors serialize their reaction; effects-only
+            # reactors (legal since the cross-transport effects feature) set
+            # None and surface their ordered effect list instead.
+            "reaction": (
+                reactor.reaction.model_dump(by_alias=True, exclude_none=True)
+                if reactor.reaction is not None
+                else None
+            ),
             "example": _mock_kafka_example(reactor),
             "note": "Active only while `agctl mock run` (kafka engine) is running.",
         }
+        if reactor.effects is not None:
+            item["effects"] = [
+                effect.model_dump(by_alias=True, exclude_none=True)
+                for effect in reactor.effects
+            ]
         if reactor.match is not None:
             item["match"] = reactor.match
         if reactor.capture:

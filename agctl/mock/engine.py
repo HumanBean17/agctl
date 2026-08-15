@@ -379,6 +379,7 @@ class MockEngine:
                         emit_event=self.emit_event,
                         concurrency_cap=64,
                         effect_executor=self._effect_executor,
+                        fail_fast=self._fail_fast,
                     )
                 except OSError as e:
                     # Check for EADDRINUSE (port already in use)
