@@ -40,6 +40,7 @@ trick ``test_mock_daemon.py`` uses for ``mock start``.
 from __future__ import annotations
 
 import json
+import os
 import select
 import socket
 import subprocess
@@ -96,6 +97,10 @@ class MockRunHandle:
     fixed sleep) and records the bound HTTP base URL. Kafka-only runs emit
     ``started`` with ``http: null`` — ``base_url`` is then None, which those
     tests ignore.
+
+    stdout is drained exclusively through ``os.read`` on the raw fd (see
+    ``_drain_ready``); the pipe's TextIOWrapper buffer is never touched, so
+    no line can hide from the readiness wait behind a userspace buffer.
     """
 
     def __init__(self, config_file: Path):
@@ -108,49 +113,76 @@ class MockRunHandle:
         )
         self.lines: list[str] = []
         self.base_url: str | None = None
+        self._buf = b""  # unterminated stdout tail between os.read() chunks
         self._wait_for_started(timeout=30.0)
 
-    def _wait_for_started(self, timeout: float) -> None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                break  # died early; drain what we have and let asserts fail
-            line = self.proc.stdout.readline()
-            if not line:
-                time.sleep(0.1)
-                continue
-            line = line.strip()
-            if not line:
-                continue
-            self.lines.append(line)
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    def _drain_ready(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` for stdout, then read it at the fd level.
+
+        ``select()`` is used only to wait for readiness; the read itself is
+        ``os.read`` on the raw fd with line-splitting done here. A buffered
+        ``readline()`` can pull a whole pipe chunk (several lines) into the
+        TextIOWrapper's userspace buffer, after which ``select()`` reports
+        the fd as not-ready for the buffered remainder — an event landing
+        behind an earlier line in the same read would then hide from
+        ``wait_for`` until its full timeout. Returns False on EOF (the child
+        closed stdout), True otherwise.
+        """
+        fd = self.proc.stdout.fileno()
+        ready, _, _ = select.select([fd], [], [], timeout)
+        if not ready:
+            return True  # nothing arrived in time; pipe still open
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return False  # EOF
+        # Only complete lines are decoded, so a multi-byte character split
+        # across chunks is never mangled.
+        parts = (self._buf + chunk).split(b"\n")
+        self._buf = parts.pop()
+        for raw in parts:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                self.lines.append(line)
+        return True
+
+    def _started_event(self) -> dict | None:
+        for event in self.events():
             if event.get("event") == "started":
+                return event
+        return None
+
+    def _wait_for_started(self, timeout: float) -> None:
+        """Poll stdout until ``started``, EOF, or the deadline.
+
+        On EOF the process is already gone (its exit code is asserted later).
+        On deadline the process is still live — terminate and reap it so a
+        start-timeout never leaks a ``mock run`` holding its port.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            event = self._started_event()
+            if event is not None:
                 listen = (event.get("http") or {}).get("listen", "")
                 if listen:
                     self.base_url = f"http://{listen}"
+                return
+            if not self._drain_ready(timeout=0.1):
+                return  # died early; drain what we have and let asserts fail
+            if time.monotonic() >= deadline:
+                self.stop_and_collect()
                 return
 
     def pump(self, budget: float = 0.3) -> None:
         """Drain currently-available stdout lines into ``self.lines``.
 
-        The engine flushes each event line under its emit lock, so a line
-        reported ready by select() is complete. Used while polling for
-        asynchronous events (reactor effects land on reactor threads).
+        Reads via ``_drain_ready`` (fd-level, no buffered readline) while the
+        budget lasts. Used while polling for asynchronous events (reactor
+        effects land on reactor threads).
         """
         deadline = time.monotonic() + budget
         while time.monotonic() < deadline:
-            ready, _, _ = select.select([self.proc.stdout], [], [], 0.05)
-            if not ready:
-                continue
-            line = self.proc.stdout.readline()
-            if not line:
+            if not self._drain_ready(timeout=0.05):
                 return  # EOF
-            line = line.strip()
-            if line:
-                self.lines.append(line)
 
     def events(self) -> list[dict]:
         """Parse every NDJSON line collected so far into event dicts."""
@@ -189,11 +221,16 @@ class MockRunHandle:
         """SIGTERM, wait for exit (never SIGKILL), drain stdout, return events."""
         self.proc.terminate()
         self.proc.wait(timeout=timeout)
-        remaining = self.proc.stdout.read() if self.proc.stdout else ""
-        for line in remaining.splitlines():
-            line = line.strip()
-            if line:
-                self.lines.append(line)
+        # The pipe hits EOF once the reaped child's write end closes. The
+        # deadline only guards a pathological grandchild holding that end open
+        # forever — everything the child wrote is already buffered by then.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and self._drain_ready(timeout=0.5):
+            pass
+        tail = self._buf.decode("utf-8", errors="replace").strip()
+        if tail:
+            self.lines.append(tail)
+        self._buf = b""
         return self.events()
 
     def summary(self) -> dict:
@@ -242,32 +279,35 @@ class TestHttpToKafkaEffects:
         }))
 
         mock = MockRunHandle(config_file)
-        assert mock.base_url is not None, f"mock did not start: {mock.lines}"
+        try:
+            assert mock.base_url is not None, f"mock did not start: {mock.lines}"
 
-        request = _run_cli(config_file, [
-            "http", "request",
-            "--url", f"{mock.base_url}/fire",
-            "--method", "POST",
-            "--body", json.dumps({"id": "o1"}),
-        ])
-        assert request.returncode == 0, (
-            f"http request failed: {request.stdout} {request.stderr}"
-        )
-        assert json.loads(request.stdout)["result"]["status_code"] == 200
+            request = _run_cli(config_file, [
+                "http", "request",
+                "--url", f"{mock.base_url}/fire",
+                "--method", "POST",
+                "--body", json.dumps({"id": "o1"}),
+            ])
+            assert request.returncode == 0, (
+                f"http request failed: {request.stdout} {request.stderr}"
+            )
+            assert json.loads(request.stdout)["result"]["status_code"] == 200
 
-        consume = _run_cli(config_file, [
-            "kafka", "consume",
-            "--topic", events_topic,
-            "--timeout", "15",
-            "--expect-count", "1",
-            "--match", '.value.id == "o1"',
-        ])
-        assert consume.returncode == 0, (
-            f"kafka consume failed: rc={consume.returncode} "
-            f"out={consume.stdout} err={consume.stderr}"
-        )
-
-        events = mock.stop_and_collect()
+            consume = _run_cli(config_file, [
+                "kafka", "consume",
+                "--topic", events_topic,
+                "--timeout", "15",
+                "--expect-count", "1",
+                "--match", '.value.id == "o1"',
+            ])
+            assert consume.returncode == 0, (
+                f"kafka consume failed: rc={consume.returncode} "
+                f"out={consume.stdout} err={consume.stderr}"
+            )
+        finally:
+            # Guarantee teardown on every path: an orphaned `mock run` holds
+            # its port and broker connections past the pytest session.
+            events = mock.stop_and_collect()
         produced = [e for e in events
                     if e.get("event") == "kafka.produced"
                     and e.get("topic") == events_topic]
@@ -313,34 +353,35 @@ class TestHttpToKafkaEffects:
         }))
 
         mock = MockRunHandle(config_file)
-        assert mock.base_url is not None, f"mock did not start: {mock.lines}"
+        try:
+            assert mock.base_url is not None, f"mock did not start: {mock.lines}"
 
-        request = _run_cli(config_file, [
-            "http", "request",
-            "--url", f"{mock.base_url}/fanout",
-            "--method", "POST",
-            "--body", json.dumps({"id": "m1"}),
-        ])
-        assert request.returncode == 0, (
-            f"http request failed: {request.stdout} {request.stderr}"
-        )
+            request = _run_cli(config_file, [
+                "http", "request",
+                "--url", f"{mock.base_url}/fanout",
+                "--method", "POST",
+                "--body", json.dumps({"id": "m1"}),
+            ])
+            assert request.returncode == 0, (
+                f"http request failed: {request.stdout} {request.stderr}"
+            )
 
-        consume = _run_cli(config_file, [
-            "kafka", "consume",
-            "--topic", events_topic,
-            "--timeout", "15",
-            "--expect-count", "2",
-            "--match", '.value.id == "m1"',
-        ])
-        assert consume.returncode == 0, (
-            f"kafka consume failed: rc={consume.returncode} "
-            f"out={consume.stdout} err={consume.stderr}"
-        )
-        messages = json.loads(consume.stdout)["result"]["messages"]
-        seqs = sorted(m["value"]["seq"] for m in messages)
-        assert seqs == [1, 2], f"expected both values produced, got {seqs}"
-
-        events = mock.stop_and_collect()
+            consume = _run_cli(config_file, [
+                "kafka", "consume",
+                "--topic", events_topic,
+                "--timeout", "15",
+                "--expect-count", "2",
+                "--match", '.value.id == "m1"',
+            ])
+            assert consume.returncode == 0, (
+                f"kafka consume failed: rc={consume.returncode} "
+                f"out={consume.stdout} err={consume.stderr}"
+            )
+            messages = json.loads(consume.stdout)["result"]["messages"]
+            seqs = sorted(m["value"]["seq"] for m in messages)
+            assert seqs == [1, 2], f"expected both values produced, got {seqs}"
+        finally:
+            events = mock.stop_and_collect()
         produced = [e for e in events
                     if e.get("event") == "kafka.produced"
                     and e.get("topic") == events_topic]
@@ -624,24 +665,25 @@ class TestFatalEffectError:
         ))
 
         mock = MockRunHandle(config_file)
-        assert mock.base_url is not None, f"mock did not start: {mock.lines}"
+        try:
+            assert mock.base_url is not None, f"mock did not start: {mock.lines}"
 
-        request = _run_cli(config_file, [
-            "http", "request",
-            "--url", f"{mock.base_url}/boom",
-            "--method", "POST",
-            "--body", json.dumps({"id": "x1"}),
-        ])
-        # The trigger completes normally even though its effect failed — the
-        # failure is fatal to the RUN, not to the request.
-        assert request.returncode == 0, (
-            f"trigger request should complete: {request.stdout} {request.stderr}"
-        )
-        assert json.loads(request.stdout)["result"]["status_code"] == 200
-
-        # The effect executor emits effect.error BEFORE http.hit/response, so
-        # by the time the request returned the event is already flushed.
-        mock.stop_and_collect()
+            request = _run_cli(config_file, [
+                "http", "request",
+                "--url", f"{mock.base_url}/boom",
+                "--method", "POST",
+                "--body", json.dumps({"id": "x1"}),
+            ])
+            # The trigger completes normally even though its effect failed —
+            # the failure is fatal to the RUN, not to the request.
+            assert request.returncode == 0, (
+                f"trigger request should complete: {request.stdout} {request.stderr}"
+            )
+            assert json.loads(request.stdout)["result"]["status_code"] == 200
+        finally:
+            # The effect executor emits effect.error BEFORE http.hit/response,
+            # so by the time the request returned the event is already flushed.
+            mock.stop_and_collect()
         errors = mock.events_of("effect.error")
         assert len(errors) == 1, f"expected 1 effect.error, got {errors}"
         assert errors[0]["fatal"] is True
@@ -706,12 +748,16 @@ class TestDaemonFatalStopVerdict:
              "mock", "start", "--only", "http", "--state-dir", str(state_dir)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90,
         )
-        assert start.returncode == 0, f"mock start failed: {start.stdout}{start.stderr}"
-        started = json.loads(start.stdout)
-        assert started["ok"] is True
-        pid = started["result"]["pid"]
-
+        # Everything from here on runs under the stop: a failed or malformed
+        # start must not leak the daemon the process may have spawned.
         try:
+            assert start.returncode == 0, (
+                f"mock start failed: {start.stdout}{start.stderr}"
+            )
+            started = json.loads(start.stdout)
+            assert started["ok"] is True
+            pid = started["result"]["pid"]
+
             self._drive_fatal_effect(port)
             self._wait_for_effect_error(state_dir)
         finally:
