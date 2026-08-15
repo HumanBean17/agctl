@@ -223,7 +223,9 @@ def collect_unknown_template_errors(cfg: Config) -> list[dict]:
                         stub.response.headers,
                     )
                 for i, effect in enumerate(stub.effects or []):
-                    _check_effect(check, f"mocks.http.stubs.{name}.effects[{i}]", effect)
+                    _check_effect(
+                        check, f"mocks.http.stubs.{name}.effects[{i}]", effect
+                    )
         if mocks.kafka is not None:
             for name, reactor in mocks.kafka.reactors.items():
                 check(f"mocks.kafka.reactors.{name}.match", reactor.match)
