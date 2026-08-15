@@ -15,8 +15,9 @@ from typing import TYPE_CHECKING
 
 import click
 
+from ..clients.http_client import HttpClient
 from ..command import envelope, load_config_or_raise
-from ..config.models import MocksConfig, parse_listen
+from ..config.models import HttpEffect, KafkaEffect, MocksConfig, parse_listen
 from ..daemon import (
     require_posix_daemon as _require_posix_daemon,
     spawn_daemon,
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 __all__ = ["mock_run", "new_mock_engine", "mock_start", "mock_stop", "mock_status"]
 
 # Import from kafka_commands to avoid duplication (no circular import)
+from .http_commands import _split_url
 from .kafka_commands import _resolve_codec, new_kafka_client, resolve_cluster_name
 
 # Import daemon lifecycle helpers (Task 2: pidfile, liveness; Task 3: log parser)
@@ -71,6 +73,8 @@ def new_mock_engine(
     grpc_server_factory: "Callable[..., Any] | None" = None,
     top_level_descriptors: "list[GrpcDescriptorSource] | None" = None,
     reaction_codecs: "dict[str, Any] | None" = None,
+    kafka_resolver: "Callable | None" = None,
+    http_resolver: "Callable | None" = None,
 ):
     """Build a MockEngine (test seam — monkeypatched in tests).
 
@@ -82,6 +86,11 @@ def new_mock_engine(
     ``reaction_codecs`` (Task 12) forwards per-reactor reaction codec dicts
     resolved from the REACTION topic's format. Default None keeps every
     reactor on today's JSON reaction path (byte-identical to pre-Task-12).
+
+    ``kafka_resolver`` / ``http_resolver`` (Task 6, cross-transport effects)
+    forward the command-layer closures that resolve an effect to its client
+    (+ codec / path). Both default None — the engine then builds no
+    EffectExecutor and pre-effects behavior is preserved byte-for-byte.
     """
     from ..mock.engine import MockEngine
 
@@ -99,7 +108,27 @@ def new_mock_engine(
         grpc_server_factory=grpc_server_factory,
         top_level_descriptors=top_level_descriptors,
         reaction_codecs=reaction_codecs,
+        kafka_resolver=kafka_resolver,
+        http_resolver=http_resolver,
     )
+
+
+def _effect_lists(mocks: MocksConfig) -> list[tuple[str, str, list]]:
+    """Yield ``(owner_kind, owner_name, effects)`` for every effects-carrier.
+
+    ``owner_kind`` is the config-scoped dotted segment — ``http.stubs`` or
+    ``kafka.reactors`` — so callers can build precise
+    ``mocks.<kind>.<name>.effects[i].<field>`` error paths. Carriers with no
+    effects are yielded with an empty list only when the sub-config exists.
+    """
+    owners: list[tuple[str, str, list]] = []
+    if mocks.http is not None:
+        for name, stub in mocks.http.stubs.items():
+            owners.append(("http.stubs", name, stub.effects or []))
+    if mocks.kafka is not None:
+        for name, reactor in mocks.kafka.reactors.items():
+            owners.append(("kafka.reactors", name, reactor.effects or []))
+    return owners
 
 
 def _resolve_engines(
@@ -503,13 +532,15 @@ def mock_run(
         # probe (the probe runs once per cluster, not once per codec).
         kafka_clients: dict[str, KafkaClient] | None = None
         reaction_codecs: dict[str, dict] = {}
+        # Shared cluster state: one KafkaClient per distinct cluster (reactors
+        # AND kafka effects reuse it) and the set of clusters whose SR has been
+        # probed this run (probe at most once per cluster across reactors,
+        # trigger+reaction pairs, and effects). Declared OUTSIDE the run_kafka
+        # block because a kafka effect on an HTTP-only config still needs both.
+        clients_by_cluster: dict[str, KafkaClient] = {}
+        probed_clusters: set[str] = set()
         if run_kafka:
             kafka_clients = {}
-            clients_by_cluster: dict[str, KafkaClient] = {}
-            # Track which clusters have already been SR-probed so the probe
-            # runs at most once per cluster even when multiple reactors (or
-            # the trigger+reaction pair) on that cluster resolve to non-JSON.
-            probed_clusters: set[str] = set()
             for reactor_name, reactor in cfg.mocks.kafka.reactors.items():
                 try:
                     cluster_name = resolve_cluster_name(
@@ -554,12 +585,17 @@ def mock_run(
                 )
                 if trigger_codec is not None:
                     probed_clusters.add(cluster_name)
-                reaction_codec, _r_vf, _r_kf = _resolve_codec(
-                    cfg, reactor.reaction.topic, cluster_name, None, None,
-                    probe=cluster_name not in probed_clusters,
-                )
-                if reaction_codec is not None:
-                    probed_clusters.add(cluster_name)
+                # Effects-only reactor (cross-transport, Task 6): there is no
+                # ``reaction`` topic, so no reaction codec — the reactor's
+                # outputs go through the EffectExecutor instead.
+                reaction_codec = None
+                if reactor.reaction is not None:
+                    reaction_codec, _r_vf, _r_kf = _resolve_codec(
+                        cfg, reactor.reaction.topic, cluster_name, None, None,
+                        probe=cluster_name not in probed_clusters,
+                    )
+                    if reaction_codec is not None:
+                        probed_clusters.add(cluster_name)
 
                 # Trigger client: codec-aware per-reactor when non-JSON;
                 # shared-by-cluster when JSON (today's optimization — all
@@ -579,6 +615,134 @@ def mock_run(
                 # via encode_payload before client.produce(_raw=True).
                 if reaction_codec is not None:
                     reaction_codecs[reactor_name] = reaction_codec
+
+        # Guard 5b (Task 6, cross-transport effects): walk every effect across
+        # HTTP stubs and Kafka reactors. The walk (1) fails fast on effects
+        # that cannot resolve — an http effect naming an unknown service, a
+        # kafka effect on an unresolvable cluster — BEFORE the engine is
+        # constructed, and (2) builds the resolver closures the engine's
+        # EffectExecutor needs. No effects anywhere ⇒ both resolvers stay None
+        # and the engine keeps its pre-effects behavior byte-for-byte.
+        kafka_resolver = None
+        http_resolver = None
+        has_kafka_effects = False
+        has_http_effects = False
+        if cfg.mocks is not None:
+            for owner_kind, owner_name, effect_list in _effect_lists(cfg.mocks):
+                for i, effect in enumerate(effect_list or []):
+                    path_prefix = f"mocks.{owner_kind}.{owner_name}.effects[{i}]"
+                    if effect.type == "http":
+                        has_http_effects = True
+                        if effect.service is not None and effect.service not in cfg.services:
+                            raise ConfigError(
+                                f"http effect references unknown service "
+                                f"'{effect.service}'",
+                                {
+                                    "service": effect.service,
+                                    "path": f"{path_prefix}.service",
+                                },
+                            )
+                    else:
+                        has_kafka_effects = True
+                        # Resolve eagerly so an unresolvable cluster fails
+                        # startup (exit 2) here, not mid-run inside the
+                        # executor. Binding = the effect topic's declared
+                        # cluster (kafka.topics.<topic>.cluster), mirroring the
+                        # reactor walk's use of reactor.cluster.
+                        topic_cfg = cfg.kafka.topics.get(effect.topic)
+                        binding = topic_cfg.cluster if topic_cfg is not None else None
+                        try:
+                            cluster_name = resolve_cluster_name(
+                                cfg.kafka,
+                                explicit=effect.cluster,
+                                binding_cluster=binding,
+                            )
+                        except ConfigError as e:
+                            raise ConfigError(
+                                e.message,
+                                {**e.detail, "path": f"{path_prefix}.cluster"},
+                            ) from e
+                        if cluster_name not in clients_by_cluster:
+                            clients_by_cluster[cluster_name] = new_kafka_client(
+                                cfg.kafka.clusters[cluster_name]
+                            )
+
+        if has_kafka_effects:
+            # Per-(cluster, topic, formats) codec cache. The client itself is
+            # codec-less — effect produces go out ``_raw`` and the executor
+            # encodes via the codec returned here (the same client can serve
+            # effects with different formats on one cluster).
+            effect_codec_cache: dict[tuple[str, str, str | None, str | None], tuple[Any, Any]] = {}
+
+            def kafka_resolver(effect: KafkaEffect):
+                """Resolve a kafka effect to ``(KafkaClient, codec)``.
+
+                Cluster chain: explicit ``effect.cluster`` → the effect
+                topic's declared ``kafka.topics.<topic>.cluster`` →
+                ``default_cluster`` / single-cluster auto-default. Shares
+                ``clients_by_cluster``/``probed_clusters`` with the reactor
+                walk so a cluster's client is built once and its SR probe
+                runs at most once per run.
+                """
+                topic_cfg = cfg.kafka.topics.get(effect.topic)
+                binding = topic_cfg.cluster if topic_cfg is not None else None
+                cluster_name = resolve_cluster_name(
+                    cfg.kafka, explicit=effect.cluster, binding_cluster=binding
+                )
+                cache_key = (
+                    cluster_name,
+                    effect.topic,
+                    effect.value_format,
+                    effect.key_format,
+                )
+                if cache_key in effect_codec_cache:
+                    return effect_codec_cache[cache_key]
+                if cluster_name not in clients_by_cluster:
+                    clients_by_cluster[cluster_name] = new_kafka_client(
+                        cfg.kafka.clusters[cluster_name]
+                    )
+                codec, _vf, _kf = _resolve_codec(
+                    cfg,
+                    effect.topic,
+                    cluster_name,
+                    effect.value_format,
+                    effect.key_format,
+                    probe=cluster_name not in probed_clusters,
+                )
+                if codec is not None:
+                    probed_clusters.add(cluster_name)
+                resolved = (clients_by_cluster[cluster_name], codec)
+                effect_codec_cache[cache_key] = resolved
+                return resolved
+
+        if has_http_effects:
+            # base_url -> HttpClient: effects targeting the same host share
+            # one pooled client (connection reuse), built lazily on first use.
+            effect_clients: dict[str, HttpClient] = {}
+
+            def http_resolver(effect: HttpEffect):
+                """Resolve an http effect to ``(HttpClient, path)``.
+
+                Service mode takes base_url/timeout from the named
+                ``services.*`` entry; url mode splits the literal url. Timeout
+                precedence: effect.timeout → service.timeout_seconds (service
+                mode only) → defaults.timeout_seconds.
+                """
+                if effect.service is not None:
+                    service = cfg.services[effect.service]
+                    base_url = service.base_url
+                    path = effect.path
+                    timeout = (
+                        effect.timeout
+                        or service.timeout_seconds
+                        or cfg.defaults.timeout_seconds
+                    )
+                else:
+                    base_url, path = _split_url(effect.url)
+                    timeout = effect.timeout or cfg.defaults.timeout_seconds
+                if base_url not in effect_clients:
+                    effect_clients[base_url] = HttpClient(base_url, timeout)
+                return effect_clients[base_url], path
 
         # Guard 6: Resolve http_listen
         if http_listen is not None:
@@ -623,6 +787,8 @@ def mock_run(
             grpc_listen=grpc_listen,
             top_level_descriptors=descriptors,
             reaction_codecs=reaction_codecs or None,
+            kafka_resolver=kafka_resolver,
+            http_resolver=http_resolver,
         )
 
         # Start the engine (probes + binds — may raise ConfigError/ConnectionFailure)
