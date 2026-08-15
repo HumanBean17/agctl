@@ -1,6 +1,6 @@
 """Pydantic v2 schema models for agctl.yaml (DESIGN §2)."""
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -301,6 +301,94 @@ class CaptureSpec(BaseModel):
     type: Literal["scalar", "object", "json"] = "scalar"
 
 
+class KafkaEffectMessage(BaseModel):
+    """One element of a ``KafkaEffect.values`` list (multi-message produce)."""
+
+    value: Any
+    key: str | None = None
+    headers: dict[str, str] | None = None
+
+
+class KafkaEffect(BaseModel):
+    """Cross-transport Kafka produce effect (DESIGN: mock effects).
+
+    Exactly one of :attr:`value` (single message; top-level :attr:`key` /
+    :attr:`headers` ride along) or :attr:`values` (ordered multi-message
+    produce, each element carrying its own ``key``/``headers``) must be set.
+    Execution semantics are a later task; this model enforces only the
+    structural exactly-one-of.
+    """
+
+    type: Literal["kafka"]
+    topic: str
+    value: Any | None = None
+    values: list[KafkaEffectMessage] | None = None
+    key: str | None = None
+    headers: dict[str, str] | None = None
+    # Named cluster this effect produces to (mirrors KafkaReactor.cluster).
+    cluster: str | None = None
+    value_format: Literal["json", "avro", "protobuf"] | None = None
+    key_format: Literal["string", "avro", "protobuf"] | None = None
+
+    @field_validator("headers")
+    @classmethod
+    def _check_headers(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        """Ensure all header values are strings (mirrors ``KafkaReaction._check_headers``)."""
+        if v is None:
+            return v
+        for key, val in v.items():
+            if not isinstance(val, str):
+                raise ValueError(
+                    f"header value for {key!r} must be a string, got {type(val).__name__}"
+                )
+        return v
+
+    @model_validator(mode="after")
+    def _exactly_one_of_value_or_values(self) -> "KafkaEffect":
+        """Enforce exactly-one-of ``value`` / ``values`` (structural check)."""
+        if (self.value is not None) == (self.values is not None):
+            raise ValueError("kafka effect requires exactly one of `value`/`values`")
+        return self
+
+
+class HttpEffect(BaseModel):
+    """Cross-transport HTTP call effect (DESIGN: mock effects).
+
+    Exactly one of :attr:`service` (a named ``services`` entry; ``base_url`` +
+    ``path``) or :attr:`url` (absolute) must be set. :attr:`capture` reads
+    values off the outgoing call's *response* envelope; it inherits
+    :class:`CaptureSpec`'s ``from`` alias and ``populate_by_name``.
+    """
+
+    type: Literal["http"]
+    service: str | None = None
+    url: str | None = None
+    path: str = "/"
+    method: str = "GET"
+    headers: dict[str, str] | None = None
+    body: Any | None = None
+    timeout: float | None = None
+    capture: dict[str, CaptureSpec] | None = None
+
+    @field_validator("method")
+    @classmethod
+    def _normalize_method(cls, v: str) -> str:
+        """Normalize HTTP method to uppercase (mirrors ``HttpStub._normalize_method``)."""
+        return v.upper()
+
+    @model_validator(mode="after")
+    def _exactly_one_of_service_or_url(self) -> "HttpEffect":
+        """Enforce exactly-one-of ``service`` / ``url`` (structural check)."""
+        if (self.service is not None) == (self.url is not None):
+            raise ValueError("http effect requires exactly one of `service`/`url`")
+        return self
+
+
+# Discriminated union on the ``type`` literal: parse-time routing to the right
+# variant (and a loud ValidationError on an unknown ``type``).
+Effect = Annotated[Union[KafkaEffect, HttpEffect], Field(discriminator="type")]
+
+
 class HttpStub(BaseModel):
     """HTTP mock stub definition."""
 
@@ -311,6 +399,8 @@ class HttpStub(BaseModel):
     capture: dict[str, CaptureSpec] | None = None
     response: HttpResponse
     delay_ms: int = 0
+    # Cross-transport effects fired after the stub responds (later tasks).
+    effects: list[Effect] | None = None
 
     @field_validator("method")
     @classmethod
@@ -359,17 +449,31 @@ class KafkaReaction(BaseModel):
 
 
 class KafkaReactor(BaseModel):
-    """Kafka reactor definition (consumes and reacts)."""
+    """Kafka reactor definition (consumes and reacts).
+
+    Exactly one of :attr:`reaction` (produce to a Kafka topic) or
+    :attr:`effects` (cross-transport effect list, e.g. an HTTP call) must be
+    set; both or neither is a structural error caught here at parse time.
+    """
 
     description: str | None = None
     topic: str
     consumer_group: str | None = None
     match: str | None = None
     capture: dict[str, CaptureSpec] | None = None
-    reaction: KafkaReaction
+    reaction: KafkaReaction | None = None
+    # Cross-transport effects fired after the reactor matches (later tasks).
+    effects: list[Effect] | None = None
     # Named cluster this reactor binds to (DESIGN §7, consumed in Task 3).
     # None -> resolved via default_cluster / single-cluster auto-default.
     cluster: str | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_of_reaction_or_effects(self) -> "KafkaReactor":
+        """Enforce exactly-one-of ``reaction`` / ``effects`` (structural check)."""
+        if (self.reaction is not None) == (self.effects is not None):
+            raise ValueError("reactor requires exactly one of `reaction`/`effects`")
+        return self
 
 
 class KafkaMockConfig(BaseModel):
