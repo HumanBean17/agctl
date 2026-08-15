@@ -140,7 +140,8 @@ class MockEngine:
         # new_mock_engine call site, updated in Task 6) keeps pre-effects
         # behavior exactly. Events flow back through self.emit_event so the
         # executor needs no counters of its own. The executor is threaded
-        # into the HTTP server construction (Task 4); reactors follow (Task 5).
+        # into the HTTP server construction (Task 4) and each Kafka reactor
+        # (Task 5).
         if kafka_resolver is not None or http_resolver is not None:
             self._effect_executor: EffectExecutor | None = EffectExecutor(
                 kafka_resolver=kafka_resolver,
@@ -342,6 +343,7 @@ class MockEngine:
                         fail_fast=self._fail_fast,
                         run_id=self._run_id,
                         reaction_codec=reaction_codecs.get(name),
+                        effect_executor=self._effect_executor,
                     )
                     self._reactors.append(reactor)
 
