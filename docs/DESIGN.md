@@ -227,6 +227,26 @@ mocks:
         # capture:
         #   cust_id: { from: ".body.customer_id" }            # nested path / header reachable
         #   ctx:     { from: ".body.context", type: object }  # whole-object pass-through
+        # effects: OPTIONAL ordered list of cross-transport side effects fired
+        # after the stub matches, synchronously BEFORE the response is sent
+        # (a 2xx response guarantees every effect landed). Each entry is one of:
+        #   - type: kafka  — produce to `topic` (own cluster/format chain:
+        #     cluster → kafka.topics.<topic>.cluster → default_cluster). `value`
+        #     (one message) XOR `values` (ordered multi-message, each
+        #     {value, key?, headers?}); top-level key/headers are per-message
+        #     defaults that a `values` item omitting its own falls back to.
+        #   - type: http   — one outbound call. `service` + `path` (supports
+        #     {placeholder}) XOR literal `url`; optional method/headers/body/
+        #     timeout; optional `capture` off the response envelope
+        #     ({status_code, headers, body, ...}) feeding later effects.
+        # Fields render via {capture} placeholders (later effects see earlier
+        # captures); `{{uuid}}`/`{{ts}}`/`{{rand}}` generators resolve once
+        # per trigger. Failure is fatal: `effect.error` event → exit 1; under
+        # `--fail-fast` the HTTP response is aborted (connection-level failure).
+        # effects:
+        #   - type: kafka
+        #     topic: orders.events
+        #     value: { id: "{cust_id}", type: "CREATED" }
         response:
           status: 201
           headers: { Content-Type: "application/json" }
@@ -260,6 +280,20 @@ mocks:
         #   tid:   { from: ".key" }
         #   rqUID: { from: ".headers.rqUID" }
         #   ctx:   { from: ".value.context", type: object }
+        # effects: OPTIONAL ordered cross-transport side effects (same shape as
+        # the HTTP stub `effects` entries above: kafka produce / http call,
+        # capture-chaining, fatal on failure). Runs inside the reactor's
+        # per-message handler, after this reactor's `capture`, before COMMIT.
+        # `reaction` XOR `effects` — a reactor with only `effects` (e.g. a
+        # Kafka→HTTP tap that produces nothing) is valid; the legacy
+        # `reaction` still emits `kafka.reacted`.
+        # effects:
+        #   - type: http
+        #     service: order-service
+        #     method: POST
+        #     path: /internal/notify
+        #     body: { tid: "{tid}" }
+        #     capture: { ackId: { from: ".body.ackId" } }
         reaction:
           topic: orders.events
           key: "{orderId}"
@@ -642,7 +676,7 @@ Template bodies (HTTP path/body, Kafka pattern `match`, free-form DB `--sql`, mo
 | `{{rand}}` | 16 lowercase hex chars. | `a1b2c3d4e5f60718` |
 | `{{rand:N}}` | N lowercase hex chars (N ≥ 1). | |
 
-Generator output is charset-restricted (injection-safe by construction). An unknown generator name (e.g. `{{foo}}`) is a `ConfigError` at both `config validate` and fill time. The global `--no-template-vars` flag (§3) is an escape hatch that leaves `{{...}}` tokens literal everywhere; the `agctl gen uuid|ts|rand` group (§3.10) generates standalone values for cross-step sharing. **Known limitation:** DB *template* SQL (`database.templates.<t>.sql`) is not yet a generator fill site — generators substitute in free-form `--sql` only; template SQL binds parameters via `:paramName`.
+Generator output is charset-restricted (injection-safe by construction). An unknown generator name (e.g. `{{foo}}`) is a `ConfigError` at both `config validate` and fill time. The global `--no-template-vars` flag (§3) is an escape hatch that leaves `{{...}}` tokens literal everywhere; the `agctl gen uuid|ts|rand` group (§3.10) generates standalone values for cross-step sharing. **Known limitation:** DB *template* SQL (`database.templates.<t>.sql`) is not yet a generator fill site — generators substitute in free-form `--sql` only; template SQL binds parameters via `:paramName`. **Known limitation:** mock *response* bodies/headers (§2.1 `mocks.*.response`) and kafka `reaction` payloads are not generator fill sites either — a `{{uuid}}` there is validated but served literally. Mock **effect** fields (`effects:` value/values/key/headers, http body/headers/path) DO resolve generators (once per trigger).
 
 ---
 
@@ -1533,24 +1567,29 @@ agctl mock run
 {"event":"kafka.reacted","reactor":"order-command-handler","topic":"orders.events","key":"ord-789","duration_ms":1,"timestamp":"…"}
 {"event":"kafka.skipped","reactor":"order-command-handler","topic":"orders.commands","reason":"non-object message value","count":3,"timestamp":"…"}
 {"event":"kafka.error","reactor":"order-command-handler","topic":"orders.commands","offset":1043,"partition":2,"error":"…","fatal":false,"timestamp":"…"}
+{"event":"kafka.produced","trigger":"create-order","topic":"orders.events","key":null,"duration_ms":2,"timestamp":"…"}
+{"event":"http.called","trigger":"order-command-handler","service":"order-service","method":"POST","path":"/internal/notify","status_code":200,"duration_ms":18,"timestamp":"…"}
+{"event":"effect.error","trigger":"create-order","effect_type":"http","error":"Connection refused","url":"http://legacy.internal:9999/x","fatal":true,"timestamp":"…"}
 {"event":"grpc.hit","stub":"echo-unary","service":"echo.EchoService","method":"Unary","call_type":"unary","status":"OK","duration_ms":1,"timestamp":"…"}
 {"event":"grpc.unmatched","service":"echo.EchoService","method":"Missing","call_type":"unary","timestamp":"…"}
 {"event":"grpc.error","stub":"echo-unary","service":"echo.EchoService","method":"Unary","error":"…","fatal":true,"timestamp":"…"}
-{"event":"summary","http_hits":7,"http_unmatched":1,"http_body_parse_skipped":0,"kafka_reactions":3,"kafka_skipped":3,"kafka_errors":0,"grpc_hits":2,"grpc_unmatched":1,"grpc_errors":0,"duration_ms":45213}
+{"event":"summary","http_hits":7,"http_unmatched":1,"http_body_parse_skipped":0,"kafka_reactions":3,"kafka_skipped":3,"kafka_errors":0,"grpc_hits":2,"grpc_unmatched":1,"grpc_errors":0,"kafka_produced":2,"http_called":1,"effect_errors":0,"duration_ms":45213}
 ```
+
+**Cross-transport effects** (the `effects:` lists on HTTP stubs / Kafka reactors, §2.1) run synchronously in list order as part of the trigger: for an HTTP stub, inside the handler before the response is sent (a 2xx response guarantees every effect landed); for a Kafka reactor, inside the per-message handler before COMMIT. Each explicit kafka produce emits a `kafka.produced` event (one per `values` item), each outbound http call an `http.called` event (exactly one of `service`/`url`). Effect failure is always fatal to the run (`effect.error` → exit 1 / `mock stop` failure; the trigger is COMMITted, not retried); under `--fail-fast` an HTTP trigger's response is aborted before any bytes are written, so the SUT sees a connection-level failure. Effects chain: an http effect's `capture` feeds the namespace later effects render against (last-wins on name collision).
 
 **Agent failure-stream protocol (load-bearing):**
 
-The mock's failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`, `grpc.unmatched`, `grpc.error`, `capture.missing`) live **only** on stdout, and the exit-1-at-shutdown escalation arrives only on a clean `SIGTERM`. The background `&`/`kill` pattern loses both by default. Agents must follow this protocol:
+The mock's failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`, `grpc.unmatched`, `grpc.error`, `effect.error`, `capture.missing`) live **only** on stdout, and the exit-1-at-shutdown escalation arrives only on a clean `SIGTERM`. The background `&`/`kill` pattern loses both by default. Agents must follow this protocol:
 
 1. Redirect the mock's stdout to a log file: `agctl mock run > mock.log 2>&1 &`.
 2. **Poll** `mock.log` for the `started` line before running the SUT (do not sleep a fixed delay).
 3. Terminate with `SIGTERM` and `wait` — **never `SIGKILL`** (which skips shutdown/summary/exit-code).
-4. After the test, **grep the log for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` / `kafka.error` / `grpc.unmatched` / `grpc.error` / `capture.missing`** regardless of the test result, and treat any hit as a failure. `capture.missing` is non-fatal (the mock substitutes empty string and continues), but it marks a likely-misconfigured `from` silently producing a plausible-but-wrong response — investigate rather than ignore.
+4. After the test, **grep the log for `http.unmatched` / `http.body_parse_skipped` / `kafka.skipped` / `kafka.error` / `grpc.unmatched` / `grpc.error` / `effect.error` / `capture.missing`** regardless of the test result, and treat any hit as a failure. `capture.missing` is non-fatal (the mock substitutes empty string and continues), but it marks a likely-misconfigured `from` silently producing a plausible-but-wrong response — investigate rather than ignore.
 
 **`--fail-fast` synchronous alternative:**
 
-For foreground runs with `--duration`, `--fail-fast` exits `1` immediately on the first runtime error (first `kafka.error` or fatal reactor failure), avoiding the log-grep step.
+For foreground runs with `--duration`, `--fail-fast` exits `1` immediately on the first runtime error (first `kafka.error`, fatal reactor failure, or `effect.error`), avoiding the log-grep step. For an HTTP stub's `effects` it also aborts the response before it is written — the SUT's request fails at the connection level instead of seeing a 2xx for side effects that did not land.
 
 **Examples:**
 
@@ -1629,7 +1668,7 @@ The `grpc` block is present only when the gRPC engine is running. `listen`/`stub
 
 #### `agctl mock stop` — managed daemon (stop)
 
-Stop a running mock daemon by signaling it, waiting for graceful shutdown, parsing the log for the final summary, and returning the verdict. If any fatal failure events are found (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`, `grpc.unmatched`, `grpc.error`), `stop` surfaces them and exits 1 (the strict rule). `capture.missing` is included in the failure list but is non-fatal.
+Stop a running mock daemon by signaling it, waiting for graceful shutdown, parsing the log for the final summary, and returning the verdict. If any fatal failure events are found (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`, `grpc.unmatched`, `grpc.error`, `effect.error`), `stop` surfaces them and exits 1 (the strict rule). `capture.missing` is included in the failure list but is non-fatal.
 
 ```
 agctl mock stop
@@ -1662,6 +1701,9 @@ Selector resolution: no-arg works when exactly one mock is running in `--state-d
       "grpc_hits": 2,
       "grpc_unmatched": 0,
       "grpc_errors": 0,
+      "kafka_produced": 2,
+      "http_called": 1,
+      "effect_errors": 0,
       "duration_ms": 45213
     },
     "failures": []
@@ -1696,6 +1738,9 @@ When fatal failures are detected, `stop` raises `AssertionFailure` (exit 1) and 
         "grpc_hits": 2,
         "grpc_unmatched": 1,
         "grpc_errors": 0,
+        "kafka_produced": 2,
+        "http_called": 1,
+        "effect_errors": 1,
         "duration_ms": 45213
       },
       "failures": [
@@ -2718,11 +2763,14 @@ Refused to overwrite (without `--force`):
 | `kafka.reacted` | Emitted per Kafka message that matched a reactor and produced a reaction. Includes `reactor`, `topic`, `key`, `duration_ms`. |
 | `kafka.skipped` | Emitted when messages are consumed but not matched (e.g., non-object value), OR when the trigger client's codec seam reports a per-side decode failure under a non-JSON trigger format (`reason: "decode failed: …"`, non-fatal, COMMIT — the reactor proceeds no further on that message: no match, no capture, no reaction). Includes `reactor`, `topic`, `reason`, `count`. |
 | `kafka.error` | Emitted on a reaction produce failure or reactor error. Includes `reactor`, `topic`, `error`, `fatal`. Under `--fail-fast`, the run exits `1` immediately after a fatal error. |
+| `kafka.produced` | Emitted per explicit kafka effect message produced (one per `values` item). Includes `trigger` (stub or reactor name), `topic`, `key`, `duration_ms`. |
+| `http.called` | Emitted per http effect call. Includes `trigger`, exactly one of `service`/`url`, `method`, `path`, `status_code`, `duration_ms`. |
+| `effect.error` | Emitted when any effect fails (produce undelivered, call refused, encode failure); the remaining effects in the list do not run. Includes `trigger`, `effect_type` (`kafka`/`http`), `error`, `fatal: true`, plus `topic` (kafka) or `url`/`service` (http). **Fatal** — exit `1` at shutdown; under `--fail-fast` an HTTP trigger's response is aborted. |
 | `grpc.hit` | Emitted per response message sent (one for unary; one per streamed message; one per matched request for client-stream / bidi). Includes `stub`, `service`, `method`, `call_type`, `status`, `duration_ms`. |
 | `grpc.unmatched` | Emitted when no stub matches `service/method`, or every predicate fails (returned `UNIMPLEMENTED`). Includes `service`, `method`, `call_type`. **Fatal** — sets the runtime-error flag so the run exits `1` at shutdown. |
 | `grpc.error` | Emitted on a handler deserialize/serialize/runtime failure. Includes `stub` (may be `null`), `service`, `method`, `error`, `fatal: true`. **Fatal.** |
-| `capture.missing` | Emitted when an explicit `capture.<name>.from` resolves to `null`/missing at runtime (HTTP stub, Kafka reactor, or gRPC stub). Includes `stub` *or* `reactor`, `name`, `from`. Non-fatal: the mock substitutes empty string and continues; investigate as a likely-misconfigured `from`. |
-| `summary` | Emitted once at shutdown. Includes `http_hits`, `http_unmatched`, `http_body_parse_skipped`, `kafka_reactions`, `kafka_skipped`, `kafka_errors`, `grpc_hits`, `grpc_unmatched`, `grpc_errors`, `duration_ms`. |
+| `capture.missing` | Emitted when an explicit `capture.<name>.from` resolves to `null`/missing at runtime (HTTP stub, Kafka reactor, or gRPC stub). Includes `stub` *or* `reactor`, `name`, `from`. Non-fatal: the mock substitutes empty string and continues; investigate as a likely-misconfigured `from`. An http **effect** capture miss emits the same event with `trigger` instead of `stub`/`reactor` (same non-fatal semantics). |
+| `summary` | Emitted once at shutdown. Includes `http_hits`, `http_unmatched`, `http_body_parse_skipped`, `kafka_reactions`, `kafka_skipped`, `kafka_errors`, `grpc_hits`, `grpc_unmatched`, `grpc_errors`, `kafka_produced`, `http_called`, `effect_errors`, `duration_ms`. |
 
 **Agent protocol (load-bearing):** See `agctl mock` §3.5 for the background lifecycle protocol (redirect stdout → log, poll for `started`, SIGTERM+wait, grep log for errors). Without this, "fail loudly" is aspirational — a silent false-positive is possible.
 
@@ -3350,7 +3398,10 @@ These items are intentionally deferred. Do not implement them until the core des
 | **OpenTelemetry trace propagation** | Inject `traceparent` headers automatically when a trace context is available, enabling distributed traces that span `agctl` invocations. |
 | **HTTP response extraction (`--capture path=name`)** | Agents still hand-roll shell `jq -r` to pull a field for the next command. Response *assertion* (`--status`/`--contains`/`--match`/`--jq-path`/`--equals`) covers the verify-on-response case; a built-in capture/extraction flag is deferred to keep v1 focused on fail-loudly. |
 | **`--match-all` flag (HTTP / Kafka)** | The "every item" case (e.g. all order items satisfy a predicate). Today covered by a jq idiom (`all(.items[]; .predicate)`); a dedicated sibling flag is deferred. |
-| **Mock: cross-transport reactions** | HTTP trigger → Kafka produce; Kafka trigger → HTTP callback. The trigger→reaction model admits this later without a rewrite. |
+| **Mock: gRPC stub effects** | The `effects:` list (§2.1) covers kafka produce and http call; a `grpc` effect variant (and `GrpcStub.effects`) is deferred. The `Effect` union and executor are shaped so it slots in without config redesign. |
+| **Mock: pluggable effect registry** | Two in-tree effect variants (kafka, http) do not justify an `agctl.mock_effects` entry-point registry yet; the executor's dispatch can grow into one without a config change if a third variant lands. |
+| **Mock: http-effect template references** | An http effect referencing a named HTTP `template` instead of inline `service`/`url`/`path`/`body` fields. Deferred; inline fields cover v1. |
+| **Mock: full http-effect response assertions** | `--status`/`--match`-style checks on an http effect's response. The effect `capture` + the `http.called` event's `status_code` cover the common "did the callback succeed and what did it return" need today. |
 | **Mock: stateful / scenario mocks** | Sequences, "Nth call → Y", reactor behavior change after N messages. |
 | **Mock: control socket / runtime RPC** | A control socket for live runtime control (add stub at runtime, live counter queries) is deferred. The current daemon model uses signal + log-file parsing for observation only (start/stop/status). |
 | **Mock: record / replay** | Record real traffic into stubs for later replay. |
@@ -3360,7 +3411,7 @@ These items are intentionally deferred. Do not implement them until the core des
 | **Mock: stateful / server-push gRPC bidi** | The gRPC mock's bidi support is request/response pairing (one rendered response per matched incoming request). Stateful conversation, server-push, and per-message client-stream aggregation are deferred. |
 | **Mock: mid-stream abort (gRPC)** | `RSTSTREAM` mid-server-stream is not modeled; a gRPC stub streams its authored `messages` to completion or a terminal `status`. |
 | **Mock: reflection-bootstrapped gRPC stubs** | The gRPC mock requires `proto`/`descriptor_set` sources to resolve service/method and encode responses — reflection is *served* but cannot *bootstrap* the mock itself. |
-| **Mock: cross-transport gRPC sagas** | gRPC stub → Kafka reaction (or vice versa) linkage is deferred alongside the HTTP↔Kafka cross-transport item above. |
+| **Mock: cross-transport gRPC sagas** | gRPC stub → Kafka reaction (or vice versa) linkage is deferred alongside the gRPC stub-effects item above. |
 
 ### Known-wrong-result / Not Covered (Mock MVP Limitations)
 
@@ -3370,7 +3421,7 @@ The mock MVP covers **stateless, single-consumer, value-keyed, plaintext** flows
 |---|---|---|
 | **Stateful flows** (OAuth/token exchange, create-then-GET lifecycle, idempotency-key replay, pagination cursors, 429-then-retry) | Static engine returns the same canned response regardless of prior calls. | State-propagation and dedupe logic go untested → false green. |
 | **TLS / HTTPS-pinned or `https://`-hardcoded SUT clients** | Plaintext mock only; cannot intercept HTTPS. | Integration is untested → false green (especially for payments/auth/healthcare). |
-| **Cross-transport sagas** (Kafka trigger → HTTP callback) | No causal linkage; requires manual orchestration. | End-to-end flow goes unexercised → false green. |
+| **Cross-transport sagas** (Kafka trigger → HTTP callback) | Covered since the `effects:` lists shipped (§2.1): a Kafka reactor can fire http effects (and an HTTP stub kafka produces) with capture-chaining. Sagas that need *gRPC* hops remain manual (gRPC effects deferred, §10). | gRPC-hop sagas go unexercised → false green; HTTP↔Kafka sagas fail loud (`effect.error`). |
 | **Multi-file / `import`-ed Protobuf schemas** (schema-registry-backed) | The Protobuf codec compiles a single `.proto` source string per Confluent subject (v1); multi-file schemas are best-effort and raise `SerializationError` on resolution failure. Avro and single-file Protobuf triggers/reactions ARE decoded/encoded when the topic opts in via `value_format`/`key_format`. | A multi-file-Protobuf topic that fails to compile emits `kafka.skipped reason="decode failed: …"` (mock) or `decode.error` (listen) → false green if consumer expects a reaction. |
 | **Containerized SUT topology** (docker-compose) | `0.0.0.0` bind works, but operator must target `host.docker.internal` / host LAN IP and avoid a SUT that swallows connection errors. | SUT may silently fail to connect → false green if it treats network errors as "fallback worked." |
 | **Shared broker + pinned `consumer_group` reused across runs/devs** | Partition split or resume-past-messages. | Silently missing/old reactions → false green. (Mitigated by unique-per-run default.) |

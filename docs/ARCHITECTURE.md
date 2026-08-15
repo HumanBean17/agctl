@@ -134,6 +134,7 @@ agctl/
 │   ├── grpc_server.py          # MockGrpcServer: grpc.Server + generic servicer dispatching `/<svc>/<mtd>` via the descriptor pool; pure dispatch core (build_envelope, dispatch_grpc, GrpcDispatchOutcome) reused from here; Health + Reflection registered on the same server; lifecycle start/serve_forever/shutdown/actual_listen
 │   ├── jq_precompile.py        # walks mocks (http/kafka/grpc) → (label, expr) pairs; compile-only validate
 │   ├── capture.py              # envelope capture resolver: jq_value(envelope, from) → typed CaptureValue
+│   ├── effects.py              # EffectExecutor: cross-transport effect dispatch ({{gen}} pre-pass → render_typed → kafka produce / http call → capture-chain; first-failure short-circuit; never raises)
 │   ├── capture_validate.py     # walks mocks (http/kafka/grpc response.message/messages) → object-capture placement errors; pure Python (no jq)
 │   ├── daemon.py               # mock-specific daemon layer: port-keyed pidfile/log paths (mock-<port>|mock-kafka|mock-grpc-<port>), RunningMock (http_listen/grpc_listen), resolve_target (matches --listen against any of listen/http_listen/grpc_listen), NDJSON log parser, failure taxonomy incl. grpc.unmatched/grpc.error (generic primitives live in agctl/daemon.py)
 │   └── engine.py               # MockEngine lifecycle (start/run/shutdown; Step 0 pre-compiles jq; Step 2b constructs+binds the gRPC server via grpc_server_factory seam)
@@ -287,6 +288,38 @@ entry); `client_stream` aggregates the request stream into a `{messages,
 count}` envelope at close (matched once, `match.body` skipped); `bidi` is
 request/response pairing (one envelope per incoming request, one rendered
 response per match, no stateful conversation).
+
+**Cross-transport effects trace** (a stub/reactor `effects:` list; both
+invocation points share one `EffectExecutor` built by `MockEngine` and fed
+by resolver closures from `mock_commands._mock_run_core`):
+
+1. **Command layer** — the `mock run` walk resolves each kafka effect's
+   cluster (`resolve_cluster_name`) + codec (`_resolve_codec`, extending
+   `clients_by_cluster`/`probed_clusters`) and validates each http effect's
+   `service`; it builds `kafka_resolver`/`http_resolver` closures (the http
+   one pools `HttpClient`s keyed `(base_url, timeout)`) and hands them to
+   `new_mock_engine`. No effects anywhere → both resolvers stay `None` and
+   the engine builds no executor (pre-effects behavior, byte-for-byte).
+2. **HTTP trigger** — `make_handler`'s Step-6 block runs
+   `effect_executor.run(stub.effects, captures, stub_name)` inside the
+   semaphore-held section, BEFORE the response bytes are written. Under
+   `--fail-fast` an `ok=False` outcome `return`s without sending — the SUT
+   sees a connection-level failure; default mode still responds and the
+   failure surfaces at the run level.
+3. **Kafka trigger** — `KafkaReactor._handle` runs the reactor's `effects`
+   after its own capture, before COMMIT. The legacy `reaction` path is
+   unchanged (still `kafka.reacted`); effects-only reactors have
+   `reaction=None` (guarded at every walk site).
+4. **Executor** (`mock/effects.py`) — per `run()` call: ONE generator memo,
+   `substitute_generators` over each effect's payload fields (`{{gen}}`
+   tokens; url-mode url/path stay literal), then per effect
+   `render_typed` → dispatch. Kafka: per-message encode
+   (`_encode_payload_with_codec`) + `produce(_raw=True)`, one
+   `kafka.produced` per `values` item (top-level key/headers are the
+   per-item fallback). Http: `HttpClient.request` (service-mode path
+   rendered), one `http.called`, then `resolve_captures` feeds later
+   effects (last-wins). ANY exception → `effect.error` (fatal), remaining
+   effects skipped, `run()` returns `ok=False` — the executor never raises.
 
 **Failure paths** all funnel through `@envelope`:
 
@@ -442,8 +475,10 @@ dependency). `agctl config validate` additionally rejects **unknown `{{...}}`
 generator tokens** in config-defined string fields via
 `collect_unknown_template_errors` (in `commands/config_commands.py`, built on
 `template_vars.find_unknown_templates`): it walks HTTP template path/headers/body,
-DB template SQL, gRPC template metadata/message, Kafka pattern `match`, and mock
-stub/reactor bodies/keys/values/headers/match, appending a `{"path","message"}`
+DB template SQL, gRPC template metadata/message, Kafka pattern `match`, mock
+stub/reactor bodies/keys/values/headers/match, and the cross-transport effect
+fields (kafka `topic`/`key`/`value`/`headers`/`values[*]`, http
+`url`/`path`/`body`/`headers`), appending a `{"path","message"}`
 error per unknown token naming the valid generators. It is a pure typo-catching
 scan — never raises, and a known generator in a non-runtime-substituted field
 still passes (the validator does not model which fields are fill-substituted).
@@ -484,9 +519,9 @@ results as they happen, so it violates "one object per invocation":
 **The second streaming exception — `mock run`.** Like `http ping`, the mock server must stream events as they happen:
 
 - Not wrapped by `@envelope`.
-- Emits one JSON object **per event** (`started`, `http.hit`, `http.unmatched`, `http.body_parse_skipped`, `capture.missing`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, `grpc.hit`, `grpc.unmatched`, `grpc.error`, `summary`) directly as they occur. The three engines share one event stream and one `started`/`summary` line; engines not running report `null` in `started` and zero counters in `summary`. `kafka.skipped` doubles as the per-message decode-failure signal under a non-JSON reactor codec (reason `"decode failed: …"`, non-fatal, COMMIT — the trigger client's codec seam invokes `on_decode_error` before `_handle`, which emits the event and clears the per-message flag).
+- Emits one JSON object **per event** (`started`, `http.hit`, `http.unmatched`, `http.body_parse_skipped`, `capture.missing`, `kafka.reacted`, `kafka.skipped`, `kafka.error`, `kafka.produced`, `http.called`, `effect.error`, `grpc.hit`, `grpc.unmatched`, `grpc.error`, `summary`) directly as they occur. The three engines share one event stream and one `started`/`summary` line; engines not running report `null` in `started` and zero counters in `summary`. `kafka.skipped` doubles as the per-message decode-failure signal under a non-JSON reactor codec (reason `"decode failed: …"`, non-fatal, COMMIT — the trigger client's codec seam invokes `on_decode_error` before `_handle`, which emits the event and clears the per-message flag).
 - All emission goes through a single-writer path (`threading.Lock` in `MockEngine.emit_event`) — concurrent HTTP handler threads, Kafka reactor threads, and gRPC per-RPC handler threads (served by the gRPC server's own `ThreadPoolExecutor(max_workers=concurrency_cap)`) emit safely without interleaved lines.
-- Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary, http_hits, http_unmatched, http_body_parse_skipped, kafka_reactions, kafka_skipped, kafka_errors, grpc_hits, grpc_unmatched, grpc_errors, duration_ms}` and exits `0` (clean, no runtime errors) or `1` (runtime errors occurred — any `kafka.error`, `grpc.unmatched`, `grpc.error`, or `--fail-fast` triggered).
+- Installs `SIGTERM`/`SIGINT` handlers that set a stop event; the loop emits a final `{summary, http_hits, http_unmatched, http_body_parse_skipped, kafka_reactions, kafka_skipped, kafka_errors, grpc_hits, grpc_unmatched, grpc_errors, kafka_produced, http_called, effect_errors, duration_ms}` and exits `0` (clean, no runtime errors) or `1` (runtime errors occurred — any `kafka.error`, `grpc.unmatched`, `grpc.error`, `effect.error`, or `--fail-fast` triggered).
 - Startup errors emit a single structured envelope **before** any event line.
 
 **The third streaming exception — `logs tail`.** Like `http ping`, the log tail command must stream entries as they appear:
@@ -573,10 +608,14 @@ response-shape-vs-call-type mismatch, invalid `response.status`, or missing
 descriptor files at `MockGrpcServer` construction (`ConfigError` at
 `mocks.grpc.stubs.<name>.<field>`), and a match-miss in `kafka assert` /
 `db assert` / `http call` / `http request` (`AssertionFailure`, exit 1).
-At runtime, `grpc.unmatched` (no stub matches `service/method`) and
-`grpc.error` (handler failure) are fatal — both set the runtime-error flag
+At runtime, `grpc.unmatched` (no stub matches `service/method`),
+`grpc.error` (handler failure), and `effect.error` (a cross-transport
+kafka/http effect failing — produce undelivered, call refused, encode
+failure) are fatal — each sets the runtime-error flag
 so `mock run` exits `1` at shutdown and `mock stop` raises `AssertionFailure`
-(they are in `FATAL_FAILURE_EVENTS` alongside `http.unmatched`/`kafka.error`).
+(they are in `FATAL_FAILURE_EVENTS` alongside `http.unmatched`/`kafka.error`;
+`kafka.produced`/`http.called`/`effect.error` are counted in
+`EVENT_TO_COUNTER` as `kafka_produced`/`http_called`/`effect_errors`).
 
 **`db execute` write-safety failures** — the command rejects writes at multiple
 gates, each surfacing as `ConfigError` (exit 2): missing `--write` flag, omitted
@@ -675,6 +714,21 @@ reactors sharing a cluster reuse a single client built via `clients_by_cluster`)
   argument validation (e.g. `subscribe` rejects an explicit `None` for
   `on_assign`/`on_revoke`; `store_offsets` — plural — is the only offset-store
   method). Keep the fakes honest against the real binding or regressions hide.
+
+### EffectExecutor (`mock/effects.py`)
+
+The cross-transport effect dispatch core consumes the two clients above via
+**DI seams only** — it imports neither `confluent_kafka` nor `httpx` (unit
+tests inject duck-typed fakes). Seams: `kafka_resolver(effect) ->
+(client, codec)` and `http_resolver(effect) -> (client, path)` (both built as
+closures in the command layer, which owns cluster/codec/service resolution
+and pools `HttpClient`s keyed `(base_url, timeout)`), plus `emit_event`
+(the engine's single-writer sink). `MockEngine` constructs the executor only
+when at least one resolver is injected — a config with no `effects:` builds
+no executor and behaves byte-for-byte as before. The executor itself is
+never raised through: any failure becomes a fatal `effect.error` event and
+an `ok=False` outcome; the HTTP handler consults that outcome only under
+`--fail-fast` (abort-before-respond).
 
 ### LogClient + backend (`clients/log_client.py`, `clients/log_common.py`, `clients/log_backends/ndjson_file.py`, `clients/log_backends/loki.py`)
 
@@ -1100,6 +1154,14 @@ and **skipped** — it never bricks the CLI, the registry, or driver discovery.
 > paths agree on service/method resolution. The `grpc` extra
 > (`grpcio`, `grpcio-tools`, `grpcio-health-checking`, `grpcio-reflection`,
 > `protobuf`, `jq`) follows the same lazy-import pattern.
+
+> **In-tree effect dispatch:** Mock cross-transport `effects:` are likewise an
+> in-tree dispatch, not an entry-point registry. `EffectExecutor.run` routes on
+> the `type:` literal of the `Effect` union (`kafka`/`http`); the transport
+> specifics live behind the injected resolvers (§8). Adding a third variant
+> (e.g. `grpc`) means extending the union + one dispatch branch — no entry-point
+> machinery is justified while only two variants exist; the dispatch can grow
+> into an `agctl.mock_effects` registry later without a config redesign.
 
 ---
 

@@ -129,7 +129,7 @@ Encode reuses `KafkaClient.produce` (+ the independent reaction-codec `_raw` pat
 | `path` | service mode | supports `{placeholder}` |
 | `method` | no (default `GET`) | |
 | `headers`, `body` | no | rendered via `render_typed` |
-| `timeout` | no | seconds; falls back to the service's `timeout_seconds` / `defaults.timeout_seconds` |
+| `timeout` | no | seconds; falls back to the service's `timeout_seconds` → `defaults.timeout_seconds` → `10` (hard default, mirroring `resolve_timeout` — a None chain never disables timeouts) |
 | `capture` | no | a `CaptureSpec` map rooted in the **HTTP response envelope** `{status_code, response_time_ms, headers (lowercased), body, url, method}` — same root as `http call --match`, so `.body.ackId`, `.status_code`, `.headers.x`. Feeds the namespace for later effects. |
 
 The call goes through the existing `HttpClient`, so `service.use_tls` / `service.tls` / `service.base_url` apply for free.
@@ -284,6 +284,16 @@ agctl/
 - **Pluggable effect registry (`agctl.mock_effects`)** — the Approach 3 evolution path, for db-write / log / delay / third-party effects. Not justified until a third variant lands.
 - **Referencing a named HTTP `template` from an http effect** — inline fields cover v1; template reference is sugar for later.
 - **Full assertion modes on http-effect responses** (`--status` / `--match`) — capture + `http.called.status_code` cover the common need; full modes deferred.
+
+### 15.1 Resolved during the final-review fix wave (recorded for the ADR)
+
+- **§5.9 fail-fast response-abort — implemented** (was an open runtime detail even after Decision 9 closed the semantics). `MockEngine` threads `fail_fast` into `make_handler`/`MockHTTPServer`; the handler consults `effect_executor.run(...)`'s outcome and, under fail-fast + `ok=False`, returns without writing a response (semaphore released in `finally`; no `http.hit` for an unserved response).
+- **Service-mode `path` rendering — implemented** (spec §6.2 promised it; the initial executor passed `path` verbatim). `_run_http` applies `render_typed(path, namespace)` when `effect.service is not None`; url mode stays fully literal.
+- **`values` item fallback to top-level `key`/`headers` — implemented** (spec §6.1 documented it as a fallback; the initial executor used items as-is). Per item: the item's own `key`/`headers` when set, else the effect-level ones.
+- **`{{gen}}` generator pre-pass — implemented.** `EffectExecutor.run` builds ONE memo per call and runs `substitute_generators` over each effect's payload fields before `render_typed` (kafka `value`/`values[*]`/`key`/`headers`; http `body`/`headers`/ service-mode `path`). Known limitation (pre-existing, now documented in DESIGN §2.5): mock *response* bodies and kafka `reaction` payloads are NOT generator fill sites — tokens there are validated but served literally.
+- **`--no-template-vars` does not reach the executor** — the global flag is read via `template_vars_enabled_from_ctx` by command callbacks, but `mock run` never threads it into the engine/executor; the pre-pass is therefore unconditional. Left as-is per fix-wave ruling (no new flag plumbing).
+- **HttpClient pool keyed `(base_url, timeout)`** — the initial per-`base_url` cache silently reused the first effect's timeout for later effects on the same host; the key now includes the resolved timeout.
+- **`agctl discover` on effects-only reactors** — the category-listing example and the item `reaction` serialization dereferenced `reaction.topic`/`model_dump` unguarded (legal `reaction=None` since T1); both guarded, with the effects list serialized under `effects` and the example naming the first kafka effect's topic (`<effects>` placeholder when only http effects).
 
 ---
 
