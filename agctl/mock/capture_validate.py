@@ -24,12 +24,16 @@ Placement rule for an ``object``-typed name ``N`` (per stub/reactor):
 
 Effects rule (DESIGN: mock effects): for each HTTP effect capture of type
 ``object`` on a stub/reactor, the whole-object ``"{N}"`` placeholder may appear
-in a LATER effect's ``value`` / ``values[*]`` / ``body`` / ``path`` / ``key`` /
-``headers`` — but only as a whole field. A non-whole occurrence (inline within
-a larger string, or a nested ``"{N.inner}"`` token, which the placeholder regex
-does not match and would render literally) is one violation per name at
-``...effects[i].capture.{N}``. An object capture no later effect uses is
-ALLOWED (chained captures may go unused). Effects-only reactors
+as a WHOLE field in a LATER effect's dict-capable slots — ``value`` /
+``values[*].value`` / ``body`` / ``path``. The string-only slots — a later
+effect's ``key`` / ``headers`` (top-level and per-``values[*]``-item) — treat
+ANY ``{N}`` occurrence (whole or nested) as a violation, mirroring
+``reaction.key`` / ``reaction.headers``: ``render_typed`` would hand the live
+dict to the producer as a non-str key / header value. A non-whole occurrence
+(inline within a larger string, or a nested ``"{N.inner}"`` token, which the
+placeholder regex does not match and would render literally) is one violation
+per name at ``...effects[i].capture.{N}``. An object capture no later effect
+uses is ALLOWED (chained captures may go unused). Effects-only reactors
 (``reaction is None``) skip the reaction checks — there is no reaction to
 misplace captures in.
 
@@ -89,61 +93,70 @@ def _walk_tree(value: Any, name: str) -> bool:
     return False
 
 
-def _classify_effect(s: str, name: str) -> bool:
-    """True when ``{name}`` appears in ``s`` in a NON-whole placement.
+def _classify_effect(s: str, name: str) -> str:
+    """Classify string ``s`` w.r.t. the ``{name}`` placeholder (effects walk).
 
-    The effects walk's classifier: a string exactly ``"{name}"`` is the valid
-    whole-object placement; an inline occurrence (``"pre={name}"``) or a
-    nested token (``"{name.inner}"`` — matched by ``_NESTED_PLACEHOLDER_RE``
-    because the plain regex does not see dotted names, which would render
-    literally at runtime) is a violation. Distinct from :func:`_classify`
-    because the effects slots are scanned uniformly rather than split into
-    whole-vs-inline categories.
+    Returns ``"whole"`` when ``s`` is exactly ``"{name}"``, ``"inline"`` when
+    ``{name}`` appears any other way — inline within a larger string
+    (``"pre={name}"``) or as a nested token (``"{name.inner}"``, matched by
+    ``_NESTED_PLACEHOLDER_RE`` because the plain regex does not see dotted
+    names, which would render literally at runtime) — and ``"none"`` when
+    ``{name}`` is absent. Mirrors :func:`_classify` but folds nested tokens
+    into ``"inline"``.
     """
     if s == f"{{{name}}}":
-        return False
+        return "whole"
     for m in _PLACEHOLDER_RE.finditer(s):
         if m.group(1) == name:
-            return True
+            return "inline"
     for m in _NESTED_PLACEHOLDER_RE.finditer(s):
         if m.group(1).split(".", 1)[0] == name:
-            return True
-    return False
+            return "inline"
+    return "none"
 
 
-def _walk_effect_tree(value: Any, name: str) -> bool:
-    """Walk a later effect's field tree; True when ``{name}`` appears non-whole.
+def _walk_effect_tree(value: Any, name: str, *, string_only: bool = False) -> bool:
+    """Walk a later effect's slot tree; True when ``{name}`` is misplaced.
 
-    Mirrors :func:`_walk_tree` (dict values / list elements recursed; whole-field
-    strings allowed) but flags nested ``{name.inner}`` tokens too.
+    Mirrors :func:`_walk_tree` (dict values / list elements recursed;
+    whole-field strings allowed) but flags nested ``{name.inner}`` tokens too.
+    With ``string_only`` the slot cannot carry an object at all — ANY
+    occurrence (whole or inline/nested) is a violation, mirroring the
+    ``reaction.key``/``reaction.headers`` checks.
     """
     if isinstance(value, str):
-        return _classify_effect(value, name)
+        c = _classify_effect(value, name)
+        return c in ("whole", "inline") if string_only else c == "inline"
     if isinstance(value, dict):
-        return any(_walk_effect_tree(v, name) for v in value.values())
+        return any(_walk_effect_tree(v, name, string_only=string_only) for v in value.values())
     if isinstance(value, list):
-        return any(_walk_effect_tree(v, name) for v in value)
+        return any(_walk_effect_tree(v, name, string_only=string_only) for v in value)
     return False
 
 
-def _effect_slot_values(later: Effect) -> list[Any]:
-    """Collect the renderable slot trees of a LATER effect.
+def _effect_slot_values(later: Effect) -> list[tuple[Any, bool]]:
+    """Collect ``(tree, string_only)`` pairs for a LATER effect's renderable slots.
 
-    kafka effect: ``value`` plus every ``values[*]`` item's ``value``/``key``/
-    ``headers`` (when ``values`` is set, top-level ``key``/``headers`` are
-    defaults, not rendered slots — the per-item ones are). http effect:
-    ``body``, ``path``, ``headers`` (``url`` is a literal base — placeholders
-    ride on ``path``). Trees may be None; the walker ignores non-str leaves.
+    ``string_only`` marks slots that cannot carry an object at all — ``key`` /
+    ``headers`` (top-level and per-``values[*]``-item), mirroring
+    ``reaction.key`` / ``reaction.headers``. kafka effect: ``value`` plus every
+    ``values[*]`` item's ``value``/``key``/``headers`` (when ``values`` is set,
+    top-level ``key``/``headers`` are defaults, not rendered slots — the
+    per-item ones are). http effect: ``body``, ``path``, ``headers`` (``url``
+    is a literal base — placeholders ride on ``path``). Trees may be None; the
+    walker ignores non-str leaves.
     """
     if later.type == "kafka":
-        slots: list[Any] = [later.key, later.headers]
+        slots: list[tuple[Any, bool]] = [(later.key, True), (later.headers, True)]
         if later.values is not None:
             for item in later.values:
-                slots.extend((item.value, item.key, item.headers))
+                slots.extend(
+                    ((item.value, False), (item.key, True), (item.headers, True))
+                )
         else:
-            slots.append(later.value)
+            slots.append((later.value, False))
         return slots
-    return [later.body, later.path, later.headers]
+    return [(later.body, False), (later.path, False), (later.headers, True)]
 
 
 def _effect_capture_errors(
@@ -153,9 +166,11 @@ def _effect_capture_errors(
 
     For each HTTP effect (index ``i``) capture of ``type == "object"``, every
     SUBSEQUENT effect in the same list is scanned: a whole-field ``"{name}"``
-    placement is valid anywhere (``value``/``body``/``path``/``key``/
-    ``headers``); any non-whole occurrence (inline or nested ``{name.x}``) is
-    one violation for that name at ``{carrier}.effects[i].capture.{name}``.
+    placement is valid in the dict-capable slots (``value`` / ``values[*].value``
+    / ``body`` / ``path``), but ``key`` / ``headers`` are string-only — ANY
+    occurrence there is a violation; any non-whole occurrence (inline or nested
+    ``{name.x}``) is a violation everywhere. One violation for that name at
+    ``{carrier}.effects[i].capture.{name}``.
     An object capture no later effect references is allowed (soft posture).
     Kafka effects carry no capture. Never raises; ``effects is None`` -> [].
     """
@@ -169,18 +184,18 @@ def _effect_capture_errors(
             if spec.type != "object":
                 continue
             if not any(
-                _walk_effect_tree(slot, cap_name)
+                _walk_effect_tree(slot, cap_name, string_only=string_only)
                 for later in effects[i + 1 :]
-                for slot in _effect_slot_values(later)
+                for slot, string_only in _effect_slot_values(later)
             ):
                 continue
             errors.append({
                 "path": f"{carrier_label}.effects[{i}].capture.{cap_name}",
                 "message": (
                     f'capture {cap_name!r} of type "object" must occupy '
-                    f"the whole field (\"{{{cap_name}}}\"); it appears inline "
-                    f"or nested in a later effect's "
-                    f"value/body/path/key/headers"
+                    f"the whole field (\"{{{cap_name}}}\") in a later effect's "
+                    f"value/body/path and cannot be used in key/headers "
+                    f"(string-only slots)"
                 ),
             })
     return errors
@@ -200,11 +215,12 @@ def collect_capture_placement_errors(mocks: MocksConfig | None) -> list[dict]:
     captures and stubs/reactors with ``capture=None`` contribute nothing.
 
     Additionally walks each HTTP effect's ``capture`` (both carriers): an
-    object capture used non-whole in a SUBSEQUENT effect's fields is one
-    violation per name, reported at ``...effects[i].capture.{N}`` (unused
-    object captures are allowed). Effects-only reactors (``reaction is None``)
-    skip the reaction checks. ``scalar``/``json`` effect captures contribute
-    nothing.
+    object capture misplaced in a SUBSEQUENT effect's fields (non-whole
+    anywhere, or any occurrence in the string-only ``key``/``headers`` slots)
+    is one violation per name, reported at ``...effects[i].capture.{N}``
+    (unused object captures are allowed). Effects-only reactors
+    (``reaction is None``) skip the reaction checks. ``scalar``/``json``
+    effect captures contribute nothing.
 
     ``mocks is None`` (or its ``http``/``kafka``/``grpc`` subsections None)
     -> ``[]``. Never raises — callers (``config validate``,

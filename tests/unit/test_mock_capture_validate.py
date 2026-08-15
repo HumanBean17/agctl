@@ -494,11 +494,13 @@ def test_http_effect_object_capture_nested_placeholder_is_flagged():
     assert errors[0]["path"] == "mocks.http.stubs.chain.effects[0].capture.ctx"
 
 
-def test_http_effect_object_capture_whole_in_later_kafka_key_headers_valid():
-    """The whole-object placeholder may appear in a later effect's
-    value/key/headers (any of the enumerated slot kinds) — whole-field is the
-    valid placement everywhere in the effects walk; only non-whole occurrences
-    are violations."""
+def test_http_effect_object_capture_whole_in_later_kafka_key_headers_flagged():
+    """``key``/``headers`` of a later kafka effect are string-only slots
+    (mirroring ``reaction.key``/``reaction.headers``): ANY ``{ctx}`` occurrence
+    there is a violation, whole-field included — ``render_typed`` would hand
+    the live dict to the producer as a non-str key / header value. One error at
+    the capture path; the whole-field ``value`` use in the same effect stays
+    valid."""
     mocks = MocksConfig(
         kafka=KafkaMockConfig(
             reactors={
@@ -523,7 +525,48 @@ def test_http_effect_object_capture_whole_in_later_kafka_key_headers_valid():
             },
         ),
     )
-    assert collect_capture_placement_errors(mocks) == []
+    errors = collect_capture_placement_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.kafka.reactors.tap.effects[0].capture.ctx"
+    assert "{ctx}" in errors[0]["message"]
+
+
+def test_http_effect_object_capture_whole_in_later_values_item_key_headers_flagged():
+    """Per-item ``key``/``headers`` inside a later kafka effect's ``values[]``
+    are string-only slots too — a whole-field ``{ctx}`` there is a violation
+    (same rule as the top-level slots); the item's whole-field ``value`` stays
+    valid."""
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "tap": KafkaReactor(
+                    topic="in",
+                    match=".v",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        KafkaEffect(
+                            type="kafka",
+                            topic="out",
+                            values=[
+                                KafkaEffectMessage(
+                                    value={"context": "{ctx}"},
+                                    key="{ctx}",
+                                    headers={"x-trace": "{ctx}"},
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.kafka.reactors.tap.effects[0].capture.ctx"
 
 
 def test_http_effect_object_capture_inline_in_later_key_flagged():
@@ -559,8 +602,10 @@ def test_http_effect_object_capture_inline_in_later_key_flagged():
 
 def test_http_effect_object_capture_in_later_headers_and_path_flagged():
     """Inline/nested occurrences in a later http effect's headers value and
-    path are each violations; whole-field '{ctx}' in the same slots is not.
-    Two stubs isolate the flagged case from the whole-field case."""
+    path are each violations. Headers is a string-only slot (mirroring
+    ``reaction.headers``), so even a whole-field '{ctx}' header value is a
+    violation; path keeps whole-field-valid semantics. Two stubs isolate the
+    inline case from the whole-field case."""
     flagged = MocksConfig(
         http=HttpMockConfig(
             stubs={
@@ -589,6 +634,8 @@ def test_http_effect_object_capture_in_later_headers_and_path_flagged():
     assert len(errors) == 1
     assert errors[0]["path"] == "mocks.http.stubs.s.effects[0].capture.ctx"
 
+    # Whole-field in path: still valid. Whole-field in headers: string-only
+    # slot -> violation.
     whole = MocksConfig(
         http=HttpMockConfig(
             stubs={
@@ -605,7 +652,6 @@ def test_http_effect_object_capture_in_later_headers_and_path_flagged():
                             type="http",
                             url="https://x/use",
                             path="{ctx}",
-                            headers={"x-ctx": "{ctx}"},
                         ),
                     ],
                     response=HttpResponse(),
@@ -614,6 +660,33 @@ def test_http_effect_object_capture_in_later_headers_and_path_flagged():
         ),
     )
     assert collect_capture_placement_errors(whole) == []
+
+    whole_header = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "s": HttpStub(
+                    method="POST",
+                    path="/o",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/fetch",
+                            capture={"ctx": _obj_cap(".body.ctx")},
+                        ),
+                        HttpEffect(
+                            type="http",
+                            url="https://x/use",
+                            headers={"x-ctx": "{ctx}"},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(whole_header)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.http.stubs.s.effects[0].capture.ctx"
 
 
 def test_http_effect_object_capture_earlier_effect_use_is_ignored():
