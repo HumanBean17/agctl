@@ -60,7 +60,7 @@ This spec closes that gap by generalizing the reactor's single Kafka `reaction` 
 3. **`value` XOR `values` on the kafka effect.** `value` covers one message; `values: [ {value, key?, headers?}, … ]` covers the "multiple Kafka messages" item within one effect. Top-level `key` / `headers` are per-message defaults (and fallback for list items that omit their own). *Rejected:* forcing multiple messages to be multiple effects (loses rendering a `values` list from one captured array).
 4. **HTTP effect dual target mode (service | url).** Mirrors `http request`: `service` + `path` (resolved against a configured `services.*`) or a literal `url`, mutually exclusive. Reuses `HttpClient` and the service's TLS/timeout config for free.
 5. **Capture chaining: ordered accumulation, last-wins on collision.** The trigger's own `capture` runs first; each effect's `capture` adds to the same namespace; later effects may reference earlier names in their `value` / `body` / `path` / `key`. On a name collision the later value wins — predictable because the list is ordered. This is documented behavior, not a validate-time error (ordered overwrite is the intended chaining mechanism).
-6. **`KafkaReactor.reaction` is back-compat sugar.** It stays valid and is exactly equivalent to `effects: [{type: kafka, topic, key, value, headers}]` bound to the reactor's existing trigger-cluster client + `reaction_codec`. Setting **both** `reaction` and `effects` on one reactor is a validate-time `ConfigError`. The legacy path keeps emitting `kafka.reacted` unchanged.
+6. **`KafkaReactor.reaction` is back-compat sugar.** It stays valid, *semantically equivalent* to `effects: [{type: kafka, topic, key, value, headers}]` bound to the reactor's existing trigger-cluster client + `reaction_codec` — but implemented as a **distinct `_handle` path**, byte-for-byte preserving today's Kafka→Kafka produce and the `kafka.reacted` event (not expanded into a bound kafka effect at startup). Setting **both** `reaction` and `effects` on one reactor is a validate-time `ConfigError`. The legacy path keeps emitting `kafka.reacted` unchanged.
 7. **Synchronous, produce/call-before-respond for HTTP triggers.** Effects run inside the HTTP handler's existing concurrency-semaphore section, before the response bytes are written, so the response is an honest acknowledgement. *Rejected:* fire-and-forget (respond immediately, produce in the background) — breaks test determinism and the fail-loud guarantee.
 8. **Effect failure: fatal + COMMIT-not-retry.** Mirrors `kafka.error` / `grpc.unmatched`. The trigger is valid; the side-effect failed. Surfaced via `effect.error` + exit 1, never via re-delivery. `--fail-fast` stops on the first `effect.error`.
 9. **HTTP response under `--fail-fast` (the one open runtime detail, closed).** Default mode: all effects run; on any failure the response is still sent and the run fails at shutdown. `--fail-fast`: on the first `effect.error` the process aborts before responding, so the SUT sees a connection-level failure (hard-fail opt-in). No retroactive response rewriting in either mode.
@@ -132,7 +132,7 @@ Encode reuses `KafkaClient.produce` (+ the independent reaction-codec `_raw` pat
 | `timeout` | no | seconds; falls back to the service's `timeout_seconds` → `defaults.timeout_seconds` → `10` (hard default, mirroring `resolve_timeout` — a None chain never disables timeouts) |
 | `capture` | no | a `CaptureSpec` map rooted in the **HTTP response envelope** `{status_code, response_time_ms, headers (lowercased), body, url, method}` — same root as `http call --match`, so `.body.ackId`, `.status_code`, `.headers.x`. Feeds the namespace for later effects. |
 
-The call goes through the existing `HttpClient`, so `service.use_tls` / `service.tls` / `service.base_url` apply for free.
+The call goes through the existing `HttpClient`, so `service.base_url` (and TLS — implicit via `https` URLs; `ServiceConfig` carries no TLS fields) applies for free.
 
 ### 6.3 Field-contract notes
 
@@ -155,7 +155,7 @@ Captures accumulate in execution order: the trigger's own `capture` runs first (
 Effects run in list order. Each is fully resolved (render + dispatch + ack) before the next begins; the executor short-circuits on the **first** failing effect. The primary result is rendered from the trigger's own captures only (independent of effect captures):
 
 - **HTTP trigger:** render `response` → run `effects` inside the concurrency-semaphore section → send the response. A returned 2xx means every effect acked.
-- **Kafka trigger:** match → trigger capture → run `effects` → `COMMIT`. The legacy `reaction` is expanded at startup into one bound kafka effect (same trigger-cluster client + `reaction_codec`) and runs in its list position if `effects` is absent.
+- **Kafka trigger:** match → trigger capture → run `effects` → `COMMIT`. The legacy `reaction` stays a **distinct `_handle` path** (byte-for-byte today's Kafka→Kafka produce, preserving `kafka.reacted`) — it is not expanded into a bound kafka effect; `reaction` and `effects` are mutually exclusive on one reactor.
 
 ### 7.3 Multiple Kafka messages
 
@@ -179,7 +179,7 @@ Its contract is a single dispatch: given an ordered `effects` list, a capture na
 **Invocation points:**
 
 - **`make_handler` (HTTP):** after match → `resolve_captures` → render `response`, the handler runs `stub.effects` through the executor **inside the existing concurrency-semaphore section, before the response is written**.
-- **`KafkaReactor._handle`:** after match → capture, the reactor runs its `effects` list. The legacy `reaction` is expanded at startup into one bound kafka effect (preserving today's Kafka→Kafka path byte-for-byte). Explicit kafka effects resolve their **own** cluster/client/codec.
+- **`KafkaReactor._handle`:** after match → capture, the reactor runs its `effects` list. The legacy `reaction` stays a **distinct `_handle` path** (byte-for-byte today's Kafka→Kafka produce, preserving `kafka.reacted`); explicit kafka effects resolve their **own** cluster/client/codec.
 
 ---
 
@@ -225,7 +225,7 @@ agctl/
 │   ├── engine.py              # EXTEND — construct executor; thread into http handler + reactors;
 │   │                          #         kafka_produced/http_called/effect_errors counters; effect.error fatal flag
 │   ├── http_server.py         # EXTEND — make_handler receives executor; runs effects in semaphore section before response
-│   ├── kafka_reactor.py       # EXTEND — _handle runs effects; startup expands legacy reaction into one bound kafka effect
+│   ├── kafka_reactor.py       # EXTEND — _handle runs effects; legacy reaction keeps its own distinct _handle path (kafka.reacted)
 │   ├── daemon.py              # EXTEND — FATAL_FAILURE_EVENTS += effect.error; EVENT_TO_COUNTER += kafka.produced/http.called/effect.error
 │   └── capture_validate.py    # EXTEND — collect_capture_placement_errors walks http-effect capture
 ├── config/
@@ -237,7 +237,7 @@ agctl/
     └── config_commands.py     # EXTEND — collect_unknown_template_errors walks effect fields
 ```
 
-`mock/jq_precompile.py` is **unchanged** — effects introduce no new jq predicates (captures use runtime `jq_value`, not startup-compiled predicates).
+`mock/jq_precompile.py` is **extended** to walk each stub/reactor's http-effect `capture.from` expressions (one `effects[i].capture.{cap}.from` label per capture) — a malformed capture `from` on an effect must fail at startup, not silently capture empty. Effect *match* predicates introduce no new jq (effects have no `match`; captures use runtime `jq_value` for resolution, the walk only compiles the `from`).
 
 ---
 
@@ -266,7 +266,7 @@ agctl/
 
 ## 14. Backward Compatibility & Docs Sync
 
-- **Backward compatible.** `effects` is opt-in. The legacy `reaction` stays valid (= one bound kafka effect, emits `kafka.reacted`). New events and summary counters are additive. No existing config or event changes.
+- **Backward compatible.** `effects` is opt-in. The legacy `reaction` stays valid (a distinct `_handle` path, emits `kafka.reacted`). New events and summary counters are additive. No existing config or event changes.
 - **Docs sync (via `docs-watcher` at implementation finish):**
   - DESIGN §2.1 — `effects` under `mocks.http.stubs` / `mocks.kafka.reactors`; the two effect variants and field tables.
   - DESIGN §3.6 — effect lifecycle, ordering, events, failure semantics.
@@ -291,9 +291,18 @@ agctl/
 - **Service-mode `path` rendering — implemented** (spec §6.2 promised it; the initial executor passed `path` verbatim). `_run_http` applies `render_typed(path, namespace)` when `effect.service is not None`; url mode stays fully literal.
 - **`values` item fallback to top-level `key`/`headers` — implemented** (spec §6.1 documented it as a fallback; the initial executor used items as-is). Per item: the item's own `key`/`headers` when set, else the effect-level ones.
 - **`{{gen}}` generator pre-pass — implemented.** `EffectExecutor.run` builds ONE memo per call and runs `substitute_generators` over each effect's payload fields before `render_typed` (kafka `value`/`values[*]`/`key`/`headers`; http `body`/`headers`/ service-mode `path`). Known limitation (pre-existing, now documented in DESIGN §2.5): mock *response* bodies and kafka `reaction` payloads are NOT generator fill sites — tokens there are validated but served literally.
-- **`--no-template-vars` does not reach the executor** — the global flag is read via `template_vars_enabled_from_ctx` by command callbacks, but `mock run` never threads it into the engine/executor; the pre-pass is therefore unconditional. Left as-is per fix-wave ruling (no new flag plumbing).
+- **`--no-template-vars` does not reach the executor** — the global flag is read via `template_vars_enabled_from_ctx` by command callbacks, but `mock run` never threads it into the engine/executor; the pre-pass is therefore unconditional. Left as-is per fix-wave ruling (no new flag plumbing; DESIGN §2.5/§3 document the carve-out).
 - **HttpClient pool keyed `(base_url, timeout)`** — the initial per-`base_url` cache silently reused the first effect's timeout for later effects on the same host; the key now includes the resolved timeout.
 - **`agctl discover` on effects-only reactors** — the category-listing example and the item `reaction` serialization dereferenced `reaction.topic`/`model_dump` unguarded (legal `reaction=None` since T1); both guarded, with the effects list serialized under `effects` and the example naming the first kafka effect's topic (`<effects>` placeholder when only http effects).
+
+### 15.2 Plan refinements + merge-fix-wave rulings (as-built deltas)
+
+- **Legacy `reaction` is NOT expanded into a bound kafka effect** (§5.6/§7.2/§8 as written were wrong): it stays a distinct `_handle` path, byte-for-byte preserving today's Kafka→Kafka produce and the `kafka.reacted` event. `reaction` and `effects` are mutually exclusive at the model layer (`exactly-one-of`), not two renderings of one list.
+- **`jq_precompile` was extended, not left unchanged** (§11 as written was wrong): the walk also compiles each stub/reactor's http-effect `capture.from` (labels `effects[i].capture.{cap}.from`) so a malformed capture `from` fails at startup.
+- **`service.use_tls` / `service.tls` removed from §6.2** — `ServiceConfig` has no TLS fields; TLS is implicit via `https` URLs (`base_url` scheme), inherited from `HttpClient` for free.
+- **Eager startup codec/url/brokers validation (merge-fix F4).** `mock_run`'s Guard 5b walk resolves each kafka effect's codec eagerly (`_resolve_codec` with the once-per-cluster SR probe dedup) and seeds the resolver's codec cache, guards the effect's resolved cluster for empty `brokers` (mirroring the reactor walk), and calls `_split_url` on every url-mode http effect at startup (malformed → `ConfigError` with the dotted `effects[i].url` path). Spec §7.4's startup-`ConfigError` promise now holds for all three, not just cluster resolution; the resolver closures remain as lazy-safe cache-hits for any path the walk misses.
+- **`min_length=1` on `effects` / `values` (merge-fix F2).** `HttpStub.effects`, `KafkaReactor.effects`, and `KafkaEffect.values` reject empty lists at parse time — `effects: []` / `values: []` were silent no-ops that still satisfied the structural exactly-one-of checks.
+- **Trigger-capture placement walk (merge-fix F5).** `collect_capture_placement_errors` additionally checks each stub/reactor's OWN `capture` entries of `type: object` against that carrier's ENTIRE effects list (a trigger-level capture exists before every effect runs, unlike a response capture which exists only after its capturing effect): whole-field in `value`/`values[*].value`/`body`/`path` valid; `key`/`headers` flag any occurrence; inline/nested flag everywhere — one violation per name at `{carrier}.capture.{N}`.
 
 ---
 

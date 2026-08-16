@@ -676,7 +676,7 @@ Template bodies (HTTP path/body, Kafka pattern `match`, free-form DB `--sql`, mo
 | `{{rand}}` | 16 lowercase hex chars. | `a1b2c3d4e5f60718` |
 | `{{rand:N}}` | N lowercase hex chars (N ≥ 1). | |
 
-Generator output is charset-restricted (injection-safe by construction). An unknown generator name (e.g. `{{foo}}`) is a `ConfigError` at both `config validate` and fill time. The global `--no-template-vars` flag (§3) is an escape hatch that leaves `{{...}}` tokens literal everywhere; the `agctl gen uuid|ts|rand` group (§3.10) generates standalone values for cross-step sharing. **Known limitation:** DB *template* SQL (`database.templates.<t>.sql`) is not yet a generator fill site — generators substitute in free-form `--sql` only; template SQL binds parameters via `:paramName`. **Known limitation:** mock *response* bodies/headers (§2.1 `mocks.*.response`) and kafka `reaction` payloads are not generator fill sites either — a `{{uuid}}` there is validated but served literally. Mock **effect** fields (`effects:` value/values/key/headers, http body/headers/path) DO resolve generators (once per trigger).
+Generator output is charset-restricted (injection-safe by construction). An unknown generator name (e.g. `{{foo}}`) is a `ConfigError` at both `config validate` and fill time. The global `--no-template-vars` flag (§3) is an escape hatch that leaves `{{...}}` tokens literal everywhere — **except** the mock `effects:` generator pre-pass, which the flag does not reach, so `{{...}}` in effect fields substitutes unconditionally; the `agctl gen uuid|ts|rand` group (§3.10) generates standalone values for cross-step sharing. **Known limitation:** DB *template* SQL (`database.templates.<t>.sql`) is not yet a generator fill site — generators substitute in free-form `--sql` only; template SQL binds parameters via `:paramName`. **Known limitation:** mock *response* bodies/headers (§2.1 `mocks.*.response`) and kafka `reaction` payloads are not generator fill sites either — a `{{uuid}}` there is validated but served literally. Mock **effect** fields (`effects:` value/values/key/headers, http body/headers/path) DO resolve generators (once per trigger).
 
 ---
 
@@ -690,7 +690,7 @@ All commands share these global flags:
 | `--env-file <path>` | `.env` next to resolved config | Explicit path to a `.env` file; values are defaults, real env wins (precedence: `--env-file` > `AGCTL_ENV_FILE` > sibling `.env`) |
 | `--overlay <path>` | — | Overlay config fragment (repeatable; later wins); layered on base config |
 | `--timeout <seconds>` | from config `defaults` | Override request/operation timeout |
-| `--no-template-vars` | off | Disable `{{...}}` value-generator substitution globally; leave generator tokens literal (escape hatch; see §2.5). `agctl gen` ignores it |
+| `--no-template-vars` | off | Disable `{{...}}` value-generator substitution globally; leave generator tokens literal (escape hatch; see §2.5). Does not reach the mock `effects:` generator pre-pass — `{{...}}` there substitutes unconditionally. `agctl gen` ignores it |
 | `--version` | — | Print version and exit |
 
 ### 3.1 `agctl http` — HTTP Requests
@@ -1788,7 +1788,10 @@ agctl mock status
       "kafka_errors": 0,
       "grpc_hits": 1,
       "grpc_unmatched": 0,
-      "grpc_errors": 0
+      "grpc_errors": 0,
+      "kafka_produced": 2,
+      "http_called": 1,
+      "effect_errors": 0
     },
     "failures_so_far": []
   },
@@ -2778,7 +2781,7 @@ Refused to overwrite (without `--force`):
 
 **Exit codes:**
 - `0` — clean shutdown, no runtime errors.
-- `1` — runtime errors occurred (`kafka_errors > 0`, fatal reactor failure, any `grpc.unmatched`/`grpc.error` event, or `--fail-fast` triggered).
+- `1` — runtime errors occurred (`kafka_errors > 0`, fatal reactor failure, any `grpc.unmatched`/`grpc.error` event, any `effect.error` event, or `--fail-fast` triggered).
 - `2` — startup error (config, bind, broker probe, missing `kafka` extra, or missing `grpc` extra when the gRPC engine is selected).
 
 #### `kafka.listen.run` streaming output
