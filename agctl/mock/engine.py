@@ -578,6 +578,24 @@ class MockEngine:
             if self._grpc_server is not None:
                 self._grpc_server.shutdown()
 
+            # Drain the HTTP server's in-flight handlers BEFORE the same
+            # snapshot (mirrors the gRPC drain above). ``shutdown()`` stops
+            # the serve loop — ThreadingHTTPServer finishes only the requests
+            # already accepted — and joining the serve thread here (instead
+            # of deferring to ``shutdown()``) guarantees those handler threads
+            # have run before the exit code is read: a handler whose effect
+            # executor fails during wind-down emits ``effect.error`` (→
+            # ``_runtime_error`` + counters) that the EXIT CODE must reflect,
+            # not just the summary. Idempotent for ``shutdown()``'s later
+            # call: ``ThreadingHTTPServer.shutdown()`` returns immediately
+            # when the serve loop already exited, ``server_close()`` still
+            # releases the socket, and ``join()`` on a finished thread is a
+            # no-op.
+            if self._http_server is not None:
+                self._http_server.shutdown()
+            if self._http_thread is not None:
+                self._http_thread.join(timeout=2.0)
+
             # Determine exit code (DESIGN §11): exit 1 if ANY runtime error
             # occurred (any kafka.error, fatal or not) or a fatal/fail-fast
             # stop was triggered; else 0. Read under _emit_lock to share the

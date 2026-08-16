@@ -848,6 +848,141 @@ mocks:
             # The engine is never constructed (startup fails before it).
             mock_factory.assert_not_called()
 
+    def test_kafka_effect_avro_without_sr_fails_startup(
+        self, temp_config, fake_engine
+    ):
+        """(F4) An avro kafka effect on an SR-less cluster -> ConfigError
+        (exit 2) at mock run STARTUP, not on the first trigger via
+        effect.error. Spec §7.4: codec resolution is eager."""
+        config_content = """
+version: "3"
+kafka:
+  clusters:
+    main:
+      brokers:
+        - "main:9092"
+  default_cluster: main
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: kafka
+            topic: eff-topic
+            value_format: avro
+            value: {"ping": 1}
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+            )
+
+            assert result.exit_code == 2
+            envelope = _single_envelope(result)
+            assert envelope["error"]["type"] == "ConfigError"
+            assert "Schema Registry" in envelope["error"]["message"]
+            mock_factory.assert_not_called()
+
+    def test_kafka_effect_empty_brokers_cluster_fails_startup(
+        self, temp_config, fake_engine
+    ):
+        """(F4) A kafka effect whose resolved cluster has empty brokers ->
+        ConfigError (exit 2) at startup, mirroring the reactor walk's guard."""
+        config_content = """
+version: "3"
+kafka:
+  clusters:
+    main:
+      brokers:
+        - "main:9092"
+    empty: {}
+  default_cluster: main
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: kafka
+            topic: eff-topic
+            cluster: empty
+            value: {"ping": 1}
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+            )
+
+            assert result.exit_code == 2
+            envelope = _single_envelope(result)
+            assert envelope["error"]["type"] == "ConfigError"
+            assert "empty.brokers" in envelope["error"]["message"]
+            mock_factory.assert_not_called()
+
+    def test_http_effect_malformed_url_fails_startup(
+        self, temp_config, fake_engine
+    ):
+        """(F4) A url-mode http effect with a malformed URL -> ConfigError
+        (exit 2) at startup, with the dotted effects[i].url path in the
+        detail (not on the first trigger via effect.error)."""
+        config_content = """
+version: "3"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            url: "ftp://not-http"
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+            )
+
+            assert result.exit_code == 2
+            envelope = _single_envelope(result)
+            assert envelope["error"]["type"] == "ConfigError"
+            assert envelope["error"]["detail"]["path"] == (
+                "mocks.http.stubs.stub1.effects[0].url"
+            )
+            mock_factory.assert_not_called()
+
     def test_http_effect_resolver_service_mode(self, temp_config, fake_engine):
         """An http effect with service="order-service" (declared) ->
         http_resolver passed; returns an HttpClient bound to the service's

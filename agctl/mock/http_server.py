@@ -373,6 +373,12 @@ def make_handler(
                             # No response bytes; the release below (finally)
                             # still frees the concurrency permit. http.hit is
                             # NOT emitted — no response was served.
+                            # close_connection makes BaseHTTPRequestHandler's
+                            # loop exit after this return instead of holding
+                            # the socket open for the next keep-alive request —
+                            # the client sees the connection-level failure
+                            # promptly rather than after a read timeout.
+                            self.close_connection = True
                             return
 
                     # Emit BEFORE sending the response (see the 404 path): the

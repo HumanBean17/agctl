@@ -775,3 +775,100 @@ def test_kafka_reactor_effects_only_with_capture_does_not_raise():
         ),
     )
     assert collect_capture_placement_errors(mocks) == []
+
+
+# --- Trigger-level object captures vs the carrier's own effects (F5) ---------
+def test_trigger_object_capture_in_effect_key_is_flagged():
+    """A reactor's OWN object capture used in an effect's ``key`` (string-only
+    slot) -> one error at the carrier path. All effects run AFTER the trigger
+    capture, so the whole effects list is in scope (not just later ones)."""
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "tap": KafkaReactor(
+                    topic="in",
+                    capture={"ctx": _obj_cap(".value.ctx")},
+                    effects=[
+                        KafkaEffect(type="kafka", topic="out", key="{ctx}", value=1),
+                    ],
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.kafka.reactors.tap.capture.ctx"
+    assert "key" in errors[0]["message"]
+
+
+def test_trigger_object_capture_inline_in_effect_body_is_flagged():
+    """A reactor's OWN object capture used inline (``{ctx.x}``) inside an
+    effect's ``body`` -> one error (nested tokens render literally)."""
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "tap": KafkaReactor(
+                    topic="in",
+                    capture={"ctx": _obj_cap(".value.ctx")},
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/notify",
+                            body={"msg": "pre={ctx.x}"},
+                        ),
+                    ],
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.kafka.reactors.tap.capture.ctx"
+    assert "whole field" in errors[0]["message"]
+
+
+def test_trigger_object_capture_whole_field_in_effect_value_is_valid():
+    """A reactor's OWN object capture occupying a WHOLE field in an effect's
+    ``value`` is the valid placement — no error (F5 does not flag what the
+    effects walk already allows)."""
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "tap": KafkaReactor(
+                    topic="in",
+                    capture={"ctx": _obj_cap(".value.ctx")},
+                    effects=[
+                        KafkaEffect(
+                            type="kafka",
+                            topic="out",
+                            value={"context": "{ctx}"},
+                        ),
+                    ],
+                ),
+            },
+        ),
+    )
+    assert collect_capture_placement_errors(mocks) == []
+
+
+def test_http_stub_trigger_object_capture_in_effect_key_is_flagged():
+    """Same F5 rule on an HTTP stub: the stub's OWN object capture used in a
+    kafka effect's ``key`` -> one error at the stub's capture path."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "s": HttpStub(
+                    method="POST",
+                    path="/o",
+                    capture={"ctx": _obj_cap(".body.ctx")},
+                    effects=[
+                        KafkaEffect(type="kafka", topic="out", key="{ctx}", value=1),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    errors = collect_capture_placement_errors(mocks)
+    assert len(errors) == 1
+    assert errors[0]["path"] == "mocks.http.stubs.s.capture.ctx"

@@ -608,6 +608,13 @@ def test_kafka_effect_headers_non_string_rejected():
         KafkaEffect(type="kafka", topic="t", value=1, headers={"x": 5})
 
 
+def test_kafka_effect_empty_values_rejected():
+    """KafkaEffect(values=[]) -> ValidationError (an empty list is a silent
+    no-op producer, not a valid multi-message effect)."""
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        KafkaEffect(type="kafka", topic="t", values=[])
+
+
 def test_http_effect_service_method_normalized():
     """HttpEffect(service='s', path='/p', method='post') parses; .method == 'POST'."""
     effect = HttpEffect(type="http", service="s", path="/p", method="post")
@@ -665,6 +672,25 @@ def test_http_stub_effects_default_none():
     """HttpStub without effects -> .effects is None."""
     stub = HttpStub(method="POST", path="/x", response={"status": 200})
     assert stub.effects is None
+
+
+def test_http_stub_empty_effects_rejected():
+    """HttpStub(effects=[]) -> ValidationError (an empty list is a silent
+    no-op, not a valid effects declaration)."""
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        HttpStub(
+            method="POST",
+            path="/x",
+            response={"status": 200},
+            effects=[],
+        )
+
+
+def test_kafka_reactor_empty_effects_rejected():
+    """KafkaReactor(effects=[]) -> ValidationError (an empty list is a silent
+    no-op, not a valid effects declaration)."""
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        KafkaReactor(topic="t", effects=[])
 
 
 def test_kafka_reactor_with_effects_only():

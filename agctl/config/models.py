@@ -322,7 +322,10 @@ class KafkaEffect(BaseModel):
     type: Literal["kafka"]
     topic: str
     value: Any | None = None
-    values: list[KafkaEffectMessage] | None = None
+    # min_length=1: an empty ``values: []`` would parse (satisfying the
+    # exactly-one-of via not-None) yet produce nothing on every trigger — a
+    # silent no-op. Reject it at parse time instead.
+    values: list[KafkaEffectMessage] | None = Field(default=None, min_length=1)
     key: str | None = None
     headers: dict[str, str] | None = None
     # Named cluster this effect produces to (mirrors KafkaReactor.cluster).
@@ -400,7 +403,9 @@ class HttpStub(BaseModel):
     response: HttpResponse
     delay_ms: int = 0
     # Cross-transport effects fired after the stub responds (later tasks).
-    effects: list[Effect] | None = None
+    # min_length=1: an empty ``effects: []`` parses (satisfying effects-only
+    # configs structurally) yet does nothing — reject the silent no-op.
+    effects: list[Effect] | None = Field(default=None, min_length=1)
 
     @field_validator("method")
     @classmethod
@@ -463,7 +468,8 @@ class KafkaReactor(BaseModel):
     capture: dict[str, CaptureSpec] | None = None
     reaction: KafkaReaction | None = None
     # Cross-transport effects fired after the reactor matches (later tasks).
-    effects: list[Effect] | None = None
+    # min_length=1: mirrors HttpStub.effects — an empty list is a silent no-op.
+    effects: list[Effect] | None = Field(default=None, min_length=1)
     # Named cluster this reactor binds to (DESIGN §7, consumed in Task 3).
     # None -> resolved via default_cluster / single-cluster auto-default.
     cluster: str | None = None

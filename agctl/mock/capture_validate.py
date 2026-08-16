@@ -37,6 +37,14 @@ uses is ALLOWED (chained captures may go unused). Effects-only reactors
 (``reaction is None``) skip the reaction checks — there is no reaction to
 misplace captures in.
 
+Trigger-capture rule: a stub's/reactor's OWN ``capture`` entries of type
+``object`` are checked against that carrier's ENTIRE effects list (a
+trigger-level capture exists before every effect runs, unlike a response
+capture which exists only after its capturing effect). Same slot rules —
+whole-field in ``value`` / ``values[*].value`` / ``body`` / ``path`` is valid;
+``key`` / ``headers`` flag any occurrence; inline/nested flag everywhere —
+one violation per name at ``{carrier}.capture.{N}``.
+
 Pure Python: imports only :mod:`config.models` and inlines a placeholder regex
 (no :mod:`resolution` import) — no jq, no ``assertions`` dependency. That keeps
 ``config/*`` free of an assertions dependency when ``config_commands.py`` calls this.
@@ -128,7 +136,10 @@ def _walk_effect_tree(value: Any, name: str, *, string_only: bool = False) -> bo
         c = _classify_effect(value, name)
         return c in ("whole", "inline") if string_only else c == "inline"
     if isinstance(value, dict):
-        return any(_walk_effect_tree(v, name, string_only=string_only) for v in value.values())
+        return any(
+            _walk_effect_tree(v, name, string_only=string_only)
+            for v in value.values()
+        )
     if isinstance(value, list):
         return any(_walk_effect_tree(v, name, string_only=string_only) for v in value)
     return False
@@ -202,6 +213,47 @@ def _effect_capture_errors(
     return errors
 
 
+def _trigger_capture_errors(
+    carrier_label: str,
+    capture: dict[str, Any] | None,
+    effects: list[Effect] | None,
+) -> list[dict]:
+    """Check a carrier's OWN ``capture`` object names against its effects.
+
+    A trigger-level capture exists BEFORE any effect runs, so the ENTIRE
+    effects list is in scope (the http-effect walk in
+    :func:`_effect_capture_errors` checks only LATER effects because a
+    response capture exists only after its capturing effect). Same slot rules
+    as :func:`_effect_slot_values`: whole-field in the dict-capable slots
+    (``value`` / ``values[*].value`` / ``body`` / ``path``) is valid; the
+    string-only ``key`` / ``headers`` slots flag ANY occurrence; inline or
+    nested (``{N.x}``) occurrences flag everywhere. One violation per name at
+    ``{carrier}.capture.{N}``.
+    """
+    if capture is None or effects is None:
+        return []
+    errors: list[dict] = []
+    for cap_name, spec in capture.items():
+        if spec.type != "object":
+            continue
+        if not any(
+            _walk_effect_tree(slot, cap_name, string_only=string_only)
+            for effect in effects
+            for slot, string_only in _effect_slot_values(effect)
+        ):
+            continue
+        errors.append({
+            "path": f"{carrier_label}.capture.{cap_name}",
+            "message": (
+                f'capture {cap_name!r} of type "object" must occupy '
+                f"the whole field (\"{{{cap_name}}}\") in an effect's "
+                f"value/body/path and cannot be used in key/headers "
+                f"(string-only slots)"
+            ),
+        })
+    return errors
+
+
 def collect_capture_placement_errors(mocks: MocksConfig | None) -> list[dict]:
     """Scan ``mocks`` for object-capture misplacement; return one record per violation.
 
@@ -242,6 +294,13 @@ def collect_capture_placement_errors(mocks: MocksConfig | None) -> list[dict]:
             errors.extend(
                 _effect_capture_errors(f"mocks.http.stubs.{name}", stub.effects)
             )
+            # The stub's OWN trigger-level captures: they exist before every
+            # effect runs, so the whole effects list is in scope (F5).
+            errors.extend(
+                _trigger_capture_errors(
+                    f"mocks.http.stubs.{name}", stub.capture, stub.effects
+                )
+            )
             if stub.capture is None:
                 continue
             for cap_name, spec in stub.capture.items():
@@ -263,6 +322,13 @@ def collect_capture_placement_errors(mocks: MocksConfig | None) -> list[dict]:
         for name, reactor in mocks.kafka.reactors.items():
             errors.extend(
                 _effect_capture_errors(f"mocks.kafka.reactors.{name}", reactor.effects)
+            )
+            # The reactor's OWN trigger-level captures: they exist before every
+            # effect runs, so the whole effects list is in scope (F5).
+            errors.extend(
+                _trigger_capture_errors(
+                    f"mocks.kafka.reactors.{name}", reactor.capture, reactor.effects
+                )
             )
             if reactor.capture is None:
                 continue

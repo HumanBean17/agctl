@@ -619,14 +619,21 @@ def mock_run(
         # Guard 5b (Task 6, cross-transport effects): walk every effect across
         # HTTP stubs and Kafka reactors. The walk (1) fails fast on effects
         # that cannot resolve — an http effect naming an unknown service, a
-        # kafka effect on an unresolvable cluster — BEFORE the engine is
-        # constructed, and (2) builds the resolver closures the engine's
-        # EffectExecutor needs. No effects anywhere ⇒ both resolvers stay None
+        # kafka effect on an unresolvable/SR-less/empty-brokers cluster, an
+        # http effect with a malformed url — BEFORE the engine is constructed,
+        # and (2) builds the resolver closures the engine's EffectExecutor
+        # needs. No effects anywhere ⇒ both resolvers stay None
         # and the engine keeps its pre-effects behavior byte-for-byte.
         kafka_resolver = None
         http_resolver = None
         has_kafka_effects = False
         has_http_effects = False
+        # Seed for the resolver's codec cache (populated eagerly below): the
+        # pre-seeded keys let the lazy closure stay a pure cache-hit for the
+        # common path while still covering any key the walk did not.
+        effect_codec_cache: dict[
+            tuple[str, str, str | None, str | None], tuple[Any, Any]
+        ] = {}
         if cfg.mocks is not None:
             for owner_kind, owner_name, effect_list in _effect_lists(cfg.mocks):
                 for i, effect in enumerate(effect_list or []):
@@ -642,6 +649,19 @@ def mock_run(
                                     "path": f"{path_prefix}.service",
                                 },
                             )
+                        elif effect.url is not None:
+                            # Split eagerly (spec §7.4): a malformed url is a
+                            # config defect, not a first-trigger runtime
+                            # effect.error — fail startup with the dotted path.
+                            # Re-raised to carry the effect's config path (the
+                            # shared helper's detail is --url-CLI-flavored).
+                            try:
+                                _split_url(effect.url)
+                            except ConfigError as e:
+                                raise ConfigError(
+                                    e.message,
+                                    {**e.detail, "path": f"{path_prefix}.url"},
+                                ) from e
                     else:
                         has_kafka_effects = True
                         # Resolve eagerly so an unresolvable cluster fails
@@ -662,17 +682,55 @@ def mock_run(
                                 e.message,
                                 {**e.detail, "path": f"{path_prefix}.cluster"},
                             ) from e
+                        # Empty-brokers guard, mirroring the reactor walk above:
+                        # the effect's resolved cluster must be reachable
+                        # before any client build/probe (spec §11).
+                        if not cfg.kafka.clusters[cluster_name].brokers:
+                            raise ConfigError(
+                                f"kafka.clusters.{cluster_name}.brokers is "
+                                f"required when running Kafka effects",
+                                {"cluster": cluster_name},
+                            )
                         if cluster_name not in clients_by_cluster:
                             clients_by_cluster[cluster_name] = new_kafka_client(
                                 cfg.kafka.clusters[cluster_name]
                             )
+                        # Codec resolution is eager too (spec §7.4): an avro/
+                        # protobuf effect on an SR-less cluster must fail
+                        # STARTUP, not the first trigger. The probe dedup keys
+                        # off probed_clusters exactly like the reactor walk;
+                        # the result seeds the resolver's cache so the closure
+                        # below is a cache-hit on the common path (and stays
+                        # lazy-safe for any key the walk misses).
+                        codec, _vf, _kf = _resolve_codec(
+                            cfg,
+                            effect.topic,
+                            cluster_name,
+                            effect.value_format,
+                            effect.key_format,
+                            probe=cluster_name not in probed_clusters,
+                        )
+                        if codec is not None:
+                            probed_clusters.add(cluster_name)
+                        cache_key = (
+                            cluster_name,
+                            effect.topic,
+                            effect.value_format,
+                            effect.key_format,
+                        )
+                        effect_codec_cache[cache_key] = (
+                            clients_by_cluster[cluster_name],
+                            codec,
+                        )
 
         if has_kafka_effects:
-            # Per-(cluster, topic, formats) codec cache. The client itself is
+            # Per-(cluster, topic, formats) codec cache — seeded eagerly by
+            # the Guard 5b walk so startup already resolved every declared
+            # effect (the closure body is a cache-hit for those keys and stays
+            # lazy-safe for any path the walk missed). The client itself is
             # codec-less — effect produces go out ``_raw`` and the executor
             # encodes via the codec returned here (the same client can serve
             # effects with different formats on one cluster).
-            effect_codec_cache: dict[tuple[str, str, str | None, str | None], tuple[Any, Any]] = {}
 
             def kafka_resolver(effect: KafkaEffect):
                 """Resolve a kafka effect to ``(KafkaClient, codec)``.

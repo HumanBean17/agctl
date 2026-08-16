@@ -453,19 +453,19 @@ class TestKafkaToHttpEffects:
         }))
 
         mock = MockRunHandle(config_file)
-        assert mock.base_url is not None, f"mock did not start: {mock.lines}"
-
-        produce = _run_cli(config_file, [
-            "kafka", "produce",
-            "--topic", commands_topic,
-            "--message", json.dumps({"command": "ship", "order_id": "ord-42"}),
-            "--key", "ord-42",
-        ])
-        assert produce.returncode == 0, (
-            f"kafka produce failed: {produce.stdout} {produce.stderr}"
-        )
-
         try:
+            assert mock.base_url is not None, f"mock did not start: {mock.lines}"
+
+            produce = _run_cli(config_file, [
+                "kafka", "produce",
+                "--topic", commands_topic,
+                "--message", json.dumps({"command": "ship", "order_id": "ord-42"}),
+                "--key", "ord-42",
+            ])
+            assert produce.returncode == 0, (
+                f"kafka produce failed: {produce.stdout} {produce.stderr}"
+            )
+
             # The effect fires asynchronously on the reactor thread — poll the
             # live log for the sink's http.hit before tearing anything down.
             hit = mock.wait_for(
@@ -570,19 +570,19 @@ class TestKafkaToHttpEffects:
         }))
 
         mock = MockRunHandle(config_file)
-        assert mock.base_url is not None, f"mock did not start: {mock.lines}"
-
-        produce = _run_cli(config_file, [
-            "kafka", "produce",
-            "--topic", commands_topic,
-            "--message", json.dumps({"command": "audit", "order_id": "ord-7"}),
-            "--key", "ord-7",
-        ])
-        assert produce.returncode == 0, (
-            f"kafka produce failed: {produce.stdout} {produce.stderr}"
-        )
-
         try:
+            assert mock.base_url is not None, f"mock did not start: {mock.lines}"
+
+            produce = _run_cli(config_file, [
+                "kafka", "produce",
+                "--topic", commands_topic,
+                "--message", json.dumps({"command": "audit", "order_id": "ord-7"}),
+                "--key", "ord-7",
+            ])
+            assert produce.returncode == 0, (
+                f"kafka produce failed: {produce.stdout} {produce.stderr}"
+            )
+
             mock.wait_for(
                 "chained kafka.produced on the audit topic",
                 lambda events: next(
@@ -866,18 +866,17 @@ class TestLegacyReactionBackCompat:
 
         mock = MockRunHandle(config_file)
         # Kafka-only run: started has http:null; base_url stays None.
-
-        produce = _run_cli(config_file, [
-            "kafka", "produce",
-            "--topic", commands_topic,
-            "--message", json.dumps({"command": "create", "order_id": "ord-legacy"}),
-            "--key", "ord-legacy",
-        ])
-        assert produce.returncode == 0, (
-            f"kafka produce failed: {produce.stdout} {produce.stderr}"
-        )
-
         try:
+            produce = _run_cli(config_file, [
+                "kafka", "produce",
+                "--topic", commands_topic,
+                "--message", json.dumps({"command": "create", "order_id": "ord-legacy"}),
+                "--key", "ord-legacy",
+            ])
+            assert produce.returncode == 0, (
+                f"kafka produce failed: {produce.stdout} {produce.stderr}"
+            )
+
             mock.wait_for(
                 "kafka.reacted",
                 lambda events: next(

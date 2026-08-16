@@ -171,8 +171,11 @@ class EffectExecutor:
             ]
         else:
             updates["value"] = substitute_generators(effect.value, memo)
-            if effect.key is not None:
-                updates["key"] = substitute_generators(effect.key, memo)
+        # Top-level key/headers substitute in BOTH modes: under ``values`` they
+        # are the per-message fallback (§6.1), so a token there must resolve
+        # before the fallback hands it to a message — not ship literally.
+        if effect.key is not None:
+            updates["key"] = substitute_generators(effect.key, memo)
         if effect.headers is not None:
             updates["headers"] = substitute_generators(effect.headers, memo)
         return effect.model_copy(update=updates)

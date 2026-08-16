@@ -430,6 +430,7 @@ def test_http_capture_missing_emits_event_and_empty_slot(emit_event):
 _UUID_RE = __import__("re").compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+_RAND8_RE = __import__("re").compile(r"^[0-9a-f]{8}$")
 
 
 def test_generator_token_in_kafka_value_resolves(emit_event):
@@ -477,6 +478,39 @@ def test_generator_token_resolves_once_per_run(emit_event):
     first = json.loads(client.produce_calls[0]["value"])
     second_key = client.produce_calls[1]["key"].decode()
     assert first["id"] == second_key
+
+
+def test_generator_token_in_values_mode_top_level_key_and_headers(emit_event):
+    """``values:`` + top-level ``key``/``headers``: ``{{gen}}`` tokens in the
+    TOP-LEVEL fields resolve too (not only per-item); an item's own key still
+    wins after substitution."""
+    client = FakeKafkaClient()
+    executor = EffectExecutor(
+        kafka_resolver=lambda effect: (client, None),
+        http_resolver=_no_http,
+        emit_event=emit_event,
+    )
+
+    effect = KafkaEffect(
+        type="kafka",
+        topic="t",
+        key="{{rand:8}}",
+        headers={"req": "{{uuid}}"},
+        values=[
+            KafkaEffectMessage(value=1),  # inherits substituted top-level fields
+            KafkaEffectMessage(value=2, key="own"),  # own key wins
+        ],
+    )
+    outcome = executor.run([effect], {}, "s")
+
+    assert outcome.ok is True
+    first, second = client.produce_calls
+    # Top-level key resolved in values mode: 8 hex chars, not the literal token.
+    assert _RAND8_RE.match(first["key"].decode()) is not None
+    # Top-level header resolved: UUID-shaped, not the literal token.
+    assert _UUID_RE.match(first["headers"]["req"]) is not None
+    # Per-item key still overrides the top-level one.
+    assert second["key"] == b"own"
 
 
 def test_generator_token_in_http_body_and_service_path(emit_event):
