@@ -58,3 +58,8 @@ not global**; `kafka assert --timeout` is **required**. Kafka `<mode>` =
 ## Depth: `agctl prime --topic <name>`
 
 One topic per domain — fetch only what the task needs:
+
+- `gotchas` — the full 16-gotcha list, db-schema authoring rules, recipes
+- `mock` — impersonate a dependency: engines, daemon vs foreground, failure rules
+- `listen` — long-lived Kafka capture: protocol, byte valve, fatality rules
+- `grpc` — gRPC calls: call types, NDJSON model, config, discovery

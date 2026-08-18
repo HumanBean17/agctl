@@ -62,3 +62,12 @@ def test_read_resource_missing_raises_config_error():
         read_resource("data", "prime", "nope.md")
     assert "not found in the agctl package" in str(excinfo.value)
     assert excinfo.value.detail["resource"] == "data/prime/nope.md"
+
+
+def test_topic_budgets_runtime():
+    """Runtime topics ship real depth, bounded: 200 < chars ≤ 6,000 each."""
+    for name in ("gotchas", "mock", "listen", "grpc"):
+        t = topic_text(name)
+        assert t is not None, f"topic '{name}' has no file"
+        assert t.startswith("# agctl — ")
+        assert 200 < len(t) <= 6_000, name

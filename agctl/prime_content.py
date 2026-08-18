@@ -33,7 +33,12 @@ __all__ = [
 #: Ordered topic registry. ``agctl prime --all`` emits these in this order and
 #: ``core.md``'s depth index lists them; tests pin the two against the packaged
 #: files (no dangling entries, no orphan files).
-TOPIC_ORDER: tuple[str, ...] = ()
+TOPIC_ORDER: tuple[str, ...] = (
+    "gotchas",
+    "mock",
+    "listen",
+    "grpc",
+)
 
 
 def read_resource(*parts: str) -> str:
