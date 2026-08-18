@@ -82,7 +82,7 @@ agctl prime [--topic <name>]… [--all] [--hook-json]
 - **Flag exclusivity:** `--hook-json` is mutually exclusive with `--topic` / `--all` (usage error, exit 2).
 - **Unknown topic:** usage error — exit 2, stderr lists the valid topic names.
 - **Core content:** version line (`agctl v{version} — this output matches the installed binary`), the one-JSON-envelope-per-invocation contract, exit codes 0/1/2, intent→command map, the five most failure-prone gotchas, the topic index, and the standing rule that `agctl <cmd> --help` is the authoritative flag spec.
-- **Hook envelope:** Claude Code SessionStart shape (`hookSpecificOutput.additionalContext`; exact field names verified against current Claude Code hook docs during implementation). The pointer states the installed version, instructs the agent to run `agctl prime` before driving agctl, and names `--topic` for depth.
+- **Hook envelope:** Claude Code SessionStart shape — `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "<pointer>"}}`, exit 0. The pointer states the installed version, instructs the agent to run `agctl prime` before driving agctl, and names `--topic` for depth.
 
 ## 7. Data Model — `agctl/data/`
 
@@ -105,7 +105,7 @@ Plain markdown files shipped in the wheel. Each topic's header is `# agctl — <
 
 ## 8. `config init` — Extended Contract
 
-`agctl config init` keeps its current behavior (writes sample `agctl.yaml` + `.env.example`, refuses an existing config) and adds:
+`agctl config init` keeps its current behavior (writes a sample `agctl.yaml`, refuses an existing config) and adds:
 
 - **Default on:** writes `.claude/skills/agctl/SKILL.md` as a byte-identical copy of the packaged stub. `--no-skills` opts out.
 - **`--skills-only`:** installs/refreshes only the stub; permitted when `agctl.yaml` already exists (the upgrade path for existing consumers).
@@ -120,7 +120,7 @@ Plain markdown files shipped in the wheel. Each topic's header is `# agctl — <
 
 ```
 pip install 'agctl[kafka,db,…]'
-agctl config init     # agctl.yaml + .env.example + .claude/skills/agctl/SKILL.md (~15 lines)
+agctl config init     # agctl.yaml + .claude/skills/agctl/SKILL.md (~15 lines)
                       # result carries the optional SessionStart hook snippet
 ```
 
