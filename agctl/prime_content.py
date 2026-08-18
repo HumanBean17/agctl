@@ -38,6 +38,14 @@ TOPIC_ORDER: tuple[str, ...] = (
     "mock",
     "listen",
     "grpc",
+    "config",
+    "config-http",
+    "config-kafka",
+    "config-db",
+    "config-db-write",
+    "config-mocks",
+    "config-logs",
+    "config-init",
 )
 
 

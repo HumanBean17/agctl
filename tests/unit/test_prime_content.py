@@ -71,3 +71,21 @@ def test_topic_budgets_runtime():
         assert t is not None, f"topic '{name}' has no file"
         assert t.startswith("# agctl — ")
         assert 200 < len(t) <= 6_000, name
+
+
+def test_topic_budgets_config():
+    """Config authoring topics ship real depth, bounded."""
+    for name in (
+        "config",
+        "config-http",
+        "config-kafka",
+        "config-db",
+        "config-db-write",
+        "config-mocks",
+        "config-logs",
+        "config-init",
+    ):
+        t = topic_text(name)
+        assert t is not None, f"topic '{name}' has no file"
+        assert t.startswith("# agctl — ")
+        assert 200 < len(t) <= 6_000, name
