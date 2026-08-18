@@ -145,7 +145,9 @@ def test_show_does_not_mask_ssl_key_path(tmp_path):
 # --- config init -----------------------------------------------------------
 
 
-def test_config_init_writes_sample(tmp_path):
+def test_config_init_writes_sample(tmp_path, monkeypatch):
+    # chdir so the default-on stub install lands in tmp_path, not the repo
+    monkeypatch.chdir(tmp_path)
     dest = tmp_path / "agctl.yaml"
     result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
     payload = json.loads(result.output)
@@ -159,8 +161,9 @@ def test_config_init_writes_sample(tmp_path):
     yaml.safe_load(dest.read_text(encoding="utf-8"))
 
 
-def test_config_init_generates_valid_config(tmp_path):
+def test_config_init_generates_valid_config(tmp_path, monkeypatch):
     """The generated sample is a clean baseline: it validates with no env vars."""
+    monkeypatch.chdir(tmp_path)
     dest = tmp_path / "agctl.yaml"
     CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
     result = CliRunner().invoke(cli, ["config", "validate", "--config", str(dest)], env={})
@@ -169,7 +172,8 @@ def test_config_init_generates_valid_config(tmp_path):
     assert payload["result"]["valid"] is True
 
 
-def test_config_init_refuses_overwrite(tmp_path):
+def test_config_init_refuses_overwrite(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     dest = tmp_path / "agctl.yaml"
     dest.write_text("existing: real-config\n")
     result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
@@ -182,7 +186,8 @@ def test_config_init_refuses_overwrite(tmp_path):
     assert dest.read_text() == "existing: real-config\n"
 
 
-def test_config_init_force_overwrites(tmp_path):
+def test_config_init_force_overwrites(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     dest = tmp_path / "agctl.yaml"
     dest.write_text("OLD\n")
     result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest), "--force"])
