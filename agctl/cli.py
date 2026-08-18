@@ -31,6 +31,7 @@ from .commands.kafka_commands import kafka_assert, kafka_consume, kafka_produce
 from .commands.kafka_listen_commands import kafka_listen_group
 from .commands.logs_commands import logs_assert, logs_query, logs_tail
 from .commands.mock_commands import mock_run, mock_start, mock_stop, mock_status
+from .commands.prime_commands import prime
 
 #: Entry-point group for third-party protocol plugins (DESIGN §9.2).
 PLUGIN_ENTRY_POINT_GROUP = "agctl.plugins"
@@ -234,6 +235,10 @@ cli.add_command(discover)
 
 # Register the config-free `gen` group (template-vars Task 3).
 cli.add_command(gen_group)
+
+# Register the config-free `prime` command — the agent manual channel
+# (skills → wheel-hosted prime; envelope-exempt like `--help`).
+cli.add_command(prime)
 
 
 # Bridge config validation to the live loaded-plugins list. The thunk reads this
