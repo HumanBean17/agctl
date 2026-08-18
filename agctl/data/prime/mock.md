@@ -17,7 +17,10 @@ Stubs/reactors are authored in the `mocks:` config section (see
 background protocol into `mock start` → `mock stop` and surfaces failures
 cleanly (`mock start` blocks until the `started` line; `mock stop` applies the
 strict failure rule: any `http.unmatched`, `http.body_parse_skipped`,
-`kafka.skipped`, `kafka.error`, `grpc.unmatched`, `grpc.error` ⇒ exit 1).
+`kafka.skipped`, `kafka.error`, `grpc.unmatched`, `grpc.error`,
+`effect.error` ⇒ exit 1). Stubs and reactors may also fire cross-transport
+`effects:` (HTTP trigger → Kafka produce; Kafka trigger → HTTP call) — an
+effect failure is the fatal `effect.error` (see `--topic config-mocks`).
 
 **Windows:** the managed daemon is unavailable on native Windows (exit 2,
 `ConfigError` pointing at `mock run`/WSL) — use foreground `mock run` there.
@@ -25,9 +28,10 @@ strict failure rule: any `http.unmatched`, `http.body_parse_skipped`,
 ## `mock run` background lifecycle (the false-green trap)
 
 Failure signals (`http.unmatched`, `http.body_parse_skipped`, `kafka.skipped`,
-`kafka.error`, `grpc.unmatched`, `grpc.error`, `capture.missing`) live **only
-on stdout**, and the exit-1 escalation arrives only on a clean `SIGTERM`. The
-plain `&`/`kill` pattern loses both and silently produces a **false green**:
+`kafka.error`, `grpc.unmatched`, `grpc.error`, `effect.error`,
+`capture.missing`) live **only on stdout**, and the exit-1 escalation arrives
+only on a clean `SIGTERM`. The plain `&`/`kill` pattern loses both and
+silently produces a **false green**:
 
 ```bash
 nohup agctl mock run > mock.log 2>&1 &
@@ -35,7 +39,7 @@ MOCK_PID=$!
 until grep -q '"event":"started"' mock.log; do sleep 0.1; done   # poll, don't sleep fixed
 # … run the SUT / assertions, pointing the SUT at the mock's listen addresses …
 kill -TERM "$MOCK_PID"; wait "$MOCK_PID"                          # SIGTERM + wait, never SIGKILL
-grep -E 'http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error|grpc.unmatched|grpc.error|capture.missing' mock.log && exit 1
+grep -E 'http.unmatched|http.body_parse_skipped|kafka.skipped|kafka.error|grpc.unmatched|grpc.error|effect.error|capture.missing' mock.log && exit 1
 ```
 
 Rules: redirect stdout to a log (capture the PID); poll the `started` line
@@ -47,9 +51,10 @@ substitutes empty string) but marks a `capture.from` that resolved to nothing
 — usually a misconfigured path silently yielding a plausible-but-wrong field.
 `--fail-fast` is the synchronous alternative for `--duration` runs.
 
-Exit rule for `mock run` itself: exit 1 only when `kafka_errors > 0` or a
-`grpc.unmatched`/`grpc.error` event fires (stricter at `mock stop` — see
-above). Daemon state (pidfile + NDJSON log keyed by engine) lives under
+Exit rule for `mock run` itself: exit 1 when `kafka_errors > 0`, a
+`grpc.unmatched`/`grpc.error` event, or an `effect.error` fires (stricter at
+`mock stop` — see above). Daemon state (pidfile + NDJSON log keyed by engine)
+lives under
 `<state-dir>/` (default `./.agctl/`); clean up with `rm -rf .agctl`.
 
 **`mock stop` selectors:** `--listen <X>` (matches any of the daemon's listen

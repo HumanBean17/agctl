@@ -60,10 +60,11 @@ def test_registry_no_orphans():
 
 
 def test_registry_indexed_in_core():
-    """core.md's depth index mentions every registered topic."""
+    """core.md's depth index mentions every registered topic (backtick-
+    anchored, so `config` can't pass via the `config-http` line)."""
     core = render_core()
     for name in TOPIC_ORDER:
-        assert name in core, f"topic '{name}' missing from core index"
+        assert f"`{name}`" in core, f"topic '{name}' missing from core index"
 
 
 def test_read_resource_missing_raises_config_error():
@@ -134,6 +135,19 @@ def test_topics_carry_no_version_token():
     token there would ship literally. Guard it forever."""
     for name in TOPIC_ORDER:
         assert "{version}" not in topic_text(name), name
+
+
+def test_mock_failure_events_match_code():
+    """Drift guard: the mock failure-event set stated in the topics must
+    match the code-defined taxonomy (agctl.mock.daemon). The old skills
+    drifted once (effect.error missing after cross-transport effects
+    shipped) and the documented grep protocol false-PASSed — never again."""
+    from agctl.mock.daemon import ALL_FAILURE_EVENTS
+
+    for doc in ("mock", "gotchas", "runbook-run"):
+        text = topic_text(doc)
+        for event in ALL_FAILURE_EVENTS:
+            assert event in text, f"topic '{doc}' missing fatal event '{event}'"
 
 
 def test_hook_snippet_shape():

@@ -10,8 +10,8 @@ reading agent logs: per step the **verbatim command**, **exit code**, raw
 - Every step has a Command and non-empty Expected; assertion steps use
   `Expected: exit 0`.
 - Every `$VAR` resolves to a prior Capture.
-- Every `{{…}}` token is a known generator (`{{uuid}}`, `{{ts}}[:ms|:iso]`,
-  `{{rand}}[:N]`) — unknown tokens are validation errors.
+- Every `{{…}}` token is a known generator (`{{uuid}}[:N]`,
+  `{{ts}}[:ms|:iso]`, `{{rand}}[:N]`) — unknown tokens are validation errors.
 - **Sidecar:** a sibling `<runbook-base>.agctl.yaml` next to the runbook →
   `agctl config validate --overlay <sidecar>` first; ok → active for the
   whole run (surface `overridden by overlay` warnings into the report);
@@ -50,8 +50,9 @@ step N)**. No cascades.
 
 Kill heartbeat PIDs; `SIGTERM` the mock PID + `wait`; **grep `mock.log` for
 `http.unmatched | http.body_parse_skipped | kafka.skipped | kafka.error |
-grpc.unmatched | grpc.error | capture.missing`** — any hit flips the overall
-verdict to FAIL (assertions passing doesn't excuse it); optional seed reset.
+grpc.unmatched | grpc.error | effect.error | capture.missing`** — any hit
+flips the overall verdict to FAIL (assertions passing doesn't excuse it);
+optional seed reset.
 
 ## 7. Emit — `runbook.results.md` (next to the runbook)
 

@@ -336,7 +336,7 @@ def test_config_init_force_overwrites_modified_stub(tmp_path, monkeypatch):
 
 
 def test_config_init_no_skills(tmp_path, monkeypatch):
-    """--no-skips skips the stub write entirely; no .claude/ tree appears."""
+    """--no-skills skips the stub write entirely; no .claude/ tree appears."""
     monkeypatch.chdir(tmp_path)
     dest = tmp_path / "agctl.yaml"
     result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest), "--no-skills"])

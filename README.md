@@ -164,7 +164,7 @@ session of that repo (instead of relying on the stub alone), add to
 }
 ```
 
-**Migrating from the old skills** (≤ 3.1): delete the four skills copied
+**Migrating from the old skills** (3.0.x and earlier): delete the four skills copied
 from this repo (`.claude/skills/agctl`, `agctl-config`,
 `agctl-write-test-runbook`, `agctl-run-test-runbook`), then run
 `agctl config init --skills-only`. Their content now ships as prime topics

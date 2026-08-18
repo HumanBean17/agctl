@@ -35,7 +35,7 @@ cwd to the first `agctl.yaml` (stop at `.git`/root). None found → **ask**.
    |---|---|---|---|
    | `${VAR}` | env var | any string value (URLs, secrets) | config load |
    | `{name}` | call-time param | HTTP `path`/`body`, Kafka `match` | call, `--param` |
-   | `:name` | SQL bind | `database.templates.*.sql` | execute, `--param` |
+   | `:name` | SQL bind | `database.templates.*.sql` & free-form `--sql` | execute, `--param` |
 
    `${VAR}` required (missing → exit 2); `${VAR:-default}` default;
    `${VAR:-}` empty-allowed. Never `${}` in keys; never `:name` in an HTTP

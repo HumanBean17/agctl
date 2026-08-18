@@ -1863,11 +1863,12 @@ directory, independent of `--output`) — a ~15-line router whose only job is
 to route the agent to `agctl prime`. Installing is idempotent: an identical
 stub is a no-op; a consumer-modified stub is refused unless `--force`.
 `--skills-only` is the upgrade path for repos that already have a config.
-The result envelope carries `skills_path`, `skills_status`
+On success the result envelope carries `skills_path`, `skills_status`
 (`created`/`unchanged`/`overwritten`/`skipped`/`refused`), and a
 ready-to-paste `hook_snippet` for wiring `agctl prime --hook-json` as a
 Claude Code SessionStart hook (the hook is printed, never written — wiring
-one is the consumer's choice).
+one is the consumer's choice). The existing-config refusal envelope (exit 2)
+is unchanged and carries no skills keys.
 
 #### `agctl config migrate`
 

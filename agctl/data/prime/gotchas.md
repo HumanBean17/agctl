@@ -53,8 +53,8 @@
     path (`.data.x` → `.body.data.x`) without dropping the flag.
 13. **`mock stop` uses the strict failure rule.** Any of `http.unmatched`,
     `http.body_parse_skipped`, `kafka.skipped`, `kafka.error`,
-    `grpc.unmatched`, `grpc.error` ⇒ exit 1 (verdict in `error.detail`);
-    `capture.missing` non-fatal but surfaced.
+    `grpc.unmatched`, `grpc.error`, `effect.error` ⇒ exit 1 (verdict in
+    `error.detail`); `capture.missing` non-fatal but surfaced.
 14. **`mock stop --all` returns an array of verdicts** (`result.stopped`);
     any fatal mock ⇒ exit 1 with the array in `error.detail.stopped`.
 15. **`mock start` is the readiness gate.** Blocks until the daemon's

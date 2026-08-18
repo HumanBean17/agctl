@@ -21,8 +21,9 @@ Procedure: **Ingest → Discover → Clarify → Design → Emit → Self-review
 
 `agctl discover` (summary) → per category (`http-templates`,
 `kafka-patterns`, `db-templates`, `log-sources`, `services`,
-`mock-http-stubs`, `mock-kafka-reactors`) → `--category <X> --name <Y>` for
-any template you intend to use (params + example). Do not invent stubs.
+`mock-http-stubs`, `mock-kafka-reactors`, `mock-grpc-stubs`) →
+`--category <X> --name <Y>` for any template you intend to use (params +
+example). Do not invent stubs.
 
 ## 3. Clarify — only when genuinely ambiguous
 
@@ -46,12 +47,12 @@ the trigger" (logs persist — no capture fixture needed); `--not` asserts
 absence. Source must resolve in `discover --category log-sources`.
 
 **Template variables** — prefer inline `{{…}}` tokens over `$(uuidgen)`
-shell anti-patterns: `{{uuid}}`, `{{ts}}`/`{{ts:ms}}`/`{{ts:iso}}`,
-`{{rand}}`/`{{rand:N}}`. The same token text = one value per step
-(`--key {{uuid}}` + `"{{uuid}}"` in the body echo one UUID). Cross-step
-sharing: `agctl gen uuid --count 2` (config-free; `result.values[]`) +
-Capture. Literal `{{…}}` payload (testing a mustache body)? Add global
-`--no-template-vars`.
+shell anti-patterns: `{{uuid}}[:N]` (N = count), `{{ts}}`/`{{ts:ms}}`/
+`{{ts:iso}}`, `{{rand}}[:N]` (N = hex chars). The same token text = one
+value per step (`--key {{uuid}}` + `"{{uuid}}"` in the body echo one UUID).
+Cross-step sharing: `agctl gen uuid --count 2` (config-free;
+`result.values[]`) + Capture. Literal `{{…}}` payload (testing a mustache
+body)? Add global `--no-template-vars`.
 
 **Fixtures** (background streamers — never Steps): **seed data**
 (`db execute --write`, keep idempotent), **mocks** (`mock run` — see

@@ -27,16 +27,17 @@ first; on `false` read `error.type`.
 | See what was published | `kafka consume --topic T [--match …]` |
 | Publish a message | `kafka produce --topic T --message '{…}'` |
 | Capture a long saga / busy topic | `kafka listen start` → `assert` → `results` → `stop` |
-| DB write / rows / value / schema | `db execute --write` / `db assert --expect-rows N` / `db assert --expect-value --path .x --equals v` / `db schema` |
+| DB write / rows / value / inspect / schema | `db execute --write` / `db query` / `db assert --expect-rows N` / `db assert --expect-value --path .x --equals v` / `db schema` |
 | Call gRPC | `grpc call <tpl> [--param…]` / `grpc call --target T \| --address host:port` |
 | Impersonate a dependency | `mock run` (foreground) / `mock start\|stop\|status` (daemon — preferred) |
 | Query / assert logs | `logs query` / `logs assert` / `logs tail` |
 | Ready? / validate / migrate config | `check ready --all` / `config validate` / `config migrate` |
 
-Global flags: `--config`, `--overlay` (repeatable), `--env-file`; a `.env`
-next to the resolved `agctl.yaml` auto-loads (real env wins). **`--timeout` is
-not global**; `kafka assert --timeout` is **required**. Kafka `<mode>` =
-`--contains '{…}' | --match '<jq>' | --pattern <name>`.
+Global flags: `--config`, `--overlay` (repeatable), `--env-file`,
+`--no-template-vars`; a `.env` next to the resolved `agctl.yaml` auto-loads
+(real env wins). **`--timeout` is not global**; `kafka assert --timeout` is
+**required**. Kafka `<mode>` = `--contains '{…}' | --match '<jq>' |
+--pattern <name>`.
 
 ## Top-5 gotchas (full list: `--topic gotchas`)
 
@@ -44,8 +45,9 @@ not global**; `kafka assert --timeout` is **required**. Kafka `<mode>` =
    `--status`/`--contains`/`--match`/`--jq-path` to flip a wrong response into
    an `AssertionError` (exit 1).
 2. **`--match` is envelope-rooted:** HTTP `.body.x` (response envelope), Kafka
-   `.value.x` (message envelope) — not payload-rooted. `--match`/`--jq-path`
-   need `pip install 'agctl[jq]'`.
+   `.value.x` (message envelope) — not payload-rooted; semantics are
+   any-truthy (for "all items" write `all(.body.items[]; .pred)`).
+   `--match`/`--jq-path` need `pip install 'agctl[jq]'`.
 3. **Kafka reads are windowed** (`now - --lookback`), not "latest": an event
    published just before you started is still matched; narrow busy topics with
    `--match`/`--contains`.
