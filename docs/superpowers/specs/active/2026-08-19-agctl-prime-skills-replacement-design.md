@@ -1,7 +1,8 @@
 # Design: `agctl prime` — the agent knowledge channel (skills → wheel-hosted prime)
 
-**Status:** in_progress
+**Status:** implemented
 **Date:** 2026-08-19
+**Branch:** `feat/agctl-prime`
 **Affects:** `agctl/commands/prime_commands.py` (new); `agctl/commands/config_commands.py` (`config init`); `agctl/data/prime/` (new); `agctl/data/skills/agctl/SKILL.md` (new); `skills/` (deleted); README.md; DESIGN.md §4 (output contract exception) + agent-channel sections; ARCHITECTURE.md §3 (module map) + data layout; CLAUDE.md (project structure); `tests/` (prime + init coverage)
 **Precedent:** `bd prime` (beads) — CLI-emitted agent context with a `--hook-json` SessionStart envelope; `agctl/data/sample-config.yaml` drift-guard test (packaged-data-is-contract pattern this design generalizes)
 **Relation to docs:** Replaces the out-of-tree `skills/` artifacts as the agent-facing knowledge channel. On implementation, DESIGN.md gains the prime channel description and the prime/`--help` envelope exception; ARCHITECTURE.md gains `prime_commands` and the `data/prime/` / `data/skills/` layout; README gains the consumer "Agent setup" section. Synced via `docs-watcher`.

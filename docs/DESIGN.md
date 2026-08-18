@@ -11,7 +11,7 @@
 
 1. [Goals & Non-Goals](#1-goals--non-goals)
 2. [Configuration Schema](#2-configuration-schema)
-3. [CLI Command Design](#3-cli-command-design) *(includes `agctl discover` §3.9, `agctl gen` §3.10)*
+3. [CLI Command Design](#3-cli-command-design) *(includes `agctl discover` §3.9, `agctl gen` §3.10, `agctl prime` §3.11)*
 4. [Output Schema](#4-output-schema)
 5. [Configuration Resolution Order](#5-configuration-resolution-order)
 6. [AGENTS.md Template](#6-agentsmd-template)
@@ -1848,13 +1848,26 @@ When `--overlay` is used, emits `{"config": <masked dump>, "overrides": [...]}`;
 
 #### `agctl config init`
 
-Write a sample `agctl.yaml` to the filesystem. The sample is a clean baseline that validates with no environment variables (all optional fields have defaults). Refuses to overwrite an existing file unless `--force` is passed. Does not accept `--config` (it bootstraps the config file itself).
+Write a sample `agctl.yaml` to the filesystem and install the agent skill stub. The sample is a clean baseline that validates with no environment variables (all optional fields have defaults). Refuses to overwrite an existing file unless `--force` is passed. Does not accept `--config` (it bootstraps the config file itself).
 
 ```
 agctl config init
     [--output <path>]           # default: ./agctl.yaml
     [--force]                   # overwrite if exists
+    [--no-skills]               # skip installing the skill stub
+    [--skills-only]             # install/refresh only the stub (existing agctl.yaml untouched)
 ```
+
+The stub lands at `.claude/skills/agctl/SKILL.md` (always at the working
+directory, independent of `--output`) — a ~15-line router whose only job is
+to route the agent to `agctl prime`. Installing is idempotent: an identical
+stub is a no-op; a consumer-modified stub is refused unless `--force`.
+`--skills-only` is the upgrade path for repos that already have a config.
+The result envelope carries `skills_path`, `skills_status`
+(`created`/`unchanged`/`overwritten`/`skipped`/`refused`), and a
+ready-to-paste `hook_snippet` for wiring `agctl prime --hook-json` as a
+Claude Code SessionStart hook (the hook is printed, never written — wiring
+one is the consumer's choice).
 
 #### `agctl config migrate`
 
@@ -2277,13 +2290,47 @@ Generates one lowercase hex string of `--length` chars (default 16) → `result.
 { "value": "a1b2c3d4e5f60718" }
 ```
 
+### 3.11 `agctl prime` — The Agent Manual
+
+The agent-facing knowledge channel: everything an agent needs to drive
+agctl ships **inside the wheel** as markdown data files and is emitted on
+demand by the installed binary — so the manual can never contradict the
+binary it came from. It replaces the pre-3.2 out-of-tree skills directory
+(consumers copied four skills by hand; their content now lives as prime
+topics).
+
+```
+agctl prime                     # the lean core (~1.2k tokens): envelope, exit
+                                # codes, intent→command map, top-5 gotchas,
+                                # topic index — prefixed with the binary's version
+agctl prime --topic <name>…     # one depth topic verbatim (repeatable, argument
+                                # order): gotchas | mock | listen | grpc | config
+                                # | config-http…config-init | runbook-write |
+                                # runbook-run
+agctl prime --all               # core + every topic, registry order
+agctl prime --hook-json         # ~100-token SessionStart pointer wrapped in the
+                                # Claude Code hook envelope
+```
+
+`prime` is **exempt from the JSON envelope** (a `--help`-class exception —
+its consumer is an agent reading markdown): raw markdown on stdout, exit 0
+on success, exit 2 on usage error only; it never exits 1. It is config-free
+(needs no `agctl.yaml`). Topic content is budget-tested (core ≤ 5,000 chars,
+each topic ≤ 6,000) so the manual cannot silently bloat.
+
+**Agent setup** (one command): `agctl config init` writes the config and
+installs a ~15-line router stub at `.claude/skills/agctl/SKILL.md` whose
+only job is to route the agent to `agctl prime` (see §3.7). The optional
+SessionStart hook (`agctl prime --hook-json` in `.claude/settings.json`)
+adds a cheap ambient pointer for repos that want it.
+
 ---
 
 ## 4. Output Schema
 
 ### 4.1 Envelope
 
-Every invocation writes exactly one JSON object to stdout (the streaming commands — `http ping`, `mock run`, `logs tail`, `grpc call` server-stream/bidi, `kafka listen run` — emit one JSON object per line plus a final summary; see §3):
+Every invocation writes exactly one JSON object to stdout (the streaming commands — `http ping`, `mock run`, `logs tail`, `grpc call` server-stream/bidi, `kafka listen run` — emit one JSON object per line plus a final summary; `agctl prime` emits raw markdown or its hook envelope — a documentation command like `--help`; see §3):
 
 ```json
 {

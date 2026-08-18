@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.resources
 import json
+from pathlib import Path
 
 import pytest
 
@@ -135,3 +136,15 @@ def test_hook_snippet_shape():
     hook = snippet["hooks"]["SessionStart"][0]["hooks"][0]
     assert hook["type"] == "command"
     assert hook["command"] == "agctl prime --hook-json"
+
+
+def test_hook_snippet_matches_readme():
+    """Drift guard (mirrors the sample-config/README test): the README's
+    Agent-setup hook block and HOOK_SETTINGS_SNIPPET are the same object,
+    so users never see two diverging wirings."""
+    readme = Path(__file__).parent.parent.parent / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    section = text.index("## Agent setup")
+    start = text.index("```json", section) + len("```json")
+    end = text.index("```", start)
+    assert json.loads(text[start:end]) == json.loads(HOOK_SETTINGS_SNIPPET)
