@@ -129,6 +129,13 @@ def test_hook_pointer_budget_and_content():
     assert "--topic" in pointer
 
 
+def test_topics_carry_no_version_token():
+    """`{version}` is a core/hook mechanism only — topics render raw, so a
+    token there would ship literally. Guard it forever."""
+    for name in TOPIC_ORDER:
+        assert "{version}" not in topic_text(name), name
+
+
 def test_hook_snippet_shape():
     """The settings.json snippet wires `agctl prime --hook-json` as a
     SessionStart command hook."""

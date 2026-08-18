@@ -298,6 +298,30 @@ def test_config_init_refuses_modified_stub(tmp_path, monkeypatch):
     assert "consumer-edited" in stub.read_text(encoding="utf-8")
 
 
+def test_config_init_refused_stub_writes_nothing_default_mode(tmp_path, monkeypatch):
+    """Default-mode Gate-2 refusal is atomic: with no config present and a
+    modified stub, plain init refuses and writes NEITHER file."""
+    monkeypatch.chdir(tmp_path)
+    stub = _stub_path()
+    stub.parent.mkdir(parents=True)
+    stub.write_text("---\nname: agctl\ndescription: consumer-edited\n---\nlocal\n")
+    result = CliRunner().invoke(cli, ["config", "init"])
+    payload = json.loads(result.output)
+    assert result.exit_code == 2
+    assert payload["result"]["skills_status"] == "refused"
+    assert not (tmp_path / "agctl.yaml").exists()
+    assert "consumer-edited" in stub.read_text(encoding="utf-8")
+
+
+def test_config_init_skills_only_no_skills_rejected(tmp_path, monkeypatch):
+    """The contradictory pair is a usage error, not a silent no-op."""
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli, ["config", "init", "--skills-only", "--no-skills"])
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.stderr
+    assert not (tmp_path / "agctl.yaml").exists()
+
+
 def test_config_init_force_overwrites_modified_stub(tmp_path, monkeypatch):
     """--force surrenders consumer edits back to the packaged stub."""
     monkeypatch.chdir(tmp_path)

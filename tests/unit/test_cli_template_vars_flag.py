@@ -35,10 +35,12 @@ def test_flag_recognized_in_root_help():
     assert "--no-template-vars" in result.output
 
 
-def test_flag_accepted_before_subcommand(tmp_path):
+def test_flag_accepted_before_subcommand(tmp_path, monkeypatch):
     """Passing the flag before a subcommand must not raise a Click UsageError
     (no 'no such option'). ``config init`` runs config-free, so it is a safe
-    probe that does not need env vars."""
+    probe that does not need env vars. chdir so the default-on skill-stub
+    install lands in tmp_path, not the developer's repo."""
+    monkeypatch.chdir(tmp_path)
     dest = tmp_path / "agctl.yaml"
     result = CliRunner().invoke(
         cli, ["--no-template-vars", "config", "init", "-o", str(dest)]

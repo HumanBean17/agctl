@@ -16,9 +16,44 @@ import json
 
 import click
 
+from ..errors import ConfigError
 from ..prime_content import TOPIC_ORDER, hook_pointer, render_all, render_core, topic_text
 
 __all__ = ["prime"]
+
+
+def _emit(topics: tuple[str, ...], all_: bool, hook_json: bool) -> None:
+    """Route flags to the right content (assumes exclusivity already checked)."""
+    if hook_json:
+        click.echo(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": hook_pointer(),
+                    }
+                },
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        )
+        return
+    if all_:
+        click.echo(render_all())
+        return
+    if not topics:
+        click.echo(render_core())
+        return
+    texts = []
+    for name in topics:
+        text = topic_text(name)
+        if text is None:
+            raise click.UsageError(
+                f"Unknown topic '{name}'. "
+                f"Valid topics: {', '.join(TOPIC_ORDER)}"
+            )
+        texts.append(text)
+    click.echo("\n\n".join(texts))
 
 
 @click.command("prime")
@@ -47,37 +82,12 @@ def prime(topics: tuple[str, ...], all_: bool, hook_json: bool) -> None:
     """Print the agent manual (output envelope, exit codes, intent→command
     map, gotchas; `--help` of subcommands is the flag spec)."""
     if hook_json and (topics or all_):
-        raise click.UsageError(
-            "--hook-json is mutually exclusive with --topic/--all."
-        )
-    if hook_json:
-        click.echo(
-            json.dumps(
-                {
-                    "hookSpecificOutput": {
-                        "hookEventName": "SessionStart",
-                        "additionalContext": hook_pointer(),
-                    }
-                },
-                separators=(",", ":"),
-            )
-        )
-        return
+        raise click.UsageError("--hook-json is mutually exclusive with --topic/--all.")
     if all_ and topics:
         raise click.UsageError("--all and --topic are mutually exclusive.")
-    if all_:
-        click.echo(render_all())
-        return
-    if not topics:
-        click.echo(render_core())
-        return
-    texts = []
-    for name in topics:
-        text = topic_text(name)
-        if text is None:
-            raise click.UsageError(
-                f"Unknown topic '{name}'. "
-                f"Valid topics: {', '.join(TOPIC_ORDER)}"
-            )
-        texts.append(text)
-    click.echo("\n\n".join(texts))
+    # prime never exits 1: a missing packaged resource is a tool error
+    # (exit 2, stderr message) — never a traceback, never "assertion failed".
+    try:
+        _emit(topics, all_, hook_json)
+    except ConfigError as err:
+        raise click.UsageError(str(err)) from err

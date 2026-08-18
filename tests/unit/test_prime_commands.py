@@ -13,6 +13,7 @@ import json
 from click.testing import CliRunner
 
 from agctl.cli import cli
+from agctl.errors import ConfigError
 from agctl.prime_content import (
     TOPIC_ORDER,
     hook_pointer,
@@ -53,12 +54,16 @@ def test_prime_topic_repeatable_argument_order():
 
 
 def test_prime_topic_unknown_exit2():
-    """Unknown topic is a usage error: exit 2, stderr lists valid topics."""
-    result = CliRunner().invoke(cli, ["prime", "--topic", "bogus"])
-    assert result.exit_code == 2
-    assert "Unknown topic 'bogus'" in result.output
-    for name in TOPIC_ORDER:
-        assert name in result.output
+    """Unknown topic (incl. the empty string) is a usage error: exit 2,
+    message on stderr, stdout empty, valid topics listed."""
+    runner = CliRunner()
+    for bad in ("bogus", ""):
+        result = runner.invoke(cli, ["prime", "--topic", bad])
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert "Unknown topic" in result.stderr
+        for name in TOPIC_ORDER:
+            assert name in result.stderr
 
 
 def test_prime_all_equals_concatenation():
@@ -92,10 +97,27 @@ def test_prime_hook_json_valid_envelope():
 
 def test_prime_hook_json_exclusive():
     """`--hook-json` cannot combine with --topic or --all."""
+    runner = CliRunner()
     for args in (
         ["prime", "--hook-json", "--topic", "mock"],
         ["prime", "--hook-json", "--all"],
     ):
-        result = CliRunner().invoke(cli, args)
+        result = runner.invoke(cli, args)
         assert result.exit_code == 2
-        assert "mutually exclusive" in result.output
+        assert result.stdout == ""
+        assert "mutually exclusive" in result.stderr
+
+
+def test_prime_missing_resource_is_usage_error(monkeypatch):
+    """prime never exits 1: a broken packaged resource surfaces as a usage
+    error (exit 2, clean stderr message), never a traceback."""
+    import agctl.commands.prime_commands as pc
+
+    def boom(*args, **kwargs):
+        raise ConfigError("Resource not found in the agctl package: gone")
+
+    monkeypatch.setattr(pc, "render_core", boom)
+    result = CliRunner().invoke(cli, ["prime"])
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "Resource not found in the agctl package" in result.stderr

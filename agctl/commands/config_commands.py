@@ -414,7 +414,7 @@ def _load_sample() -> str:
     "--force",
     is_flag=True,
     default=False,
-    help="Overwrite an existing file instead of refusing.",
+    help="Overwrite existing files instead of refusing (the config and/or a modified skill stub).",
 )
 @click.option(
     "--skills-only",
@@ -439,12 +439,17 @@ def config_init(
     no_skills: bool,
 ) -> None:
     """Write a sample agctl.yaml + install the agctl skill stub. Exit 2 on refusal (use --force)."""
+    if skills_only and no_skills:
+        raise click.UsageError(
+            "--skills-only and --no-skills are mutually exclusive."
+        )
     start = time.monotonic()
     dest = Path(output) if output else Path.cwd() / "agctl.yaml"
     stub_dest = Path.cwd() / ".claude" / "skills" / "agctl" / "SKILL.md"
 
-    # Gate 1 — existing config (unchanged behavior; the stub is NOT written
-    # on this path either: no partial bootstrap). Skipped under --skills-only.
+    # Gate 1 — existing config (envelope intentionally unchanged for
+    # back-compat: no skills_* keys on this path; the stub is NOT written
+    # either — no partial bootstrap). Skipped under --skills-only.
     if not skills_only and dest.exists() and not force:
         msg = f"Refusing to overwrite existing {dest} (pass --force to overwrite)."
         emit(
@@ -457,15 +462,24 @@ def config_init(
         raise SystemExit(2)
 
     # Gate 2 — stub pre-flight BEFORE any write: a consumer-modified stub is
-    # never silently clobbered; --force is the explicit surrender.
+    # never silently clobbered; --force is the explicit surrender. The stub
+    # is read ONCE here and reused below (no gate-vs-write race).
     stub_installed = not no_skills
-    if stub_installed and stub_dest.exists():
+    packaged_stub: str | None = None
+    existing_stub: str | None = None
+    if stub_installed:
         try:
-            existing_stub = stub_dest.read_text(encoding="utf-8")
-        except OSError as err:
-            _emit_config_error("config.init", ConfigError(str(err)), start)
+            packaged_stub = stub_text()
+            if stub_dest.exists():
+                existing_stub = stub_dest.read_text(encoding="utf-8")
+        except (ConfigError, OSError, UnicodeDecodeError) as err:
+            _emit_config_error("config.init", err if isinstance(err, ConfigError) else ConfigError(str(err)), start)
             raise SystemExit(2)
-        if existing_stub != stub_text() and not force:
+        if (
+            existing_stub is not None
+            and existing_stub != packaged_stub
+            and not force
+        ):
             msg = (
                 f"Refusing to overwrite modified {stub_dest} "
                 "(pass --force to overwrite)."
@@ -476,6 +490,7 @@ def config_init(
                 result={
                     "path": None if skills_only else str(dest),
                     "created": False,
+                    "bytes": 0,
                     "skills_path": str(stub_dest),
                     "skills_status": "refused",
                 },
@@ -504,15 +519,16 @@ def config_init(
         )
 
     if stub_installed:
-        existing_stub = (
-            stub_dest.read_text(encoding="utf-8") if stub_dest.exists() else None
-        )
-        if existing_stub == stub_text():
-            status = "unchanged"
-        else:
-            stub_dest.parent.mkdir(parents=True, exist_ok=True)
-            stub_dest.write_text(stub_text(), encoding="utf-8")
-            status = "overwritten" if existing_stub is not None else "created"
+        try:
+            if existing_stub == packaged_stub:
+                status = "unchanged"
+            else:
+                stub_dest.parent.mkdir(parents=True, exist_ok=True)
+                stub_dest.write_text(packaged_stub, encoding="utf-8")
+                status = "overwritten" if existing_stub is not None else "created"
+        except OSError as err:
+            _emit_config_error("config.init", ConfigError(str(err)), start)
+            raise SystemExit(2)
         result.update({"skills_path": str(stub_dest), "skills_status": status})
     else:
         result.update({"skills_path": None, "skills_status": "skipped"})
