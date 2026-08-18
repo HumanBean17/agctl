@@ -89,3 +89,23 @@ def test_topic_budgets_config():
         assert t is not None, f"topic '{name}' has no file"
         assert t.startswith("# agctl — ")
         assert 200 < len(t) <= 6_000, name
+
+
+def test_topic_budgets_runbook():
+    """Runbook workflow topics ship real depth, bounded."""
+    for name in ("runbook-write", "runbook-run"):
+        t = topic_text(name)
+        assert t is not None, f"topic '{name}' has no file"
+        assert t.startswith("# agctl — ")
+        assert 200 < len(t) <= 6_000, name
+
+
+def test_registry_complete():
+    """The registry is complete at 14 topics, in the pinned order —
+    `--all` output order and the core index depend on it."""
+    assert TOPIC_ORDER == (
+        "gotchas", "mock", "listen", "grpc",
+        "config", "config-http", "config-kafka", "config-db", "config-db-write",
+        "config-mocks", "config-logs", "config-init",
+        "runbook-write", "runbook-run",
+    )

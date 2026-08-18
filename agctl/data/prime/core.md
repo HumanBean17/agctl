@@ -66,3 +66,5 @@ One topic per domain — fetch only what the task needs:
 - `config` — authoring agctl.yaml: contract, placeholder table, close-out, checklist
 - `config-http` / `config-kafka` / `config-db` / `config-db-write` / `config-mocks` / `config-logs` — per-mode extraction from source artifacts
 - `config-init` — bootstrap a whole config by scanning the repo
+- `runbook-write` — author a markdown test runbook (grounded in `discover`)
+- `runbook-run` — execute a runbook; write the annotated evidence report

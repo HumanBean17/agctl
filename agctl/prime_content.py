@@ -46,6 +46,8 @@ TOPIC_ORDER: tuple[str, ...] = (
     "config-mocks",
     "config-logs",
     "config-init",
+    "runbook-write",
+    "runbook-run",
 )
 
 
