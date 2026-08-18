@@ -29,6 +29,7 @@ __all__ = [
     "read_resource",
     "render_all",
     "render_core",
+    "stub_text",
     "topic_text",
 ]
 
@@ -119,3 +120,13 @@ HOOK_SETTINGS_SNIPPET: Final[str] = (
     '{"hooks": {"SessionStart": '
     '[{"hooks": [{"type": "command", "command": "agctl prime --hook-json"}]}]}}'
 )
+
+
+def stub_text() -> str:
+    """The router skill stub installed by ``agctl config init``.
+
+    A thin trigger + pointer (≤ 20 lines, zero domain content): its only job
+    is to make ``agctl`` discoverable by skill matching and route the agent
+    to ``agctl prime``. All real content ships as prime topics.
+    """
+    return read_resource("data", "skills", "agctl", "SKILL.md")
