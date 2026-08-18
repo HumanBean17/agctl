@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import click
 
-from ..prime_content import TOPIC_ORDER, render_core, topic_text
+from ..prime_content import TOPIC_ORDER, render_all, render_core, topic_text
 
 __all__ = ["prime"]
 
@@ -26,9 +26,21 @@ __all__ = ["prime"]
     multiple=True,
     help="Emit one depth topic verbatim (repeatable; see `agctl prime` for the list).",
 )
-def prime(topics: tuple[str, ...]) -> None:
+@click.option(
+    "--all",
+    "all_",
+    is_flag=True,
+    default=False,
+    help="Emit the core manual plus every topic (registry order).",
+)
+def prime(topics: tuple[str, ...], all_: bool) -> None:
     """Print the agent manual (output envelope, exit codes, intent→command
     map, gotchas; `--help` of subcommands is the flag spec)."""
+    if all_ and topics:
+        raise click.UsageError("--all and --topic are mutually exclusive.")
+    if all_:
+        click.echo(render_all())
+        return
     if not topics:
         click.echo(render_core())
         return
