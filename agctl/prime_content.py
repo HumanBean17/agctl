@@ -17,12 +17,15 @@ so a Windows checkout stays byte-consistent.
 from __future__ import annotations
 
 import importlib.resources
+from typing import Final
 
 from . import __version__
 from .errors import ConfigError
 
 __all__ = [
+    "HOOK_SETTINGS_SNIPPET",
     "TOPIC_ORDER",
+    "hook_pointer",
     "read_resource",
     "render_all",
     "render_core",
@@ -95,3 +98,24 @@ def render_all() -> str:
     """``--all``: the core manual followed by every topic, registry order."""
     topics = "\n\n".join(topic_text(name) for name in TOPIC_ORDER)
     return render_core() if not topics else f"{render_core()}\n\n{topics}"
+
+
+def hook_pointer() -> str:
+    """The SessionStart pointer: a ≤ 800-char nudge toward ``agctl prime``.
+
+    Wired as ``agctl prime --hook-json`` in the consumer's
+    ``.claude/settings.json`` (see :data:`HOOK_SETTINGS_SNIPPET`). Deliberately
+    tiny — a hook fires every session in the repo, so it must cost less than
+    the one skill-description it replaces.
+    """
+    return _render(read_resource("data", "prime", "hook.md"))
+
+
+#: Ready-to-paste ``.claude/settings.json`` fragment for the SessionStart
+#: hook. Printed by ``agctl config init`` (never written to settings.json —
+#: wiring a hook is the consumer's deliberate choice) and mirrored in the
+#: README (a drift test pins the two together).
+HOOK_SETTINGS_SNIPPET: Final[str] = (
+    '{"hooks": {"SessionStart": '
+    '[{"hooks": [{"type": "command", "command": "agctl prime --hook-json"}]}]}}'
+)

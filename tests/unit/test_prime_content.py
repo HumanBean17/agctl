@@ -9,12 +9,20 @@ rendered core ≤ 5,000, hook pointer ≤ 800, every topic ≤ 6,000 and > 200.
 from __future__ import annotations
 
 import importlib.resources
+import json
 
 import pytest
 
 import agctl
 from agctl.errors import ConfigError
-from agctl.prime_content import TOPIC_ORDER, read_resource, render_core, topic_text
+from agctl.prime_content import (
+    HOOK_SETTINGS_SNIPPET,
+    TOPIC_ORDER,
+    hook_pointer,
+    read_resource,
+    render_core,
+    topic_text,
+)
 
 
 def _prime_dir():
@@ -109,3 +117,21 @@ def test_registry_complete():
         "config-mocks", "config-logs", "config-init",
         "runbook-write", "runbook-run",
     )
+
+
+def test_hook_pointer_budget_and_content():
+    """The SessionStart pointer is tiny (≤ 800 chars) and points at prime."""
+    pointer = hook_pointer()
+    assert len(pointer) <= 800
+    assert f"agctl v{agctl.__version__}" in pointer
+    assert "agctl prime" in pointer
+    assert "--topic" in pointer
+
+
+def test_hook_snippet_shape():
+    """The settings.json snippet wires `agctl prime --hook-json` as a
+    SessionStart command hook."""
+    snippet = json.loads(HOOK_SETTINGS_SNIPPET)
+    hook = snippet["hooks"]["SessionStart"][0]["hooks"][0]
+    assert hook["type"] == "command"
+    assert hook["command"] == "agctl prime --hook-json"

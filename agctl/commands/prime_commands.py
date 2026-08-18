@@ -12,9 +12,11 @@ program parsing results): raw markdown on stdout, exit 0 on success, exit 2
 
 from __future__ import annotations
 
+import json
+
 import click
 
-from ..prime_content import TOPIC_ORDER, render_all, render_core, topic_text
+from ..prime_content import TOPIC_ORDER, hook_pointer, render_all, render_core, topic_text
 
 __all__ = ["prime"]
 
@@ -33,9 +35,34 @@ __all__ = ["prime"]
     default=False,
     help="Emit the core manual plus every topic (registry order).",
 )
-def prime(topics: tuple[str, ...], all_: bool) -> None:
+@click.option(
+    "--hook-json",
+    "hook_json",
+    is_flag=True,
+    default=False,
+    help="Emit the tiny SessionStart pointer wrapped in the Claude Code "
+    "hook JSON envelope (for .claude/settings.json wiring).",
+)
+def prime(topics: tuple[str, ...], all_: bool, hook_json: bool) -> None:
     """Print the agent manual (output envelope, exit codes, intent→command
     map, gotchas; `--help` of subcommands is the flag spec)."""
+    if hook_json and (topics or all_):
+        raise click.UsageError(
+            "--hook-json is mutually exclusive with --topic/--all."
+        )
+    if hook_json:
+        click.echo(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": hook_pointer(),
+                    }
+                },
+                separators=(",", ":"),
+            )
+        )
+        return
     if all_ and topics:
         raise click.UsageError("--all and --topic are mutually exclusive.")
     if all_:

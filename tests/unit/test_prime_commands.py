@@ -8,10 +8,18 @@ output, the config-free property, and root-group registration.
 
 from __future__ import annotations
 
+import json
+
 from click.testing import CliRunner
 
 from agctl.cli import cli
-from agctl.prime_content import TOPIC_ORDER, render_all, render_core, topic_text
+from agctl.prime_content import (
+    TOPIC_ORDER,
+    hook_pointer,
+    render_all,
+    render_core,
+    topic_text,
+)
 
 
 def test_prime_default_outputs_core():
@@ -68,3 +76,26 @@ def test_prime_all_with_topic_rejected():
     result = CliRunner().invoke(cli, ["prime", "--all", "--topic", "mock"])
     assert result.exit_code == 2
     assert "mutually exclusive" in result.output
+
+
+def test_prime_hook_json_valid_envelope():
+    """`--hook-json` emits the Claude Code SessionStart envelope with the
+    pointer as additionalContext."""
+    result = CliRunner().invoke(cli, ["prime", "--hook-json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    spec = payload["hookSpecificOutput"]
+    assert spec["hookEventName"] == "SessionStart"
+    assert spec["additionalContext"] == hook_pointer()
+    assert len(spec["additionalContext"]) <= 800
+
+
+def test_prime_hook_json_exclusive():
+    """`--hook-json` cannot combine with --topic or --all."""
+    for args in (
+        ["prime", "--hook-json", "--topic", "mock"],
+        ["prime", "--hook-json", "--all"],
+    ):
+        result = CliRunner().invoke(cli, args)
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
