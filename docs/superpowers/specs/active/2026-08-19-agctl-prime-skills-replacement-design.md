@@ -1,6 +1,6 @@
 # Design: `agctl prime` — the agent knowledge channel (skills → wheel-hosted prime)
 
-**Status:** draft
+**Status:** in_progress
 **Date:** 2026-08-19
 **Affects:** `agctl/commands/prime_commands.py` (new); `agctl/commands/config_commands.py` (`config init`); `agctl/data/prime/` (new); `agctl/data/skills/agctl/SKILL.md` (new); `skills/` (deleted); README.md; DESIGN.md §4 (output contract exception) + agent-channel sections; ARCHITECTURE.md §3 (module map) + data layout; CLAUDE.md (project structure); `tests/` (prime + init coverage)
 **Precedent:** `bd prime` (beads) — CLI-emitted agent context with a `--hook-json` SessionStart envelope; `agctl/data/sample-config.yaml` drift-guard test (packaged-data-is-contract pattern this design generalizes)
