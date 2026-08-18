@@ -11,7 +11,8 @@ from typing import Any
 import httpx
 import pytest
 
-from agctl.config.models import CaptureSpec, HttpMatch, HttpStub, HttpResponse
+from agctl.config.models import CaptureSpec, HttpMatch, HttpStub, HttpResponse, KafkaEffect
+from agctl.mock.effects import EffectOutcome
 from agctl.mock.http_server import MockHTTPServer
 
 
@@ -27,10 +28,24 @@ def emit_event(event_sink: list[dict[str, Any]]) -> callable:
     return lambda event: event_sink.append(event)
 
 
+class FakeEffectExecutor:
+    """Records run() calls; returns a configured outcome (never touches a transport)."""
+
+    def __init__(self, outcome: EffectOutcome | None = None) -> None:
+        self.calls: list[tuple[Any, dict[str, Any], str]] = []
+        self._outcome = outcome or EffectOutcome(ok=True)
+
+    def run(self, effects, namespace, trigger_label):
+        self.calls.append((effects, dict(namespace), trigger_label))
+        return self._outcome
+
+
 def start_server(
     stubs: dict[str, HttpStub],
     emit_event: callable,
     concurrency_cap: int = 64,
+    effect_executor: Any = None,
+    fail_fast: bool = False,
 ) -> MockHTTPServer:
     """Start a MockHTTPServer in a background thread and return it."""
     server = MockHTTPServer(
@@ -38,6 +53,8 @@ def start_server(
         stubs=stubs,
         emit_event=emit_event,
         concurrency_cap=concurrency_cap,
+        effect_executor=effect_executor,
+        fail_fast=fail_fast,
     )
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1087,3 +1104,223 @@ class TestMatchAndCaptureShareEnvelopeRoot:
             assert unmatched_events[0]["status"] == 404
         finally:
             server.shutdown()
+
+
+class TestStubEffects:
+    """Stub effects run inside the semaphore-held block, before the response (Task 4)."""
+
+    def _stub(self) -> HttpStub:
+        """One stub with a kafka effect rendered from a body capture."""
+        return HttpStub(
+            method="POST",
+            path="/notify",
+            capture={"cust_id": CaptureSpec.model_validate({"from": ".body.id"})},
+            response=HttpResponse(status=201, body={"ok": True}),
+            effects=[KafkaEffect.model_validate({"type": "kafka", "topic": "t", "value": {"id": "{cust_id}"}})],
+        )
+
+    def test_effect_runs_with_stub_label_and_namespace(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """run() called once with label=<stub name>, namespace carrying the body capture."""
+        executor = FakeEffectExecutor()
+        server = start_server({"notify-order": self._stub()}, emit_event, effect_executor=executor)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/notify", json={"id": "c1"}
+                )
+
+            assert len(executor.calls) == 1
+            effects, namespace, label = executor.calls[0]
+            assert label == "notify-order"
+            assert namespace["cust_id"].value == "c1"
+            # The stub's effect list is passed through as-is
+            assert effects[0].type == "kafka"
+            assert effects[0].topic == "t"
+
+            # The response is still the configured stub response
+            assert response.status_code == 201
+            assert response.json() == {"ok": True}
+            assert [e["event"] for e in event_sink] == ["http.hit"]
+        finally:
+            server.shutdown()
+
+    def test_response_sent_when_effect_fails(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """An ok=False outcome does not change the response (effect.error is fatal at run level)."""
+        executor = FakeEffectExecutor(outcome=EffectOutcome(ok=False, error="boom"))
+        server = start_server({"notify-order": self._stub()}, emit_event, effect_executor=executor)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/notify", json={"id": "c1"}
+                )
+
+            assert response.status_code == 201
+            assert response.json() == {"ok": True}
+            assert len(executor.calls) == 1
+            assert [e["event"] for e in event_sink] == ["http.hit"]
+        finally:
+            server.shutdown()
+
+    def test_fail_fast_effect_failure_aborts_response(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """Spec §5.9: under fail_fast, an ok=False effect outcome aborts BEFORE
+        the response is written — the client sees a connection-level failure,
+        not the stub's 201, and no http.hit is emitted."""
+        executor = FakeEffectExecutor(outcome=EffectOutcome(ok=False, error="boom"))
+        server = start_server(
+            {"notify-order": self._stub()},
+            emit_event,
+            effect_executor=executor,
+            fail_fast=True,
+        )
+        port = server.server_port
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                with pytest.raises(httpx.HTTPError):
+                    client.post(f"http://127.0.0.1:{port}/notify", json={"id": "c1"})
+
+            assert len(executor.calls) == 1
+            # No response was served -> no http.hit on the stream.
+            assert [e["event"] for e in event_sink] == []
+        finally:
+            server.shutdown()
+
+    def test_fail_fast_ok_effect_still_responds(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """fail_fast only changes the FAILURE path: a successful effect run
+        still serves the stub response under --fail-fast."""
+        executor = FakeEffectExecutor()  # ok=True
+        server = start_server(
+            {"notify-order": self._stub()},
+            emit_event,
+            effect_executor=executor,
+            fail_fast=True,
+        )
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/notify", json={"id": "c1"}
+                )
+
+            assert response.status_code == 201
+            assert [e["event"] for e in event_sink] == ["http.hit"]
+        finally:
+            server.shutdown()
+
+    def test_stub_without_effects_never_invokes_executor(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """A stub with no effects behaves byte-for-byte as before."""
+        executor = FakeEffectExecutor()
+        stubs = {
+            "plain": HttpStub(
+                method="POST",
+                path="/plain",
+                response=HttpResponse(status=200, body={"plain": True}),
+            )
+        }
+        server = start_server(stubs, emit_event, effect_executor=executor)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/plain", json={"x": 1}
+                )
+
+            assert executor.calls == []
+            assert response.status_code == 200
+            assert response.json() == {"plain": True}
+            assert [e["event"] for e in event_sink] == ["http.hit"]
+        finally:
+            server.shutdown()
+
+    def test_no_executor_configured_still_serves(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """effect_executor=None (default) + stub.effects -> no effects run, response unchanged."""
+        server = start_server({"notify-order": self._stub()}, emit_event)
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/notify", json={"id": "c1"}
+                )
+
+            assert response.status_code == 201
+            assert response.json() == {"ok": True}
+            assert [e["event"] for e in event_sink] == ["http.hit"]
+        finally:
+            server.shutdown()
+
+    def test_effects_not_run_when_semaphore_exhausted(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """429 overflow path runs no effects and emits no http.hit (existing behavior)."""
+        executor = FakeEffectExecutor()
+        server = start_server(
+            {"notify-order": self._stub()}, emit_event, concurrency_cap=1, effect_executor=executor
+        )
+        port = server.server_port
+        server.semaphore.acquire()  # exhaust the single permit
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/notify", json={"id": "c1"}
+                )
+
+            assert response.status_code == 429
+            assert executor.calls == []
+            assert event_sink == []
+        finally:
+            server.semaphore.release()
+            server.shutdown()
+
+    def test_effects_run_inside_semaphore_before_response(
+        self, emit_event: callable, event_sink: list[dict[str, Any]]
+    ) -> None:
+        """Effects run while the permit is held, and http.hit duration_ms covers them."""
+        permit_free_during_effect: list[bool] = []
+
+        class ProbingExecutor:
+            def run(self, effects, namespace, trigger_label):
+                # A cap of 1 with the handler holding its permit means no
+                # permit is free here: effect latency counts against the
+                # concurrency cap (and, via emit-before-send, http.hit's
+                # duration_ms).
+                permit_free_during_effect.append(_permit_free(server.semaphore))
+                return EffectOutcome(ok=True)
+
+        server = start_server(
+            {"notify-order": self._stub()},
+            emit_event,
+            concurrency_cap=1,
+            effect_executor=ProbingExecutor(),
+        )
+        port = server.server_port
+        try:
+            with httpx.Client() as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/notify", json={"id": "c1"}
+                )
+
+            assert response.status_code == 201
+            assert permit_free_during_effect == [False]
+        finally:
+            server.shutdown()
+
+
+def _permit_free(semaphore: threading.Semaphore) -> bool:
+    """True iff a permit is free right now (probing acquire + release)."""
+    if semaphore.acquire(blocking=False):
+        semaphore.release()
+        return True
+    return False

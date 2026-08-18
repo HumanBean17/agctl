@@ -218,6 +218,7 @@ FATAL_FAILURE_EVENTS: frozenset[str] = frozenset(
         "kafka.error",
         "grpc.unmatched",
         "grpc.error",
+        "effect.error",
     }
 )
 
@@ -233,6 +234,9 @@ EVENT_TO_COUNTER: dict[str, str] = {
     "grpc.hit": "grpc_hits",
     "grpc.unmatched": "grpc_unmatched",
     "grpc.error": "grpc_errors",
+    "kafka.produced": "kafka_produced",
+    "http.called": "http_called",
+    "effect.error": "effect_errors",
 }
 
 

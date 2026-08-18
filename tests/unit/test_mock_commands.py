@@ -641,6 +641,1034 @@ mocks:
             assert result.exit_code == 1
 
 
+# ---------------------------------------------------------------------------
+# Task 6 (cross-transport effects): resolver building in mock_run
+# ---------------------------------------------------------------------------
+
+
+def _single_envelope(result) -> dict:
+    """Parse the single NDJSON envelope line out of a CliRunner result."""
+    lines = [line for line in result.output.split("\n") if line.strip()]
+    assert len(lines) == 1, f"expected exactly one output line, got: {lines}"
+    return json.loads(lines[0])
+
+
+class TestMockRunEffectResolvers:
+    """Task 6: mock_run builds kafka/http effect resolvers from config."""
+
+    HTTP_STUB_WITH_KAFKA_EFFECT = """
+version: "3"
+kafka:
+  clusters:
+    main:
+      brokers:
+        - "main:9092"
+    effects:
+      brokers:
+        - "effects:9092"
+  default_cluster: main
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: kafka
+            topic: eff-topic
+            cluster: effects
+            value: {"ping": 1}
+"""
+
+    def test_kafka_effect_resolver_passed_and_client_built(
+        self, temp_config, fake_engine, monkeypatch
+    ):
+        """HTTP stub with a kafka effect on a cluster no reactor uses ->
+        new_kafka_client called for that cluster and kafka_resolver passed."""
+        temp_config.write_text(self.HTTP_STUB_WITH_KAFKA_EFFECT)
+
+        recorded = []
+        built = MagicMock()
+        built.codec = None
+
+        def fake_factory(cluster, group_id=None, *, codec=None):
+            recorded.append(cluster)
+            built.codec = codec
+            return built
+
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.new_kafka_client", fake_factory
+        )
+        # No topic format config anywhere: the real _resolve_codec resolves
+        # JSON and returns codec=None without touching Schema Registry.
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+
+            call_kwargs = mock_factory.call_args.kwargs
+            kafka_resolver = call_kwargs["kafka_resolver"]
+            assert callable(kafka_resolver)
+            # http_resolver is None: no http effects in this config
+            assert call_kwargs["http_resolver"] is None
+
+            # The client is built lazily on first resolver invocation, for the
+            # EFFECT's cluster ("effects") — a cluster no reactor references.
+            from agctl.config.models import KafkaEffect
+
+            effect = KafkaEffect(
+                type="kafka", topic="eff-topic", cluster="effects", value={"ping": 1}
+            )
+            client, codec = kafka_resolver(effect)
+            assert client is built
+            assert codec is None  # pure-JSON topic -> codec None
+            assert built.codec is None  # client is codec-less (_raw produce)
+            assert [c.brokers for c in recorded] == [["effects:9092"]]
+
+    def test_kafka_resolver_caches_and_skips_reprobe(
+        self, temp_config, fake_engine, monkeypatch
+    ):
+        """Calling kafka_resolver twice for the same (cluster, topic, fmt)
+        returns the cached (client, codec) and does not re-probe."""
+        temp_config.write_text(self.HTTP_STUB_WITH_KAFKA_EFFECT)
+
+        client_calls = {"n": 0}
+        codec_calls = []
+
+        def fake_factory(cluster, group_id=None, *, codec=None):
+            client_calls["n"] += 1
+            return MagicMock()
+
+        def fake_resolve_codec(
+            cfg, topic, cluster_name, cli_vf, cli_kf, *, probe=True
+        ):
+            codec_calls.append(
+                {"topic": topic, "cluster": cluster_name, "probe": probe}
+            )
+            return None, None, None  # JSON codec
+
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.new_kafka_client", fake_factory
+        )
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands._resolve_codec", fake_resolve_codec
+        )
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            kafka_resolver = mock_factory.call_args.kwargs["kafka_resolver"]
+
+            from agctl.config.models import KafkaEffect
+
+            effect = KafkaEffect(
+                type="kafka", topic="eff-topic", cluster="effects", value={"ping": 1}
+            )
+            first_client, first_codec = kafka_resolver(effect)
+            assert client_calls["n"] == 1
+            # First resolution probes (the cluster has not been probed yet).
+            assert codec_calls == [
+                {"topic": "eff-topic", "cluster": "effects", "probe": True}
+            ]
+
+            # Second call: cached (client, codec), no new client, no re-resolve.
+            second_client, second_codec = kafka_resolver(effect)
+            assert second_client is first_client
+            assert second_codec is first_codec
+            assert client_calls["n"] == 1
+            assert len(codec_calls) == 1
+
+    def test_kafka_effect_unresolvable_cluster_fails_startup(
+        self, temp_config, fake_engine
+    ):
+        """A kafka effect naming an unknown cluster -> ConfigError (exit 2)
+        BEFORE the engine is constructed."""
+        config_content = """
+version: "3"
+kafka:
+  clusters:
+    main:
+      brokers:
+        - "main:9092"
+    other:
+      brokers:
+        - "other:9092"
+  default_cluster: main
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: kafka
+            topic: eff-topic
+            cluster: missing
+            value: {"ping": 1}
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+            )
+
+            assert result.exit_code == 2
+            envelope = _single_envelope(result)
+            assert envelope["error"]["type"] == "ConfigError"
+            assert "missing" in envelope["error"]["message"]
+            # The engine is never constructed (startup fails before it).
+            mock_factory.assert_not_called()
+
+    def test_kafka_effect_avro_without_sr_fails_startup(
+        self, temp_config, fake_engine
+    ):
+        """(F4) An avro kafka effect on an SR-less cluster -> ConfigError
+        (exit 2) at mock run STARTUP, not on the first trigger via
+        effect.error. Spec §7.4: codec resolution is eager."""
+        config_content = """
+version: "3"
+kafka:
+  clusters:
+    main:
+      brokers:
+        - "main:9092"
+  default_cluster: main
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: kafka
+            topic: eff-topic
+            value_format: avro
+            value: {"ping": 1}
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+            )
+
+            assert result.exit_code == 2
+            envelope = _single_envelope(result)
+            assert envelope["error"]["type"] == "ConfigError"
+            assert "Schema Registry" in envelope["error"]["message"]
+            mock_factory.assert_not_called()
+
+    def test_kafka_effect_empty_brokers_cluster_fails_startup(
+        self, temp_config, fake_engine
+    ):
+        """(F4) A kafka effect whose resolved cluster has empty brokers ->
+        ConfigError (exit 2) at startup, mirroring the reactor walk's guard."""
+        config_content = """
+version: "3"
+kafka:
+  clusters:
+    main:
+      brokers:
+        - "main:9092"
+    empty: {}
+  default_cluster: main
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: kafka
+            topic: eff-topic
+            cluster: empty
+            value: {"ping": 1}
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+            )
+
+            assert result.exit_code == 2
+            envelope = _single_envelope(result)
+            assert envelope["error"]["type"] == "ConfigError"
+            assert "empty.brokers" in envelope["error"]["message"]
+            mock_factory.assert_not_called()
+
+    def test_http_effect_malformed_url_fails_startup(
+        self, temp_config, fake_engine
+    ):
+        """(F4) A url-mode http effect with a malformed URL -> ConfigError
+        (exit 2) at startup, with the dotted effects[i].url path in the
+        detail (not on the first trigger via effect.error)."""
+        config_content = """
+version: "3"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            url: "ftp://not-http"
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+            )
+
+            assert result.exit_code == 2
+            envelope = _single_envelope(result)
+            assert envelope["error"]["type"] == "ConfigError"
+            assert envelope["error"]["detail"]["path"] == (
+                "mocks.http.stubs.stub1.effects[0].url"
+            )
+            mock_factory.assert_not_called()
+
+    def test_http_effect_resolver_service_mode(self, temp_config, fake_engine):
+        """An http effect with service="order-service" (declared) ->
+        http_resolver passed; returns an HttpClient bound to the service's
+        base_url and the effect's path."""
+        config_content = """
+version: "3"
+services:
+  order-service:
+    base_url: http://orders.internal:8080
+    timeout_seconds: 7
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            service: order-service
+            path: /internal/notify
+            method: POST
+            body: {"ok": true}
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            call_kwargs = mock_factory.call_args.kwargs
+            http_resolver = call_kwargs["http_resolver"]
+            assert callable(http_resolver)
+            # kafka_resolver is None: no kafka effects in this config
+            assert call_kwargs["kafka_resolver"] is None
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            effect = HttpEffect(
+                type="http", service="order-service", path="/internal/notify"
+            )
+            client, path = http_resolver(effect)
+            # Assert on the observable HttpClient contract (base_url/timeout on
+            # the wrapped httpx client + a working .request) rather than
+            # isinstance: test_http_client.py reloads the module, which
+            # replaces the class object and breaks class-identity checks.
+            assert client._client.base_url == "http://orders.internal:8080"
+            # Service timeout_seconds rides along (effect.timeout unset).
+            assert client._client.timeout == httpx.Timeout(7)
+            assert callable(client.request)
+            assert path == "/internal/notify"
+
+    def test_http_effect_resolver_caches_client_per_base_url(
+        self, temp_config, fake_engine
+    ):
+        """Two http effects on the same base_url (same service) reuse ONE
+        HttpClient instance (connection pooling)."""
+        config_content = """
+version: "3"
+services:
+  order-service:
+    base_url: http://orders.internal:8080
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            service: order-service
+            path: /a
+          - type: http
+            service: order-service
+            path: /b
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            from agctl.config.models import HttpEffect
+
+            c1, p1 = http_resolver(
+                HttpEffect(type="http", service="order-service", path="/a")
+            )
+            c2, p2 = http_resolver(
+                HttpEffect(type="http", service="order-service", path="/b")
+            )
+            assert c1 is c2
+            assert (p1, p2) == ("/a", "/b")
+
+    def test_http_effect_resolver_timeout_joins_cache_key(
+        self, temp_config, fake_engine
+    ):
+        """The client cache keys on (base_url, timeout): two effects on the
+        same service with different ``timeout`` values get DIFFERENT clients,
+        so a per-effect timeout is never discarded by an earlier build."""
+        config_content = """
+version: "3"
+services:
+  order-service:
+    base_url: http://orders.internal:8080
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            service: order-service
+            path: /a
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            c1, _ = http_resolver(
+                HttpEffect(type="http", service="order-service", path="/a")
+            )
+            c2, _ = http_resolver(
+                HttpEffect(
+                    type="http", service="order-service", path="/b", timeout=2
+                )
+            )
+            c3, _ = http_resolver(
+                HttpEffect(type="http", service="order-service", path="/c")
+            )
+            # Same (base_url, resolved-timeout) -> same client; a different
+            # timeout -> a distinct client carrying that timeout.
+            assert c1 is c3
+            assert c1 is not c2
+            assert c1._client.timeout == httpx.Timeout(10)
+            assert c2._client.timeout == httpx.Timeout(2)
+
+    def test_http_effect_resolver_url_mode(self, temp_config, fake_engine):
+        """An http effect with a literal url -> resolver splits base_url/path
+        from the url (no configured service needed)."""
+        config_content = """
+version: "3"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            url: http://legacy.internal:9999/legacy/path?x=1
+            method: GET
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            from agctl.config.models import HttpEffect
+
+            effect = HttpEffect(
+                type="http", url="http://legacy.internal:9999/legacy/path?x=1"
+            )
+            client, path = http_resolver(effect)
+            assert client._client.base_url == "http://legacy.internal:9999"
+            assert path == "/legacy/path?x=1"
+
+    def test_http_effect_unknown_service_fails_before_engine(
+        self, temp_config, fake_engine
+    ):
+        """An http effect referencing an undeclared service -> ConfigError
+        (exit 2) with the dotted effects path, BEFORE the engine is built."""
+        config_content = """
+version: "3"
+services:
+  other-service:
+    base_url: http://other.internal:8080
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            service: order-service
+            path: /internal/notify
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+            )
+
+            assert result.exit_code == 2
+            envelope = _single_envelope(result)
+            error = envelope["error"]
+            assert error["type"] == "ConfigError"
+            assert "order-service" in error["message"]
+            assert (
+                error["detail"]["path"]
+                == "mocks.http.stubs.stub1.effects[0].service"
+            )
+            mock_factory.assert_not_called()
+
+    def test_reactor_http_effect_unknown_service_fails_before_engine(
+        self, temp_config, fake_engine, monkeypatch
+    ):
+        """Same unknown-service guard for a kafka reactor's http effect, with
+        the reactors-scoped dotted path."""
+        config_content = """
+version: "3"
+kafka:
+  clusters:
+    main:
+      brokers:
+        - "main:9092"
+  default_cluster: main
+mocks:
+  kafka:
+    reactors:
+      r1:
+        topic: in-topic
+        effects:
+          - type: http
+            service: nope-service
+            path: /notify
+"""
+        temp_config.write_text(config_content)
+
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.new_kafka_client",
+            lambda cluster, group_id=None, *, codec=None: MagicMock(),
+        )
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run"],
+            )
+
+            assert result.exit_code == 2
+            envelope = _single_envelope(result)
+            error = envelope["error"]
+            assert error["type"] == "ConfigError"
+            assert (
+                error["detail"]["path"]
+                == "mocks.kafka.reactors.r1.effects[0].service"
+            )
+            mock_factory.assert_not_called()
+
+    def test_no_effects_passes_no_resolvers(self, temp_config, fake_engine, monkeypatch):
+        """A config with no effects anywhere -> both resolvers are None."""
+        config_content = """
+version: "3"
+services:
+  order-service:
+    base_url: http://orders.internal:8080
+kafka:
+  clusters:
+    main:
+      brokers:
+        - "main:9092"
+  default_cluster: main
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+  kafka:
+    reactors:
+      r1:
+        topic: in-topic
+        reaction:
+          topic: out-topic
+          value: {}
+"""
+        temp_config.write_text(config_content)
+
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.new_kafka_client",
+            lambda cluster, group_id=None, *, codec=None: MagicMock(),
+        )
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            call_kwargs = mock_factory.call_args.kwargs
+            assert call_kwargs["kafka_resolver"] is None
+            assert call_kwargs["http_resolver"] is None
+
+    def test_reactor_kafka_effect_extends_reactor_cluster_clients(
+        self, temp_config, fake_engine, monkeypatch
+    ):
+        """A kafka effect (reactor-scoped) on a cluster NO reactor binds ->
+        the effect's cluster gets its own client, and kafka_resolver is passed."""
+        config_content = """
+version: "3"
+kafka:
+  clusters:
+    main:
+      brokers:
+        - "main:9092"
+    effects:
+      brokers:
+        - "effects:9092"
+  default_cluster: main
+mocks:
+  kafka:
+    reactors:
+      r1:
+        topic: in-topic
+        effects:
+          - type: kafka
+            topic: eff-topic
+            cluster: effects
+            value: {"x": 1}
+"""
+        temp_config.write_text(config_content)
+
+        recorded = []
+
+        def fake_factory(cluster, group_id=None, *, codec=None):
+            recorded.append(tuple(cluster.brokers))
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "agctl.commands.mock_commands.new_kafka_client", fake_factory
+        )
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "kafka"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            call_kwargs = mock_factory.call_args.kwargs
+            kafka_resolver = call_kwargs["kafka_resolver"]
+            assert callable(kafka_resolver)
+            assert call_kwargs["http_resolver"] is None
+
+            from agctl.config.models import KafkaEffect
+
+            effect = KafkaEffect(
+                type="kafka", topic="eff-topic", cluster="effects", value={"x": 1}
+            )
+            client, codec = kafka_resolver(effect)
+            assert codec is None
+            # Reactor cluster client (main) + effect cluster client (effects).
+            assert ("main:9092",) in recorded
+            assert ("effects:9092",) in recorded
+
+    # -- http effect timeout fallback (resolve_timeout parity: ... or 10s) --
+
+    def test_http_effect_url_mode_timeout_falls_back_to_10(
+        self, temp_config, fake_engine
+    ):
+        """url-mode effect with no timeout anywhere (effect.timeout,
+        defaults.timeout_seconds all unset — the common case) -> the client
+        gets a 10s hard timeout, NOT httpx's timeout=None (timeouts off)."""
+        config_content = """
+version: "3"
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            url: http://legacy.internal:9999/legacy/path
+            method: GET
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            effect = HttpEffect(
+                type="http", url="http://legacy.internal:9999/legacy/path"
+            )
+            client, _path = http_resolver(effect)
+            assert client._client.timeout == httpx.Timeout(10)
+
+    def test_http_effect_service_mode_timeout_falls_back_to_10(
+        self, temp_config, fake_engine
+    ):
+        """service-mode effect with no timeout anywhere (service has no
+        timeout_seconds, defaults.timeout_seconds unset) -> 10s."""
+        config_content = """
+version: "3"
+services:
+  order-service:
+    base_url: http://orders.internal:8080
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            service: order-service
+            path: /notify
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            client, _path = http_resolver(
+                HttpEffect(type="http", service="order-service", path="/notify")
+            )
+            assert client._client.timeout == httpx.Timeout(10)
+
+    def test_http_effect_explicit_timeout_wins(self, temp_config, fake_engine):
+        """effect.timeout beats both defaults.timeout_seconds and the 10s
+        fallback (both modes; distinct base_urls so per-host caching doesn't
+        mask the difference)."""
+        config_content = """
+version: "3"
+defaults:
+  timeout_seconds: 9
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            url: http://a.internal:1/x
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            # url mode: explicit timeout beats defaults (9) and the 10s fallback
+            client, _path = http_resolver(
+                HttpEffect(type="http", url="http://a.internal:1/x", timeout=3.5)
+            )
+            assert client._client.timeout == httpx.Timeout(3.5)
+
+    def test_http_effect_defaults_timeout_used_when_no_effect_timeout(
+        self, temp_config, fake_engine
+    ):
+        """url mode, effect.timeout unset but defaults.timeout_seconds set ->
+        defaults wins over the 10s fallback."""
+        config_content = """
+version: "3"
+defaults:
+  timeout_seconds: 9
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            url: http://legacy.internal:9999/legacy/path
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            client, _path = http_resolver(
+                HttpEffect(type="http", url="http://legacy.internal:9999/x")
+            )
+            assert client._client.timeout == httpx.Timeout(9)
+
+    def test_http_effect_service_timeout_beats_defaults(
+        self, temp_config, fake_engine
+    ):
+        """service.timeout_seconds (7) beats defaults.timeout_seconds (9);
+        the 10s fallback only fires when both are unset."""
+        config_content = """
+version: "3"
+defaults:
+  timeout_seconds: 9
+services:
+  order-service:
+    base_url: http://orders.internal:8080
+    timeout_seconds: 7
+mocks:
+  http:
+    listen: "0.0.0.0:18080"
+    stubs:
+      stub1:
+        method: GET
+        path: /test
+        response:
+          status: 200
+          body: '{}'
+        effects:
+          - type: http
+            service: order-service
+            path: /notify
+"""
+        temp_config.write_text(config_content)
+
+        with patch(
+            "agctl.commands.mock_commands.new_mock_engine",
+            return_value=fake_engine,
+        ) as mock_factory:
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(temp_config), "mock", "run", "--only", "http"],
+                catch_exceptions=False,
+            )
+
+            assert result.exit_code == 0
+            http_resolver = mock_factory.call_args.kwargs["http_resolver"]
+
+            import httpx
+
+            from agctl.config.models import HttpEffect
+
+            client, _path = http_resolver(
+                HttpEffect(type="http", service="order-service", path="/notify")
+            )
+            assert client._client.timeout == httpx.Timeout(7)
+
+
 # Task 7: mock start daemon argv forwards --overlay
 @pytest.mark.skipif(
     os.name == "nt",

@@ -430,8 +430,9 @@ class TestResolveTarget:
 class TestTaxonomyConstants:
     """Tests for failure-event taxonomy constants."""
 
-    def test_fatal_failure_events_has_six_names_with_grpc(self):
-        """FATAL_FAILURE_EVENTS contains the four HTTP/Kafka names plus grpc.*."""
+    def test_fatal_failure_events_has_seven_names_with_effect_error(self):
+        """FATAL_FAILURE_EVENTS contains the four HTTP/Kafka names, grpc.*,
+        and effect.error (a failed cross-transport effect is always fatal)."""
         from agctl.mock.daemon import FATAL_FAILURE_EVENTS
 
         assert FATAL_FAILURE_EVENTS == {
@@ -441,6 +442,7 @@ class TestTaxonomyConstants:
             "kafka.error",
             "grpc.unmatched",
             "grpc.error",
+            "effect.error",
         }
 
     def test_all_failure_events_includes_capture_missing(self):
@@ -457,6 +459,14 @@ class TestTaxonomyConstants:
         assert "capture.missing" in ALL_FAILURE_EVENTS
         assert "capture.missing" not in FATAL_FAILURE_EVENTS
 
+    def test_effect_error_is_fatal_and_in_all_failures(self):
+        """effect.error rides in both failure sets (a failed effect always
+        fails the run, regardless of --fail-fast)."""
+        from agctl.mock.daemon import ALL_FAILURE_EVENTS, FATAL_FAILURE_EVENTS
+
+        assert "effect.error" in FATAL_FAILURE_EVENTS
+        assert "effect.error" in ALL_FAILURE_EVENTS
+
     def test_event_to_counter_has_grpc_entries(self):
         """EVENT_TO_COUNTER maps grpc.hit/unmatched/error to summary counters."""
         from agctl.mock.daemon import EVENT_TO_COUNTER
@@ -464,6 +474,15 @@ class TestTaxonomyConstants:
         assert EVENT_TO_COUNTER["grpc.hit"] == "grpc_hits"
         assert EVENT_TO_COUNTER["grpc.unmatched"] == "grpc_unmatched"
         assert EVENT_TO_COUNTER["grpc.error"] == "grpc_errors"
+
+    def test_event_to_counter_has_effect_entries(self):
+        """EVENT_TO_COUNTER maps kafka.produced/http.called/effect.error to
+        their summary counters."""
+        from agctl.mock.daemon import EVENT_TO_COUNTER
+
+        assert EVENT_TO_COUNTER["kafka.produced"] == "kafka_produced"
+        assert EVENT_TO_COUNTER["http.called"] == "http_called"
+        assert EVENT_TO_COUNTER["effect.error"] == "effect_errors"
 
 
 class TestParseLog:
@@ -518,6 +537,9 @@ class TestParseLog:
             "grpc_hits": 0,
             "grpc_unmatched": 0,
             "grpc_errors": 0,
+            "kafka_produced": 0,
+            "http_called": 0,
+            "effect_errors": 0,
         }
 
         # Check failures - should have 3 entries (unmatched, kafka.error, capture.missing)
@@ -603,6 +625,9 @@ class TestParseLog:
             "grpc_hits": 0,
             "grpc_unmatched": 0,
             "grpc_errors": 0,
+            "kafka_produced": 0,
+            "http_called": 0,
+            "effect_errors": 0,
         }
         assert parsed.failures == []
 
@@ -626,6 +651,9 @@ class TestParseLog:
             "grpc_hits": 0,
             "grpc_unmatched": 0,
             "grpc_errors": 0,
+            "kafka_produced": 0,
+            "http_called": 0,
+            "effect_errors": 0,
         }
         assert parsed.failures == []
 

@@ -41,10 +41,12 @@ class FakeHTTPServer:
     The bind call can be configured to raise EADDRINUSE to test port-in-use errors.
     """
 
-    def __init__(self, server_address, RequestHandlerClass, *, stubs, emit_event, concurrency_cap=64):
+    def __init__(self, server_address, RequestHandlerClass, *, stubs, emit_event, concurrency_cap=64, effect_executor=None, fail_fast=False):
         self.server_address = server_address
         self.stubs = stubs
         self.emit_event = emit_event
+        self.effect_executor = effect_executor  # stub-effects executor forwarded by the engine (Task 4)
+        self.fail_fast = fail_fast  # response-abort flag forwarded by the engine (fix wave I5)
         self.bind_called = True  # Binding happens in __init__ for ThreadingHTTPServer
         self.serve_called = False
         self.shutdown_called = False
@@ -1862,6 +1864,440 @@ def test_run_grpc_without_mocks_grpc_raises_config_error():
 
     with pytest.raises(ConfigError, match="mocks.grpc"):
         engine.start()
+
+
+# =============================================================================
+# Cross-transport effect executor wiring (Task 3): resolver params, executor
+# construction, effect.* event taxonomy, summary counters
+# =============================================================================
+
+
+def _fake_kafka_resolver(effect):
+    """Fake kafka_resolver handoff — returns a client/codec pair."""
+    return (object(), None)
+
+
+def _fake_http_resolver(effect):
+    """Fake http_resolver handoff — returns a client/path pair."""
+    return (object(), "/x")
+
+
+def _effect_engine(capture_emit, *, kafka_resolver=None, http_resolver=None):
+    """No-op engine with the effect resolvers wired (no transports started)."""
+    return MockEngine(
+        mocks=None,
+        run_http=False,
+        run_kafka=False,
+        http_listen="127.0.0.1:0",
+        kafka_clients=None,
+        emit_fn=capture_emit,
+        run_id="test-run-effects",
+        kafka_resolver=kafka_resolver,
+        http_resolver=http_resolver,
+    )
+
+
+def test_effect_executor_none_without_resolvers():
+    """No resolvers → no executor (the engine preserves pre-effects behavior)."""
+    engine = _effect_engine(lambda _line: None)
+    assert engine._effect_executor is None
+
+
+def test_effect_executor_built_when_kafka_resolver_present():
+    """A kafka resolver alone is enough to construct the executor."""
+    from agctl.mock.effects import EffectExecutor
+
+    engine = _effect_engine(lambda _line: None, kafka_resolver=_fake_kafka_resolver)
+    assert isinstance(engine._effect_executor, EffectExecutor)
+
+
+def test_effect_executor_built_when_http_resolver_present():
+    """An http resolver alone is enough to construct the executor."""
+    from agctl.mock.effects import EffectExecutor
+
+    engine = _effect_engine(lambda _line: None, http_resolver=_fake_http_resolver)
+    assert isinstance(engine._effect_executor, EffectExecutor)
+
+
+def test_effect_executor_forwarded_to_http_server():
+    """The engine's executor is threaded into the MockHTTPServer it binds (Task 4)."""
+    captured_lines = []
+    fake_http_instances = []
+
+    def make_fake_http(*args, **kwargs):
+        server = FakeHTTPServer(*args, **kwargs)
+        fake_http_instances.append(server)
+        return server
+
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            listen="127.0.0.1:0",
+            stubs={"stub1": HttpStub(method="GET", path="/test", response=HttpResponse(status=200))},
+        ),
+    )
+
+    with patch("agctl.mock.engine.MockHTTPServer", side_effect=make_fake_http):
+        engine = MockEngine(
+            mocks=mocks,
+            run_http=True,
+            run_kafka=False,
+            http_listen="127.0.0.1:0",
+            kafka_clients=None,
+            emit_fn=captured_lines.append,
+            run_id="test-run-effects-fwd",
+            kafka_resolver=_fake_kafka_resolver,
+        )
+        engine.start()
+
+        # The bound server received the engine's executor instance verbatim.
+        assert len(fake_http_instances) == 1
+        assert fake_http_instances[0].effect_executor is engine._effect_executor
+
+        engine._stop.set()
+        engine.run()
+        engine.shutdown()
+
+
+def test_http_winddown_effect_error_during_shutdown_drain_yields_exit_1():
+    """(F3) Regression: an in-flight HTTP handler emitting ``effect.error``
+    during the wind-down must yield exit 1, not 0.
+
+    Mirrors the gRPC drain regression
+    (``test_grpc_winddown_error_during_shutdown_drain_yields_exit_1``): the
+    real ``ThreadingHTTPServer.shutdown()`` stops accepting NEW connections
+    but lets in-flight handler threads finish, so a handler whose executor
+    fails during the drain window emits ``effect.error`` AFTER stop is set.
+    ``run()`` must stop the HTTP server BEFORE reading the exit-code snapshot
+    so that late error is counted — otherwise run() returns 0 while the
+    summary shows ``effect_errors=1`` (a false green). The fake server models
+    the in-flight-during-drain race deterministically (and the shutdown's
+    idempotence: the second call from ``engine.shutdown()`` must not
+    double-count).
+    """
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    class WinddownErrorHTTP(FakeHTTPServer):
+        """Fake whose ``shutdown()`` emits a fatal effect.error exactly once.
+
+        Models an in-flight handler's executor failing during
+        ``ThreadingHTTPServer.shutdown()``'s drain window, and the required
+        idempotence — the second call (from ``engine.shutdown()``) must NOT
+        re-emit / double-count.
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._drained = False
+
+        def shutdown(self):
+            if not self._drained:
+                self._drained = True
+                # In-flight handler's effect executor aborts during the drain.
+                self.emit_event(
+                    {
+                        "event": "effect.error",
+                        "trigger": "stub1",
+                        "effect_type": "http",
+                        "error": "handler aborted during drain",
+                        "fatal": True,
+                        "url": "http://svc.internal",
+                    }
+                )
+            super().shutdown()
+
+    fake_http_instances = []
+
+    def make_fake_http(*args, **kwargs):
+        server = WinddownErrorHTTP(*args, **kwargs)
+        fake_http_instances.append(server)
+        return server
+
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            listen="127.0.0.1:0",
+            stubs={
+                "stub1": HttpStub(
+                    method="GET", path="/test", response=HttpResponse(status=200)
+                )
+            },
+        ),
+    )
+
+    with patch("agctl.mock.engine.MockHTTPServer", side_effect=make_fake_http):
+        engine = MockEngine(
+            mocks=mocks,
+            run_http=True,
+            run_kafka=False,
+            http_listen="127.0.0.1:0",
+            kafka_clients=None,
+            emit_fn=capture_emit,
+            run_id="test-http-winddown",
+        )
+        engine.start()
+        # Pre-set stop so run()'s loop exits immediately; the HTTP drain still
+        # runs (after the loop, before the snapshot) — the code path under test.
+        engine._stop.set()
+        exit_code = engine.run()
+
+        # Exit code must be 1 (a runtime error occurred during the drain),
+        # matching the summary's effect_errors count — not a false-green 0.
+        assert exit_code == 1, (
+            f"expected exit 1 after wind-down effect.error, got {exit_code}"
+        )
+
+        # Idempotence: the second shutdown (inside engine.shutdown()) did not
+        # re-emit / double-count.
+        errors = [l for l in captured_lines if l.get("event") == "effect.error"]
+        assert len(errors) == 1, (
+            "the idempotent drain must emit exactly one effect.error"
+        )
+        engine.shutdown()
+        summary = [l for l in captured_lines if l.get("event") == "summary"][0]
+        assert summary["effect_errors"] == 1
+
+
+def test_http_drain_shutdown_called_inside_run_before_engine_shutdown():
+    """(F3) ``run()`` itself stops the HTTP server before returning the exit
+    code (the drain is not deferred to ``engine.shutdown()``).
+
+    The drain must run inside ``run()`` so the exit-code snapshot (taken in
+    ``run()``) observes the drained counters. Verified by setting ``_stop``
+    before ``run()`` (loop exits immediately) and asserting the fake's
+    ``shutdown_called`` is True right after ``run()`` returns — BEFORE
+    ``engine.shutdown()`` is invoked.
+    """
+    fake_http_instances = []
+
+    def make_fake_http(*args, **kwargs):
+        server = FakeHTTPServer(*args, **kwargs)
+        fake_http_instances.append(server)
+        return server
+
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            listen="127.0.0.1:0",
+            stubs={
+                "stub1": HttpStub(
+                    method="GET", path="/test", response=HttpResponse(status=200)
+                )
+            },
+        ),
+    )
+
+    with patch("agctl.mock.engine.MockHTTPServer", side_effect=make_fake_http):
+        engine = MockEngine(
+            mocks=mocks,
+            run_http=True,
+            run_kafka=False,
+            http_listen="127.0.0.1:0",
+            kafka_clients=None,
+            emit_fn=lambda _line: None,
+            run_id="test-http-drain-ordering",
+        )
+        engine.start()
+        engine._stop.set()  # loop exits immediately; drain still runs
+        engine.run()
+
+        # The drain happened INSIDE run(), before engine.shutdown() is called.
+        assert fake_http_instances[0].shutdown_called is True, (
+            "run() must stop the HTTP server before returning the exit code"
+        )
+        engine.shutdown()
+
+
+def test_fail_fast_forwarded_to_http_server():
+    """The engine's ``fail_fast`` flag is threaded into the MockHTTPServer it
+    binds (the response-abort seam, symmetric to the executor forwarding)."""
+    fake_http_instances = []
+
+    def make_fake_http(*args, **kwargs):
+        server = FakeHTTPServer(*args, **kwargs)
+        fake_http_instances.append(server)
+        return server
+
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            listen="127.0.0.1:0",
+            stubs={
+                "stub1": HttpStub(
+                    method="GET", path="/test", response=HttpResponse(status=200)
+                )
+            },
+        ),
+    )
+
+    with patch("agctl.mock.engine.MockHTTPServer", side_effect=make_fake_http):
+        engine = MockEngine(
+            mocks=mocks,
+            run_http=True,
+            run_kafka=False,
+            http_listen="127.0.0.1:0",
+            kafka_clients=None,
+            emit_fn=lambda _line: None,
+            run_id="test-failfast-fwd",
+            fail_fast=True,
+        )
+        engine.start()
+
+        # The bound server received the engine's flag verbatim.
+        assert len(fake_http_instances) == 1
+        assert fake_http_instances[0].fail_fast is True
+
+        engine._stop.set()
+        engine.run()
+        engine.shutdown()
+
+
+def test_effect_executor_forwarded_to_kafka_reactor():
+    """The engine's executor is threaded into each KafkaReactor it constructs
+    (the reactor-side forwarding seam, symmetric to the HTTP server one)."""
+    reactor_instances = []
+
+    class RecordingReactor:
+        """Fake KafkaReactor recording its constructor kwargs."""
+
+        def __init__(
+            self,
+            *,
+            name,
+            config,
+            client,
+            emit_event,
+            stop_event,
+            fail_fast=False,
+            run_id=None,
+            reaction_codec=None,
+            effect_executor=None,
+        ):
+            self.name = name
+            self.config = config
+            self.client = client
+            self.emit_event = emit_event
+            self.stop_event = stop_event
+            self.fail_fast = fail_fast
+            self.run_id = run_id
+            self.reaction_codec = reaction_codec
+            self.effect_executor = effect_executor
+            # The started line reads these attributes off each reactor.
+            self._name = name
+            self._config = config
+            reactor_instances.append(self)
+
+        def prepare(self):
+            pass
+
+        def run(self):
+            pass
+
+        def close(self):
+            pass
+
+        def resolved_group(self):
+            return "g"
+
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "r1": KafkaReactor(
+                    topic="in",
+                    reaction=KafkaReaction(topic="out", value={}),
+                ),
+            },
+        ),
+    )
+
+    with patch("agctl.mock.engine.KafkaReactorClass", RecordingReactor):
+        engine = MockEngine(
+            mocks=mocks,
+            run_http=False,
+            run_kafka=True,
+            http_listen="127.0.0.1:0",
+            kafka_clients={"r1": FakeKafkaClient()},
+            emit_fn=lambda _line: None,
+            run_id="test-effects-fwd-reactor",
+            fail_fast=True,
+            kafka_resolver=_fake_kafka_resolver,
+        )
+        engine.start()
+
+        # The constructed reactor received the engine's executor verbatim (and
+        # the fail_fast flag too — both engine-owned seams).
+        assert len(reactor_instances) == 1
+        assert reactor_instances[0].effect_executor is engine._effect_executor
+        assert reactor_instances[0].fail_fast is True
+
+        engine._stop.set()
+        engine.run()
+        engine.shutdown()
+
+
+def test_effect_events_tally_and_effect_error_sets_runtime_error_exit_1():
+    """``kafka.produced``/``http.called`` tally; ``effect.error`` tallies AND
+    sets the runtime-error flag UNCONDITIONALLY (mirroring grpc.unmatched /
+    grpc.error), so a failed effect fails the run even without --fail-fast."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    engine = _effect_engine(
+        capture_emit,
+        kafka_resolver=_fake_kafka_resolver,
+        http_resolver=_fake_http_resolver,
+    )
+    engine.start()
+
+    for _ in range(2):
+        engine.emit_event({"event": "kafka.produced", "trigger": "s", "topic": "t"})
+    engine.emit_event({"event": "http.called", "trigger": "s", "url": "http://x", "status_code": 200})
+    engine.emit_event(
+        {
+            "event": "effect.error",
+            "trigger": "s",
+            "effect_type": "kafka",
+            "error": "x",
+            "fatal": True,
+        }
+    )
+
+    assert engine._kafka_produced == 2
+    assert engine._http_called == 1
+    assert engine._effect_errors == 1
+    assert engine._runtime_error is True
+
+    engine._stop.set()
+    exit_code = engine.run()
+    assert exit_code == 1, "effect.error sets _runtime_error → exit 1"
+
+    engine.shutdown()
+
+    summary = [l for l in captured_lines if l.get("event") == "summary"][0]
+    assert summary["kafka_produced"] == 2
+    assert summary["http_called"] == 1
+    assert summary["effect_errors"] == 1
+
+
+def test_summary_line_contains_effect_counter_keys():
+    """The summary line carries the three new effect counter keys (zero-valued
+    when no effect events were emitted)."""
+    captured_lines = []
+
+    def capture_emit(line):
+        captured_lines.append(line.copy())
+
+    engine = _effect_engine(capture_emit)
+    engine.start()
+    engine._stop.set()
+    engine.run()
+    engine.shutdown()
+
+    summary = [l for l in captured_lines if l.get("event") == "summary"][0]
+    assert summary["kafka_produced"] == 0
+    assert summary["http_called"] == 0
+    assert summary["effect_errors"] == 0
 
 
 def test_default_grpc_server_factory_lazy_imports_real_server():

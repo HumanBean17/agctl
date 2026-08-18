@@ -872,6 +872,182 @@ def test_reactor_capture_missing_emits_event_and_empty(emit_event, stop_event):
     assert missing[0]["from"] == ".value.nope"
 
 
+# ---------------------------------------------------------------------------
+# Effects path (cross-transport mock effects, Task 5)
+# ---------------------------------------------------------------------------
+
+
+class FakeEffectExecutor:
+    """Records run() calls; returns a configured outcome (never touches a transport)."""
+
+    def __init__(self, outcome=None):
+        from agctl.mock.effects import EffectOutcome
+
+        self.calls = []
+        self._outcome = outcome or EffectOutcome(ok=True)
+
+    def run(self, effects, namespace, trigger_label):
+        self.calls.append((effects, dict(namespace), trigger_label))
+        return self._outcome
+
+
+def _effect_msg():
+    """Normalized trigger envelope for the effects-path tests."""
+    return {
+        "value": {"id": "o1"},
+        "key": None,
+        "partition": 0,
+        "offset": 0,
+        "timestamp": 0,
+        "headers": {},
+    }
+
+
+def _effects_config():
+    """KafkaReactor config carrying effects (no reaction) + an orderId capture."""
+    from agctl.config.models import HttpEffect
+
+    return KafkaReactor(
+        topic="commands",
+        match=None,
+        capture={"orderId": CaptureSpec.model_validate({"from": ".value.id"})},
+        reaction=None,
+        effects=[
+            HttpEffect(
+                type="http",
+                url="https://x",
+                method="POST",
+                body={"id": "{orderId}"},
+            )
+        ],
+    )
+
+
+def test_reactor_effects_path_runs_executor_and_commits(emit_event, stop_event):
+    """Effects reactor: _handle runs the executor with the capture namespace → COMMIT."""
+    executor = FakeEffectExecutor()
+    reactor = Reactor(
+        name="orders",
+        config=_effects_config(),
+        client=FakeKafkaClient(),
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+        effect_executor=executor,
+    )
+
+    result = reactor._handle(_effect_msg(), attempt=1, final=True)
+
+    assert result == ReactionResult.COMMIT
+    assert len(executor.calls) == 1
+    effects, namespace, label = executor.calls[0]
+    assert label == "orders"
+    assert effects == _effects_config().effects
+    assert namespace["orderId"].value == "o1"
+    # The trigger client never produces on the effects path (transport work
+    # belongs to the executor), and no kafka.reacted event is emitted.
+    assert len(emit_event.events) == 0
+
+
+def test_reactor_effects_failure_commits_without_fail_fast(emit_event, stop_event):
+    """Effect failure, fail_fast=False: executor already emitted effect.error → COMMIT."""
+    from agctl.mock.effects import EffectOutcome
+
+    executor = FakeEffectExecutor(outcome=EffectOutcome(ok=False, error="boom"))
+    reactor = Reactor(
+        name="orders",
+        config=_effects_config(),
+        client=FakeKafkaClient(),
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+        effect_executor=executor,
+    )
+
+    result = reactor._handle(_effect_msg(), attempt=1, final=True)
+
+    # No retry on effect failure; COMMIT mirrors the legacy final-failure arm.
+    assert result == ReactionResult.COMMIT
+
+
+def test_reactor_effects_failure_stops_with_fail_fast(emit_event, stop_event):
+    """Effect failure, fail_fast=True: STOP (mirrors the legacy fail-fast arm)."""
+    from agctl.mock.effects import EffectOutcome
+
+    executor = FakeEffectExecutor(outcome=EffectOutcome(ok=False, error="boom"))
+    reactor = Reactor(
+        name="orders",
+        config=_effects_config(),
+        client=FakeKafkaClient(),
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=True,
+        run_id="run-1",
+        effect_executor=executor,
+    )
+
+    result = reactor._handle(_effect_msg(), attempt=1, final=True)
+
+    assert result == ReactionResult.STOP
+
+
+def test_reactor_effects_without_executor_emits_kafka_error(emit_event, stop_event):
+    """Defensive: effects configured but no executor wired → kafka.error + COMMIT."""
+    reactor = Reactor(
+        name="orders",
+        config=_effects_config(),
+        client=FakeKafkaClient(),
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+        effect_executor=None,
+    )
+
+    result = reactor._handle(_effect_msg(), attempt=1, final=True)
+
+    assert result == ReactionResult.COMMIT
+    assert len(emit_event.events) == 1
+    event = emit_event.events[0]
+    assert event["event"] == "kafka.error"
+    assert event["reactor"] == "orders"
+    assert event["topic"] == "commands"
+    assert "error" in event
+
+
+def test_reactor_reaction_path_ignores_executor(emit_event, stop_event):
+    """Back-compat: a reaction reactor with an executor wired never calls it."""
+    config = KafkaReactor(
+        topic="commands",
+        match=None,
+        capture={"orderId": CaptureSpec.model_validate({"from": ".value.id"})},
+        reaction=KafkaReaction(topic="events", value={"id": "{orderId}"}),
+    )
+    executor = FakeEffectExecutor()
+    client = FakeKafkaClient()
+    reactor = Reactor(
+        name="orders",
+        config=config,
+        client=client,
+        emit_event=emit_event,
+        stop_event=stop_event,
+        fail_fast=False,
+        run_id="run-1",
+        effect_executor=executor,
+    )
+
+    result = reactor._handle(_effect_msg(), attempt=1, final=True)
+
+    assert result == ReactionResult.COMMIT
+    assert executor.calls == []
+    assert len(client.produce_calls) == 1
+    assert client.produce_calls[0]["_raw"] is True
+    assert len(emit_event.events) == 1
+    assert emit_event.events[0]["event"] == "kafka.reacted"
+
+
 def test_match_and_capture_share_envelope_root_kafka(emit_event, stop_event):
     """Acceptance test for #22: match and capture share one `.` root.
 

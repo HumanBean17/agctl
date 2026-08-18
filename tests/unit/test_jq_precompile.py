@@ -14,10 +14,12 @@ from agctl.config.models import (
     GrpcResponse,
     GrpcResponseMessage,
     GrpcStub,
+    HttpEffect,
     HttpMatch,
     HttpMockConfig,
     HttpResponse,
     HttpStub,
+    KafkaEffect,
     KafkaMockConfig,
     KafkaReaction,
     KafkaReactor,
@@ -667,6 +669,194 @@ def test_collect_grpc_valid_returns_empty():
                     match=GrpcMatch(jq='.msg == "hi"'),
                     capture={"id": CaptureSpec(from_=".msg.id")},
                     response=GrpcResponse(message={}),
+                ),
+            },
+        ),
+    )
+    assert collect_jq_compile_errors(mocks) == []
+
+
+# --- (j) http-effect capture.from walked on BOTH carriers (Task 8) -----------
+def test_iter_http_stub_effect_capture_from_yielded():
+    """An http effect on an HTTP stub yields ``effects[i].capture.{cap}.from``
+    (verbatim) after the stub's own labels — only http effects carry a capture
+    (kafka effects contribute nothing)."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "fire": HttpStub(
+                    method="POST",
+                    path="/orders",
+                    match=HttpMatch(jq=".a"),
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://svc.internal/notify",
+                            capture={"x": CaptureSpec(from_=".body.id")},
+                        ),
+                    ],
+                    response=HttpResponse(status=202),
+                ),
+            },
+        ),
+    )
+    assert list(iter_mock_jq_expressions(mocks)) == [
+        ("mocks.http.stubs.fire.match.jq", ".a"),
+        ("mocks.http.stubs.fire.effects[0].capture.x.from", ".body.id"),
+    ]
+
+
+def test_iter_kafka_reactor_http_effect_capture_from_yielded():
+    """An http effect on a Kafka reactor (effects-only reactor, reaction=None)
+    yields ``mocks.kafka.reactors.<r>.effects[i].capture.{cap}.from`` likewise."""
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "tap": KafkaReactor(
+                    topic="orders.events",
+                    match=".value.type",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://svc.internal/notify",
+                            capture={"ack": CaptureSpec(from_=".body.ackId")},
+                        ),
+                    ],
+                ),
+            },
+        ),
+    )
+    assert list(iter_mock_jq_expressions(mocks)) == [
+        ("mocks.kafka.reactors.tap.match", ".value.type"),
+        ("mocks.kafka.reactors.tap.effects[0].capture.ack.from", ".body.ackId"),
+    ]
+
+
+def test_iter_kafka_effect_and_effectless_capture_yield_nothing_extra():
+    """A kafka effect has no ``capture`` and an http effect with capture=None —
+    neither yields effect labels; the stub's own match.jq is untouched."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "s": HttpStub(
+                    method="POST",
+                    path="/o",
+                    match=HttpMatch(jq=".a"),
+                    effects=[
+                        KafkaEffect(type="kafka", topic="t", value={"id": 1}),
+                        HttpEffect(type="http", url="https://x/y"),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    assert list(iter_mock_jq_expressions(mocks)) == [
+        ("mocks.http.stubs.s.match.jq", ".a"),
+    ]
+
+
+def test_iter_effect_capture_order_follows_list_and_dict_order():
+    """Effect capture labels follow the effects-list order and, within one
+    effect, capture dict insertion order; multiple effects each contribute."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "s": HttpStub(
+                    method="POST",
+                    path="/o",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/1",
+                            capture={
+                                "b": CaptureSpec(from_=".body.b"),
+                                "a": CaptureSpec(from_=".body.a"),
+                            },
+                        ),
+                        HttpEffect(
+                            type="http",
+                            url="https://x/2",
+                            capture={"c": CaptureSpec(from_=".body.c")},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+    )
+    pairs = list(iter_mock_jq_expressions(mocks))
+    assert pairs == [
+        ("mocks.http.stubs.s.effects[0].capture.b.from", ".body.b"),
+        ("mocks.http.stubs.s.effects[0].capture.a.from", ".body.a"),
+        ("mocks.http.stubs.s.effects[1].capture.c.from", ".body.c"),
+    ]
+
+
+def test_collect_malformed_effect_capture_from_surfaces_under_effect_label():
+    """collect_jq_compile_errors surfaces a malformed http-effect capture
+    ``from`` under the effect's capture label (not the stub's match.jq), on
+    both carriers."""
+    mocks = MocksConfig(
+        http=HttpMockConfig(
+            stubs={
+                "bad": HttpStub(
+                    method="POST",
+                    path="/o",
+                    match=HttpMatch(jq=".a"),
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/y",
+                            capture={"x": CaptureSpec(from_=".body[")},
+                        ),
+                    ],
+                    response=HttpResponse(),
+                ),
+            },
+        ),
+        kafka=KafkaMockConfig(
+            reactors={
+                "bad-r": KafkaReactor(
+                    topic="t",
+                    match=".v",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/y",
+                            capture={"k": CaptureSpec(from_=".body[")},
+                        ),
+                    ],
+                ),
+            },
+        ),
+    )
+    errors = collect_jq_compile_errors(mocks)
+    paths = [e["path"] for e in errors]
+    assert paths == [
+        "mocks.http.stubs.bad.effects[0].capture.x.from",
+        "mocks.kafka.reactors.bad-r.effects[0].capture.k.from",
+    ]
+    for err in errors:
+        assert set(err.keys()) == {"path", "message"}
+        assert "invalid jq expression" in err["message"]
+
+
+def test_collect_valid_effect_capture_froms_return_empty():
+    """Compilable effect-capture froms on both carriers -> []."""
+    mocks = MocksConfig(
+        kafka=KafkaMockConfig(
+            reactors={
+                "r": KafkaReactor(
+                    topic="t",
+                    match=".v",
+                    effects=[
+                        HttpEffect(
+                            type="http",
+                            url="https://x/y",
+                            capture={"ok": CaptureSpec(from_=".body.ok")},
+                        ),
+                    ],
                 ),
             },
         ),

@@ -17,6 +17,8 @@ import json
 from click.testing import CliRunner
 
 from agctl.cli import cli
+from agctl.commands.config_commands import collect_unknown_template_errors
+from agctl.config import load_config
 
 
 def _validate(tmp_path, yaml_text):
@@ -27,6 +29,163 @@ def _validate(tmp_path, yaml_text):
         cli,
         ["config", "validate", "--config", str(cfg_file)],
     )
+
+
+# --- Task 9: unknown ``{{...}}`` tokens in effect fields ----------------------
+
+#: Minimal named-cluster block so kafka effects / reactors load cleanly.
+_KAFKA = """
+kafka:
+  clusters:
+    default:
+      brokers:
+        - localhost:9092
+  default_cluster: default
+"""
+
+
+def _load(tmp_path, yaml_text):
+    """Write a temp agctl.yaml and load it into a ``Config`` (temp-config pattern)."""
+    cfg_file = tmp_path / "agctl.yaml"
+    cfg_file.write_text(yaml_text)
+    return load_config(str(cfg_file), env={})
+
+
+def _messages_at(errors, path):
+    """Join the messages of all errors attributed at ``path`` (empty if none)."""
+    return " | ".join(e["message"] for e in errors if e["path"] == path)
+
+
+def test_collect_unknown_template_errors_stub_kafka_effect_fields(tmp_path):
+    """A stub's kafka effect fields are walked: ``{{foo}}`` in ``value`` is
+    flagged at ``mocks.http.stubs.<s>.effects[0].value`` while ``{{uuid}}`` in
+    the same dict is not; ``topic``/``key``/``headers`` and each ``values[j]``
+    element are flagged at their own paths."""
+    cfg = _load(
+        tmp_path,
+        'version: "3"\n'
+        + _KAFKA
+        + """
+mocks:
+  http:
+    stubs:
+      s1:
+        method: POST
+        path: /orders
+        response:
+          status: 200
+        effects:
+          - type: kafka
+            topic: "out-{{topy}}"
+            key: "{{keyy}}"
+            headers:
+              h: "{{heady}}"
+            value:
+              id: "{{uuid}}"
+              bad: "{{foo}}"
+          - type: kafka
+            topic: out2
+            values:
+              - value: "{{valy}}"
+                key: "{{keyy}}"
+                headers:
+                  h: "{{heady}}"
+""",
+    )
+    errors = collect_unknown_template_errors(cfg)
+    base = "mocks.http.stubs.s1.effects"
+    assert "{{foo}}" in _messages_at(errors, f"{base}[0].value")
+    assert "{{topy}}" in _messages_at(errors, f"{base}[0].topic")
+    assert "{{keyy}}" in _messages_at(errors, f"{base}[0].key")
+    assert "{{heady}}" in _messages_at(errors, f"{base}[0].headers")
+    assert "{{valy}}" in _messages_at(errors, f"{base}[1].values[0].value")
+    assert "{{keyy}}" in _messages_at(errors, f"{base}[1].values[0].key")
+    assert "{{heady}}" in _messages_at(errors, f"{base}[1].values[0].headers")
+    # A known generator riding in the same value dict is NOT flagged.
+    assert not any("{{uuid}}" in e["message"] for e in errors)
+
+
+def test_collect_unknown_template_errors_stub_http_effect_fields(tmp_path):
+    """A stub's http effect fields (url/path/body/headers) are walked; each
+    unknown token is flagged at its own ``effects[i].<field>`` path."""
+    cfg = _load(
+        tmp_path,
+        'version: "3"\n'
+        + _KAFKA
+        + """
+mocks:
+  http:
+    stubs:
+      s1:
+        method: POST
+        path: /orders
+        response:
+          status: 200
+        effects:
+          - type: http
+            url: "https://x/{{bary}}"
+            path: "/p/{{pathy}}"
+            body:
+              note: "{{bodyy}}"
+            headers:
+              X-H: "{{heady}}"
+""",
+    )
+    errors = collect_unknown_template_errors(cfg)
+    base = "mocks.http.stubs.s1.effects[0]"
+    assert "{{bary}}" in _messages_at(errors, f"{base}.url")
+    assert "{{pathy}}" in _messages_at(errors, f"{base}.path")
+    assert "{{bodyy}}" in _messages_at(errors, f"{base}.body")
+    assert "{{heady}}" in _messages_at(errors, f"{base}.headers")
+
+
+def test_collect_unknown_template_errors_reactor_effect_fields(tmp_path):
+    """A reactor's effect list is walked under the ``mocks.kafka.reactors``
+    prefix: kafka ``effects[0].value`` and http ``effects[1].url`` tokens are
+    each flagged at their own path."""
+    cfg = _load(
+        tmp_path,
+        'version: "3"\n'
+        + _KAFKA
+        + """
+mocks:
+  kafka:
+    reactors:
+      r1:
+        topic: in
+        effects:
+          - type: kafka
+            topic: out
+            value: "{{foo}}"
+          - type: http
+            url: "https://y/{{bar}}"
+""",
+    )
+    errors = collect_unknown_template_errors(cfg)
+    assert "{{foo}}" in _messages_at(errors, "mocks.kafka.reactors.r1.effects[0].value")
+    assert "{{bar}}" in _messages_at(errors, "mocks.kafka.reactors.r1.effects[1].url")
+
+
+def test_collect_unknown_template_errors_effects_only_reactor_does_not_raise(tmp_path):
+    """An effects-only reactor (``reaction`` is None — legal since T1) must not
+    crash the collector: the reaction-field checks are skipped for it and a
+    clean effect list yields no errors."""
+    cfg = _load(
+        tmp_path,
+        'version: "3"\n'
+        + _KAFKA
+        + """
+mocks:
+  kafka:
+    reactors:
+      r1:
+        topic: in
+        effects:
+          - type: http
+            url: "https://y/{{uuid}}"
+""",
+    )
+    assert collect_unknown_template_errors(cfg) == []
 
 
 # --- (a) malformed HTTP stub match.jq -----------------------------------------

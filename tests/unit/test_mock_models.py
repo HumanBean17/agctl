@@ -1,20 +1,26 @@
 """Tests for mock server config models (Task 1, Task 3)."""
 
+from typing import get_args
+
 import pytest
 from pydantic import ValidationError
 
 from agctl.config.models import (
     Config,
     CaptureSpec,
+    Effect,
     GrpcMatch,
     GrpcMockConfig,
     GrpcResponse,
     GrpcResponseMessage,
     GrpcStub,
+    HttpEffect,
     HttpMatch,
     HttpMockConfig,
     HttpResponse,
     HttpStub,
+    KafkaEffect,
+    KafkaEffectMessage,
     KafkaMockConfig,
     KafkaReaction,
     KafkaReactor,
@@ -548,3 +554,239 @@ def test_config_with_grpc_mocks_end_to_end():
     stub = cfg.mocks.grpc.stubs["get-order"]
     assert stub.method == "GetOrder"
     assert stub.response.status == "OK"
+
+
+# --- Effects (cross-transport: HTTP stub -> Kafka produce; Kafka reactor -> HTTP call) ---
+#
+# Structural config models only: discriminated-union routing on `type`,
+# exactly-one-of checks (value/values, service/url, reaction/effects), and the
+# method/headers normalization validators. Execution is later tasks.
+
+
+def test_kafka_effect_value_dict():
+    """KafkaEffect(type='kafka', topic='t', value={...}) parses; .value is the dict."""
+    effect = KafkaEffect(type="kafka", topic="t", value={"a": 1})
+    assert effect.type == "kafka"
+    assert effect.topic == "t"
+    assert effect.value == {"a": 1}
+    assert effect.values is None
+
+
+def test_kafka_effect_values_list():
+    """KafkaEffect(values=[{value:1},{value:2,key:'k'}]) parses; .values has 2 items."""
+    effect = KafkaEffect(
+        type="kafka",
+        topic="t",
+        values=[{"value": 1}, {"value": 2, "key": "k"}],
+    )
+    assert effect.value is None
+    assert effect.values is not None
+    assert len(effect.values) == 2
+    assert isinstance(effect.values[0], KafkaEffectMessage)
+    assert effect.values[0].value == 1
+    assert effect.values[0].key is None
+    assert effect.values[0].headers is None
+    assert effect.values[1].value == 2
+    assert effect.values[1].key == "k"
+
+
+def test_kafka_effect_neither_value_nor_values_rejected():
+    """KafkaEffect(type='kafka', topic='t') (neither) -> ValidationError."""
+    with pytest.raises(ValidationError, match="exactly one of"):
+        KafkaEffect(type="kafka", topic="t")
+
+
+def test_kafka_effect_both_value_and_values_rejected():
+    """KafkaEffect(value=1, values=[...]) (both) -> ValidationError."""
+    with pytest.raises(ValidationError, match="exactly one of"):
+        KafkaEffect(type="kafka", topic="t", value=1, values=[{"value": 2}])
+
+
+def test_kafka_effect_headers_non_string_rejected():
+    """KafkaEffect headers values must be strings (mirrors KafkaReaction._check_headers)."""
+    with pytest.raises(ValidationError):
+        KafkaEffect(type="kafka", topic="t", value=1, headers={"x": 5})
+
+
+def test_kafka_effect_empty_values_rejected():
+    """KafkaEffect(values=[]) -> ValidationError (an empty list is a silent
+    no-op producer, not a valid multi-message effect)."""
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        KafkaEffect(type="kafka", topic="t", values=[])
+
+
+def test_http_effect_service_method_normalized():
+    """HttpEffect(service='s', path='/p', method='post') parses; .method == 'POST'."""
+    effect = HttpEffect(type="http", service="s", path="/p", method="post")
+    assert effect.type == "http"
+    assert effect.service == "s"
+    assert effect.url is None
+    assert effect.method == "POST"
+    assert effect.path == "/p"
+
+
+def test_http_effect_url_only():
+    """HttpEffect(url='https://x/y') parses; .url set, .service is None."""
+    effect = HttpEffect(type="http", url="https://x/y")
+    assert effect.url == "https://x/y"
+    assert effect.service is None
+
+
+def test_http_effect_neither_service_nor_url_rejected():
+    """HttpEffect(type='http') (neither) -> ValidationError."""
+    with pytest.raises(ValidationError, match="exactly one of"):
+        HttpEffect(type="http")
+
+
+def test_http_effect_both_service_and_url_rejected():
+    """HttpEffect(service=..., url=...) (both) -> ValidationError."""
+    with pytest.raises(ValidationError, match="exactly one of"):
+        HttpEffect(type="http", service="s", url="https://x")
+
+
+def test_http_effect_capture_alias():
+    """HttpEffect capture inherits CaptureSpec's `from` alias + populate_by_name."""
+    effect = HttpEffect(
+        type="http",
+        url="https://x",
+        capture={"op_id": {"from": ".body.id"}},
+    )
+    assert effect.capture is not None
+    assert effect.capture["op_id"].from_ == ".body.id"
+
+
+def test_http_stub_with_effects():
+    """HttpStub(effects=[{type:'kafka', topic:'t', value:1}]) parses; .effects[0].topic == 't'."""
+    stub = HttpStub(
+        method="POST",
+        path="/x",
+        response={"status": 200},
+        effects=[{"type": "kafka", "topic": "t", "value": 1}],
+    )
+    assert stub.effects is not None
+    assert len(stub.effects) == 1
+    assert stub.effects[0].topic == "t"
+
+
+def test_http_stub_effects_default_none():
+    """HttpStub without effects -> .effects is None."""
+    stub = HttpStub(method="POST", path="/x", response={"status": 200})
+    assert stub.effects is None
+
+
+def test_http_stub_empty_effects_rejected():
+    """HttpStub(effects=[]) -> ValidationError (an empty list is a silent
+    no-op, not a valid effects declaration)."""
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        HttpStub(
+            method="POST",
+            path="/x",
+            response={"status": 200},
+            effects=[],
+        )
+
+
+def test_kafka_reactor_empty_effects_rejected():
+    """KafkaReactor(effects=[]) -> ValidationError (an empty list is a silent
+    no-op, not a valid effects declaration)."""
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        KafkaReactor(topic="t", effects=[])
+
+
+def test_kafka_reactor_with_effects_only():
+    """KafkaReactor(topic='t', effects=[{type:'http', url:'https://x'}]) parses with reaction None."""
+    reactor = KafkaReactor(topic="t", effects=[{"type": "http", "url": "https://x"}])
+    assert reactor.reaction is None
+    assert reactor.effects is not None
+    assert len(reactor.effects) == 1
+
+
+def test_kafka_reactor_reaction_still_works():
+    """KafkaReactor with only reaction parses (pre-existing shape unchanged)."""
+    reactor = KafkaReactor(topic="t", reaction={"topic": "t", "value": 1})
+    assert reactor.reaction is not None
+    assert reactor.reaction.topic == "t"
+    assert reactor.effects is None
+
+
+def test_kafka_reactor_neither_reaction_nor_effects_rejected():
+    """KafkaReactor(topic='t') (neither) -> ValidationError."""
+    with pytest.raises(ValidationError, match="exactly one of"):
+        KafkaReactor(topic="t")
+
+
+def test_kafka_reactor_both_reaction_and_effects_rejected():
+    """KafkaReactor with both reaction and effects -> ValidationError."""
+    with pytest.raises(ValidationError, match="exactly one of"):
+        KafkaReactor(
+            topic="t",
+            reaction={"topic": "t", "value": 1},
+            effects=[{"type": "kafka", "topic": "t", "value": 2}],
+        )
+
+
+def test_effect_alias_covers_both_variants():
+    """Effect is a discriminated union of KafkaEffect and HttpEffect."""
+    union_args = get_args(get_args(Effect)[0])
+    assert KafkaEffect in union_args
+    assert HttpEffect in union_args
+
+
+def test_effect_discriminator_routes_kafka():
+    """Effect discriminator: type:'kafka' routes to KafkaEffect."""
+    cfg = Config.model_validate(
+        {
+            "version": "1",
+            "mocks": {
+                "http": {
+                    "stubs": {
+                        "s": {
+                            "method": "POST",
+                            "path": "/x",
+                            "response": {"status": 200},
+                            "effects": [{"type": "kafka", "topic": "t", "value": 1}],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    routed = cfg.mocks.http.stubs["s"].effects[0]
+    assert isinstance(routed, KafkaEffect)
+    assert routed.type == "kafka"
+
+
+def test_effect_discriminator_routes_http():
+    """Effect discriminator: type:'http' routes to HttpEffect."""
+    cfg = Config.model_validate(
+        {
+            "version": "1",
+            "mocks": {
+                "kafka": {
+                    "reactors": {
+                        "r": {
+                            "topic": "t",
+                            "effects": [
+                                {"type": "http", "url": "https://x", "method": "post"}
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    routed = cfg.mocks.kafka.reactors["r"].effects[0]
+    assert isinstance(routed, HttpEffect)
+    assert routed.type == "http"
+    assert routed.method == "POST"
+
+
+def test_effect_discriminator_unknown_type_rejected():
+    """Effect discriminator: type:'other' -> ValidationError."""
+    with pytest.raises(ValidationError):
+        HttpStub(
+            method="POST",
+            path="/x",
+            response={"status": 200},
+            effects=[{"type": "other"}],
+        )

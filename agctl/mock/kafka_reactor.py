@@ -20,6 +20,7 @@ from ..clients.kafka_client import (
 from ..config.models import KafkaReactor as KafkaReactorConfig
 from ..resolution import CaptureValue, render_typed
 from .capture import resolve_captures
+from .effects import EffectExecutor
 
 
 class KafkaReactor:
@@ -51,6 +52,7 @@ class KafkaReactor:
         fail_fast: bool,
         run_id: str,
         reaction_codec: dict | None = None,
+        effect_executor: EffectExecutor | None = None,
     ):
         """Initialize the reactor.
 
@@ -78,6 +80,12 @@ class KafkaReactor:
                 not consulted on the reaction path. A reactor may thus
                 decode a JSON trigger and emit an Avro reaction, or any
                 other combination.
+            effect_executor: Cross-transport effect executor (Task 5).
+                Runs a reactor's ``effects`` list (the ``reaction``-free config
+                shape) against the live capture namespace. The executor never
+                raises — it emits ``effect.error`` itself on failure — and is
+                only consulted when ``config.effects`` is set; a legacy
+                ``reaction`` reactor never touches it.
         """
         self._name = name
         self._config = config
@@ -87,6 +95,7 @@ class KafkaReactor:
         self._fail_fast = fail_fast
         self._run_id = run_id
         self._reaction_codec = reaction_codec
+        self._effect_executor = effect_executor
 
         # Per-message decode-error flag (Task 12 codec seam). The trigger
         # client's ``consume_loop`` invokes ``on_decode_error`` BEFORE
@@ -256,6 +265,48 @@ class KafkaReactor:
                         "from": from_path,
                     }
                 )
+
+        # Step 3b: Effects path (cross-transport, Task 5). Task 1's model
+        # validator guarantees EXACTLY ONE of ``reaction``/``effects`` on any
+        # reactor, so ``reaction is None`` here means ``config.effects`` is
+        # the configured arm (and vice versa: a ``reaction`` reactor never
+        # reaches this branch). The guard sits BEFORE the legacy react block
+        # so that block stays byte-for-byte unchanged. Unlike a reaction
+        # failure, an effect failure is NEVER retried: the executor already
+        # emitted a fatal ``effect.error`` (which the engine tallies into
+        # its runtime-error flag), so retrying would duplicate side effects
+        # on other transports. The trigger message is committed either way
+        # (or STOPped under fail_fast, mirroring the legacy final arm).
+        if self._config.reaction is None:
+            # Defensive: ``effects`` configured but no executor wired. The
+            # engine always builds an executor when effect resolvers exist
+            # (Task 3), so this is an internal wiring bug — surface it as a
+            # kafka.error (not a silent skip) and commit past the message.
+            if self._effect_executor is None:
+                self._emit_event(
+                    {
+                        "event": "kafka.error",
+                        "reactor": self._name,
+                        "topic": self._config.topic,
+                        "offset": msg["offset"],
+                        "partition": msg["partition"],
+                        "error": (
+                            f"reactor {self._name!r} has effects configured "
+                            "but no effect executor was wired"
+                        ),
+                        "fatal": self._fail_fast,
+                    }
+                )
+                return ReactionResult.COMMIT
+
+            outcome = self._effect_executor.run(
+                self._config.effects, capture_context, self._name
+            )
+            if outcome.ok:
+                return ReactionResult.COMMIT
+            return (
+                ReactionResult.STOP if self._fail_fast else ReactionResult.COMMIT
+            )
 
         # Step 4: React (render templates and produce)
         try:

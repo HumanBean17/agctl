@@ -139,13 +139,41 @@ def _template_token_message(token: str) -> str:
     return f"unknown template token {token!r}; valid generators: {valid}"
 
 
+def _check_effect(check: Callable[[str, Any], None], prefix: str, effect: Any) -> None:
+    """Scan one cross-transport effect's string fields for unknown tokens.
+
+    ``check`` is :func:`collect_unknown_template_errors`'s inner closure;
+    ``prefix`` is the effect's config path (e.g.
+    ``mocks.http.stubs.<s>.effects[0]``). Kafka effects scan ``topic``/``key``/
+    ``value``/``headers`` plus every ``values[j]`` element's own fields; http
+    effects scan ``url``/``path``/``body``/``headers``. Both carriers (HTTP
+    stubs, Kafka reactors) route through here, so their effect paths differ
+    only in the prefix.
+    """
+    if effect.type == "kafka":
+        check(f"{prefix}.topic", effect.topic)
+        check(f"{prefix}.key", effect.key)
+        check(f"{prefix}.value", effect.value)
+        check(f"{prefix}.headers", effect.headers)
+        for j, msg in enumerate(effect.values or []):
+            check(f"{prefix}.values[{j}].value", msg.value)
+            check(f"{prefix}.values[{j}].key", msg.key)
+            check(f"{prefix}.values[{j}].headers", msg.headers)
+    else:
+        check(f"{prefix}.url", effect.url)
+        check(f"{prefix}.path", effect.path)
+        check(f"{prefix}.body", effect.body)
+        check(f"{prefix}.headers", effect.headers)
+
+
 def collect_unknown_template_errors(cfg: Config) -> list[dict]:
     """Scan config-defined string fields for unknown ``{{...}}`` tokens.
 
     Walks the resolved :class:`Config`'s string-bearing fields (HTTP template
     path/headers/body, DB template SQL, gRPC template metadata/message, kafka
-    pattern match expressions, and the mock stub/reactor bodies/keys/values/
-    headers/match expressions) and calls :func:`find_unknown_templates` on each.
+    pattern match expressions, the mock stub/reactor bodies/keys/values/
+    headers/match expressions, and their cross-transport ``effects`` fields)
+    and calls :func:`find_unknown_templates` on each.
     Each unknown token is appended as a ``{"path", "message"}`` error attributed
     at its config path. Never raises — :func:`find_unknown_templates` is a pure
     scan. A valid generator (``{{uuid}}``) or non-matching text
@@ -194,21 +222,32 @@ def collect_unknown_template_errors(cfg: Config) -> list[dict]:
                         f"mocks.http.stubs.{name}.response.headers",
                         stub.response.headers,
                     )
+                for i, effect in enumerate(stub.effects or []):
+                    _check_effect(
+                        check, f"mocks.http.stubs.{name}.effects[{i}]", effect
+                    )
         if mocks.kafka is not None:
             for name, reactor in mocks.kafka.reactors.items():
                 check(f"mocks.kafka.reactors.{name}.match", reactor.match)
-                check(
-                    f"mocks.kafka.reactors.{name}.reaction.key",
-                    reactor.reaction.key,
-                )
-                check(
-                    f"mocks.kafka.reactors.{name}.reaction.value",
-                    reactor.reaction.value,
-                )
-                if reactor.reaction.headers is not None:
+                # Effects-only reactors (legal since T1) have no reaction: skip
+                # the reaction-field checks rather than dereference None.
+                if reactor.reaction is not None:
                     check(
-                        f"mocks.kafka.reactors.{name}.reaction.headers",
-                        reactor.reaction.headers,
+                        f"mocks.kafka.reactors.{name}.reaction.key",
+                        reactor.reaction.key,
+                    )
+                    check(
+                        f"mocks.kafka.reactors.{name}.reaction.value",
+                        reactor.reaction.value,
+                    )
+                    if reactor.reaction.headers is not None:
+                        check(
+                            f"mocks.kafka.reactors.{name}.reaction.headers",
+                            reactor.reaction.headers,
+                        )
+                for i, effect in enumerate(reactor.effects or []):
+                    _check_effect(
+                        check, f"mocks.kafka.reactors.{name}.effects[{i}]", effect
                     )
         if mocks.grpc is not None:
             for name, stub in mocks.grpc.stubs.items():

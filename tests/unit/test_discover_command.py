@@ -583,6 +583,90 @@ def test_item_mock_kafka_reactor_unknown(monkeypatch):
     assert payload["error"]["type"] == "TemplateNotFound"
 
 
+# An effects-only reactor (reaction=None, legal since the cross-transport
+# effects feature): the listing and item paths must not dereference None.
+_EFFECTS_ONLY_CONFIG = (
+    'version: "3"\n'
+    "services:\n"
+    "  demo:\n"
+    '    base_url: "http://localhost:9999"\n'
+    "mocks:\n"
+    "  kafka:\n"
+    "    reactors:\n"
+    "      order-tap:\n"
+    '        description: "Call HTTP on every order event"\n'
+    "        topic: orders.events\n"
+    "        effects:\n"
+    "          - type: http\n"
+    "            service: demo\n"
+    "            method: POST\n"
+    "            path: /internal/notify\n"
+    "          - type: kafka\n"
+    "            topic: audit.events\n"
+    "            value: { tapped: true }\n"
+)
+
+
+def test_category_effects_only_reactor_lists(tmp_path, monkeypatch):
+    """The category listing survives an effects-only reactor (no reaction)."""
+    result = _run_with(
+        ["--category", "mock-kafka-reactors"], _EFFECTS_ONLY_CONFIG, tmp_path, monkeypatch
+    )
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["count"] == 1
+    assert res["items"][0]["name"] == "order-tap"
+    assert res["items"][0]["topic"] == "orders.events"
+
+
+def test_item_effects_only_reactor_targets_first_kafka_effect(
+    tmp_path, monkeypatch
+):
+    """Item detail on an effects-only reactor: reaction is None, the effects
+    list is serialized, and the example names the first kafka effect's topic."""
+    result = _run_with(
+        ["--category", "mock-kafka-reactors", "--name", "order-tap"],
+        _EFFECTS_ONLY_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["name"] == "order-tap"
+    assert res["reaction"] is None
+    assert [e["type"] for e in res["effects"]] == ["http", "kafka"]
+    assert res["effects"][1]["topic"] == "audit.events"
+    # The example names the first kafka effect's topic (the http call has none).
+    assert "audit.events" in res["example"]
+    assert "<effects>" not in res["example"]
+
+
+_HTTP_EFFECTS_ONLY_CONFIG = _EFFECTS_ONLY_CONFIG.replace(
+    "          - type: kafka\n"
+    "            topic: audit.events\n"
+    "            value: { tapped: true }\n",
+    "",
+)
+
+
+def test_item_effects_only_reactor_http_only_shows_placeholder(
+    tmp_path, monkeypatch
+):
+    """A reactor with only http effects has no kafka target to name — the
+    example falls back to ``<effects>``."""
+    result = _run_with(
+        ["--category", "mock-kafka-reactors", "--name", "order-tap"],
+        _HTTP_EFFECTS_ONLY_CONFIG,
+        tmp_path,
+        monkeypatch,
+    )
+    assert result.exit_code == 0
+    res = _payload(result)["result"]
+    assert res["reaction"] is None
+    assert [e["type"] for e in res["effects"]] == ["http"]
+    assert "reactor emits to <effects>" in res["example"]
+
+
 def test_search_finds_mock_http_stub(monkeypatch):
     result = _run(["--search", "charge"], monkeypatch)
     assert result.exit_code == 0

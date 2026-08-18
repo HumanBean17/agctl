@@ -391,3 +391,341 @@ def test_kafka_no_topics_no_schema_registry_baseline_clean():
     errors, warnings = validate_config(cfg)
     assert errors == []
     assert warnings == []
+
+
+# --------------------------------------------------------------------------- #
+# Task 7 (mock effects): cross-transport effect cross-refs — http-effect
+# service refs, kafka-effect cluster/brokers, and SR-dependent formats.
+# Cluster resolution mirrors resolve_cluster_name (effect.cluster ->
+# kafka.topics.<topic>.cluster -> default_cluster -> single-cluster
+# auto-default) inlined here so config/ stays free of a commands/ import.
+# --------------------------------------------------------------------------- #
+
+
+def test_http_effect_unknown_service_is_error():
+    """An http effect naming a service absent from ``services`` is an error
+    at mocks.http.stubs.<s>.effects[i].service."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "services": {"billing": {"base_url": "http://billing"}},
+            "kafka": {"clusters": {"c1": {"brokers": ["localhost:9092"]}}},
+            "mocks": {
+                "http": {
+                    "stubs": {
+                        "s": {
+                            "description": "stub",
+                            "method": "GET",
+                            "path": "/pay",
+                            "response": {"status": 200},
+                            "effects": [
+                                {"type": "http", "service": "missing", "path": "/hook"}
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "mocks.http.stubs.s.effects[0].service",
+            "message": "http effect references unknown service 'missing'",
+        }
+    ]
+    assert warnings == []
+
+
+def test_reactor_http_effect_unknown_service_is_error():
+    """Same unknown-service check for an http effect on a kafka reactor, at
+    mocks.kafka.reactors.<r>.effects[i].service."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "services": {"billing": {"base_url": "http://billing"}},
+            "kafka": {"clusters": {"c1": {"brokers": ["localhost:9092"]}}},
+            "mocks": {
+                "kafka": {
+                    "reactors": {
+                        "r": {
+                            "description": "reactor",
+                            "topic": "orders",
+                            "effects": [{"type": "http", "service": "ghost"}],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "mocks.kafka.reactors.r.effects[0].service",
+            "message": "http effect references unknown service 'ghost'",
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_effect_unknown_explicit_cluster_is_error():
+    """A kafka effect whose explicit cluster is absent from kafka.clusters is
+    an error at <trigger>.effects[i]."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {"clusters": {"real": {"brokers": ["localhost:9092"]}}},
+            "mocks": {
+                "http": {
+                    "stubs": {
+                        "s": {
+                            "description": "stub",
+                            "method": "GET",
+                            "path": "/pay",
+                            "response": {"status": 200},
+                            "effects": [
+                                {
+                                    "type": "kafka",
+                                    "topic": "orders",
+                                    "value": {"a": 1},
+                                    "cluster": "nope",
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "mocks.http.stubs.s.effects[0]",
+            "message": "kafka effect requires a resolvable cluster",
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_effect_ambiguous_cluster_is_error():
+    """A kafka effect with no explicit cluster, no topic binding, no default,
+    and >1 cluster resolves nothing -> error (single-cluster auto-default
+    does not apply)."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {
+                    "a": {"brokers": ["h1:9092"]},
+                    "b": {"brokers": ["h2:9092"]},
+                }
+            },
+            "mocks": {
+                "http": {
+                    "stubs": {
+                        "s": {
+                            "description": "stub",
+                            "method": "GET",
+                            "path": "/pay",
+                            "response": {"status": 200},
+                            "effects": [
+                                {"type": "kafka", "topic": "orders", "value": {}}
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "mocks.http.stubs.s.effects[0]",
+            "message": "kafka effect requires a resolvable cluster",
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_effect_topic_binding_empty_brokers_is_error():
+    """A kafka effect resolving via its topic's declared cluster binding to a
+    cluster with empty brokers -> error at the effect naming the cluster."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {
+                    "main": {"brokers": ["localhost:9092"]},
+                    "empty": {"brokers": []},
+                },
+                "default_cluster": "main",
+                "topics": {"out": {"cluster": "empty"}},
+            },
+            "mocks": {
+                "kafka": {
+                    "reactors": {
+                        "r": {
+                            "description": "reactor",
+                            "topic": "in",
+                            "effects": [
+                                {"type": "kafka", "topic": "out", "value": {}}
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "mocks.kafka.reactors.r.effects[0]",
+            "message": "kafka effect requires kafka.clusters.empty.brokers",
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_effect_avro_without_schema_registry_url_is_error():
+    """A kafka effect with value_format=avro resolving to a cluster with no
+    schema_registry_url -> error at the effect (an override drove the need)."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {"clusters": {"c1": {"brokers": ["localhost:9092"]}}},
+            "mocks": {
+                "http": {
+                    "stubs": {
+                        "s": {
+                            "description": "stub",
+                            "method": "GET",
+                            "path": "/pay",
+                            "response": {"status": 200},
+                            "effects": [
+                                {
+                                    "type": "kafka",
+                                    "topic": "orders",
+                                    "value": {},
+                                    "value_format": "avro",
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "mocks.http.stubs.s.effects[0]",
+            "message": (
+                "Kafka effect on topic 'orders' format (value=avro) requires "
+                "a schema registry but cluster 'c1' has no schema_registry_url"
+            ),
+        }
+    ]
+    assert warnings == []
+
+
+def test_kafka_effect_cluster_default_avro_without_schema_registry_url_is_error():
+    """Cluster-default avro with no SR URL -> error at the cluster, not the
+    effect (the need arises only from the cluster default — mirrors the
+    topic check's placement)."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "kafka": {
+                "clusters": {
+                    "c1": {"brokers": ["localhost:9092"], "value_format": "avro"}
+                }
+            },
+            "mocks": {
+                "http": {
+                    "stubs": {
+                        "s": {
+                            "description": "stub",
+                            "method": "GET",
+                            "path": "/pay",
+                            "response": {"status": 200},
+                            "effects": [
+                                {"type": "kafka", "topic": "orders", "value": {}}
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == [
+        {
+            "path": "kafka.clusters.c1",
+            "message": (
+                "Kafka effect on topic 'orders' format (value=avro) requires "
+                "a schema registry but cluster 'c1' has no schema_registry_url"
+            ),
+        }
+    ]
+    assert warnings == []
+
+
+def test_mock_effects_all_refs_resolve_no_errors():
+    """Valid config: http effect on a known service + kafka effect resolving
+    via its topic binding among two clusters, JSON formats -> no errors."""
+    cfg = Config.model_validate(
+        {
+            "version": "2",
+            "services": {"billing": {"base_url": "http://billing"}},
+            "kafka": {
+                "clusters": {
+                    "a": {"brokers": ["h1:9092"]},
+                    "b": {"brokers": ["h2:9092"]},
+                },
+                "default_cluster": "a",
+                "topics": {"orders": {"cluster": "b"}},
+            },
+            "mocks": {
+                "http": {
+                    "stubs": {
+                        "s": {
+                            "description": "stub",
+                            "method": "GET",
+                            "path": "/pay",
+                            "response": {"status": 200},
+                            "effects": [
+                                {
+                                    "type": "http",
+                                    "service": "billing",
+                                    "path": "/hook",
+                                },
+                                {
+                                    "type": "kafka",
+                                    "topic": "orders",
+                                    "value": {"k": "v"},
+                                },
+                            ],
+                        }
+                    }
+                },
+                "kafka": {
+                    "reactors": {
+                        "r": {
+                            "description": "reactor",
+                            "topic": "in",
+                            "effects": [
+                                {
+                                    "type": "http",
+                                    "service": "billing",
+                                    "path": "/notify",
+                                }
+                            ],
+                        }
+                    }
+                },
+            },
+        }
+    )
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+    assert warnings == []
