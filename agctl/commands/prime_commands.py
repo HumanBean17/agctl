@@ -1,0 +1,93 @@
+"""``agctl prime`` — emit the agent manual (spec:
+``2026-08-19-agctl-prime-skills-replacement-design``).
+
+A **config-free** documentation command, like ``discover``/``gen``: it reads
+packaged markdown from :mod:`agctl.prime_content` and needs no ``agctl.yaml``.
+
+prime is exempt from the one-JSON-envelope-per-invocation contract (a
+``--help``-class exception — its consumer is an agent reading markdown, not a
+program parsing results): raw markdown on stdout, exit 0 on success, exit 2
+(``UsageError``) on bad usage only. It asserts nothing, so it never exits 1.
+"""
+
+from __future__ import annotations
+
+import json
+
+import click
+
+from ..errors import ConfigError
+from ..prime_content import TOPIC_ORDER, hook_pointer, render_all, render_core, topic_text
+
+__all__ = ["prime"]
+
+
+def _emit(topics: tuple[str, ...], all_: bool, hook_json: bool) -> None:
+    """Route flags to the right content (assumes exclusivity already checked)."""
+    if hook_json:
+        click.echo(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": hook_pointer(),
+                    }
+                },
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        )
+        return
+    if all_:
+        click.echo(render_all())
+        return
+    if not topics:
+        click.echo(render_core())
+        return
+    texts = []
+    for name in topics:
+        text = topic_text(name)
+        if text is None:
+            raise click.UsageError(
+                f"Unknown topic '{name}'. "
+                f"Valid topics: {', '.join(TOPIC_ORDER)}"
+            )
+        texts.append(text)
+    click.echo("\n\n".join(texts))
+
+
+@click.command("prime")
+@click.option(
+    "--topic",
+    "topics",
+    multiple=True,
+    help="Emit one depth topic verbatim (repeatable; see `agctl prime` for the list).",
+)
+@click.option(
+    "--all",
+    "all_",
+    is_flag=True,
+    default=False,
+    help="Emit the core manual plus every topic (registry order).",
+)
+@click.option(
+    "--hook-json",
+    "hook_json",
+    is_flag=True,
+    default=False,
+    help="Emit the tiny SessionStart pointer wrapped in the Claude Code "
+    "hook JSON envelope (for .claude/settings.json wiring).",
+)
+def prime(topics: tuple[str, ...], all_: bool, hook_json: bool) -> None:
+    """Print the agent manual (output envelope, exit codes, intent→command
+    map, gotchas; `--help` of subcommands is the flag spec)."""
+    if hook_json and (topics or all_):
+        raise click.UsageError("--hook-json is mutually exclusive with --topic/--all.")
+    if all_ and topics:
+        raise click.UsageError("--all and --topic are mutually exclusive.")
+    # prime never exits 1: a missing packaged resource is a tool error
+    # (exit 2, stderr message) — never a traceback, never "assertion failed".
+    try:
+        _emit(topics, all_, hook_json)
+    except ConfigError as err:
+        raise click.UsageError(str(err)) from err

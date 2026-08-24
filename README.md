@@ -100,7 +100,8 @@ agt --help
 ```
 
 Scaffold a config file you can edit. `agctl config init` writes a sample
-`agctl.yaml` at your repo root with concrete localhost values — replace them with
+`agctl.yaml` at your repo root with concrete localhost values and installs the
+agent skill stub (see [Agent setup](#agent-setup)) — replace the values with
 your own services, topics, and connections. (It refuses to overwrite an existing
 file; pass `--force` to replace one.) Confirm it loads and validates:
 
@@ -114,6 +115,60 @@ Then orient yourself — this is the first command an agent runs in a session:
 ```bash
 agctl discover
 ```
+
+---
+
+## Agent setup
+
+`agctl` ships its agent-facing knowledge inside the binary — no skills to
+copy from a repo. One command bootstraps a consuming repo:
+
+```bash
+agctl config init    # writes ./agctl.yaml + .claude/skills/agctl/SKILL.md (a ~15-line
+                     # router stub) and prints the optional hook snippet below
+```
+
+The stub's only job is discoverability: when a session touches agctl, the
+agent runs `agctl prime` — the manual (output envelope, exit codes 0/1/2,
+intent→command map, top gotchas; ~1k tokens). Depth is fetched on demand:
+
+```bash
+agctl prime                    # the manual — matches the installed binary
+agctl prime --topic mock       # one depth topic (gotchas, mock, listen, grpc,
+                               # config, config-*, runbook-write, runbook-run)
+agctl prime --all              # everything in one shot
+```
+
+Have an existing `agctl.yaml`? `agctl config init --skills-only` installs or
+refreshes just the stub (idempotent; a modified stub is never silently
+overwritten — `--force` surrenders it).
+
+**Optional — SessionStart hook.** For a ~100-token ambient pointer in every
+session of that repo (instead of relying on the stub alone), add to
+`.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agctl prime --hook-json"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Migrating from the old skills** (3.0.x and earlier): delete the four skills copied
+from this repo (`.claude/skills/agctl`, `agctl-config`,
+`agctl-write-test-runbook`, `agctl-run-test-runbook`), then run
+`agctl config init --skills-only`. Their content now ships as prime topics
+inside the wheel — version-synced with the binary by construction.
 
 ---
 

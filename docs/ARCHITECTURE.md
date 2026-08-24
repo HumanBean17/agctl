@@ -106,6 +106,7 @@ agctl/
 ├── params.py                   # --param k=v  →  dict[str,str]
 ├── resolution.py               # {placeholder} fill (+ {{generator}} pre-pass via memo), body deep_merge, :name→%(name)s
 ├── template_vars.py            # {{uuid}}/{{ts}}/{{rand}} generators + substitute_generators / find_unknown_templates
+├── prime_content.py            # the prime content channel: importlib.resources loads of data/prime/*.md + data/skills stub, TOPIC_ORDER registry, {version} rendering, HOOK_SETTINGS_SNIPPET (no Click; content access only)
 ├── assertions.py               # jq / subset / equals / coercion primitives
 ├── assertion_registry.py       # pluggable assertion-mode registry + entry-point discovery
 ├── plugin_protocol.py          # Protocol contract for protocol plugins
@@ -122,7 +123,8 @@ agctl/
 │   ├── db_commands.py          # db query / assert / execute / schema
 │   ├── logs_commands.py        # logs query / assert / tail
 │   ├── check_commands.py       # check ready
-│   ├── config_commands.py      # config validate / show / init / migrate
+│   ├── config_commands.py      # config validate / show / init (also installs the .claude/skills/agctl stub) / migrate
+│   ├── prime_commands.py       # prime [--topic…] [--all] [--hook-json] — config-free manual emitter; envelope-exempt (see §6)
 │   ├── discover_commands.py    # discover summary / category / item / search
 │   ├── gen_commands.py         # gen uuid / ts / rand (config-free, @envelope-wrapped; tags gen.*)
 │   ├── grpc_commands.py        # grpc call / healthcheck
@@ -151,7 +153,9 @@ agctl/
 │   ├── avro_codec.py           # lazy fastavro decode/encode (parsed-schema cache; strict=True on encode)
 │   └── protobuf_codec.py       # lazy DynamicMessage codec (compiles .proto via grpc_descriptors kernel; single-file v1)
 ├── data/
-│   └── sample-config.yaml      # packaged starter config (read via importlib.resources)
+│   ├── sample-config.yaml      # packaged starter config (read via importlib.resources)
+│   ├── prime/                  # agent manual: core.md + hook.md + 14 topic files (≤ 6,000 chars each, test-enforced; emitted by `agctl prime`)
+│   └── skills/agctl/SKILL.md   # the ~15-line router stub `config init` copies into .claude/skills/ (zero domain content)
 └── clients/
     ├── http_client.py          # httpx wrapper (lazy import)
     ├── kafka_client.py         # confluent-kafka wrapper (lazy import)
@@ -554,6 +558,8 @@ results as they happen, so it violates "one object per invocation":
 - `mock stop` signals the daemon, waits for shutdown, parses the log for summary + failure events, and returns the `mock.stop` verdict (`stopped`/`pid`/`signal`/`summary`/`failures`). When fatal failures are found, it raises `AssertionFailure` (exit 1) with the verdict in `error.detail`.
 - `mock status` reads the live log and returns the `mock.status` snapshot (`running`/`pid`/`listen`/`uptime_ms`/`summary_so_far`/`failures_so_far`).
 - All three commands are wrapped by `@envelope` and follow the one-emit contract; they do NOT stream NDJSON like `mock run`.
+
+**The documentation exception — `prime`.** `agctl prime` emits raw markdown (or, with `--hook-json`, one hook-envelope JSON line), not the result envelope — a `--help`-class exception: its consumer is an agent reading a manual, not a program parsing results. It is config-free (no `agctl.yaml` needed), asserts nothing (never exits 1), and its only failure class is usage error (unknown `--topic`, mutually exclusive flags) → Click `UsageError`, exit 2. Content comes from `prime_content.py` over `data/prime/*.md`; char budgets (core ≤ 5,000, hook pointer ≤ 800, each topic ≤ 6,000) are pinned by tests so the manual cannot silently bloat. `config init` installs the `data/skills/agctl/SKILL.md` router stub into `.claude/skills/` (default-on; `--no-skills` skips; `--skills-only` refreshes just the stub beside an existing config; a consumer-modified stub is refused unless `--force`); the SessionStart hook snippet (`HOOK_SETTINGS_SNIPPET`) rides in the init result, never written to `settings.json`.
 
 **The managed daemon commands — `kafka listen start`/`stop`/`status`** mirror the mock trio (POSIX/WSL-gated via `require_posix_daemon()`, state-keyed by `run_id` under `<state-dir>/listen-<run_id>/`). Each is a normal `@envelope`-wrapped command that emits one JSON object:
 

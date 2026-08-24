@@ -35,6 +35,7 @@ from ..config.validator import validate_config
 from ..mock.capture_validate import collect_capture_placement_errors
 from ..mock.jq_precompile import collect_jq_compile_errors
 from ..output import emit
+from ..prime_content import HOOK_SETTINGS_SNIPPET, stub_text
 from ..template_vars import BUILTIN_GENERATORS, find_unknown_templates
 
 __all__ = ["config_init", "config_validate", "config_show", "config_migrate", "set_plugins_provider"]
@@ -413,14 +414,43 @@ def _load_sample() -> str:
     "--force",
     is_flag=True,
     default=False,
-    help="Overwrite an existing file instead of refusing.",
+    help="Overwrite existing files instead of refusing (the config and/or a modified skill stub).",
+)
+@click.option(
+    "--skills-only",
+    "skills_only",
+    is_flag=True,
+    default=False,
+    help="Install/refresh only the .claude/skills/agctl stub (works with an existing agctl.yaml).",
+)
+@click.option(
+    "--no-skills",
+    "no_skills",
+    is_flag=True,
+    default=False,
+    help="Skip installing the .claude/skills/agctl router skill stub.",
 )
 @click.pass_context
-def config_init(ctx: click.Context, output: str | None, force: bool) -> None:
-    """Write a sample agctl.yaml to edit. Exit 2 if it already exists (use --force)."""
+def config_init(
+    ctx: click.Context,
+    output: str | None,
+    force: bool,
+    skills_only: bool,
+    no_skills: bool,
+) -> None:
+    """Write a sample agctl.yaml + install the agctl skill stub. Exit 2 on refusal (use --force)."""
+    if skills_only and no_skills:
+        raise click.UsageError(
+            "--skills-only and --no-skills are mutually exclusive."
+        )
     start = time.monotonic()
     dest = Path(output) if output else Path.cwd() / "agctl.yaml"
-    if dest.exists() and not force:
+    stub_dest = Path.cwd() / ".claude" / "skills" / "agctl" / "SKILL.md"
+
+    # Gate 1 — existing config (envelope intentionally unchanged for
+    # back-compat: no skills_* keys on this path; the stub is NOT written
+    # either — no partial bootstrap). Skipped under --skills-only.
+    if not skills_only and dest.exists() and not force:
         msg = f"Refusing to overwrite existing {dest} (pass --force to overwrite)."
         emit(
             ok=False,
@@ -430,22 +460,80 @@ def config_init(ctx: click.Context, output: str | None, force: bool) -> None:
             duration_ms=_ms(start),
         )
         raise SystemExit(2)
-    try:
-        content = _load_sample()
-    except ConfigError as err:
-        _emit_config_error("config.init", err, start)
-        raise SystemExit(2)
-    dest.write_text(content, encoding="utf-8")
-    emit(
-        ok=True,
-        command="config.init",
-        result={
-            "path": str(dest),
-            "created": True,
-            "bytes": len(content.encode("utf-8")),
-        },
-        duration_ms=_ms(start),
-    )
+
+    # Gate 2 — stub pre-flight BEFORE any write: a consumer-modified stub is
+    # never silently clobbered; --force is the explicit surrender. The stub
+    # is read ONCE here and reused below (no gate-vs-write race).
+    stub_installed = not no_skills
+    packaged_stub: str | None = None
+    existing_stub: str | None = None
+    if stub_installed:
+        try:
+            packaged_stub = stub_text()
+            if stub_dest.exists():
+                existing_stub = stub_dest.read_text(encoding="utf-8")
+        except (ConfigError, OSError, UnicodeDecodeError) as err:
+            _emit_config_error("config.init", err if isinstance(err, ConfigError) else ConfigError(str(err)), start)
+            raise SystemExit(2)
+        if (
+            existing_stub is not None
+            and existing_stub != packaged_stub
+            and not force
+        ):
+            msg = (
+                f"Refusing to overwrite modified {stub_dest} "
+                "(pass --force to overwrite)."
+            )
+            emit(
+                ok=False,
+                command="config.init",
+                result={
+                    "path": None if skills_only else str(dest),
+                    "created": False,
+                    "bytes": 0,
+                    "skills_path": str(stub_dest),
+                    "skills_status": "refused",
+                },
+                error={"type": "ConfigError", "message": msg},
+                duration_ms=_ms(start),
+            )
+            raise SystemExit(2)
+
+    # Writes — all gates passed, so neither target can be clobbered silently.
+    result: dict = {"hook_snippet": HOOK_SETTINGS_SNIPPET}
+    if skills_only:
+        result.update({"path": None, "created": False, "bytes": 0})
+    else:
+        try:
+            content = _load_sample()
+        except ConfigError as err:
+            _emit_config_error("config.init", err, start)
+            raise SystemExit(2)
+        dest.write_text(content, encoding="utf-8")
+        result.update(
+            {
+                "path": str(dest),
+                "created": True,
+                "bytes": len(content.encode("utf-8")),
+            }
+        )
+
+    if stub_installed:
+        try:
+            if existing_stub == packaged_stub:
+                status = "unchanged"
+            else:
+                stub_dest.parent.mkdir(parents=True, exist_ok=True)
+                stub_dest.write_text(packaged_stub, encoding="utf-8")
+                status = "overwritten" if existing_stub is not None else "created"
+        except OSError as err:
+            _emit_config_error("config.init", ConfigError(str(err)), start)
+            raise SystemExit(2)
+        result.update({"skills_path": str(stub_dest), "skills_status": status})
+    else:
+        result.update({"skills_path": None, "skills_status": "skipped"})
+
+    emit(ok=True, command="config.init", result=result, duration_ms=_ms(start))
 
 
 # --- config migrate --------------------------------------------------------

@@ -6,6 +6,7 @@ from click.testing import CliRunner
 
 from agctl.cli import cli
 from agctl.commands.config_commands import _load_sample
+from agctl.prime_content import HOOK_SETTINGS_SNIPPET, stub_text
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "agctl.yaml"
 
@@ -144,7 +145,9 @@ def test_show_does_not_mask_ssl_key_path(tmp_path):
 # --- config init -----------------------------------------------------------
 
 
-def test_config_init_writes_sample(tmp_path):
+def test_config_init_writes_sample(tmp_path, monkeypatch):
+    # chdir so the default-on stub install lands in tmp_path, not the repo
+    monkeypatch.chdir(tmp_path)
     dest = tmp_path / "agctl.yaml"
     result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
     payload = json.loads(result.output)
@@ -158,8 +161,9 @@ def test_config_init_writes_sample(tmp_path):
     yaml.safe_load(dest.read_text(encoding="utf-8"))
 
 
-def test_config_init_generates_valid_config(tmp_path):
+def test_config_init_generates_valid_config(tmp_path, monkeypatch):
     """The generated sample is a clean baseline: it validates with no env vars."""
+    monkeypatch.chdir(tmp_path)
     dest = tmp_path / "agctl.yaml"
     CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
     result = CliRunner().invoke(cli, ["config", "validate", "--config", str(dest)], env={})
@@ -168,7 +172,8 @@ def test_config_init_generates_valid_config(tmp_path):
     assert payload["result"]["valid"] is True
 
 
-def test_config_init_refuses_overwrite(tmp_path):
+def test_config_init_refuses_overwrite(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     dest = tmp_path / "agctl.yaml"
     dest.write_text("existing: real-config\n")
     result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
@@ -181,7 +186,8 @@ def test_config_init_refuses_overwrite(tmp_path):
     assert dest.read_text() == "existing: real-config\n"
 
 
-def test_config_init_force_overwrites(tmp_path):
+def test_config_init_force_overwrites(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     dest = tmp_path / "agctl.yaml"
     dest.write_text("OLD\n")
     result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest), "--force"])
@@ -233,3 +239,153 @@ def test_version_flag():
     assert result.exit_code == 0
     assert __version__ in result.output
     assert result.output.strip().startswith("agctl ")
+
+
+# --- config init: skill stub installation (prime spec) ----------------------
+
+
+def _stub_path() -> Path:
+    return Path.cwd() / ".claude" / "skills" / "agctl" / "SKILL.md"
+
+
+def test_config_init_installs_stub_by_default(tmp_path, monkeypatch):
+    """Default init writes the config AND the router skill stub (byte-identical
+    to the packaged one), and carries the hook snippet in the result."""
+    monkeypatch.chdir(tmp_path)
+    dest = tmp_path / "agctl.yaml"
+    result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    stub = _stub_path()
+    assert stub.exists()
+    assert stub.read_text(encoding="utf-8") == stub_text()
+    assert payload["result"]["skills_status"] == "created"
+    assert payload["result"]["skills_path"] == str(stub)
+    assert payload["result"]["hook_snippet"] == HOOK_SETTINGS_SNIPPET
+
+
+def test_config_init_idempotent_identical_stub(tmp_path, monkeypatch):
+    """Re-running over an identical stub is a no-op success ('unchanged')."""
+    monkeypatch.chdir(tmp_path)
+    dest = tmp_path / "agctl.yaml"
+    CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
+    result = CliRunner().invoke(
+        cli, ["config", "init", "-o", str(dest), "--force", "--skills-only"]
+    )
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    assert payload["result"]["skills_status"] == "unchanged"
+    assert _stub_path().read_text(encoding="utf-8") == stub_text()
+
+
+def test_config_init_refuses_modified_stub(tmp_path, monkeypatch):
+    """A consumer-modified stub is never silently clobbered: refuse with a
+    pointer at --force, leave the file untouched, write nothing else."""
+    monkeypatch.chdir(tmp_path)
+    dest = tmp_path / "agctl.yaml"
+    CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
+    stub = _stub_path()
+    stub.write_text("---\nname: agctl\ndescription: consumer-edited\n---\nlocal edits\n")
+    dest.write_text("existing: config\n")  # also pre-stage config for --skills-only
+    result = CliRunner().invoke(cli, ["config", "init", "--skills-only"])
+    payload = json.loads(result.output)
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ConfigError"
+    assert "--force" in payload["error"]["message"]
+    assert payload["result"]["skills_status"] == "refused"
+    # consumer edits preserved
+    assert "consumer-edited" in stub.read_text(encoding="utf-8")
+
+
+def test_config_init_refused_stub_writes_nothing_default_mode(tmp_path, monkeypatch):
+    """Default-mode Gate-2 refusal is atomic: with no config present and a
+    modified stub, plain init refuses and writes NEITHER file."""
+    monkeypatch.chdir(tmp_path)
+    stub = _stub_path()
+    stub.parent.mkdir(parents=True)
+    stub.write_text("---\nname: agctl\ndescription: consumer-edited\n---\nlocal\n")
+    result = CliRunner().invoke(cli, ["config", "init"])
+    payload = json.loads(result.output)
+    assert result.exit_code == 2
+    assert payload["result"]["skills_status"] == "refused"
+    assert not (tmp_path / "agctl.yaml").exists()
+    assert "consumer-edited" in stub.read_text(encoding="utf-8")
+
+
+def test_config_init_skills_only_no_skills_rejected(tmp_path, monkeypatch):
+    """The contradictory pair is a usage error, not a silent no-op."""
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli, ["config", "init", "--skills-only", "--no-skills"])
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.stderr
+    assert not (tmp_path / "agctl.yaml").exists()
+
+
+def test_config_init_force_overwrites_modified_stub(tmp_path, monkeypatch):
+    """--force surrenders consumer edits back to the packaged stub."""
+    monkeypatch.chdir(tmp_path)
+    dest = tmp_path / "agctl.yaml"
+    CliRunner().invoke(cli, ["config", "init", "-o", str(dest)])
+    _stub_path().write_text("consumer edits\n")
+    result = CliRunner().invoke(cli, ["config", "init", "--skills-only", "--force"])
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    assert payload["result"]["skills_status"] == "overwritten"
+    assert _stub_path().read_text(encoding="utf-8") == stub_text()
+
+
+def test_config_init_no_skills(tmp_path, monkeypatch):
+    """--no-skills skips the stub write entirely; no .claude/ tree appears."""
+    monkeypatch.chdir(tmp_path)
+    dest = tmp_path / "agctl.yaml"
+    result = CliRunner().invoke(cli, ["config", "init", "-o", str(dest), "--no-skills"])
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    assert not (tmp_path / ".claude").exists()
+    assert payload["result"]["skills_status"] == "skipped"
+    assert payload["result"]["skills_path"] is None
+
+
+def test_config_init_skills_only_skips_config(tmp_path, monkeypatch):
+    """--skills-only installs/refreshes the stub while leaving an existing
+    config byte-untouched (the upgrade path for existing consumers)."""
+    monkeypatch.chdir(tmp_path)
+    sentinel = tmp_path / "agctl.yaml"
+    sentinel.write_text("existing: real-config\n")
+    result = CliRunner().invoke(cli, ["config", "init", "--skills-only"])
+    payload = json.loads(result.output)
+    assert result.exit_code == 0
+    assert sentinel.read_text() == "existing: real-config\n"
+    assert _stub_path().read_text(encoding="utf-8") == stub_text()
+    assert payload["result"]["path"] is None
+    assert payload["result"]["created"] is False
+    assert payload["result"]["skills_status"] == "created"
+
+
+def test_config_init_existing_config_refusal_untouched(tmp_path, monkeypatch):
+    """Plain init with an existing config keeps today's refusal AND does not
+    write the stub either — no partial bootstrap."""
+    monkeypatch.chdir(tmp_path)
+    dest = tmp_path / "agctl.yaml"
+    dest.write_text("existing: real-config\n")
+    result = CliRunner().invoke(cli, ["config", "init"])
+    payload = json.loads(result.output)
+    assert result.exit_code == 2
+    assert payload["ok"] is False
+    assert payload["result"]["created"] is False
+    assert not (tmp_path / ".claude").exists()
+
+
+def test_stub_packaged_shape():
+    """The packaged stub is a thin router: ≤ 20 lines, frontmatter intact,
+    points at prime, and carries zero domain content."""
+    text = stub_text()
+    assert len(text.splitlines()) <= 20
+    assert text.startswith("---")
+    assert "name: agctl" in text
+    assert "description:" in text
+    assert "agctl prime" in text
+    # zero-domain-content guard: depth lives in prime topics, not the stub
+    assert "--match" not in text
+    assert "kafka listen" not in text
