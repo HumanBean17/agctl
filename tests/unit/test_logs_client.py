@@ -433,6 +433,62 @@ def test_scan_tail_lines_bounds_read(tmp_path):
     assert result.matched <= 3
 
 
+def test_scan_truncated_when_window_capped(tmp_path):
+    """truncated is True when the read window itself was capped (issue #67).
+
+    A 10-line file with tail_lines=3 leaves 7 lines unread; even though every
+    scanned line matched (matched <= limit), the result is incomplete and the
+    envelope must say so instead of reporting truncated=False.
+    """
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    lines = [
+        f'{{"@timestamp":"2026-07-08T10:00:0{i}Z","level":"INFO","logger_name":"c.Foo","message":"msg{i}"}}'
+        for i in range(10)
+    ]
+    log_file.write_text("\n".join(lines))
+
+    source = LogSource(path=str(log_file), format="logstash")
+    backend = NdjsonFileBackend(source)
+
+    result = backend.scan(
+        LogFilter(), since=None, until=None, limit=50, tail_lines=3
+    )
+
+    assert result.scanned == 3
+    assert result.matched == 3
+    assert len(result.entries) == 3
+    assert result.truncated is True
+
+
+def test_scan_not_truncated_when_file_fits_window_exactly(tmp_path):
+    """A file with exactly tail_lines lines reads the whole file (no cap).
+
+    Guards the capped-detection edge: len(lines) == tail_lines must NOT be
+    reported as capped when the window reached the start of the file.
+    """
+    from agctl.clients.log_backends.ndjson_file import NdjsonFileBackend
+
+    log_file = tmp_path / "test.log"
+    lines = [
+        f'{{"@timestamp":"2026-07-08T10:00:0{i}Z","level":"INFO","logger_name":"c.Foo","message":"msg{i}"}}'
+        for i in range(3)
+    ]
+    log_file.write_text("\n".join(lines))
+
+    source = LogSource(path=str(log_file), format="logstash")
+    backend = NdjsonFileBackend(source)
+
+    result = backend.scan(
+        LogFilter(), since=None, until=None, limit=50, tail_lines=3
+    )
+
+    assert result.scanned == 3
+    assert result.matched == 3
+    assert result.truncated is False
+
+
 def test_scan_tail_lines_long_lines(tmp_path):
     """scan handles long lines (300-800 bytes) via loop-growing read window."""
     import json
