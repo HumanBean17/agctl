@@ -53,6 +53,10 @@ against these.
 
 - Reads **only the current file** — no rolled-over history; need
   yesterday's entries → point `path` at the archived file.
+- File reads are **windowed to the last `tail_lines` lines** (default 200;
+  `logs query --limit N` grows the window to N) — older entries are
+  invisible. `result.truncated: true` = more matches than `--limit` **or** a
+  capped read (file window / loki `fetch_limit`); widen the knob and re-query.
 - **Missing file = empty source** (exit 0, zero entries) — config for
   not-yet-started services is valid.
 - `logs tail` streams NDJSON (a streaming command) — stop with `--duration
