@@ -210,7 +210,10 @@ def db_query(
     param: tuple[str, ...],
     connection: str | None,
 ) -> None:
-    """Run a DB query and return the rows."""
+    """Run a DB query and return the rows.
+
+    Exactly one of --template or --sql must be given.
+    """
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
@@ -300,7 +303,7 @@ def _db_assert_core(
     if rows_mode + value_mode + custom_mode != 1:
         raise ConfigError(
             "Exactly one of --expect-rows, --expect-value, or --assertion must be given",
-            {},
+            {"modes": ["--expect-rows", "--expect-value", "--assertion"]},
         )
     if value_mode and (not path or equals is None):
         raise ConfigError("--expect-value requires --path and --equals", {})
@@ -374,13 +377,19 @@ def _db_assert_core(
 @click.option("--sql", "sql", default=None, help="Free-form SQL text")
 @click.option("--param", "param", multiple=True, help="k=v query parameter")
 @click.option("--connection", "connection", default=None, help="Connection name override")
-@click.option("--expect-rows", "expect_rows", type=int, default=None, help="Expected row count")
+@click.option(
+    "--expect-rows",
+    "expect_rows",
+    type=int,
+    default=None,
+    help="Expected row count (mode 1/3; exactly one mode per call)",
+)
 @click.option(
     "--expect-value",
     "expect_value",
     is_flag=True,
     default=False,
-    help="Assert a cell value via --path/--equals",
+    help="Assert a cell value via --path/--equals (mode 2/3)",
 )
 @click.option("--path", "path", default=None, help="jq path into the FIRST ROW (expect-value), e.g. .status")
 @click.option("--equals", "equals", default=None, help="Expected value (expect-value)")
@@ -388,7 +397,7 @@ def _db_assert_core(
     "--assertion",
     "assertion",
     default=None,
-    help="Named custom assertion mode",
+    help="Named custom assertion mode (mode 3/3)",
 )
 @click.pass_context
 def db_assert(
@@ -403,7 +412,11 @@ def db_assert(
     equals: str | None,
     assertion: str | None,
 ) -> None:
-    """Run a DB query and assert on its result."""
+    """Run a DB query and assert on its result.
+
+    Exactly one assertion mode per call (they are mutually exclusive):
+    --expect-rows N | --expect-value --path P --equals V | --assertion NAME.
+    """
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None
@@ -515,7 +528,11 @@ def db_execute(
     connection: str | None,
     write: bool,
 ) -> None:
-    """Execute a write SQL statement and return affected row count."""
+    """Execute a write SQL statement and return affected row count.
+
+    Exactly one of --template or --sql must be given; requires --write and an
+    explicitly named target (--template or --connection).
+    """
     config_path = ctx.obj.get("config_path") if ctx.obj else None
     ovs = ctx.obj.get("overlay_paths") if ctx.obj else None
     env_file = ctx.obj.get("env_file") if ctx.obj else None

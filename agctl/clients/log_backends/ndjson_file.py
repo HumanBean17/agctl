@@ -84,23 +84,25 @@ class NdjsonFileBackend:
         until: datetime | None,
         limit: int,
         tail_lines: int,
-    ) -> tuple[list[CanonicalEntry], int, int]:
-        """Read and filter a time window, returning (entries, matched, scanned).
+    ) -> tuple[list[CanonicalEntry], int, int, bool]:
+        """Read and filter a time window, returning (entries, matched, scanned, capped).
 
         Shared helper for scan and await_one. Reads up to tail_lines from file,
         applies time bounds and filters, returns up to limit matches.
 
         Returns:
-            (entries, matched, scanned) tuple
+            (entries, matched, scanned, window_capped) tuple. ``window_capped``
+            is True when the read stopped at ``tail_lines`` with more lines
+            behind it in the file (in-window matches may exist beyond the window).
         """
         if self._path is None:
-            return [], 0, 0
+            return [], 0, 0, False
         path = Path(self._path)
         if not path.exists():
-            return [], 0, 0
+            return [], 0, 0, False
 
         # Read last tail_lines from file (backward read without loading all)
-        lines = self._tail_lines(path, tail_lines)
+        lines, window_capped = self._tail_lines(path, tail_lines)
 
         matched = 0
         scanned = 0
@@ -145,7 +147,7 @@ class NdjsonFileBackend:
             if len(entries) < limit:
                 entries.append(entry)
 
-        return entries, matched, scanned
+        return entries, matched, scanned, window_capped
 
     def scan(
         self,
@@ -164,8 +166,11 @@ class NdjsonFileBackend:
         Window bounds (since/until) are applied via _parse_iso_datetime.
         Filters are applied in AND order (level, logger glob, message substring,
         jq predicate). Returns up to ``limit`` matches with truncation flag.
+        ``truncated`` is True when matches exceeded ``limit`` OR the read window
+        itself was capped at ``tail_lines`` with more lines behind it (mirrors
+        the Loki backend's server-cap signal).
         """
-        entries, matched, scanned = self._read_window(
+        entries, matched, scanned, window_capped = self._read_window(
             filt, since, until, limit, tail_lines
         )
 
@@ -173,10 +178,10 @@ class NdjsonFileBackend:
             entries=entries,
             matched=matched,
             scanned=scanned,
-            truncated=matched > limit,
+            truncated=matched > limit or window_capped,
         )
 
-    def _tail_lines(self, path: Path, n: int) -> list[str]:
+    def _tail_lines(self, path: Path, n: int) -> tuple[list[str], bool]:
         """Read the last n lines from a file without loading it all.
 
         Uses loop-growing read window to handle long lines robustly.
@@ -185,6 +190,11 @@ class NdjsonFileBackend:
         leading fragment when seeking from a non-zero offset.
         Robust to files smaller than the estimate and final lines without
         trailing newline.
+
+        Returns ``(lines, capped)``: ``capped`` is True when the read stopped
+        at ``n`` lines with at least one more line behind the window (a
+        non-zero seek offset always discards a partial leading line, so
+        content exists before the window).
         """
         with path.open("rb") as f:
             # Get file size
@@ -222,13 +232,16 @@ class NdjsonFileBackend:
 
                 # Check if we got enough lines
                 if len(all_lines) >= n:
-                    # We have enough (or more), return last n
-                    return all_lines[-n:]
+                    # We have enough (or more), return last n. Capped when
+                    # there is content behind the window: either the window
+                    # starts mid-file (seek_offset > 0) or the read found
+                    # more lines than requested.
+                    return all_lines[-n:], seek_offset > 0 or len(all_lines) > n
 
                 # Not enough lines - check if we've reached the start
                 if seek_offset == 0:
-                    # At file start, return whatever we have
-                    return all_lines
+                    # At file start, return whatever we have (whole file)
+                    return all_lines, False
 
                 # Not at start and not enough lines - grow the window and retry
                 estimate *= 2
@@ -295,7 +308,7 @@ class NdjsonFileBackend:
 
         # Phase 1 (one-shot mode is just this phase): read the historical window
         # once and count each line exactly once.
-        entries, _matched, scanned = self._read_window(
+        entries, _matched, scanned, _capped = self._read_window(
             filt=filt,
             since=since,
             until=until_now,
@@ -587,7 +600,7 @@ class NdjsonFileBackend:
         # then delegate presence-tracking to log_common.infer_schema (shared
         # with future backends -- any backend that can produce a list of
         # CanonicalEntry reuses the same union logic).
-        lines = self._tail_lines(path, sample_lines)
+        lines, _capped = self._tail_lines(path, sample_lines)
 
         entries: list[CanonicalEntry] = []
         for line in lines:

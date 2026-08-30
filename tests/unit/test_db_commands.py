@@ -449,6 +449,13 @@ def test_db_assert_neither_mode_is_config_error(install_fake):
     assert result.exit_code == 2
     assert payload["ok"] is False
     assert payload["error"]["type"] == "ConfigError"
+    # detail lists the three modes so the caller can pick one without --help
+    # (issue #67: the XOR was learnable only from the error)
+    assert payload["error"]["detail"]["modes"] == [
+        "--expect-rows",
+        "--expect-value",
+        "--assertion",
+    ]
 
 
 def test_db_assert_expect_value_zero_rows(install_fake):

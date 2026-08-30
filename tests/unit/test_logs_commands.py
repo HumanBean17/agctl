@@ -260,6 +260,58 @@ def test_logs_query_truncated_flag(install_fake):
     assert len(payload["result"]["entries"]) == 2
 
 
+def test_logs_query_limit_grows_read_window(install_fake):
+    """An explicit --limit above defaults.tail_lines grows the read window.
+
+    Issue #67: the file backend scans only the last ``tail_lines`` lines, so
+    ``--limit 400`` against the default window of 200 used to return 200
+    entries (silently capped). The window must honor the requested limit.
+    """
+    scan_res = ScanResult(entries=[], matched=0, scanned=0, truncated=False)
+    fake = install_fake(scan=scan_res)
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "logs",
+            "query",
+            "--source",
+            "order-service",
+            "--limit",
+            "400",
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert len(fake.scan_calls) == 1
+    assert fake.scan_calls[0]["limit"] == 400
+    assert fake.scan_calls[0]["tail_lines"] == 400
+
+
+def test_logs_query_window_default_when_no_limit(install_fake):
+    """Without --limit the window stays at defaults.tail_lines (200)."""
+    scan_res = ScanResult(entries=[], matched=0, scanned=0, truncated=False)
+    fake = install_fake(scan=scan_res)
+
+    result = _run(
+        [
+            "--config",
+            str(FIXTURE),
+            "logs",
+            "query",
+            "--source",
+            "order-service",
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert len(fake.scan_calls) == 1
+    # Fixture sets no logs.defaults -> model defaults: limit 50, tail_lines 200
+    assert fake.scan_calls[0]["limit"] == 50
+    assert fake.scan_calls[0]["tail_lines"] == 200
+
+
 # --------------------------------------------------------------------------- #
 # logs assert
 # --------------------------------------------------------------------------- #
@@ -386,7 +438,12 @@ def test_logs_assert_not_failure_when_match_found(install_fake):
 
 
 def test_logs_assert_since_required():
-    """--since is required for logs assert (missing -> ConfigError)."""
+    """--since is required for logs assert (missing -> ConfigError).
+
+    The error must be self-recovering (issue #67): message carries a working
+    example and detail lists the accepted formats, so the caller can retry
+    without consulting docs.
+    """
     result = _run(
         [
             "--config",
@@ -402,6 +459,15 @@ def test_logs_assert_since_required():
     assert result.exit_code == 2
     assert payload["error"]["type"] == "ConfigError"
     assert "--since" in payload["error"]["message"]
+    # A runnable example in the message, accepted formats in the detail
+    assert "--since 5m" in payload["error"]["message"]
+    assert payload["error"]["detail"]["flag"] == "--since"
+    assert payload["error"]["detail"]["formats"] == [
+        "30s",
+        "5m",
+        "1h",
+        "2026-01-01T00:00:00Z",
+    ]
 
 
 def test_logs_assert_timeout_optional_default_oneshot(install_fake):

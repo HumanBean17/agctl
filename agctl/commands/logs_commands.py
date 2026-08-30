@@ -197,12 +197,16 @@ def _logs_query_core(
     until_dt = _parse_since_until(until) if until else datetime.datetime.now(datetime.timezone.utc)
 
     client = new_logs_client(src)
+    effective_limit = limit or cfg.logs.defaults.limit
     res = client.scan(
         filt,
         since=since_dt,
         until=until_dt,
-        limit=limit or cfg.logs.defaults.limit,
-        tail_lines=cfg.logs.defaults.tail_lines,
+        limit=effective_limit,
+        # Grow the read window to honor an explicit --limit: the file backend
+        # scans only the last ``tail_lines`` lines, so a --limit above the
+        # default window would otherwise be silently capped (issue #67).
+        tail_lines=max(cfg.logs.defaults.tail_lines, effective_limit),
     )
 
     return {
@@ -228,7 +232,13 @@ def _logs_query_core(
 @click.option("--param", "param", multiple=True, help="k=v placeholder for --match")
 @click.option("--since", "since", default=None, help="Start time (ISO-8601 or duration like 30s/5m/1h)")
 @click.option("--until", "until", default=None, help="End time (ISO-8601 or duration)")
-@click.option("--limit", "limit", type=int, default=None, help="Max entries to return")
+@click.option(
+    "--limit",
+    "limit",
+    type=int,
+    default=None,
+    help="Max entries to return (default 50; the read window grows to honor this)",
+)
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
 @click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.pass_context
@@ -307,9 +317,18 @@ def _logs_assert_core(
     )
 
     if since is None:
+        # Mandatory by DESIGN §6.3 (guards against runaway scans). Click-level
+        # required=True is not an option: it emits a plain-text usage error,
+        # breaking the one-JSON-envelope contract. So the requirement lives
+        # here -- with the accepted formats spelled out so the caller can
+        # retry without another round-trip (issue #67).
         raise ConfigError(
-            "--since is required for logs assert",
-            {},
+            "--since is required for logs assert "
+            "(e.g. --since 5m or --since 2026-01-01T00:00:00Z)",
+            {
+                "flag": "--since",
+                "formats": ["30s", "5m", "1h", "2026-01-01T00:00:00Z"],
+            },
         )
 
     since_dt = _parse_since_until(since)
@@ -372,7 +391,12 @@ def _logs_assert_core(
     help="jq predicate against canonical entry fields",
 )
 @click.option("--param", "param", multiple=True, help="k=v placeholder for --match")
-@click.option("--since", "since", default=None, help="Start time (ISO-8601 or duration)")
+@click.option(
+    "--since",
+    "since",
+    default=None,
+    help="Start time, REQUIRED (ISO-8601 or duration like 30s/5m/1h)",
+)
 @click.option("--not", "not_", is_flag=True, default=False, help="Invert: fail if a match IS found")
 @click.option("--timeout", "timeout", type=float, default=None, help="Poll timeout (seconds); omit for one-shot")
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
@@ -469,8 +493,20 @@ def _tail_run(
     help="jq predicate against canonical entry fields",
 )
 @click.option("--param", "param", multiple=True, help="k=v placeholder for --match")
-@click.option("--duration", "duration", type=float, default=None, help="Stop after N seconds")
-@click.option("--until-stopped", "until_stopped", is_flag=True, default=False)
+@click.option(
+    "--duration",
+    "duration",
+    type=float,
+    default=None,
+    help="Stop after N seconds (mutually exclusive with --until-stopped)",
+)
+@click.option(
+    "--until-stopped",
+    "until_stopped",
+    is_flag=True,
+    default=False,
+    help="Stream until stopped by signal (mutually exclusive with --duration)",
+)
 @click.option("--config", "config_path", default=None, help="Path to agctl.yaml")
 @click.option("--env-file", "env_file", default=None, help="Path to .env file (default: .env next to agctl.yaml)")
 @click.pass_context

@@ -1357,6 +1357,8 @@ agctl logs query
 }
 ```
 
+**Truncation flag:** `truncated` is true when matches exceeded `--limit` OR the read hit a cap — the file backend's `tail_lines` read window (an explicit `--limit` above the default grows the window to honor it) or Loki's server-side `fetch_limit`. More in-window entries may exist beyond the cap.
+
 **Time window parsing:** `--since` and `--until` accept either ISO-8601 strings (`"2026-07-08T12:00:00Z"`) or relative durations (`30s`, `5m`, `1h`). Duration forms compute `now(UTC) - duration`.
 
 **`--match` predicate:** Evaluated against the full canonical entry (all top-level fields plus `.fields.*`). True on **any** truthy output (`.fields.orderId == "ord-789"` means "≥1 entry qualifies," not "all"). Use `{placeholder}` syntax for runtime values filled via `--param`. A malformed expression raises `ConfigError` (exit 2); missing `jq` library surfaces as `ConfigError` pointing at `pip install 'agctl[logs]'`.
